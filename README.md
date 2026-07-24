@@ -39,9 +39,8 @@ and documented on their own terms.
 
 ## Building
 
-Each of the four data-structure projects builds independently with its own
-Makefile (the supporting components are header-only and are built as part of
-the projects that use them):
+Each project builds independently with its own Makefile (`Spinlock` is a
+single header, built as part of the projects that use it):
 
 ```sh
 cd ConcurrentDeque   # or any other project

@@ -1,0 +1,40 @@
+# Built binaries (benchmarks, tests, sanitizer variants)
+*_bm
+*_gmbm
+*_lmbm
+*_mbm
+*_ppmbm
+*_test
+*_test_asan
+*_test_tsan
+*_asan
+*_tsan
+
+# Editor leftovers and backups
+*.bak
+*~
+.*.sw?
+*.old
+
+# Development version snapshots
+V[0-9]/
+
+# Book chapter drafts
+B32053_*.pdf
+
+# Local tool settings and session files
+.claude/
+*.session
+prompt_list.txt
+
+# WSL/Windows download metadata
+*Zone.Identifier
+
+# Documentation: only READMEs are published
+*.md
+!README.md
+
+# Daniel Anderson's atomic_shared_ptr: redistribution permission unclear,
+# fetch from https://github.com/DanielLiamAnderson/atomic_shared_ptr
+SharedPtr/lock_free_shared_ptr/parlay/
+SharedPtr/atomic_shared_ptr/

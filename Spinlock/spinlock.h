@@ -41,12 +41,12 @@
 //   short (~1 ns request): nanosleep rounds this up to the next scheduling
 //     opportunity, so in practice it just relinquishes the CPU -- a cheap yield
 //     used while the lock looks briefly contended.
-//   long  (~10 ms):        a real sleep, used once short yields have failed
+//   long  (~1 ms):         a real sleep, used once short yields have failed
 //     enough times, so a thread waiting on a long-held lock stops burning a
 //     core and lets the OS schedule useful work instead.
 namespace {
   static const struct timespec spin_wait_short = { 0, 1 };
-  static const struct timespec spin_wait_long  = { 0, 10000001 };
+  static const struct timespec spin_wait_long  = { 0, 1000001 };
   static inline void spin_wait_short_sleep() { nanosleep(&spin_wait_short, nullptr); }
   static inline void spin_wait_long_sleep()  { nanosleep(&spin_wait_long,  nullptr); }
 } // anonymous namespace
@@ -89,7 +89,7 @@ class SpinLock {
   // instructions of the holder's unlock, without branching on the back-off
   // counter between attempts. Only if all eight attempts fail do we sleep, and
   // the back-off escalates: eight rounds of near-zero yields (spin_count 0..7),
-  // then one ~10 ms sleep, resetting the counter and repeating -- so a
+  // then one ~1 ms sleep, resetting the counter and repeating -- so a
   // contended-but-brief lock stays busy-ish while a long-held lock lets the
   // waiter get out of the scheduler's way.
   void lock() {
@@ -131,7 +131,7 @@ class SpinLock {
   // not actual lock contention. Instead, this runs the same TTAS spin as
   // lock() -- the unrolled burst of eight attempts rides out the ownership
   // transfer, and up to eight rounds of near-zero yields ride out a brief
-  // holder -- and gives up only where lock() would escalate to the ~10 ms
+  // holder -- and gives up only where lock() would escalate to the ~1 ms
   // long sleep. So false means the lock was genuinely held the whole time,
   // but a "failed" try_lock() has already spun and yielded for a short while;
   // callers that need a truly non-blocking (and correspondingly racy) probe

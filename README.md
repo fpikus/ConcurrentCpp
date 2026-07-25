@@ -32,15 +32,15 @@ Supporting components shared by the projects above:
   intrusive pointer with an embedded one-bit lock, and an adapter for Daniel
   Anderson's genuinely lock-free `atomic_shared_ptr` (fetched separately;
   see [SharedPtr/lock_free_shared_ptr](SharedPtr/lock_free_shared_ptr/)).
-- **[Spinlock](Spinlock/)** — the spinlock used throughout.
+- **[Spinlock](Spinlock/)** — the TTAS spinlock with a two-tier back-off
+  used throughout, with the benchmarks that tuned it.
 
 New projects added after the book's publication will be exactly that — new,
 and documented on their own terms.
 
 ## Building
 
-Each project builds independently with its own Makefile (`Spinlock` is a
-single header, built as part of the projects that use it):
+Each project builds independently with its own Makefile:
 
 ```sh
 cd ConcurrentDeque   # or any other project

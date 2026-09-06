@@ -394,7 +394,10 @@ public:
      * Why any directory loaded here is safe for every index below the observed size:
      * - It cannot be too OLD: the writer stores directory_ before the release store of
      *   size_, so once the caller's acquire load of size_ observes the new size, write-read
-     *   coherence forbids this load from returning an earlier directory value.
+     *   coherence forbids this load from returning an earlier directory value. The two
+     *   stores need not come from the same thread: both happen under spinlock_, whose
+     *   lock()/unlock() are acquire/release, so a directory published by one writer
+     *   (e.g. in reserve()) happens-before the size_ store of every later writer.
      * - It CAN be too new (a concurrent reallocation may have swapped directories since
      *   size() was read), but that is harmless: a new directory starts as a superset of the
      *   old one's block pointers, and blocks never move, so every index < size() still maps

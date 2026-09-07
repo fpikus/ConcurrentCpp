@@ -110,19 +110,38 @@ away from being your numbers.
 ## Building and testing
 
 ```sh
-make                # benchmarks + ASan/TSan unit tests
+make benchmarks     # just the benchmarks — needs only Google Benchmark
+make                # benchmarks + ASan/TSan unit tests (needs GoogleTest)
 make run_tests      # run both sanitizer test binaries
-make run_benchmarks # the contention sweep, then the tier sweep
+make run_benchmarks # every benchmark, full grid — very long
 ```
 
-Requires clang (the Makefile uses `clang++-22`, C++23), Google Benchmark and
-GoogleTest; point `GBENCH_DIR` and `GTEST_DIR` at your installations if they
-are not in `$HOME/GoogleBench` and `$HOME/GoogleTest`.
+Every configuration is registered in every binary; a Google Benchmark filter
+(`--benchmark_filter=...`) selects the ones you want — the saturation proof,
+the reader confirmation, the low-contention probes, the overhead grid — and
+the measurement protocol is the standard `--benchmark_repetitions`,
+`--benchmark_report_aggregates_only`, and
+`--benchmark_enable_random_interleaving`. `make run_benchmarks` runs the full
+grid; the output is Google Benchmark JSON, one report per run.
+
+Binaries land in `build/<hostname>/` and results in `results/<hostname>/`, so
+any number of machines can build and run concurrently in one shared tree.
+The machine-specific configuration — compiler, `-march` target, C++ standard,
+and the Google Benchmark/GoogleTest install paths — lives in `../config.mk`,
+shared by every benchmark directory and written once per machine; the Makefile
+itself is machine-independent. The reference `config.mk` uses `clang++-22`,
+`-march=native`, C++23, and libraries in `$HOME/GoogleBench` and
+`$HOME/GoogleTest`.
 
 - `spinlock.h` — the lock
 - `spinlock_test.C` — unit tests (built with ASan and TSan)
 - `spinlock_bm.C` — the lock against its alternatives, across the contention range
-- `spinlock_tune_bm.C` — the back-off tier sweep
+- `spinlock_tune.h` — the lock with the whole back-off ladder as one constexpr parameter set, chosen per call site
+- `spinlock_tune_bm.C` — the exploration of that parameter space
+- `spinlock_rw_tune_bm.C` — whether readers and writers of one lock want different back-off
+- `overhead_bm.C` — the lock against the atomic and the CAS loop, across the sharing:work grid, with compute-heavy and memory-streaming work
+- `spinlock_mem_bm.C` — the same ladder sweep with memory-streaming work in place of sin/cos
+- `spinlock_tune_configs.h` — the ladder configurations, shared by both sweeps
 - `spinlock_bm_common.h` — the shared benchmark harness
 
 ## The book

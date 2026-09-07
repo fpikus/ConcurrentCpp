@@ -105,10 +105,16 @@ class SpinLock {
       if (!(lock_.load(std::memory_order_relaxed) || lock_.exchange(1, std::memory_order_acquire))) return;
       if (!(lock_.load(std::memory_order_relaxed) || lock_.exchange(1, std::memory_order_acquire))) return;
       if (spin_count < 8) {
-        spin_wait_short_sleep();        // first 8 rounds: yield, stay hot
+        spin_wait_short_sleep();        // 8 rounds per cycle: yield, stay hot
       } else {
-        spin_count = 0;                 // then escalate to a real sleep and
-        spin_wait_long_sleep();         // start the yield budget over
+        // Escalate to a real sleep and start the yield budget over. The reset
+        // is to -1, not 0, because the for-header's ++spin_count runs before
+        // the next round reads it: resetting to 0 would spend seven yields on
+        // every cycle after the first instead of the eight documented above --
+        // and would also make lock() escalate sooner than try_lock() gives up,
+        // when the two are meant to draw the line at the same place.
+        spin_count = -1;
+        spin_wait_long_sleep();
       }
     } // spin/back-off loop
   } // SpinLock::lock()

@@ -181,13 +181,13 @@ static void BM_AccessNoGrowth(benchmark::State& state) {
 // (real) time is what actually measures concurrent scaling here.
 BENCHMARK_TEMPLATE(BM_AccessNoGrowth, SpinlockDeque<int>)
     ->ArgsProduct({
-        benchmark::CreateRange(1000, 100000, /*multi=*/10),
+        benchmark::CreateRange(1000, 1000000, /*multi=*/10),
         benchmark::CreateRange(1, num_cpu, /*multi=*/2)
     })->UseRealTime();
 
 BENCHMARK_TEMPLATE(BM_AccessNoGrowth, ConcurrentAppendDeque<int, 1024>)
     ->ArgsProduct({
-        benchmark::CreateRange(1000, 100000, /*multi=*/10),
+        benchmark::CreateRange(1000, 1000000, /*multi=*/10),
         benchmark::CreateRange(1, num_cpu, /*multi=*/2)
     })->UseRealTime();
 
@@ -250,13 +250,13 @@ static void BM_AccessWithSizeCheck(benchmark::State& state) {
 
 BENCHMARK_TEMPLATE(BM_AccessWithSizeCheck, SpinlockDeque<int>)
     ->ArgsProduct({
-        benchmark::CreateRange(1000, 100000, /*multi=*/10),
+        benchmark::CreateRange(1000, 1000000, /*multi=*/10),
         benchmark::CreateRange(1, num_cpu, /*multi=*/2)
     })->UseRealTime();
 
 BENCHMARK_TEMPLATE(BM_AccessWithSizeCheck, ConcurrentAppendDeque<int, 1024>)
     ->ArgsProduct({
-        benchmark::CreateRange(1000, 100000, /*multi=*/10),
+        benchmark::CreateRange(1000, 1000000, /*multi=*/10),
         benchmark::CreateRange(1, num_cpu, /*multi=*/2)
     })->UseRealTime();
 
@@ -338,13 +338,13 @@ static void BM_ResizeAndWrite(benchmark::State& state) {
 
 BENCHMARK_TEMPLATE(BM_ResizeAndWrite, SpinlockDeque<int>)
     ->ArgsProduct({
-        benchmark::CreateRange(1000, 100000, /*multi=*/10),
+        benchmark::CreateRange(1000, 1000000, /*multi=*/10),
         benchmark::CreateRange(1, num_cpu, /*multi=*/2)
     })->UseRealTime();
 
 BENCHMARK_TEMPLATE(BM_ResizeAndWrite, ConcurrentAppendDeque<int, 1024>)
     ->ArgsProduct({
-        benchmark::CreateRange(1000, 100000, /*multi=*/10),
+        benchmark::CreateRange(1000, 1000000, /*multi=*/10),
         benchmark::CreateRange(1, num_cpu, /*multi=*/2)
     })->UseRealTime();
 
@@ -502,7 +502,7 @@ static void BM_WriterVsPollingReaders(benchmark::State& state) {
 
 BENCHMARK_TEMPLATE(BM_WriterVsPollingReaders, ConcurrentAppendDeque<int, 1024>)
     ->ArgsProduct({
-        benchmark::CreateRange(1000, 100000, /*multi=*/10),
+        benchmark::CreateRange(1000, 1000000, /*multi=*/10),
         benchmark::CreateRange(1, num_cpu, /*multi=*/2)
     })->UseRealTime();
 

@@ -56,19 +56,19 @@ server:
 
 | Threads | Spinlocked `std::deque` | `ConcurrentAppendDeque` |
 |--------:|------------------------:|------------------------:|
-| 1       | 136 M elements/s        | 1.8 G elements/s        |
-| 2       | 40 M/s                  | 3.6 G/s                 |
-| 32      | 83 M/s                  | 27.4 G/s                |
-| 128     | 94 M/s                  | 53.6 G/s                |
+| 1       | 137 M elements/s        | 2.0 G elements/s        |
+| 2       | 135 M/s                 | 4.0 G/s                 |
+| 32      | 116 M/s                 | 61 G/s                  |
+| 128     | 64 M/s                  | 91 G/s                  |
 
-The single-threaded result is over 13x faster, before contention even enters
-the picture, and the scaling is nearly linear until NUMA effects take over.
-In the dynamic pattern — every thread repeatedly reserves a new range with
-`resize()` and then works on it — the locked baseline degrades into serialized
-execution at ~100–130 M elements/s regardless of thread count, while the
-concurrent deque reaches 22.7 G elements/s at 128 threads. The same shape
-repeats on ARM (NVIDIA Grace) and on a desktop Ryzen; only the absolute
-numbers change.
+The single-threaded result is nearly 15x faster, before contention even enters
+the picture, and the scaling is nearly linear until NUMA effects take over —
+while the locked baseline, unable to do anything concurrently, only sinks as
+threads are added. In the dynamic pattern — every thread repeatedly reserves a
+new range with `resize()` and then works on it — the locked baseline degrades
+into serialized execution around 100–130 M elements/s, while the concurrent
+deque reaches 30 G elements/s at 128 threads. The same shape repeats on ARM
+(NVIDIA Grace) and on a desktop Ryzen; only the absolute numbers change.
 
 ## Building and testing
 
@@ -77,9 +77,13 @@ make            # benchmark + ASan/TSan unit tests
 make run_tests  # run both sanitizer test binaries
 ```
 
-Requires clang (the Makefile uses `clang++-22`, C++23), Google Benchmark and
-GoogleTest; point `GBENCH_DIR` and `GTEST_DIR` at your installations if they
-are not in `$HOME/GoogleBench` and `$HOME/GoogleTest`.
+Build configuration — the compiler, C++ standard, and the Google Benchmark and
+GoogleTest install paths — comes from `../config.mk`, a single file shared by
+every directory in this repository and written once per machine. It defaults to
+`clang++-22`, C++23, and `$HOME/GoogleBench` / `$HOME/GoogleTest`; edit that file
+(or override on the `make` command line) to match your setup. Binaries are
+written under `build/<hostname>/`, so several machines can build concurrently in
+a shared tree.
 
 - `concurrent_deque.h` — the container (used as the backing store by the
   concurrent hash set in `../ConcurrentHash`)

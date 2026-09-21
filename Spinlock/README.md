@@ -112,7 +112,7 @@ away from being your numbers.
 ```sh
 make benchmarks     # just the benchmarks — needs only Google Benchmark
 make                # benchmarks + ASan/TSan unit tests (needs GoogleTest)
-make run_tests      # run both sanitizer test binaries
+make run_tests      # run all four sanitizer test binaries
 make run_benchmarks # every benchmark, full grid — very long
 ```
 
@@ -141,6 +141,9 @@ itself is machine-independent. The reference `config.mk` uses `clang++-22`,
 - `spinlock_rw_tune_bm.C` — whether readers and writers of one lock want different back-off
 - `overhead_bm.C` — the lock against the atomic and the CAS loop, across the sharing:work grid, with compute-heavy and memory-streaming work
 - `spinlock_mem_bm.C` — the same ladder sweep with memory-streaming work in place of sin/cos
+- `seqlock.h` — a sequence lock: readers copy the payload out without writing to shared memory
+- `seqlock_test.C` — unit tests for the sequence lock (built with ASan and TSan)
+- `seqlock_bm.C` — the sequence lock against the spinlock and a bare atomic, across the same read:write mix
 - `spinlock_tune_configs.h` — the ladder configurations, shared by both sweeps
 - `spinlock_bm_common.h` — the shared benchmark harness
 

@@ -33,15 +33,20 @@ TARGET_RW_TUNE_BM = $(BUILD_DIR)/spinlock_rw_tune_bm
 TARGET_OVERHEAD_BM = $(BUILD_DIR)/overhead_bm
 TARGET_MEM_BM = $(BUILD_DIR)/spinlock_mem_bm
 TARGET_LAYOUT_BM = $(BUILD_DIR)/spinlock_layout_bm
+TARGET_SEQLOCK_BM = $(BUILD_DIR)/seqlock_bm
 TARGET_TEST_ASAN = $(BUILD_DIR)/spinlock_test_asan
 TARGET_TEST_TSAN = $(BUILD_DIR)/spinlock_test_tsan
+TARGET_SEQLOCK_TEST_ASAN = $(BUILD_DIR)/seqlock_test_asan
+TARGET_SEQLOCK_TEST_TSAN = $(BUILD_DIR)/seqlock_test_tsan
 
 # The two groups: `make benchmarks` needs only Google Benchmark and works on
 # machines without sanitizer runtimes; `make tests` needs GoogleTest and
 # ASan/TSan. `make all` is both.
 BENCHMARKS = $(TARGET_BM) $(TARGET_TUNE_BM) $(TARGET_RW_TUNE_BM) \
-             $(TARGET_OVERHEAD_BM) $(TARGET_MEM_BM) $(TARGET_LAYOUT_BM)
-TESTS = $(TARGET_TEST_ASAN) $(TARGET_TEST_TSAN)
+             $(TARGET_OVERHEAD_BM) $(TARGET_MEM_BM) $(TARGET_LAYOUT_BM) \
+             $(TARGET_SEQLOCK_BM)
+TESTS = $(TARGET_TEST_ASAN) $(TARGET_TEST_TSAN) \
+        $(TARGET_SEQLOCK_TEST_ASAN) $(TARGET_SEQLOCK_TEST_TSAN)
 
 # Headers every target depends on; editing them must trigger a rebuild.
 # Recipes use $< (the source file), not $^, so the headers are prerequisites
@@ -54,6 +59,9 @@ HEADERS = spinlock.h spinlock_bm_common.h ../config.mk
 TUNE_HEADERS = spinlock_tune.h
 # The shared ladder-configuration list, needed only by the two sweep benchmarks.
 TUNE_CONFIGS = spinlock_tune_configs.h
+# The sequence lock. It includes spinlock_tune.h (for spin_pause()), so its
+# users list $(TUNE_HEADERS) as well.
+SEQLOCK_HEADERS = seqlock.h
 
 .PHONY: all benchmarks tests clean run_tests run_benchmarks
 
@@ -90,6 +98,10 @@ $(TARGET_MEM_BM): spinlock_mem_bm.C $(HEADERS) $(TUNE_HEADERS) $(TUNE_CONFIGS) |
 $(TARGET_LAYOUT_BM): spinlock_layout_bm.C $(HEADERS) $(TUNE_HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) -o $@
 
+# Build sequence-lock benchmark (seqlock vs spinlock vs atomic, read/write mix)
+$(TARGET_SEQLOCK_BM): seqlock_bm.C $(HEADERS) $(TUNE_HEADERS) $(SEQLOCK_HEADERS) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) -o $@
+
 # Build ASan test
 $(TARGET_TEST_ASAN): spinlock_test.C $(HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_TEST_ASAN) $< $(LIBS_TEST) -o $@
@@ -98,10 +110,20 @@ $(TARGET_TEST_ASAN): spinlock_test.C $(HEADERS) | $(BUILD_DIR)
 $(TARGET_TEST_TSAN): spinlock_test.C $(HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_TEST_TSAN) $< $(LIBS_TEST) -o $@
 
+# Build SeqLock ASan test
+$(TARGET_SEQLOCK_TEST_ASAN): seqlock_test.C $(HEADERS) $(TUNE_HEADERS) $(SEQLOCK_HEADERS) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS_TEST_ASAN) $< $(LIBS_TEST) -o $@
+
+# Build SeqLock TSan test
+$(TARGET_SEQLOCK_TEST_TSAN): seqlock_test.C $(HEADERS) $(TUNE_HEADERS) $(SEQLOCK_HEADERS) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS_TEST_TSAN) $< $(LIBS_TEST) -o $@
+
 # Run tests
 run_tests: tests
 	./$(TARGET_TEST_ASAN)
 	./$(TARGET_TEST_TSAN)
+	./$(TARGET_SEQLOCK_TEST_ASAN)
+	./$(TARGET_SEQLOCK_TEST_TSAN)
 
 # Run benchmarks
 run_benchmarks: benchmarks
@@ -110,6 +132,7 @@ run_benchmarks: benchmarks
 	./$(TARGET_RW_TUNE_BM)
 	./$(TARGET_OVERHEAD_BM)
 	./$(TARGET_MEM_BM)
+	./$(TARGET_SEQLOCK_BM)
 
 # Clean build artifacts
 clean:

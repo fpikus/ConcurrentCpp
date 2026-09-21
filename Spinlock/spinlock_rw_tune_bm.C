@@ -5,6 +5,12 @@
 // single-ladder sweep on a pure write workload see spinlock_tune_bm.C; for the
 // lock against the atomic and std::mutex reference points see spinlock_bm.C.
 //
+// The benchmark body (BM_rw()), the (reads, writes, work) argument grid
+// (RW_ARGS), and the plain-SpinLock comparator (SpinLockData) are the shared
+// read/write harness in spinlock_bm_common.h, which seqlock_bm.C runs as well.
+// What this file adds is the instrument and the sweep: the two-policy Data
+// class and the named ladders it is instantiated with.
+//
 // THE HYPOTHESIS
 //
 // write() and read() need the same lock to be correct: the value is a plain
@@ -68,10 +74,13 @@
 
 #include "spinlock_bm_common.h"
 
-// The shared data: one plain unsigned long behind one lock. This is the shape
-// the hypothesis is about -- a value that is not itself atomic, so both the
-// increment and the load must be inside the critical section, and the only
-// thing that can differ between them is how a waiter waits.
+// The instrument, behind the harness's write()/read() interface: one plain
+// unsigned long and one TunableSpinLock, the same shape as the SpinLockData
+// comparator in spinlock_bm_common.h but with the two waiting policies as
+// template parameters. This is the shape the hypothesis is about -- a value
+// that is not itself atomic, so both the increment and the load must be inside
+// the critical section, and the only thing that can differ between them is how
+// a waiter waits.
 //
 // There is no two-role lock class here: the lock is one TunableSpinLock word,
 // and each operation binds its waiting policy at the call site through a
@@ -91,7 +100,7 @@ class Data {
   public:
   // Take the lock the writer's way, add `n` to the shared total, release. The
   // increment is passed in rather than being a constant 1 because it is the
-  // result of the caller's work chunk -- see BM_rw.
+  // result of the caller's work chunk -- see BM_rw() in spinlock_bm_common.h.
   void write(unsigned long n) {
     LockAdapter<WriteP> adapter(lock_);
     std::lock_guard guard(adapter);
@@ -107,99 +116,9 @@ class Data {
   } // Data::read()
 
   private:
-  alignas(64) TunableSpinLock lock_;
+  alignas(64) TunableSpinLock lock_;    // one word, climbed two different ways
   alignas(64) unsigned long x_ = 0;     // plain, non-atomic: the lock is the
 }; // class Data                        // only thing making this well-defined
-
-// The benchmark body, shared by every lock configuration: each iteration does
-// `writes` guarded increments followed by `reads` guarded loads. The two are
-// batched rather than interleaved, which is what the mixes are meant to model
-// -- at reads:100/writes:1 a thread makes one update and then reads for a
-// while, the shape a read-mostly structure actually sees.
-//
-// Every guarded operation is preceded by `work` evaluations of x = sin(cos(x))
-// on a thread-local value -- the contention dial of spinlock_bm_common.h, and
-// the reason it matters here: the single-ladder sweep showed that the optimal
-// back-off at ~1% lock occupancy is the opposite of the optimal back-off at
-// saturation, so a read-versus-write comparison run only at work=0 answers the
-// question in one regime out of two.
-//
-// The work goes before each guarded operation rather than once per iteration
-// with a batch of operations after it (the shape of overhead_bm.C, where the
-// batch size is itself the dial). Per-operation is what keeps `work` meaning
-// the same thing at every mix: one work burst per lock acquisition, so lock
-// occupancy depends on `work` alone and not on the read:write ratio. At the
-// pure endpoints the two placements coincide.
-//
-// The work is COUPLED to the shared value at both ends, which is the point of
-// sharing data in the first place -- a thread computes something locally and
-// folds it into global state, or reads global state and computes from it:
-//   writes: the increment handed to write() is the result of the work chunk,
-//           so the shared total depends on the computation, not on a constant.
-//   reads:  the value read out seeds the next work chunk, so the load is on
-//           the dependency path of everything that follows it.
-// Decoupled work would let the compiler schedule the two halves independently
-// and would model a workload nobody has.
-//
-// The read seed is masked to its low bits before it becomes a double: over a
-// long mixed run the shared total grows without bound, and cos() of a huge
-// argument drops into libm's slow argument-reduction path, which would make the
-// work chunk quietly get more expensive as the run proceeds. The dependency is
-// what this needs, not the magnitude.
-//
-// Reports items/s == guarded operations/s (reads plus writes), so the number is
-// comparable across mixes even though an iteration costs `reads + writes` lock
-// acquisitions rather than one.
-template <typename DataT, typename Work>
-void BM_rw(benchmark::State& state) {
-  alignas(64) static DataT data;
-  const long reads = state.range(0);
-  const long writes = state.range(1);
-  const long work = state.range(2);
-  Work::warmup(work);                   // untimed; a no-op for SinCosWork
-  double local_x = 1.0 + state.thread_index();
-  for (auto _ : state) {
-    for (long i = 0; i < writes; ++i) {
-      local_x = Work::run(local_x, work);
-      data.write(static_cast<unsigned long>(1.0 + local_x));
-    }
-    for (long i = 0; i < reads; ++i) {
-      local_x = Work::run(static_cast<double>(data.read() & 0xFF), work);
-      // Pin each chunk's result: it is otherwise dead, since the next
-      // iteration reseeds from data.read(), and a compiler that proves
-      // sin/cos side-effect-free could keep the guarded loads while
-      // discarding the work between them. (Today libm's sin/cos may set
-      // errno, which happens to prevent that; the measurement should not
-      // hang on a math flag.) The write loop needs no pin -- every chunk's
-      // result is consumed by data.write().
-      benchmark::DoNotOptimize(local_x);
-    }
-  }
-  state.SetItemsProcessed(state.iterations()*(reads + writes));
-} // BM_rw
-
-// The shipped SpinLock behind the same Data interface: both paths take the
-// one lock the one way SpinLock knows how. Runs alongside as the cross-check
-// on w:base/r:base.
-class SpinLockData {
-  public:
-  void write(unsigned long n) {
-    lock_.lock();
-    x_ += n;
-    lock_.unlock();
-  } // SpinLockData::write()
-
-  unsigned long read() {
-    lock_.lock();
-    const unsigned long x = x_;
-    lock_.unlock();
-    return x;
-  } // SpinLockData::read()
-
-  private:
-  alignas(64) SpinLock lock_;
-  alignas(64) unsigned long x_ = 0;
-}; // class SpinLockData
 
 // The parameter sets the sweep is built from, written as their deltas from
 // the shipped ladder (BackOffParams{} == what SpinLock ships). The rest are
@@ -215,38 +134,6 @@ inline constexpr BackOffParams ladder_burst {.ntry = 32};
 inline constexpr BackOffParams ladder_spin {.nshort = 0, .long_sleep_ns = NS_off};
 inline constexpr BackOffParams ladder_park {.nshort = 0};
 inline constexpr BackOffParams ladder_quick {.long_sleep_ns = NS_100us};
-
-// The mix and contention arguments, as (reads, writes, work) per iteration.
-// The name reads as the ratio -- reads:100 with writes:1 is the 100:1
-// read-mostly case -- and `work` sets the contention level: saturation, then
-// the two low-occupancy points where the single-ladder sweep showed the
-// optimum moving (work:0 is ~100% of a thread's time under the lock, work:30
-// ~1%, work:100 ~0.3%).
-//
-// The pure endpoints are what decide whether readers and writers want
-// different ladders at all; a mix can only interpolate between them, so the
-// default test sets (run_sets.sh) run the endpoints and leave the mixes for
-// when the endpoints show a spread. The endpoints are also self-calibrating:
-// at reads:0/writes:1 the read ladder is never used, so every `r:*` line must
-// collapse onto the baseline and the whole benchmark must reproduce the
-// write-only sweep in spinlock_tune_bm.C; reads:1/writes:0 is the mirror,
-// where only the read ladder can move the number.
-#define RW_ENDPOINTS(work) \
-  ->Args({0, 1, work})                  /* 100% writers */ \
-  ->Args({1, 0, work})                  /* 100% readers */
-
-// The read:write mixes -- the case where the shared total actually grows (see
-// the read-seed masking in BM_rw, which exists for it).
-#define RW_MIXES(work) \
-  ->Args({1, 100, work})->Args({1, 10, work})->Args({1, 1, work}) \
-  ->Args({10, 1, work})->Args({100, 1, work})
-
-#define RW_ARGS \
-  ->ArgNames({"reads", "writes", "work"}) \
-  RW_ENDPOINTS(0) RW_ENDPOINTS(30) RW_ENDPOINTS(100) \
-  RW_MIXES(0) RW_MIXES(30) RW_MIXES(100) \
-  ->ThreadRange(1, numcpu) \
-  ->UseRealTime()
 
 // Register one (write ladder, read ladder) pair under both kinds of work,
 // named by the two tags and the work kind:
@@ -288,8 +175,9 @@ RW_BM(quick, base);
 RW_BM(park, spin);
 RW_BM(spin, park);
 
-// The header's SpinLock on both paths: must match w:base/r:base. Any gap beyond
-// run-to-run noise means the tunable lock has drifted from the real lock.
+// The shipped SpinLock on both paths, via the shared comparator SpinLockData
+// (spinlock_bm_common.h): must match w:base/r:base. Any gap beyond run-to-run
+// noise means the tunable lock has drifted from the real lock.
 BENCHMARK_TEMPLATE(BM_rw, SpinLockData, SinCosWork)->Name("BM_spinlock") RW_ARGS;
 BENCHMARK_TEMPLATE(BM_rw, SpinLockData, MemWork)->Name("BM_spinlock_mem") RW_ARGS;
 

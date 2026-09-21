@@ -33,10 +33,13 @@
 // instead of repeatedly issuing read-for-ownership atomic RMWs, which is what
 // makes a naive test-and-set spinlock collapse under contention.
 //
-// Back-off sleeps for the spin loops below. Anonymous namespace gives these
-// internal linkage, so every translation unit that includes this header gets
-// its own copy with no ODR clash (the extra `static` is redundant belt-and-
-// suspenders). The timespec format is {seconds, nanoseconds}; two escalating
+// Back-off sleeps for the spin loops below. These are `inline` entities with
+// external linkage -- one definition shared by every translation unit that
+// includes this header -- and deliberately NOT internal-linkage ones (static or
+// anonymous namespace): SpinLock's inline member functions have external
+// linkage and call them, and an inline function defined in several translation
+// units must name the same entities in each of them, or the program violates
+// the ODR. The timespec format is {seconds, nanoseconds}; two escalating
 // tiers:
 //   short (~1 ns request): nanosleep rounds this up to the next scheduling
 //     opportunity, so in practice it just relinquishes the CPU -- a cheap yield
@@ -44,12 +47,13 @@
 //   long  (~1 ms):         a real sleep, used once short yields have failed
 //     enough times, so a thread waiting on a long-held lock stops burning a
 //     core and lets the OS schedule useful work instead.
-namespace {
-  static const struct timespec spin_wait_short = { 0, 1 };
-  static const struct timespec spin_wait_long  = { 0, 1000001 };
-  static inline void spin_wait_short_sleep() { nanosleep(&spin_wait_short, nullptr); }
-  static inline void spin_wait_long_sleep()  { nanosleep(&spin_wait_long,  nullptr); }
-} // anonymous namespace
+inline const struct timespec spin_wait_short = { 0, 1 };
+inline const struct timespec spin_wait_long  = { 0, 1000001 };
+// Relinquish the CPU briefly (short tier). No arguments, no result; the
+// nanosleep return value is ignored: an early wake-up just retries sooner.
+inline void spin_wait_short_sleep() { nanosleep(&spin_wait_short, nullptr); }
+// Sleep for ~1 ms (long tier). Same contract as spin_wait_short_sleep().
+inline void spin_wait_long_sleep()  { nanosleep(&spin_wait_long,  nullptr); }
 
 // A test-and-test-and-set (TTAS) spinlock with escalating back-off: cheap and
 // fast under low contention, and it degrades gracefully (yielding, then

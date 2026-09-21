@@ -75,16 +75,18 @@
 // Portable spin-wait hint: PAUSE on x86, YIELD on ARM, nothing elsewhere.
 // PAUSE does not release the core -- it quiets the pipeline and shortens the
 // memory-order-violation penalty on exiting the spin -- so the pause tier below
-// is still "spinning", just politer spinning.
-namespace {
-  static inline void spin_pause() {
+// is still "spinning", just politer spinning. No arguments, no result.
+// Plain `inline` (external linkage), not static or anonymous-namespace: it is
+// called from inline functions with external linkage (the ladder below,
+// SeqLock's reader loop), which must name the same entity in every translation
+// unit to satisfy the ODR.
+inline void spin_pause() {
 #if defined(__x86_64__) || defined(__i386__)
-    _mm_pause();
+  _mm_pause();
 #elif defined(__aarch64__)
-    __asm__ volatile("yield" ::: "memory");
+  __asm__ volatile("yield" ::: "memory");
 #endif
-  } // spin_pause()
-} // anonymous namespace
+} // spin_pause()
 
 // Sleep durations for ladder configurations, named so that benchmark names read
 // as durations: the benchmarks pass the macro and stringify the argument, so a

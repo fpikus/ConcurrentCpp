@@ -23,18 +23,28 @@ LIBS_BM = $(GBENCH_DIR)/lib/libbenchmark.a $(COMMON_LIBS)
 # Test flags
 CXXFLAGS_TEST_ASAN = $(COMMON_FLAGS) -O0 -Wno-misleading-indentation -fsanitize=address $(COMMON_INCLUDES) -I$(GTEST_DIR)/include
 CXXFLAGS_TEST_TSAN = $(COMMON_FLAGS) -O0 -Wno-misleading-indentation -fsanitize=thread $(COMMON_INCLUDES) -I$(GTEST_DIR)/include
+# The store-buffering regression test is the one test in this directory that must
+# NOT be a sanitizer build. It observes a real store-buffering execution (the
+# resizer's plain store of table_size_ still in its store buffer when it reads a
+# bucket head); both sanitizer runtimes execute locked instructions all over that
+# path and -O0 stretches it by hundreds of instructions, either of which drains
+# the buffer before the window opens. Built under ASan/TSan or at -O0 the test can
+# only ever pass, which would make it worthless. Same optimization settings as the
+# benchmarks, same GoogleTest link as the other tests.
+CXXFLAGS_TEST_TSO = $(COMMON_FLAGS) -O3 -DNDEBUG $(COMMON_INCLUDES) -I$(GTEST_DIR)/include
 LIBS_TEST = $(GTEST_DIR)/lib/libgtest.a $(GTEST_DIR)/lib/libgtest_main.a $(COMMON_LIBS)
 
 # Target definitions (all under the per-host build directory)
 TARGET_BM = $(BUILD_DIR)/concurrent_hash_set_bm
 TARGET_TEST_ASAN = $(BUILD_DIR)/concurrent_hash_set_test_asan
 TARGET_TEST_TSAN = $(BUILD_DIR)/concurrent_hash_set_test_tsan
+TARGET_TEST_TSO = $(BUILD_DIR)/concurrent_hash_set_tso_test
 
 # `make benchmarks` needs only Google Benchmark and builds on machines without
 # sanitizer runtimes; `make tests` needs GoogleTest and ASan/TSan. `make all` is
 # both.
 BENCHMARKS = $(TARGET_BM)
-TESTS = $(TARGET_TEST_ASAN) $(TARGET_TEST_TSAN)
+TESTS = $(TARGET_TEST_ASAN) $(TARGET_TEST_TSAN) $(TARGET_TEST_TSO)
 
 # Headers every target depends on; editing them must trigger a rebuild. Recipes
 # use $< (the source file), not $^, so the headers are prerequisites only and
@@ -68,10 +78,15 @@ $(TARGET_TEST_ASAN): concurrent_hash_set_test.C $(HEADERS) | $(BUILD_DIR)
 $(TARGET_TEST_TSAN): concurrent_hash_set_test.C $(HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_TEST_TSAN) $< $(LIBS_TEST) -o $@
 
+# Build the -O3, no-sanitizer store-buffering test (see CXXFLAGS_TEST_TSO above)
+$(TARGET_TEST_TSO): concurrent_hash_set_tso_test.C $(HEADERS) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS_TEST_TSO) $< $(LIBS_TEST) -o $@
+
 # Run tests
 run_tests: tests
 	./$(TARGET_TEST_ASAN)
 	./$(TARGET_TEST_TSAN)
+	./$(TARGET_TEST_TSO)
 
 # Run benchmarks
 run_benchmarks: benchmarks

@@ -1,58 +1,82 @@
-CXX = clang++-22
-VEC = native
-STD = c++23
+# Machine-specific configuration -- compiler, -march target, standard, and the
+# Google Benchmark / GoogleTest install paths -- comes from ../config.mk, shared
+# by every benchmark directory and written once per machine. Everything below
+# this include is machine-independent and ships unchanged.
+include ../config.mk
+
+# Per-host build directory: several hosts build concurrently in the same
+# NFS-shared tree, so binaries must not overwrite each other. Same convention as
+# the Spinlock, DCLP, ConcurrentDeque, and ConcurrentQueue directories: per-host
+# subdirectories under build/, and clean removes only this host's subdirectory.
+BUILD_DIR = build/$(shell hostname)
 
 # Common configuration
 COMMON_FLAGS = -march=$(VEC) --std=$(STD) -g -Werror -Wall -Wextra -pedantic
 COMMON_INCLUDES = -I.
-COMMON_LIBS = -lpthread -lrt -lm
+# `?=` so a machine's config.mk can override: macOS has no librt.
+COMMON_LIBS ?= -lpthread -lrt -lm
 
 # Benchmark flags (optimized)
-GBENCH_DIR ?= $(HOME)/GoogleBench
 CXXFLAGS_BM = $(COMMON_FLAGS) -O3 -DNDEBUG $(COMMON_INCLUDES) -I$(GBENCH_DIR)/include
 LIBS_BM = $(GBENCH_DIR)/lib/libbenchmark.a $(COMMON_LIBS)
 
 # Test flags
-GTEST_DIR ?= $(HOME)/GoogleTest
 CXXFLAGS_TEST_ASAN = $(COMMON_FLAGS) -O0 -Wno-misleading-indentation -fsanitize=address $(COMMON_INCLUDES) -I$(GTEST_DIR)/include
 CXXFLAGS_TEST_TSAN = $(COMMON_FLAGS) -O0 -Wno-misleading-indentation -fsanitize=thread $(COMMON_INCLUDES) -I$(GTEST_DIR)/include
 LIBS_TEST = $(GTEST_DIR)/lib/libgtest.a $(GTEST_DIR)/lib/libgtest_main.a $(COMMON_LIBS)
 
-# Target definitions
-TARGET_BM = concurrent_hash_set_bm
-TARGET_TEST_ASAN = concurrent_hash_set_test_asan
-TARGET_TEST_TSAN = concurrent_hash_set_test_tsan
+# Target definitions (all under the per-host build directory)
+TARGET_BM = $(BUILD_DIR)/concurrent_hash_set_bm
+TARGET_TEST_ASAN = $(BUILD_DIR)/concurrent_hash_set_test_asan
+TARGET_TEST_TSAN = $(BUILD_DIR)/concurrent_hash_set_test_tsan
 
-# Headers every target depends on; editing them must trigger a rebuild.
-# Recipes use $< (the source file), not $^, so the headers are prerequisites
-# only and are not passed to the compiler command line.
-HEADERS = concurrent_deque.h concurrent_hash_set.h spinlock.h
+# `make benchmarks` needs only Google Benchmark and builds on machines without
+# sanitizer runtimes; `make tests` needs GoogleTest and ASan/TSan. `make all` is
+# both.
+BENCHMARKS = $(TARGET_BM)
+TESTS = $(TARGET_TEST_ASAN) $(TARGET_TEST_TSAN)
 
-.PHONY: all clean run_tests
+# Headers every target depends on; editing them must trigger a rebuild. Recipes
+# use $< (the source file), not $^, so the headers are prerequisites only and
+# are not passed to the compiler. The machine configuration is on the list for
+# the same reason: a changed compiler or -march must rebuild everything, or
+# stale binaries get measured.
+# concurrent_deque.h and spinlock.h are symlinks into ../ConcurrentDeque and
+# ../Spinlock; make follows them, so a change to the shipped header rebuilds here.
+HEADERS = concurrent_deque.h concurrent_hash_set.h spinlock.h ../config.mk
 
-all: $(TARGET_BM) $(TARGET_TEST_ASAN) $(TARGET_TEST_TSAN)
+.PHONY: all benchmarks tests clean run_tests run_benchmarks
+
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
+
+all: benchmarks tests
+
+benchmarks: $(BENCHMARKS)
+
+tests: $(TESTS)
 
 # Build benchmark
-$(TARGET_BM): concurrent_hash_set_bm.C $(HEADERS)
+$(TARGET_BM): concurrent_hash_set_bm.C $(HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) -o $@
 
 # Build ASan test
-$(TARGET_TEST_ASAN): concurrent_hash_set_test.C $(HEADERS)
+$(TARGET_TEST_ASAN): concurrent_hash_set_test.C $(HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_TEST_ASAN) $< $(LIBS_TEST) -o $@
 
 # Build TSan test
-$(TARGET_TEST_TSAN): concurrent_hash_set_test.C $(HEADERS)
+$(TARGET_TEST_TSAN): concurrent_hash_set_test.C $(HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_TEST_TSAN) $< $(LIBS_TEST) -o $@
 
 # Run tests
-run_tests: $(TARGET_TEST_ASAN) $(TARGET_TEST_TSAN)
+run_tests: tests
 	./$(TARGET_TEST_ASAN)
 	./$(TARGET_TEST_TSAN)
 
 # Run benchmarks
-run_benchmarks: $(TARGET_BM)
+run_benchmarks: benchmarks
 	./$(TARGET_BM)
 
 # Clean build artifacts
 clean:
-	rm -f $(TARGET_BM) $(TARGET_TEST_ASAN) $(TARGET_TEST_TSAN) f *.bak *~
+	rm -rf $(BUILD_DIR) *.bak *~

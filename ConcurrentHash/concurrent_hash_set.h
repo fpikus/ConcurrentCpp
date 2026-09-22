@@ -143,18 +143,17 @@ using DefaultConcurrentDeque = ConcurrentAppendDeque<T, 1024>;
 //   2. table_size_ store is release; every load is acquire. A resize stores the
 //      UNINITIALIZED bucket markers (relaxed) and THEN releases table_size_, so
 //      any thread that acquires the new size is guaranteed to see the markers.
-//   3. The arena. No read path here ever calls data_.size() (only the resize
-//      trigger does, as a hint). A reader that indexes data_[idx] relies on
-//      channel 1 -- the index reached it through a release CAS/store and an
-//      acquire load -- plus the acquire load of the block directory inside
-//      ConcurrentAppendDeque::operator[]: the node's construction and its
-//      block pointer are stored under the arena lock before the index is
-//      returned, so any happens-before path from the publisher suffices.
-//      NOTE: this satisfies the deque's implementation but not the letter of
-//      operator[]'s documented precondition ("size() must have been called
-//      prior"); see the comment there. Likewise buckets_[j] is indexed on the
-//      strength of channel 2 (table_size_ is released after buckets_.resize()),
-//      never of buckets_.size().
+//   3. The arena. ConcurrentAppendDeque's rule is that a thread may index an
+//      element only after it has learned, with an acquire, how many elements
+//      exist: from size(), or from the return value of its own emplace_back().
+//      No read path here calls data_.size(); instead the thread that appended
+//      the node (and so knows its index) hands the index to readers through
+//      channel 1 -- a release CAS on a bucket head or a release store into a
+//      link, read with acquire -- which is the same handoff size() performs,
+//      with the head or link word in the role of size_. operator[] then does
+//      its own acquire load of the block directory. Likewise buckets_[j] is
+//      indexed on the strength of channel 2 (table_size_ is released after
+//      buckets_.resize()), never of buckets_.size().
 //   4. A node link's state bits are set by a release CAS and read by acquire
 //      loads: an operation that returns after erase() returned sees the
 //      tombstone, and a thread that sees FROZEN or a raised seal level is

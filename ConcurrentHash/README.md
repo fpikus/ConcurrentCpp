@@ -1,8 +1,12 @@
 # ConcurrentResizableHashSet
 
-A chained concurrent hash set with wait-free lookups, lock-free insertion,
-optional deletion, and live resizing — safe for any number of threads, in any
-mix of operations, with no external synchronization.
+A chained concurrent hash set with optional deletion and live resizing — safe
+for any number of threads, in any mix of operations, with no external
+synchronization. Lookups take no lock and write no shared memory, except when a
+lookup is the first to touch a bucket after a resize and performs its lazy
+split. Inserts publish with a single CAS but allocate their node under the
+arena's spinlock (see [Performance](#performance)), so insertion is not
+lock-free.
 
 If you have ever tried to design a concurrent hash table, you know that two
 problems dominate the effort: safe memory reclamation (when may a node be
@@ -68,8 +72,10 @@ comparable to the baseline at one thread, then sharply divergent — the
 throughput amortizes allocation and lazy rehashing across threads until it
 peaks between 8 and 16 threads, at which point the benchmark is no longer
 measuring the hash table at all, only the physical limit of the arena
-allocator's spinlock (acquired once per 1,024 elements, courtesy of the
-deque underneath).
+allocator's spinlock. There are two locks, and they are taken at very
+different rates: the bucket table is doubled under a lock once per doubling,
+but every new node — including every node copied by a lazy split — is
+appended to the arena deque under its lock, one acquisition per element.
 
 While these benchmarks run, the CPU fans rev up. Under the reader-writer-lock
 baseline, the machine stays quiet: at 32 threads its threads spend over 95% of
@@ -79,17 +85,19 @@ concurrency benchmark falls quiet, be suspicious.
 ## Building and testing
 
 ```sh
-make            # benchmark + ASan/TSan unit tests
-make run_tests  # run both sanitizer test binaries
+make            # benchmark + ASan/TSan unit tests + the -O3 store-buffering test
+make run_tests  # run all three test binaries
 ```
 
-Requires clang (the Makefile uses `clang++-22`, C++23), Google Benchmark and
-GoogleTest; point `GBENCH_DIR` and `GTEST_DIR` at your installations if they
-are not in `$HOME/GoogleBench` and `$HOME/GoogleTest`.
+The compiler, C++ standard and library paths come from `../config.mk`, shared
+by every directory in this repository and written once per machine; binaries
+go to `build/<hostname>/`. Requires Google Benchmark and GoogleTest.
 
 - `concurrent_hash_set.h` — the hash set
 - `concurrent_deque.h` — the backing store (see `../ConcurrentDeque`)
 - `concurrent_hash_set_test.C` — unit tests (built with ASan and TSan)
+- `concurrent_hash_set_tso_test.C` — the store-buffering regression test; it
+  can only fail when built `-O3` without a sanitizer, so it is its own binary
 - `concurrent_hash_set_bm.C` — the benchmarks quoted above
 
 ## The book
@@ -98,6 +106,7 @@ This directory accompanies Chapter 7 of *The Art of Writing Efficient
 Programs, Second Edition* by Fedor G. Pikus. The chapter contains what this
 README deliberately omits: the split-bucket arithmetic that makes stale
 copies mathematically incapable of resurrection, the insert-versus-resize race
-and both of its resolutions, and the benchmark that lied — a lazily-evaluated
-structure that made "setup" a fiction until the deferred work was forced to
-quiesce.
+and the rule that resolves it (every decision is made on one atomic word, so
+the decision and the split that could invalidate it are totally ordered), and
+the benchmark that lied — a lazily-evaluated structure that made "setup" a
+fiction until the deferred work was forced to quiesce.

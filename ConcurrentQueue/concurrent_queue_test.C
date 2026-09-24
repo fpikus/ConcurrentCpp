@@ -650,7 +650,7 @@ TEST_F(QueueTesterIntConcurrent, MultiProducerMultiConsumer) {
             }
             std::lock_guard g(m);
             for (int value : consumed_items) all_consumed_items.insert(value);
-            if (!running_under_TAP) EXPECT_NE(0u, consumed_items.size()) << "Consumer " << i << " did not pop any elements";
+            if (!running_under_TAP) { EXPECT_NE(0u, consumed_items.size()) << "Consumer " << i << " did not pop any elements"; }
         });
     }
 
@@ -831,7 +831,7 @@ TEST_F(QueueTesterIntStringConcurrent, MultiProducerMultiConsumer) {
             }
             std::lock_guard g(m);
             for (int value : consumed_items) all_consumed_items.insert(value);
-            if (!running_under_TAP) EXPECT_NE(0u, consumed_items.size()) << "Consumer " << i << " did not pop any elements";
+            if (!running_under_TAP) { EXPECT_NE(0u, consumed_items.size()) << "Consumer " << i << " did not pop any elements"; }
         });
     }
 

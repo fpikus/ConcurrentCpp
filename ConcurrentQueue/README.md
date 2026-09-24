@@ -81,9 +81,10 @@ make run_tests       # run both sanitizer test binaries
 make run_benchmarks
 ```
 
-Requires clang (the Makefile uses `clang++-22`, C++23), Google Benchmark and
-GoogleTest; point `GBENCH_DIR` and `GTEST_DIR` at your installations if they
-are not in `$HOME/GoogleBench` and `$HOME/GoogleTest`.
+The compiler, C++ standard and library paths come from `../config.mk`, shared
+by every directory in this repository and written once per machine; binaries
+go to `build/<hostname>/`. Requires Google Benchmark and GoogleTest.
+`make benchmarks` and `make tests` build either group alone.
 
 - `concurrent_queue.h` — the queue
 - `concurrent_queue_test.C` — unit tests (built with ASan and TSan)
@@ -91,7 +92,9 @@ are not in `$HOME/GoogleBench` and `$HOME/GoogleTest`.
   benchmarks (Google Benchmark and a hand-rolled twin producing the same
   measurement)
 - `concurrent_queue_lmbm.C` — push-to-pop handoff latency under MPMC
-  contention, using the hardware timestamp counter (x86 and ARM)
+  contention, using the hardware timestamp counter (x86 and ARM). Sweeps
+  thread counts and all four slot alignments by default; `--threads=N` and
+  `--align=A` pin one of each for long single-point runs
 - `concurrent_queue_ppmbm.C` — 1-producer/1-consumer ping-pong round-trip
   latency
 

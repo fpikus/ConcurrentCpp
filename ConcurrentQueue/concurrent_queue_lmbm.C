@@ -154,6 +154,8 @@ int main(int argc, char** argv) {
     double duration_s    = 5.0;
     size_t refill_batch  = 8;
     size_t warmup_skip   = 100;
+    size_t fixed_threads = 0;   // --threads=N: run ONLY this count (single-point long runs)
+    long   only_align    = -1;  // --align=A: run only that ALIGN (default: all four)
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -161,9 +163,11 @@ int main(int argc, char** argv) {
         else if (a.rfind("--capacity=", 0) == 0) capacity_hint = std::strtoull(a.c_str() + 11, nullptr, 0);
         else if (a.rfind("--batch=",    0) == 0) refill_batch  = std::strtoull(a.c_str() + 8,  nullptr, 0);
         else if (a.rfind("--warmup=",   0) == 0) warmup_skip   = std::strtoull(a.c_str() + 9,  nullptr, 0);
+        else if (a.rfind("--threads=",  0) == 0) fixed_threads = std::strtoull(a.c_str() + 10, nullptr, 0);
+        else if (a.rfind("--align=",    0) == 0) only_align    = std::atol(a.c_str() + 8);
         else if (a == "--dump-hist") latbench::g_dump_hist = true;
         else if (a == "--help" || a == "-h") {
-            std::printf("usage: %s [--duration=SECONDS] [--capacity=N] [--batch=N] [--warmup=N] [--dump-hist]\n", argv[0]);
+            std::printf("usage: %s [--duration=SECONDS] [--capacity=N] [--batch=N] [--warmup=N] [--threads=N] [--align=A] [--dump-hist]\n", argv[0]);
             return 0;
         }
     }
@@ -175,6 +179,7 @@ int main(int argc, char** argv) {
     for (size_t t = 2; t <= hw; t *= 2) thread_counts.push_back(t);
     if (thread_counts.empty() || thread_counts.back() != hw)
         thread_counts.push_back(hw);
+    if (fixed_threads) thread_counts = {fixed_threads};   // single-count long-run mode
 
     const auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::duration<double>(duration_s));
@@ -183,10 +188,12 @@ int main(int argc, char** argv) {
                 hw, capacity_hint, duration_s, refill_batch, warmup_skip, cyc_per_ns);
     latbench::print_header();
 
-    sweep<8, 0>  ("Ring_a0",   capacity_hint, thread_counts, duration, cyc_per_ns, refill_batch, warmup_skip);
-    sweep<8, 16> ("Ring_a16",  capacity_hint, thread_counts, duration, cyc_per_ns, refill_batch, warmup_skip);
-    sweep<8, 64> ("Ring_a64",  capacity_hint, thread_counts, duration, cyc_per_ns, refill_batch, warmup_skip);
-    sweep<8, 128>("Ring_a128", capacity_hint, thread_counts, duration, cyc_per_ns, refill_batch, warmup_skip);
+    // --align selects one ALIGN (default -1 = all four). --threads (thread count)
+    // is independent, so histogram runs can do all 4 ALIGN at one thread count.
+    if (only_align < 0 || only_align == 0)   sweep<8, 0>  ("Ring_a0",   capacity_hint, thread_counts, duration, cyc_per_ns, refill_batch, warmup_skip);
+    if (only_align < 0 || only_align == 16)  sweep<8, 16> ("Ring_a16",  capacity_hint, thread_counts, duration, cyc_per_ns, refill_batch, warmup_skip);
+    if (only_align < 0 || only_align == 64)  sweep<8, 64> ("Ring_a64",  capacity_hint, thread_counts, duration, cyc_per_ns, refill_batch, warmup_skip);
+    if (only_align < 0 || only_align == 128) sweep<8, 128>("Ring_a128", capacity_hint, thread_counts, duration, cyc_per_ns, refill_batch, warmup_skip);
 
     return 0;
 }

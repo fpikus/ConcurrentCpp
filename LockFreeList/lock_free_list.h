@@ -1,5 +1,5 @@
 // Copyright (c) 2026 Fedor G. Pikus, fpikus@gmail.com
-//  https://github.com/fpikus/LockFree
+//  https://github.com/fpikus/ConcurrentCpp
 //
 // MIT License
 //

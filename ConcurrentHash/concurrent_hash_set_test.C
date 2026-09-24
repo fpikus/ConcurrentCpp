@@ -510,8 +510,9 @@ TEST(ConcurrentHashSetTest, InsertContention_NoMemoryLeak) {
 // ===========================================================================
 // Return-value exactness under concurrent resizes. The tests below are the
 // regression guards for the four defects demonstrated against the pre-seal
-// header (notes/insert_race.md): double-true insert, erase undone by a stale
-// inserter, double-true erase, and a key lost through a doubling.
+// header (commit ec875ed; described in the message of c5c19e4): double-true
+// insert, erase undone by a stale inserter, double-true erase, and a key lost
+// through a doubling.
 // ===========================================================================
 
 // PER-KEY exactly-one-winner for insert(), across many doublings.
@@ -830,8 +831,8 @@ TEST(ConcurrentHashSetTest, InsertEraseChurnPerKeyAccounting) {
 // (phase 3) is exact, but it has never been made to FIRE. Run against the pre-seal
 // stock header and against both mutants (seal removed, freeze removed), the
 // resurrection counters stayed at zero in every run; what fails on those headers is
-// the phase-1 exactly-one-winner check. That is consistent with the analysis in
-// notes/insert_race.md: the stale node those headers strand in an old bucket j can
+// the phase-1 exactly-one-winner check. That is consistent with the split arithmetic:
+// the stale node those headers strand in an old bucket j can
 // only be copied forward when bucket j's CHILD is split, and by the time the strand
 // happens that child has long since been published -- so the stranded node is dead
 // weight and never resurrects. In other words this test currently guards a property

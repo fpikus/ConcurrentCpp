@@ -103,9 +103,14 @@ Measured on servers from 64 to 256 hardware threads, and stated plainly:
 
 `spinlock_bm.C` measures the lock against the atomic and mutex baselines
 across a contention dial from 100% of time under the lock down to 0.1%;
-`spinlock_tune_bm.C` re-runs the tier sweep. Both scale their thread range to
-the machine they run on — the numbers above are one `make run_benchmarks`
-away from being your numbers.
+`spinlock_tune_bm.C` re-runs the tier sweep; `spinlock_layout_bm.C` asks
+whether the guarded data belongs on the lock's cache line, placing the same
+payload at four distances from the lock. (The folklore says share the line.
+Measured on the fleet, sharing it loses 1.2–2.2× at saturation on x86 and
+wins 2–3.7× at low contention on every architecture; on Grace it wins at
+saturation too.) All of them scale their thread range to the machine they run
+on — the numbers above are one `make run_benchmarks` away from being your
+numbers.
 
 ## Building and testing
 
@@ -122,10 +127,18 @@ the reader confirmation, the low-contention probes, the overhead grid — and
 the measurement protocol is the standard `--benchmark_repetitions`,
 `--benchmark_report_aggregates_only`, and
 `--benchmark_enable_random_interleaving`. `make run_benchmarks` runs the full
-grid; the output is Google Benchmark JSON, one report per run.
+grid and prints Google Benchmark's console report. For machine-readable
+results, run a binary directly and ask for JSON:
 
-Binaries land in `build/<hostname>/` and results in `results/<hostname>/`, so
-any number of machines can build and run concurrently in one shared tree.
+```sh
+build/$(hostname)/spinlock_bm --benchmark_filter='work:0/' \
+    --benchmark_repetitions=5 --benchmark_report_aggregates_only=true \
+    --benchmark_enable_random_interleaving=true \
+    --benchmark_out=spinlock_bm.json --benchmark_out_format=json
+```
+
+Binaries land in `build/<hostname>/`, so any number of machines can build and
+run concurrently in one shared tree.
 The machine-specific configuration — compiler, `-march` target, C++ standard,
 and the Google Benchmark/GoogleTest install paths — lives in `../config.mk`,
 shared by every benchmark directory and written once per machine; the Makefile
@@ -141,6 +154,7 @@ itself is machine-independent. The reference `config.mk` uses `clang++-22`,
 - `spinlock_rw_tune_bm.C` — whether readers and writers of one lock want different back-off
 - `overhead_bm.C` — the lock against the atomic and the CAS loop, across the sharing:work grid, with compute-heavy and memory-streaming work
 - `spinlock_mem_bm.C` — the same ladder sweep with memory-streaming work in place of sin/cos
+- `spinlock_layout_bm.C` — whether the guarded payload belongs on the lock's cache line: the same payload at four distances from the lock
 - `seqlock.h` — a sequence lock: readers copy the payload out without writing to shared memory
 - `seqlock_test.C` — unit tests for the sequence lock (built with ASan and TSan)
 - `seqlock_bm.C` — the sequence lock against the spinlock and a bare atomic, across the same read:write mix

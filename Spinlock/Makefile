@@ -65,6 +65,11 @@ SEQLOCK_HEADERS = seqlock.h
 
 .PHONY: all benchmarks tests clean run_tests run_benchmarks
 
+# The first rule in a Makefile is the default goal; without this line it would
+# be the $(BUILD_DIR) rule below, and a bare `make` would only create the
+# directory.
+.DEFAULT_GOAL := all
+
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
@@ -132,6 +137,7 @@ run_benchmarks: benchmarks
 	./$(TARGET_RW_TUNE_BM)
 	./$(TARGET_OVERHEAD_BM)
 	./$(TARGET_MEM_BM)
+	./$(TARGET_LAYOUT_BM)
 	./$(TARGET_SEQLOCK_BM)
 
 # Clean build artifacts

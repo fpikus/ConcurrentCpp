@@ -48,6 +48,11 @@ HEADERS = concurrent_deque.h spinlock.h ../config.mk
 
 .PHONY: all benchmarks tests clean run_tests run_benchmarks
 
+# The first rule in a Makefile is the default goal; without this line it would
+# be the $(BUILD_DIR) rule below, and a bare `make` would only create the
+# directory.
+.DEFAULT_GOAL := all
+
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 

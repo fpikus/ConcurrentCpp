@@ -50,7 +50,7 @@
  *    Because every key is globally unique and attempted exactly once, every
  *    insert() MUST return true -- this is verified per thread, which makes the
  *    benchmark a standing regression test for the insert return-value
- *    semantics under concurrent resize (the re-insert fallback).
+ *    semantics under concurrent resize (the seal on the bucket head).
  *
  *  - Lookup_MostlyOld: the table is pre-populated with PREFILL keys (untimed)
  *    at full capacity, so that no resize can occur during the timed region in

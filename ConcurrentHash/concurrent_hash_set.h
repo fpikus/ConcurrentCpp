@@ -647,10 +647,11 @@ public:
                 // doubles per epoch (current_ts == ts). NOTE: data_.size() is TOTAL
                 // arena occupancy -- it counts tombstones, stale split copies and
                 // abandoned subchains -- so this is an arena-consumption trigger,
-                // not a live-load-factor trigger (see the walkthrough's load-factor
-                // caveat). New buckets are marked UNINITIALIZED (relaxed) and then
-                // table_size_ is released, so any thread that later acquires the new
-                // size is guaranteed to observe those markers (channel 2).
+                // not a live-load-factor trigger: a delete-heavy workload grows the
+                // table although the live key count does not. New buckets are
+                // marked UNINITIALIZED (relaxed) and then table_size_ is released,
+                // so any thread that later acquires the new size is guaranteed to
+                // observe those markers (channel 2).
                 if (data_.size() > ts * 2) {
                     std::lock_guard lock(resize_lock_);
                     size_t current_ts = table_size_.load(std::memory_order_relaxed);

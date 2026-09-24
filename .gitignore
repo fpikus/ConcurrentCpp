@@ -19,13 +19,16 @@
 # Development version snapshots
 V[0-9]/
 
+# Collected measurements
+results/
+
 # Book chapter drafts
 B32053_*.pdf
 
 # Local tool settings and session files
 .claude/
-*.session
 prompt_list.txt
+claude_sessions.txt
 
 # WSL/Windows download metadata
 *Zone.Identifier

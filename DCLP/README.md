@@ -72,13 +72,24 @@ hardware-specific — the same code reads differently on Intel, AMD, and Arm —
 and the benchmark scales its thread range to whatever it runs on. The numbers
 are one `make run_benchmarks` away from being yours.
 
+Timing says *that* DCLP wins on `grow`; `atomic_max_count.C` says *why*. It
+runs the same feed through instrumented copies of the CAS loop and the DCLP
+body and tallies what each offer did: dodged on the read, updated, or wasted —
+a failed compare-exchange for CAS, a lock taken for nothing for DCLP. On a
+16-thread laptop (Ryzen 7940HS), CAS wastes about three failed exchanges for every
+successful one, each of which drags the cache line; DCLP wastes about one lock
+acquisition in ten thousand offers, and more than nine offers in ten never write
+at all. The read pretest does more than skip the lock: it filters out the stale
+offers before any read-modify-write happens, which the CAS loop only does
+after its first exchange has already failed.
+
 ## Building and testing
 
 ```sh
-make benchmarks     # just the benchmark — needs only Google Benchmark
-make                # benchmark + ASan/TSan unit tests (needs GoogleTest)
+make benchmarks     # the benchmark and the outcome counter — needs only Google Benchmark
+make                # benchmarks + ASan/TSan unit tests (needs GoogleTest)
 make run_tests      # run both sanitizer test binaries
-make run_benchmarks # the benchmark, full thread range
+make run_benchmarks # the benchmark over the full thread range, then the counter
 ```
 
 The unit tests (`atomic_max_test.C`) check the contract single-threaded, then
@@ -97,6 +108,7 @@ the repository rather than a private copy.
 - `atomic_max.h` — the lock-free maximum (the shipped facility)
 - `atomic_max_test.C` — unit tests (built with ASan and TSan)
 - `atomic_max_bm.C` — the three mechanisms across two workloads and the thread range
+- `atomic_max_count.C` — per-offer outcomes (dodged / updated / wasted) of CAS and DCLP on the `grow` feed; `atomic_max_count [nthreads [iters]]`
 
 ## The book
 

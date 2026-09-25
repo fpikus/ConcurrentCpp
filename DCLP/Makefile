@@ -29,13 +29,14 @@ LIBS_TEST = $(GTEST_DIR)/lib/libgtest.a $(GTEST_DIR)/lib/libgtest_main.a $(COMMO
 
 # Target definitions (all under the per-host build directory)
 TARGET_BM = $(BUILD_DIR)/atomic_max_bm
+TARGET_COUNT = $(BUILD_DIR)/atomic_max_count
 TARGET_TEST_ASAN = $(BUILD_DIR)/atomic_max_test_asan
 TARGET_TEST_TSAN = $(BUILD_DIR)/atomic_max_test_tsan
 
 # The two groups: `make benchmarks` needs only Google Benchmark and works on
 # machines without sanitizer runtimes; `make tests` needs GoogleTest and
 # ASan/TSan. `make all` is both.
-BENCHMARKS = $(TARGET_BM)
+BENCHMARKS = $(TARGET_BM) $(TARGET_COUNT)
 TESTS = $(TARGET_TEST_ASAN) $(TARGET_TEST_TSAN)
 
 # Headers every target depends on; editing them must trigger a rebuild. Recipes
@@ -65,6 +66,11 @@ tests: $(TESTS)
 $(TARGET_BM): atomic_max_bm.C $(HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) -o $@
 
+# Build the outcome counter (per-offer outcomes of CAS vs DCLP on the grow
+# feed; not a timing run, so no Google Benchmark library)
+$(TARGET_COUNT): atomic_max_count.C $(HEADERS) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS_BM) $< $(COMMON_LIBS) -o $@
+
 # Build ASan test (atomic_max correctness + ordering)
 $(TARGET_TEST_ASAN): atomic_max_test.C $(HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_TEST_ASAN) $< $(LIBS_TEST) -o $@
@@ -81,6 +87,7 @@ run_tests: tests
 # Run benchmarks
 run_benchmarks: benchmarks
 	./$(TARGET_BM)
+	./$(TARGET_COUNT)
 
 # Clean build artifacts
 clean:

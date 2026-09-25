@@ -38,8 +38,12 @@ the barrier.
 One line earns its keep:
 
 ```cpp
-while (__builtin_expect(val > cur, 0)) { ... }   // update is the cold path
+while (ATOMIC_MAX_UNLIKELY(val > cur)) { ... }   // update is the cold path
 ```
+
+(`ATOMIC_MAX_UNLIKELY` is `__builtin_expect(c, 0)` under GCC and Clang,
+clang-cl included, and the bare condition elsewhere: correct everywhere, fast
+where the builtin exists.)
 
 The hint marks the update cold, so the compiler sinks the compare-exchange out
 of line and the common no-update fast path becomes a *single* taken branch

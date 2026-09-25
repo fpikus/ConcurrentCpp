@@ -55,7 +55,9 @@ wrong suspect — is in the book.
 ## What the benchmark shows
 
 `atomic_max_bm.C` runs all three mechanisms against two workloads that bracket
-how often the maximum actually moves:
+how often the maximum actually moves. CAS and DCLP each also run in a `_nohint`
+form, identical but without the cold-update hint, to measure what the branch
+layout alone is worth:
 
 - **`never`** — each thread offers one fixed random value, so after a brief
   warm-up the maximum never advances and the read-only fast path is
@@ -71,6 +73,12 @@ Where DCLP beats the lock-free CAS, and where they converge, is
 hardware-specific — the same code reads differently on Intel, AMD, and Arm —
 and the benchmark scales its thread range to whatever it runs on. The numbers
 are one `make run_benchmarks` away from being yours.
+
+The hinted/unhinted pairs agree on one thing everywhere: predict "no update".
+When there is no update, the hint takes two jumps off the fast path, and the
+fast path is all an offer costs. When there is an update, the lock or the
+compare-exchange costs so much that two extra jumps beside it are hardly
+noticeable.
 
 Timing says *that* DCLP wins on `grow`; `atomic_max_count.C` says *why*. It
 runs the same feed through instrumented copies of the CAS loop and the DCLP
@@ -107,7 +115,7 @@ the repository rather than a private copy.
 
 - `atomic_max.h` — the lock-free maximum (the shipped facility)
 - `atomic_max_test.C` — unit tests (built with ASan and TSan)
-- `atomic_max_bm.C` — the three mechanisms across two workloads and the thread range
+- `atomic_max_bm.C` — the three mechanisms (CAS and DCLP each with and without the branch hint) across two workloads and the thread range
 - `atomic_max_count.C` — per-offer outcomes (dodged / updated / wasted) of CAS and DCLP on the `grow` feed; `atomic_max_count [nthreads [iters]]`
 
 ## The book

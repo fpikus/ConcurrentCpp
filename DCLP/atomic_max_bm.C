@@ -12,6 +12,14 @@
 //                   lock taken and the check repeated under it. The whole point
 //                   is that most offers never touch the lock.
 //
+// BM_cas and BM_dclp each have a `_nohint` twin that is identical except for
+// the __builtin_expect that marks the update as the cold path. The pairs
+// measure what the branch layout alone is worth. Result: predicting "no update"
+// is always the right call. With no update, the hint removes two jumps from the
+// fast path, which is the whole cost of an offer and shows. With an update, the
+// lock or the compare-exchange is so expensive that two extra jumps on its path
+// are hardly noticeable.
+//
 // Two workloads bracket the interesting range of how often the maximum actually
 // changes -- which is what decides whether DCLP's fast path pays off:
 //   never -- each thread offers random 64-bit values. After a brief warm-up the
@@ -120,12 +128,46 @@ void BM_spinlock_grow(benchmark::State& state) {
 // the same read-only / read-write barrier split atomic_max() uses. The inner
 // re-read can be relaxed: it runs while holding the lock, whose acquire already
 // synchronized with the previous holder's releasing unlock().
-void BM_dclp_never(benchmark::State& state) {
+//
+// The _nohint pair is the plain `if`; BM_dclp_never/_grow below differ only in
+// wrapping the probe in __builtin_expect(..., 0) so that the locked update is
+// laid out as the cold path, as atomic_max() does for the CAS loop.
+void BM_dclp_nohint_never(benchmark::State& state) {
   if (state.thread_index() == 0) nmax_atomic.store(0, std::memory_order_relaxed);
   std::mt19937_64 rng(state.thread_index());
   volatile unsigned long n = rng();
   for (auto _ : state) {
     if (n > nmax_atomic.load(std::memory_order_acquire)) {   // fast path: read-only
+      std::lock_guard guard(lock);
+      if (n > nmax_atomic.load(std::memory_order_relaxed))   // re-check under lock
+        nmax_atomic.store(n, std::memory_order_release);     // publish: read-write
+    }
+  }
+  benchmark::DoNotOptimize(nmax_atomic.load());
+  state.SetItemsProcessed(state.iterations());
+} // BM_dclp_nohint_never
+
+void BM_dclp_nohint_grow(benchmark::State& state) {
+  if (state.thread_index() == 0) nmax_atomic.store(0, std::memory_order_relaxed);
+  unsigned long n = state.thread_index(), dn = state.threads();
+  for (auto _ : state) {
+    n += dn;
+    if (n > nmax_atomic.load(std::memory_order_acquire)) {
+      std::lock_guard guard(lock);
+      if (n > nmax_atomic.load(std::memory_order_relaxed))
+        nmax_atomic.store(n, std::memory_order_release);
+    }
+  }
+  benchmark::DoNotOptimize(nmax_atomic.load());
+  state.SetItemsProcessed(state.iterations());
+} // BM_dclp_nohint_grow
+
+void BM_dclp_never(benchmark::State& state) {
+  if (state.thread_index() == 0) nmax_atomic.store(0, std::memory_order_relaxed);
+  std::mt19937_64 rng(state.thread_index());
+  volatile unsigned long n = rng();
+  for (auto _ : state) {
+    if (__builtin_expect(n > nmax_atomic.load(std::memory_order_acquire), 0)) {   // fast path: read-only
       std::lock_guard guard(lock);
       if (n > nmax_atomic.load(std::memory_order_relaxed))   // re-check under lock
         nmax_atomic.store(n, std::memory_order_release);     // publish: read-write
@@ -140,7 +182,7 @@ void BM_dclp_grow(benchmark::State& state) {
   unsigned long n = state.thread_index(), dn = state.threads();
   for (auto _ : state) {
     n += dn;
-    if (n > nmax_atomic.load(std::memory_order_acquire)) {
+    if (__builtin_expect(n > nmax_atomic.load(std::memory_order_acquire), 0)) {
       std::lock_guard guard(lock);
       if (n > nmax_atomic.load(std::memory_order_relaxed))
         nmax_atomic.store(n, std::memory_order_release);
@@ -156,11 +198,13 @@ static const long numcpu = sysconf(_SC_NPROCESSORS_CONF);
   ->ThreadRange(1, numcpu) \
   ->UseRealTime()
 
-// Grouped by workload so the four mechanisms sit adjacent for comparison:
-// cas (shipped, hinted) vs cas_nohint (baseline) vs dclp vs the dumb lock.
+// Grouped by workload so the variants sit adjacent for comparison: cas
+// (shipped, hinted) vs cas_nohint, dclp_nohint vs dclp (hinted), and the dumb
+// lock.
 #define REGISTER(SUFFIX) \
   BENCHMARK(BM_cas##SUFFIX) ARGS;        \
   BENCHMARK(BM_cas_nohint##SUFFIX) ARGS; \
+  BENCHMARK(BM_dclp_nohint##SUFFIX) ARGS;       \
   BENCHMARK(BM_dclp##SUFFIX) ARGS;       \
   BENCHMARK(BM_spinlock##SUFFIX) ARGS;
 REGISTER(_never)

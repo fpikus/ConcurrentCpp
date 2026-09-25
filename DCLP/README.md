@@ -49,9 +49,9 @@ The hint marks the update cold, so the compiler sinks the compare-exchange out
 of line and the common no-update fast path becomes a *single* taken branch
 instead of a forward "skip the CAS" plus the loop back-edge. On a core that
 retires one taken branch per cycle this roughly doubles the read-only fast
-path; on a core that already lays it out that way it costs nothing, and it
-costs a few percent only under a monotone-increasing feed that a warmed-up
-maximum never sees. The standard `[[unlikely]]` attribute does *not* achieve
+path; on a core that already lays it out that way it costs nothing, and
+under a monotone-increasing feed — which a warmed-up maximum never sees — its
+cost is within noise on the fleet. The standard `[[unlikely]]` attribute does *not* achieve
 this — only the builtin on the loop condition reaches the compiler's loop
 layout. Why that is — and why the memory barrier you first reach for is the
 wrong suspect — is in the book.

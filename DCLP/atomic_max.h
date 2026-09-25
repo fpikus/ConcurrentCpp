@@ -29,11 +29,13 @@
 // `c`, marked as usually false, so the compiler lays out the code that runs
 // when it is true as the cold path. With GCC and Clang (including clang-cl)
 // this is __builtin_expect; elsewhere the hint is dropped and the code is still
-// correct, only without the layout benefit. The standard [[unlikely]] attribute
+// correct, only without the layout benefit. The !! makes the builtin accept
+// exactly what the bare condition accepts (a type with only an explicit
+// operator bool would not convert to the builtin's `long` parameter). The standard [[unlikely]] attribute
 // is not a substitute: placed on the loop body it does not reach the loop's
 // block layout (see atomic_max()).
 #if defined(__GNUC__) || defined(__clang__)
-#define ATOMIC_MAX_UNLIKELY(c) __builtin_expect((c), 0)
+#define ATOMIC_MAX_UNLIKELY(c) __builtin_expect(!!(c), 0)
 #else
 #define ATOMIC_MAX_UNLIKELY(c) (c)
 #endif

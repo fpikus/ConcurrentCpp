@@ -3,7 +3,8 @@
 // example. Every iteration offers one candidate value to a shared maximum:
 //
 //   BM_cas       -- lock-free: atomic_max() (atomic_max.h), a compare-exchange
-//                   loop that touches the shared word on every offer.
+//                   loop that touches the shared word on every offer. Whatever
+//                   the shipped header does today.
 //   BM_spinlock  -- the "stupid" version: take a lock (the shipped SpinLock
 //                   from ../Spinlock/spinlock.h) and do a plain compare-store,
 //                   every single offer, whether or not it changes the maximum.
@@ -12,13 +13,23 @@
 //                   lock taken and the check repeated under it. The whole point
 //                   is that most offers never touch the lock.
 //
-// BM_cas and BM_dclp each have a `_nohint` twin that is identical except for
-// the __builtin_expect that marks the update as the cold path. The pairs
-// measure what the branch layout alone is worth. Result: predicting "no update"
-// is always the right call. With no update, the hint removes two jumps from the
-// fast path, which is the whole cost of an offer and shows. With an update, the
-// lock or the compare-exchange is so expensive that two extra jumps on its path
-// are hardly noticeable.
+// The branch-layout experiment: BM_cas_hint / BM_cas_nohint and BM_dclp /
+// BM_dclp_nohint are pairs that differ only in the __builtin_expect that marks
+// the update as the cold path. The CAS pair uses its own copies of the loop
+// (atomic_max_hint / atomic_max_nohint below), NOT atomic_max.h, so the
+// experiment stays fixed when the shipped implementation changes.
+//
+// Why "no update is likely" is the right prediction everywhere: single-threaded
+// the question does not arise (nobody uses an atomic there). With many threads
+// the maximum either changes rarely or is contended. If it changes rarely, the
+// no-update path is nearly every offer, and two jumps saved on it are most of
+// its cost. If it is contended, everybody loses -- a failed exchange or a
+// contended lock costs far more than two jumps -- and the hint is still the
+// best available layout. Measured (fleet, 2026-09-06, hinted = the then-shipped
+// atomic_max()): with no updates the hint doubles CAS on Grace and M3, gives
+// 1.3-1.7x on Zen 5 and nothing on Intel (x86 already lays it out this way),
+// which makes CAS equal to DCLP; with updates it has no consistent effect, and
+// DCLP beats CAS by 1.5-80x at every thread count above one.
 //
 // Two workloads bracket the interesting range of how often the maximum actually
 // changes -- which is what decides whether DCLP's fast path pays off:
@@ -50,15 +61,26 @@ alignas(64) static std::atomic<unsigned long> nmax_atomic;
 alignas(64) static unsigned long nmax_plain;
 alignas(64) static SpinLock lock;
 
-// The pre-hint version of the header's atomic_max(): the same straightforward
-// while loop WITHOUT the __builtin_expect update-is-cold hint. Kept only as the
-// benchmark's "before": on cores that retire one taken branch per cycle its
-// no-update fast path is two taken branches (a forward "skip the CAS" plus the
-// loop back-edge), where the shipped atomic_max() biases the update cold and
-// fuses them to one -- doubling the read-only fast path (measured on Grace).
-// The experiment that established this (loop shape x branch bias, and that the
-// [[likely]] attribute does NOT reach the loop layout while __builtin_expect on
-// the condition does) lived here; only the winner and this baseline remain.
+// The CAS pair of the branch-layout experiment, independent of atomic_max.h.
+// atomic_max_hint marks the update cold, so the compiler sinks the
+// compare_exchange out of line and the no-update fast path is ONE taken branch;
+// atomic_max_nohint is the same while loop without the hint, whose no-update
+// path is two taken branches (a forward "skip the CAS" plus the loop back-edge)
+// on cores that retire one taken branch per cycle. The experiment that chose
+// this form (loop shape x branch bias, and that [[likely]] does NOT reach the
+// loop layout while __builtin_expect on the condition does) lived here earlier;
+// only the winner and its baseline remain.
+template <typename T>
+static bool atomic_max_hint(std::atomic<T>& target, T val,
+                            std::memory_order success = std::memory_order_acq_rel,
+                            std::memory_order failure = std::memory_order_acquire) {
+  T cur = target.load(failure);
+  while (__builtin_expect(val > cur, 0)) {
+    if (target.compare_exchange_weak(cur, val, success, failure)) return true;
+  }
+  return false;
+} // atomic_max_hint()
+
 template <typename T>
 static bool atomic_max_nohint(std::atomic<T>& target, T val,
                               std::memory_order success = std::memory_order_acq_rel,
@@ -94,8 +116,9 @@ static bool atomic_max_nohint(std::atomic<T>& target, T val,
     state.SetItemsProcessed(state.iterations());                              \
   } /* NAME##_grow */
 
-CAS_BM(BM_cas,        atomic_max)          // header while, WITH the hint (shipped)
-CAS_BM(BM_cas_nohint, atomic_max_nohint)   // same loop, WITHOUT the hint (baseline)
+CAS_BM(BM_cas,        atomic_max)          // the shipped atomic_max.h, whatever it is
+CAS_BM(BM_cas_hint,   atomic_max_hint)     // experiment: loop WITH the hint
+CAS_BM(BM_cas_nohint, atomic_max_nohint)   // experiment: same loop WITHOUT it
 
 // --- locked: take the lock on every offer, plain compare-store -------------
 void BM_spinlock_never(benchmark::State& state) {
@@ -198,11 +221,12 @@ static const long numcpu = sysconf(_SC_NPROCESSORS_CONF);
   ->ThreadRange(1, numcpu) \
   ->UseRealTime()
 
-// Grouped by workload so the variants sit adjacent for comparison: cas
-// (shipped, hinted) vs cas_nohint, dclp_nohint vs dclp (hinted), and the dumb
-// lock.
+// Grouped by workload so the variants sit adjacent for comparison: the
+// shipped cas, the cas hint/nohint pair, the dclp nohint/hint pair, and the
+// dumb lock.
 #define REGISTER(SUFFIX) \
   BENCHMARK(BM_cas##SUFFIX) ARGS;        \
+  BENCHMARK(BM_cas_hint##SUFFIX) ARGS;   \
   BENCHMARK(BM_cas_nohint##SUFFIX) ARGS; \
   BENCHMARK(BM_dclp_nohint##SUFFIX) ARGS;       \
   BENCHMARK(BM_dclp##SUFFIX) ARGS;       \

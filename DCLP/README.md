@@ -55,9 +55,9 @@ wrong suspect — is in the book.
 ## What the benchmark shows
 
 `atomic_max_bm.C` runs all three mechanisms against two workloads that bracket
-how often the maximum actually moves. CAS and DCLP each also run in a `_nohint`
-form, identical but without the cold-update hint, to measure what the branch
-layout alone is worth:
+how often the maximum actually moves. Alongside the shipped `atomic_max()`, a
+hinted/unhinted pair of the CAS loop (kept in the benchmark, independent of the
+header) and of DCLP measures what the branch layout alone is worth:
 
 - **`never`** — each thread offers one fixed random value, so after a brief
   warm-up the maximum never advances and the read-only fast path is
@@ -74,11 +74,18 @@ hardware-specific — the same code reads differently on Intel, AMD, and Arm —
 and the benchmark scales its thread range to whatever it runs on. The numbers
 are one `make run_benchmarks` away from being yours.
 
-The hinted/unhinted pairs agree on one thing everywhere: predict "no update".
-When there is no update, the hint takes two jumps off the fast path, and the
-fast path is all an offer costs. When there is an update, the lock or the
-compare-exchange costs so much that two extra jumps beside it are hardly
-noticeable.
+The hinted/unhinted pairs say to predict "no update", and the reason is not
+specific to this benchmark. Single-threaded, nobody would use an atomic here.
+With many threads, the maximum either changes rarely or is contended. If it
+changes rarely, the no-update path is nearly every offer, and two jumps saved on
+it are most of its cost. If it is contended, everybody loses — a failed exchange
+or a contended lock costs far more than two jumps — and the hinted layout is
+still the best available. On the fleet the hint doubles CAS with no updates on
+Grace and Apple M3, gives 1.3–1.7× on Zen 5 and nothing on Intel (whose compiler
+output already has that layout), which brings CAS level with DCLP. It does not
+rescue CAS when the maximum moves: there DCLP wins at every thread count above
+one, by 1.5× on the best case for CAS and by an order of magnitude or more on
+Intel and M3.
 
 Timing says *that* DCLP wins on `grow`; `atomic_max_count.C` says *why*. It
 runs the same feed through instrumented copies of the CAS loop and the DCLP

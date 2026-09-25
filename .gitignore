@@ -1,3 +1,6 @@
+# Per-host build directories (every Makefile builds into build/<hostname>/)
+build/
+
 # Built binaries (benchmarks, tests, sanitizer variants)
 *_bm
 *_gmbm

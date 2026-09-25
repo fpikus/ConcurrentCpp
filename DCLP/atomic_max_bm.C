@@ -174,10 +174,15 @@ void BM_spinlock_grow(benchmark::State& state) {
 // the if/else were reversed. The hint makes the layout independent of both,
 // and BM_dclp_uphint forces the wrong layout, which is how to see what the
 // plain `if` would cost if the compiler did not get lucky.
-// Measured: on linda (Zen 5, GCC 16.2, 2026-09-24) the DCLP pair is identical
-// (1.00x, within 1%) at every thread count in both workloads -- GCC gets the
-// fast layout for this code -- while the CAS pair shows 1.2-1.6x with no
-// updates. On naptime (Zen 4, clang++-22) the DCLP pair is within noise too.
+// Measured with no updates (2026-09-24, 3 runs x 10 reps): on linda (Zen 5,
+// GCC 16.2) the unhinted DCLP equals the cold-hinted one (1.00x) at every
+// thread count -- GCC chose the fast layout for this `if` -- and forcing the
+// other layout (BM_dclp_uphint) costs 12-15%. GCC's unhinted CAS loop, by
+// contrast, matches the HOT layout (~0.63x of cold), which is why the shipped
+// hint is worth 1.5-1.6x there. On naptime (Zen 4, clang++-22, one short run)
+// the unhinted DCLP also equals the cold hint, and the forced hot layout halves
+// its throughput. Whether the 12-15% vs 2x difference is the compiler or the
+// core has not been separated.
 // One never/grow pair per layout; LAYOUT wraps only the unlocked probe.
 #define DCLP_BM(NAME, LAYOUT)                                                   \
   void NAME##_never(benchmark::State& state) {                                 \

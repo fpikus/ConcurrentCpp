@@ -27,22 +27,25 @@
 // contended lock costs far more than two jumps -- and the hint is still the
 // best available layout. Measured (fleet, 2026-09-06, hinted = the then-shipped
 // atomic_max()): with no updates the hint doubles CAS on Grace and M3, gives
-// 1.3-1.7x on Zen 5 and nothing on Intel (x86 already lays it out this way),
-// which makes CAS equal to DCLP; with updates it has no consistent effect, and
-// DCLP beats CAS by 1.5-80x at every thread count above one.
+// 1.3-1.7x on Zen 5 and nothing on Intel (whose compiler output already has
+// that layout), which makes CAS equal to DCLP; with updates it has no
+// consistent effect, and DCLP beats CAS by 1.5-80x at every thread count above
+// one except leslie's 256 (full SMT), a cell where CAS swings 4x between runs.
 //
 // Two workloads bracket the interesting range of how often the maximum actually
 // changes -- which is what decides whether DCLP's fast path pays off:
-//   never -- each thread offers random 64-bit values. After a brief warm-up the
-//            running maximum is enormous and essentially never advances, so DCLP
-//            almost never locks and the lock/CAS is almost never contended for a
-//            write. This is DCLP's best case.
-//   grow  -- each thread offers a strictly increasing sequence, so EVERY offer
-//            is a new global maximum: the maximum advances on every iteration,
-//            DCLP's inner check always passes, and it degenerates into the
-//            locked version plus the cost of the outer read. This is DCLP's
-//            worst case, and the honest test of whether the double check hurts
-//            when it never helps.
+//   never -- each thread offers one fixed random 64-bit value on every
+//            iteration. After a brief warm-up the running maximum is the largest
+//            of those values and never advances, so DCLP almost never locks and
+//            the lock/CAS is almost never contended for a write. DCLP's best case.
+//   grow  -- each thread offers a strictly increasing sequence (thread t offers
+//            t+n, t+2n, ... for n threads), so the maximum advances all the time
+//            and every offer is a new maximum FOR ITS THREAD. Most are
+//            nevertheless stale by the time they reach the shared word -- other
+//            threads have already passed them -- so DCLP's unlocked read still
+//            skips the lock for most offers (93.7% with 16 threads on a
+//            Ryzen 7940HS laptop, per atomic_max_count). The test of whether the
+//            double check pays when the maximum really moves.
 #include <unistd.h>
 #include <atomic>
 #include <mutex>

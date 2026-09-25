@@ -6,7 +6,8 @@
 // dn = nthreads, so every offer is strictly increasing (a new max FOR THAT
 // THREAD), but most are stale by the time they reach the shared word.
 //
-// Outcomes tallied (per offer):
+// Outcomes tallied. `fast` and `updated` are one per offer; CAS `wasted` is one
+// per FAILED EXCHANGE, so a CAS offer can add several (DCLP: at most one):
 //   CAS : fast    -- val <= cur at the acquire load; no compare_exchange at all
 //         updated -- a compare_exchange SUCCEEDED (the max advanced)
 //         wasted  -- a compare_exchange FAILED (RMW that bounced the line, lost)
@@ -90,11 +91,13 @@ static Counts run(Offer offer, int nthreads, unsigned long iters) {
   return tot;
 } // run()
 
-static void report(const char* name, const Counts& c) {
-  unsigned long total = c.fast + c.updated + c.wasted;
-  double pct = total ? 100.0/total : 0.0;
+// Print one mechanism's tallies. `offers` is the number of offers made
+// (threads x iterations): the fast-path share is a share of OFFERS, not of
+// tallies, because a CAS offer can be tallied as several failed exchanges.
+static void report(const char* name, const Counts& c, unsigned long offers) {
+  double pct = offers ? 100.0/offers : 0.0;
   printf("  %-5s fast=%-12lu updated=%-10lu wasted=%-12lu | "
-         "fast=%.2f%% wasted/updated=%.1f\n",
+         "fast=%.2f%% of offers, wasted/updated=%.1f\n",
          name, c.fast, c.updated, c.wasted,
          c.fast*pct, c.updated ? double(c.wasted)/c.updated : 0.0);
 } // report()
@@ -107,7 +110,8 @@ int main(int argc, char** argv) {
     return 1;
   }
   printf("grow_always, threads=%d, iters/thread=%lu\n", nthreads, iters);
-  report("CAS",  run(cas_offer,  nthreads, iters));
-  report("DCLP", run(dclp_offer, nthreads, iters));
+  const unsigned long offers = static_cast<unsigned long>(nthreads)*iters;
+  report("CAS",  run(cas_offer,  nthreads, iters), offers);
+  report("DCLP", run(dclp_offer, nthreads, iters), offers);
   return 0;
 } // main()

@@ -65,8 +65,9 @@ bool atomic_max(std::atomic<T>& target, T val,
   // fast path is a single taken branch instead of a forward "skip the CAS"
   // branch plus the loop back-edge. On a core that retires one taken branch per
   // cycle (e.g. Neoverse-V2) that roughly DOUBLES the read-only fast path
-  // (measured: Grace 1.64 -> 3.28 G/s at t1); x86 already lays it out this way,
-  // so the hint is a no-op there. It costs ~2-3% only when the maximum advances
+  // (measured: Grace 1.64 -> 3.28 G/s at t1). On x86 it depends on the core the
+  // compiler tunes for: Intel (Granite Rapids) builds already have this layout,
+  // so the hint is a no-op there, while Zen 5 gains 1.3-1.7x. It costs ~2-3% only when the maximum advances
   // on nearly every call (a monotone-increasing feed), which a warmed-up
   // maximum does not. NOTE: the standard [[unlikely]] attribute does NOT achieve
   // this -- only the builtin on the loop condition reaches the loop layout.

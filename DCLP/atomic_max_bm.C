@@ -13,11 +13,12 @@
 //                   lock taken and the check repeated under it. The whole point
 //                   is that most offers never touch the lock.
 //
-// The branch-layout experiment: BM_cas_hint / BM_cas_nohint and BM_dclp /
-// BM_dclp_nohint are pairs that differ only in the __builtin_expect that marks
-// the update as the cold path. The CAS pair uses its own copies of the loop
-// (atomic_max_hint / atomic_max_nohint below), NOT atomic_max.h, so the
-// experiment stays fixed when the shipped implementation changes.
+// The branch-layout experiment: for each of CAS and DCLP, three variants that
+// differ only in how the update condition is hinted -- cold (BM_cas_hint,
+// BM_dclp), not at all (BM_cas_nohint, BM_dclp_nohint), hot (BM_cas_uphint,
+// BM_dclp_uphint); see LAYOUT_* below. The CAS variants use their own copies of
+// the loop, NOT atomic_max.h, so the experiment stays fixed when the shipped
+// implementation changes.
 //
 // Why "no update is likely" is the right prediction everywhere: single-threaded
 // the question does not arise (nobody uses an atomic there). With many threads
@@ -64,36 +65,45 @@ alignas(64) static std::atomic<unsigned long> nmax_atomic;
 alignas(64) static unsigned long nmax_plain;
 alignas(64) static SpinLock lock;
 
-// The CAS pair of the branch-layout experiment, independent of atomic_max.h.
-// atomic_max_hint marks the update cold, so the compiler sinks the
-// compare_exchange out of line and the no-update fast path is ONE taken branch;
-// atomic_max_nohint is the same while loop without the hint, whose no-update
-// path is two taken branches (a forward "skip the CAS" plus the loop back-edge)
-// on cores that retire one taken branch per cycle. The experiment that chose
-// this form (loop shape x branch bias, and that [[likely]] does NOT reach the
-// loop layout while __builtin_expect on the condition does) lived here earlier;
-// only the winner and its baseline remain.
-template <typename T>
-static bool atomic_max_hint(std::atomic<T>& target, T val,
-                            std::memory_order success = std::memory_order_acq_rel,
-                            std::memory_order failure = std::memory_order_acquire) {
-  T cur = target.load(failure);
-  while (__builtin_expect(val > cur, 0)) {
-    if (target.compare_exchange_weak(cur, val, success, failure)) return true;
-  }
-  return false;
-} // atomic_max_hint()
+// Branch-layout parameter of the experiment: how the "the maximum must be
+// updated" condition is presented to the compiler.
+//   LAYOUT_COLD -- __builtin_expect(c, 0): update unlikely. The compiler sinks the
+//                  update out of line; the no-update fast path is ONE taken branch.
+//   LAYOUT_NONE -- the bare condition: the compiler chooses. For the CAS while
+//                  loop that is two taken branches on the no-update path (a forward
+//                  "skip the CAS" plus the loop back-edge) on cores that retire one
+//                  taken branch per cycle; for DCLP's `if` it depends on the
+//                  compiler and the branch order.
+//   LAYOUT_HOT  -- __builtin_expect(c, 1): update likely. Forces the layout that
+//                  favors the update path, whatever the compiler would choose --
+//                  the control that shows what the no-update path costs when the
+//                  layout is wrong for it.
+// Macros, not an inline helper: the hint must sit directly on the branch
+// condition to reach the compiler's block layout.
+#define LAYOUT_COLD(c) __builtin_expect((c), 0)
+#define LAYOUT_NONE(c) (c)
+#define LAYOUT_HOT(c)  __builtin_expect((c), 1)
 
-template <typename T>
-static bool atomic_max_nohint(std::atomic<T>& target, T val,
-                              std::memory_order success = std::memory_order_acq_rel,
-                              std::memory_order failure = std::memory_order_acquire) {
-  T cur = target.load(failure);
-  while (val > cur) {
-    if (target.compare_exchange_weak(cur, val, success, failure)) return true;
-  }
-  return false;
-} // atomic_max_nohint()
+// The CAS loops of the experiment, independent of atomic_max.h (which may
+// change): the same while loop as the shipped function, one per layout. The
+// experiment that chose the loop shape (loop shape x branch bias, and that
+// [[likely]] does NOT reach the loop layout while __builtin_expect on the
+// condition does) lived here earlier; only its conclusion remains.
+#define CAS_LOOP(NAME, LAYOUT)                                                  \
+  template <typename T>                                                        \
+  static bool NAME(std::atomic<T>& target, T val,                              \
+                   std::memory_order success = std::memory_order_acq_rel,      \
+                   std::memory_order failure = std::memory_order_acquire) {    \
+    T cur = target.load(failure);                                              \
+    while (LAYOUT(val > cur)) {                                                \
+      if (target.compare_exchange_weak(cur, val, success, failure)) return true; \
+    }                                                                          \
+    return false;                                                              \
+  } /* NAME() */
+
+CAS_LOOP(atomic_max_hint,   LAYOUT_COLD)
+CAS_LOOP(atomic_max_nohint, LAYOUT_NONE)
+CAS_LOOP(atomic_max_uphint, LAYOUT_HOT)
 
 // One never/grow benchmark pair per CAS flavor -- the loop body differs only in
 // which max function it calls, so a macro keeps the two from being two copies.
@@ -122,6 +132,7 @@ static bool atomic_max_nohint(std::atomic<T>& target, T val,
 CAS_BM(BM_cas,        atomic_max)          // the shipped atomic_max.h, whatever it is
 CAS_BM(BM_cas_hint,   atomic_max_hint)     // experiment: loop WITH the hint
 CAS_BM(BM_cas_nohint, atomic_max_nohint)   // experiment: same loop WITHOUT it
+CAS_BM(BM_cas_uphint, atomic_max_uphint)   // experiment: update hinted LIKELY
 
 // --- locked: take the lock on every offer, plain compare-store -------------
 void BM_spinlock_never(benchmark::State& state) {
@@ -155,76 +166,54 @@ void BM_spinlock_grow(benchmark::State& state) {
 // re-read can be relaxed: it runs while holding the lock, whose acquire already
 // synchronized with the previous holder's releasing unlock().
 //
-// The _nohint pair is the plain `if`; BM_dclp_never/_grow below differ only in
-// wrapping the probe in __builtin_expect(..., 0) so that the locked update is
-// laid out as the cold path, as atomic_max() does for the CAS loop. Whether the
+// BM_dclp (update cold), BM_dclp_nohint (plain `if`) and BM_dclp_uphint (update
+// hot) differ only in the LAYOUT wrapped around the unlocked probe. Whether the
 // plain `if` needs the hint depends on the compiler: Clang lays it out 1-1
 // without a hint, while GCC always uses the 2-0 layout, which is fast or slow
 // depending on the order of the branches -- lucky with this code, unlucky if
-// the if/else were reversed. The hint makes the layout independent of both.
+// the if/else were reversed. The hint makes the layout independent of both,
+// and BM_dclp_uphint forces the wrong layout, which is how to see what the
+// plain `if` would cost if the compiler did not get lucky.
 // Measured: on linda (Zen 5, GCC 16.2, 2026-09-24) the DCLP pair is identical
 // (1.00x, within 1%) at every thread count in both workloads -- GCC gets the
 // fast layout for this code -- while the CAS pair shows 1.2-1.6x with no
 // updates. On naptime (Zen 4, clang++-22) the DCLP pair is within noise too.
-void BM_dclp_nohint_never(benchmark::State& state) {
-  if (state.thread_index() == 0) nmax_atomic.store(0, std::memory_order_relaxed);
-  std::mt19937_64 rng(state.thread_index());
-  volatile unsigned long n = rng();
-  for (auto _ : state) {
-    if (n > nmax_atomic.load(std::memory_order_acquire)) {   // fast path: read-only
-      std::lock_guard guard(lock);
-      if (n > nmax_atomic.load(std::memory_order_relaxed))   // re-check under lock
-        nmax_atomic.store(n, std::memory_order_release);     // publish: read-write
-    }
-  }
-  benchmark::DoNotOptimize(nmax_atomic.load());
-  state.SetItemsProcessed(state.iterations());
-} // BM_dclp_nohint_never
+// One never/grow pair per layout; LAYOUT wraps only the unlocked probe.
+#define DCLP_BM(NAME, LAYOUT)                                                   \
+  void NAME##_never(benchmark::State& state) {                                 \
+    if (state.thread_index() == 0)                                             \
+      nmax_atomic.store(0, std::memory_order_relaxed);                         \
+    std::mt19937_64 rng(state.thread_index());                                 \
+    volatile unsigned long n = rng();                                          \
+    for (auto _ : state) {                                                     \
+      if (LAYOUT(n > nmax_atomic.load(std::memory_order_acquire))) { /* read-only probe */ \
+        std::lock_guard guard(lock);                                           \
+        if (n > nmax_atomic.load(std::memory_order_relaxed))  /* re-check under lock */ \
+          nmax_atomic.store(n, std::memory_order_release);    /* publish */    \
+      }                                                                        \
+    }                                                                          \
+    benchmark::DoNotOptimize(nmax_atomic.load());                              \
+    state.SetItemsProcessed(state.iterations());                              \
+  } /* NAME##_never */                                                         \
+  void NAME##_grow(benchmark::State& state) {                                  \
+    if (state.thread_index() == 0)                                             \
+      nmax_atomic.store(0, std::memory_order_relaxed);                         \
+    unsigned long n = state.thread_index(), dn = state.threads();              \
+    for (auto _ : state) {                                                     \
+      n += dn;                                                                 \
+      if (LAYOUT(n > nmax_atomic.load(std::memory_order_acquire))) {           \
+        std::lock_guard guard(lock);                                           \
+        if (n > nmax_atomic.load(std::memory_order_relaxed))                   \
+          nmax_atomic.store(n, std::memory_order_release);                     \
+      }                                                                        \
+    }                                                                          \
+    benchmark::DoNotOptimize(nmax_atomic.load());                              \
+    state.SetItemsProcessed(state.iterations());                              \
+  } /* NAME##_grow */
 
-void BM_dclp_nohint_grow(benchmark::State& state) {
-  if (state.thread_index() == 0) nmax_atomic.store(0, std::memory_order_relaxed);
-  unsigned long n = state.thread_index(), dn = state.threads();
-  for (auto _ : state) {
-    n += dn;
-    if (n > nmax_atomic.load(std::memory_order_acquire)) {
-      std::lock_guard guard(lock);
-      if (n > nmax_atomic.load(std::memory_order_relaxed))
-        nmax_atomic.store(n, std::memory_order_release);
-    }
-  }
-  benchmark::DoNotOptimize(nmax_atomic.load());
-  state.SetItemsProcessed(state.iterations());
-} // BM_dclp_nohint_grow
-
-void BM_dclp_never(benchmark::State& state) {
-  if (state.thread_index() == 0) nmax_atomic.store(0, std::memory_order_relaxed);
-  std::mt19937_64 rng(state.thread_index());
-  volatile unsigned long n = rng();
-  for (auto _ : state) {
-    if (__builtin_expect(n > nmax_atomic.load(std::memory_order_acquire), 0)) {   // fast path: read-only
-      std::lock_guard guard(lock);
-      if (n > nmax_atomic.load(std::memory_order_relaxed))   // re-check under lock
-        nmax_atomic.store(n, std::memory_order_release);     // publish: read-write
-    }
-  }
-  benchmark::DoNotOptimize(nmax_atomic.load());
-  state.SetItemsProcessed(state.iterations());
-} // BM_dclp_never
-
-void BM_dclp_grow(benchmark::State& state) {
-  if (state.thread_index() == 0) nmax_atomic.store(0, std::memory_order_relaxed);
-  unsigned long n = state.thread_index(), dn = state.threads();
-  for (auto _ : state) {
-    n += dn;
-    if (__builtin_expect(n > nmax_atomic.load(std::memory_order_acquire), 0)) {
-      std::lock_guard guard(lock);
-      if (n > nmax_atomic.load(std::memory_order_relaxed))
-        nmax_atomic.store(n, std::memory_order_release);
-    }
-  }
-  benchmark::DoNotOptimize(nmax_atomic.load());
-  state.SetItemsProcessed(state.iterations());
-} // BM_dclp_grow
+DCLP_BM(BM_dclp,        LAYOUT_COLD)   // update hinted unlikely
+DCLP_BM(BM_dclp_nohint, LAYOUT_NONE)   // plain `if`: the compiler chooses
+DCLP_BM(BM_dclp_uphint, LAYOUT_HOT)    // update hinted likely
 
 static const long numcpu = sysconf(_SC_NPROCESSORS_CONF);
 
@@ -233,14 +222,15 @@ static const long numcpu = sysconf(_SC_NPROCESSORS_CONF);
   ->UseRealTime()
 
 // Grouped by workload so the variants sit adjacent for comparison: the
-// shipped cas, the cas hint/nohint pair, the dclp nohint/hint pair, and the
-// dumb lock.
+// shipped cas, the three cas layouts, the three dclp layouts, the dumb lock.
 #define REGISTER(SUFFIX) \
-  BENCHMARK(BM_cas##SUFFIX) ARGS;        \
-  BENCHMARK(BM_cas_hint##SUFFIX) ARGS;   \
-  BENCHMARK(BM_cas_nohint##SUFFIX) ARGS; \
-  BENCHMARK(BM_dclp_nohint##SUFFIX) ARGS;       \
-  BENCHMARK(BM_dclp##SUFFIX) ARGS;       \
+  BENCHMARK(BM_cas##SUFFIX) ARGS;         \
+  BENCHMARK(BM_cas_hint##SUFFIX) ARGS;    \
+  BENCHMARK(BM_cas_nohint##SUFFIX) ARGS;  \
+  BENCHMARK(BM_cas_uphint##SUFFIX) ARGS;  \
+  BENCHMARK(BM_dclp##SUFFIX) ARGS;        \
+  BENCHMARK(BM_dclp_nohint##SUFFIX) ARGS; \
+  BENCHMARK(BM_dclp_uphint##SUFFIX) ARGS; \
   BENCHMARK(BM_spinlock##SUFFIX) ARGS;
 REGISTER(_never)
 REGISTER(_grow)

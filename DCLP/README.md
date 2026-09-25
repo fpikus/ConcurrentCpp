@@ -55,9 +55,10 @@ wrong suspect — is in the book.
 ## What the benchmark shows
 
 `atomic_max_bm.C` runs all three mechanisms against two workloads that bracket
-how often the maximum actually moves. Alongside the shipped `atomic_max()`, a
-hinted/unhinted pair of the CAS loop (kept in the benchmark, independent of the
-header) and of DCLP measures what the branch layout alone is worth:
+how often the maximum actually moves. Alongside the shipped `atomic_max()`, the
+CAS loop (kept in the benchmark, independent of the header) and DCLP each run in
+three layouts — update hinted unlikely, not hinted, and hinted likely — to
+measure what the branch layout alone is worth:
 
 - **`never`** — each thread offers one fixed random value, so after a brief
   warm-up the maximum never advances and the read-only fast path is
@@ -94,7 +95,9 @@ GCC's layout is fast or slow depending on the order of the branches — this cod
 happens to get the fast one, the reversed if/else would not. The hint takes the
 luck out of it. Measured with GCC 16 on a 128-thread Zen 5 server, hinted and
 plain DCLP are indistinguishable at every thread count, updates or not, while
-the same hint is worth 1.2–1.6× to the CAS loop when nothing changes.
+the same hint is worth 1.2–1.6× to the CAS loop when nothing changes. Hinting
+the update as *likely* shows what the luck is worth: with Clang on a laptop it
+halves DCLP's no-update throughput.
 
 Timing says *that* DCLP wins on `grow`; `atomic_max_count.C` says *why*. It
 runs the same feed through instrumented copies of the CAS loop and the DCLP

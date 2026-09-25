@@ -67,7 +67,9 @@ alignas(64) static std::atomic<unsigned long> nmax_atomic;
 alignas(64) static unsigned long nmax_plain;
 alignas(64) static SpinLock lock;
 
-// The same maximum and lock packed onto ONE cache line, for BM_dclp_sameline.
+// The same maximum and lock packed onto ONE cache line, for
+// BM_dclp_sameline_work (the only place placement can matter: `never` never
+// takes the lock, and plain `grow` is the work:0 point of that sweep).
 // Question: DCLP's writer touches both the lock and the maximum, and at low
 // contention a shared line means one line transfer per update instead of two;
 // at high contention the readers' probe of the maximum shares the line with the
@@ -236,7 +238,6 @@ void BM_spinlock_grow(benchmark::State& state) {
 DCLP_BM(BM_dclp,          LAYOUT_COLD, nmax_atomic,    lock)            // update hinted unlikely
 DCLP_BM(BM_dclp_nohint,   LAYOUT_NONE, nmax_atomic,    lock)            // plain `if`: the compiler chooses
 DCLP_BM(BM_dclp_uphint,   LAYOUT_HOT,  nmax_atomic,    lock)            // update hinted likely
-DCLP_BM(BM_dclp_sameline, LAYOUT_COLD, sameline.value, sameline.lock)   // BM_dclp with maximum + lock on one line
 
 // --- Contention dial: grow with work between offers --------------------------
 // `grow` offers back to back, which is the most contended the maximum can get;
@@ -293,7 +294,6 @@ static const long numcpu = sysconf(_SC_NPROCESSORS_CONF);
   BENCHMARK(BM_dclp##SUFFIX) ARGS;        \
   BENCHMARK(BM_dclp_nohint##SUFFIX) ARGS; \
   BENCHMARK(BM_dclp_uphint##SUFFIX) ARGS; \
-  BENCHMARK(BM_dclp_sameline##SUFFIX) ARGS; \
   BENCHMARK(BM_spinlock##SUFFIX) ARGS;
 REGISTER(_never)
 REGISTER(_grow)

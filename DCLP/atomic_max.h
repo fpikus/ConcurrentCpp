@@ -25,8 +25,9 @@
 #define INCLUDED_ATOMIC_MAX_H
 #include <atomic>
 
-// ATOMIC_MAX_UNLIKELY(c): the condition `c`, marked as usually false, so the
-// compiler lays out the code that runs when it is true as the cold path. With
+// ATOMIC_MAX_UNLIKELY(c) (header-private, #undef'd at the end): the condition
+// `c`, marked as usually false, so the compiler lays out the code that runs
+// when it is true as the cold path. With
 // GCC and Clang (including clang-cl) this is __builtin_expect; elsewhere the
 // hint is dropped and the code is still correct, only without the layout
 // benefit. The standard [[unlikely]] attribute is not a substitute: placed on
@@ -96,5 +97,10 @@ bool atomic_max(std::atomic<T>& target, T val,
   } // while our candidate still exceeds the observed maximum
   return false;
 } // atomic_max()
+
+// Header-private: expanded when atomic_max() above was parsed (macros expand at
+// definition, not at template instantiation), so it is not exported to
+// includers.
+#undef ATOMIC_MAX_UNLIKELY
 
 #endif // INCLUDED_ATOMIC_MAX_H

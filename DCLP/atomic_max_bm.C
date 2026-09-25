@@ -154,7 +154,14 @@ void BM_spinlock_grow(benchmark::State& state) {
 //
 // The _nohint pair is the plain `if`; BM_dclp_never/_grow below differ only in
 // wrapping the probe in __builtin_expect(..., 0) so that the locked update is
-// laid out as the cold path, as atomic_max() does for the CAS loop.
+// laid out as the cold path, as atomic_max() does for the CAS loop. Whether the
+// plain `if` needs the hint depends on the compiler: Clang lays it out 1-1
+// without a hint, while GCC always uses the 2-0 layout, which is fast or slow
+// depending on the order of the branches -- lucky with this code, unlucky if
+// the if/else were reversed. The hint makes the layout independent of both.
+// (Fleet runs of 2026-09-06 were GCC builds: the plain-`if` DCLP matched the
+// hinted CAS on the no-update path there. On naptime, clang++-22, 2026-09-24,
+// the DCLP pair is within noise.)
 void BM_dclp_nohint_never(benchmark::State& state) {
   if (state.thread_index() == 0) nmax_atomic.store(0, std::memory_order_relaxed);
   std::mt19937_64 rng(state.thread_index());

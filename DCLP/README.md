@@ -87,6 +87,12 @@ rescue CAS when the maximum moves: there DCLP wins at every thread count above
 one, by 1.5× on the best case for CAS and by an order of magnitude or more on
 Intel and M3.
 
+DCLP's plain `if` may or may not need the hint, and that depends on the
+compiler rather than the hardware: Clang lays it out well without one, while
+GCC's layout is fast or slow depending on the order of the branches — this code
+happens to get the fast one, the reversed if/else would not. The hint takes the
+luck out of it.
+
 Timing says *that* DCLP wins on `grow`; `atomic_max_count.C` says *why*. It
 runs the same feed through instrumented copies of the CAS loop and the DCLP
 body and tallies what each offer did: dodged on the read, updated, or wasted —

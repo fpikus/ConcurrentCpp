@@ -91,7 +91,9 @@ DCLP's plain `if` may or may not need the hint, and that depends on the
 compiler rather than the hardware: Clang lays it out well without one, while
 GCC's layout is fast or slow depending on the order of the branches — this code
 happens to get the fast one, the reversed if/else would not. The hint takes the
-luck out of it.
+luck out of it. Measured with GCC 16 on a 128-thread Zen 5 server, hinted and
+plain DCLP are indistinguishable at every thread count, updates or not, while
+the same hint is worth 1.2–1.6× to the CAS loop when nothing changes.
 
 Timing says *that* DCLP wins on `grow`; `atomic_max_count.C` says *why*. It
 runs the same feed through instrumented copies of the CAS loop and the DCLP

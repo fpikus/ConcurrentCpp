@@ -159,9 +159,10 @@ void BM_spinlock_grow(benchmark::State& state) {
 // without a hint, while GCC always uses the 2-0 layout, which is fast or slow
 // depending on the order of the branches -- lucky with this code, unlucky if
 // the if/else were reversed. The hint makes the layout independent of both.
-// (Fleet runs of 2026-09-06 were GCC builds: the plain-`if` DCLP matched the
-// hinted CAS on the no-update path there. On naptime, clang++-22, 2026-09-24,
-// the DCLP pair is within noise.)
+// Measured: on linda (Zen 5, GCC 16.2, 2026-09-24) the DCLP pair is identical
+// (1.00x, within 1%) at every thread count in both workloads -- GCC gets the
+// fast layout for this code -- while the CAS pair shows 1.2-1.6x with no
+// updates. On naptime (Zen 4, clang++-22) the DCLP pair is within noise too.
 void BM_dclp_nohint_never(benchmark::State& state) {
   if (state.thread_index() == 0) nmax_atomic.store(0, std::memory_order_relaxed);
   std::mt19937_64 rng(state.thread_index());

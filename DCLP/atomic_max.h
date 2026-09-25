@@ -31,9 +31,15 @@
 // this is __builtin_expect; elsewhere the hint is dropped and the code is still
 // correct, only without the layout benefit. The !! makes the builtin accept
 // exactly what the bare condition accepts (a type with only an explicit
-// operator bool would not convert to the builtin's `long` parameter). The standard [[unlikely]] attribute
-// is not a substitute: placed on the loop body it does not reach the loop's
-// block layout (see atomic_max()).
+// operator bool would not convert to the builtin's `long` parameter).
+//
+// Why the builtin and not the standard attribute: `while (c) [[unlikely]] {...}`
+// also reaches the loop's layout -- with g++-16 and clang++-22 it produces the
+// same code as the builtin for this loop (checked 2026-09-24) -- but the
+// standard leaves the attribute's strength to the compiler, while
+// __builtin_expect states the edge's weight unambiguously. The right layout is
+// a real win and the wrong one largely harmless, so the unambiguous form is
+// used rather than depending on how a given compiler weighs the attribute.
 #if defined(__GNUC__) || defined(__clang__)
 #define ATOMIC_MAX_UNLIKELY(c) __builtin_expect(!!(c), 0)
 #else
@@ -84,9 +90,8 @@ bool atomic_max(std::atomic<T>& target, T val,
   // compiler tunes for: Intel (Granite Rapids) builds already have this layout,
   // so the hint is a no-op there, while Zen 5 gains 1.3-1.7x. When the maximum
   // advances on nearly every call (a monotone-increasing feed, which a warmed-up
-  // maximum is not) the cost is within noise on the fleet. NOTE: the standard
-  // [[unlikely]] attribute does NOT achieve this -- only the builtin on the loop
-  // condition reaches the loop layout.
+  // maximum is not) the cost is within noise on the fleet. (Why the builtin
+  // rather than [[unlikely]]: see ATOMIC_MAX_UNLIKELY above.)
   while (ATOMIC_MAX_UNLIKELY(val > cur)) {
     // compare_exchange_weak (not strong) because we are already in a retry
     // loop: a spurious failure just re-tests the condition and costs one more

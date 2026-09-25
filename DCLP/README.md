@@ -41,7 +41,7 @@ One line earns its keep:
 while (ATOMIC_MAX_UNLIKELY(val > cur)) { ... }   // update is the cold path
 ```
 
-(`ATOMIC_MAX_UNLIKELY` is `__builtin_expect(c, 0)` under GCC and Clang,
+(`ATOMIC_MAX_UNLIKELY` is `__builtin_expect(!!(c), 0)` under GCC and Clang,
 clang-cl included, and the bare condition elsewhere: correct everywhere, fast
 where the builtin exists.)
 
@@ -51,10 +51,12 @@ instead of a forward "skip the CAS" plus the loop back-edge. On a core that
 retires one taken branch per cycle this roughly doubles the read-only fast
 path; on a core that already lays it out that way it costs nothing, and
 under a monotone-increasing feed — which a warmed-up maximum never sees — its
-cost is within noise on the fleet. The standard `[[unlikely]]` attribute does *not* achieve
-this — only the builtin on the loop condition reaches the compiler's loop
-layout. Why that is — and why the memory barrier you first reach for is the
-wrong suspect — is in the book.
+cost is within noise on the fleet. The standard `[[unlikely]]` attribute on the
+loop body can say the same thing — with current GCC and Clang it produces the
+same code here — but its strength is left to the compiler, while the builtin
+sets the edge's weight outright. With the right layout a real win and the wrong
+one largely harmless, the unambiguous form is the one to use. Why the layout matters so much — and why
+the memory barrier you first reach for is the wrong suspect — is in the book.
 
 ## What the benchmark shows
 

@@ -104,9 +104,12 @@ static SameLineMax sameline;
 
 // The CAS loops of the experiment, independent of atomic_max.h (which may
 // change): the same while loop as the shipped function, one per layout. The
-// experiment that chose the loop shape (loop shape x branch bias, and that
-// [[likely]] does NOT reach the loop layout while __builtin_expect on the
-// condition does) lived here earlier; only its conclusion remains.
+// experiment that chose the loop shape (loop shape x branch bias, and the
+// attribute vs the builtin) lived here earlier; only its conclusion remains:
+// the builtin on the condition, because it states the edge's weight
+// unambiguously where the attribute's strength is up to the compiler (with
+// g++-16 and clang++-22, [[unlikely]] on the loop body gives the same code for
+// this loop; see atomic_max.h).
 #define CAS_LOOP(NAME, LAYOUT)                                                  \
   template <typename T>                                                        \
   static bool NAME(std::atomic<T>& target, T val,                              \

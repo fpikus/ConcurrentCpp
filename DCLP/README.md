@@ -100,6 +100,15 @@ default layout for the `while` loop is the slow one. Hinting the DCLP update as
 *likely* forces the other layout and shows what the luck is worth: 12–15% with
 GCC on that server, half the throughput with Clang on a Zen 4 laptop.
 
+Where the lock goes matters too. Putting DCLP's lock on the same cache line as
+the maximum — the arrangement that wins for an ordinary lock and its data at low
+contention — never pays off here: on the 128-thread Zen 5 server it ties at low
+contention and loses up to half the throughput under contention
+(`BM_dclp_sameline_work` against `BM_dclp_work`, with a work dial between
+offers). DCLP's offers mostly only read the maximum, and every lock acquisition
+by a writer drags the readers' copy of that line away even when it ends up not
+writing. When the contention is not known in advance, keep them apart.
+
 Timing says *that* DCLP wins on `grow`; `atomic_max_count.C` says *why*. It
 runs the same feed through instrumented copies of the CAS loop and the DCLP
 body and tallies what each offer did: dodged on the read, updated, or wasted —

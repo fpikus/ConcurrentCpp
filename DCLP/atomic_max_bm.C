@@ -249,6 +249,17 @@ DCLP_BM(BM_dclp_uphint,   LAYOUT_HOT,  nmax_atomic,    lock)            // updat
 // sin(cos(x)) before each offer (the same work unit as Spinlock's do_work();
 // kept local rather than including that harness), swept over work and threads.
 // The work result feeds the next unit and is pinned, so it cannot be dropped.
+//
+// Measured (linda, Zen 5, GCC 16.2, 2026-09-24, 3 runs x 10 reps): the shared
+// line never wins. It ties at one thread and at low contention (work 100-300,
+// up to 32 threads), and loses 8-48% under contention (work 0-30, 8-128
+// threads; noisier cells show more). So separate lines is the choice when the
+// contention is not known in advance: it costs nothing measurable anywhere and
+// avoids losing up to half. Unlike a lock guarding a payload (Spinlock's layout
+// benchmark, where the shared line wins at low contention), DCLP's operations
+// mostly only READ the maximum, and a writer's lock acquire/release on the same
+// line invalidates the readers' copy even when no update follows (reasoned,
+// not measured with counters).
 static inline double do_work(double x, long work) {
   for (long i = 0; i < work; ++i) x = std::sin(std::cos(x));
   return x;

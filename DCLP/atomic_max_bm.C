@@ -48,6 +48,8 @@
 //            Ryzen 7940HS laptop, per atomic_max_count). The test of whether the
 //            double check pays when the maximum really moves.
 #include <unistd.h>
+#include <cstddef>
+#include <cmath>
 #include <atomic>
 #include <mutex>
 #include <random>
@@ -64,6 +66,20 @@
 alignas(64) static std::atomic<unsigned long> nmax_atomic;
 alignas(64) static unsigned long nmax_plain;
 alignas(64) static SpinLock lock;
+
+// The same maximum and lock packed onto ONE cache line, for BM_dclp_sameline.
+// Question: DCLP's writer touches both the lock and the maximum, and at low
+// contention a shared line means one line transfer per update instead of two;
+// at high contention the readers' probe of the maximum shares the line with the
+// lock traffic. Where is the crossover? Wrapped in a struct so the layout is
+// guaranteed rather than left to the linker, and pinned by static_asserts.
+struct alignas(64) SameLineMax {
+  std::atomic<unsigned long> value {0};   // the shared maximum
+  SpinLock lock;                          // guards updates of `value`
+}; // struct SameLineMax
+static_assert(sizeof(SameLineMax) == 64, "maximum and lock must share one 64-byte line");
+static_assert(offsetof(SameLineMax, lock) < 64, "lock must be on the maximum's line");
+static SameLineMax sameline;
 
 // Branch-layout parameter of the experiment: how the "the maximum must be
 // updated" condition is presented to the compiler.
@@ -183,42 +199,83 @@ void BM_spinlock_grow(benchmark::State& state) {
 // the unhinted DCLP also equals the cold hint, and the forced hot layout halves
 // its throughput. Whether the 12-15% vs 2x difference is the compiler or the
 // core has not been separated.
-// One never/grow pair per layout; LAYOUT wraps only the unlocked probe.
-#define DCLP_BM(NAME, LAYOUT)                                                   \
-  void NAME##_never(benchmark::State& state) {                                 \
-    if (state.thread_index() == 0)                                             \
-      nmax_atomic.store(0, std::memory_order_relaxed);                         \
-    std::mt19937_64 rng(state.thread_index());                                 \
-    volatile unsigned long n = rng();                                          \
-    for (auto _ : state) {                                                     \
-      if (LAYOUT(n > nmax_atomic.load(std::memory_order_acquire))) { /* read-only probe */ \
-        std::lock_guard guard(lock);                                           \
-        if (n > nmax_atomic.load(std::memory_order_relaxed))  /* re-check under lock */ \
-          nmax_atomic.store(n, std::memory_order_release);    /* publish */    \
-      }                                                                        \
-    }                                                                          \
-    benchmark::DoNotOptimize(nmax_atomic.load());                              \
-    state.SetItemsProcessed(state.iterations());                              \
-  } /* NAME##_never */                                                         \
-  void NAME##_grow(benchmark::State& state) {                                  \
-    if (state.thread_index() == 0)                                             \
-      nmax_atomic.store(0, std::memory_order_relaxed);                         \
-    unsigned long n = state.thread_index(), dn = state.threads();              \
-    for (auto _ : state) {                                                     \
-      n += dn;                                                                 \
-      if (LAYOUT(n > nmax_atomic.load(std::memory_order_acquire))) {           \
-        std::lock_guard guard(lock);                                           \
-        if (n > nmax_atomic.load(std::memory_order_relaxed))                   \
-          nmax_atomic.store(n, std::memory_order_release);                     \
-      }                                                                        \
-    }                                                                          \
-    benchmark::DoNotOptimize(nmax_atomic.load());                              \
-    state.SetItemsProcessed(state.iterations());                              \
+// One never/grow pair per variant: LAYOUT wraps only the unlocked probe; MAXV
+// and LOCK name the shared maximum and its lock (separate lines, or one).
+#define DCLP_BM(NAME, LAYOUT, MAXV, LOCK)                                       \
+  void NAME##_never(benchmark::State& state) {                                  \
+    if (state.thread_index() == 0)                                              \
+      MAXV.store(0, std::memory_order_relaxed);                                 \
+    std::mt19937_64 rng(state.thread_index());                                  \
+    volatile unsigned long n = rng();                                           \
+    for (auto _ : state) {                                                      \
+      if (LAYOUT(n > MAXV.load(std::memory_order_acquire))) { /* read-only probe */ \
+        std::lock_guard guard(LOCK);                                            \
+        if (n > MAXV.load(std::memory_order_relaxed))  /* re-check under lock */ \
+          MAXV.store(n, std::memory_order_release);    /* publish */            \
+      }                                                                         \
+    }                                                                           \
+    benchmark::DoNotOptimize(MAXV.load());                                      \
+    state.SetItemsProcessed(state.iterations());                                \
+  } /* NAME##_never */                                                          \
+  void NAME##_grow(benchmark::State& state) {                                   \
+    if (state.thread_index() == 0)                                              \
+      MAXV.store(0, std::memory_order_relaxed);                                 \
+    unsigned long n = state.thread_index(), dn = state.threads();               \
+    for (auto _ : state) {                                                      \
+      n += dn;                                                                  \
+      if (LAYOUT(n > MAXV.load(std::memory_order_acquire))) {                   \
+        std::lock_guard guard(LOCK);                                            \
+        if (n > MAXV.load(std::memory_order_relaxed))                           \
+          MAXV.store(n, std::memory_order_release);                             \
+      }                                                                         \
+    }                                                                           \
+    benchmark::DoNotOptimize(MAXV.load());                                      \
+    state.SetItemsProcessed(state.iterations());                                \
   } /* NAME##_grow */
 
-DCLP_BM(BM_dclp,        LAYOUT_COLD)   // update hinted unlikely
-DCLP_BM(BM_dclp_nohint, LAYOUT_NONE)   // plain `if`: the compiler chooses
-DCLP_BM(BM_dclp_uphint, LAYOUT_HOT)    // update hinted likely
+DCLP_BM(BM_dclp,          LAYOUT_COLD, nmax_atomic,    lock)            // update hinted unlikely
+DCLP_BM(BM_dclp_nohint,   LAYOUT_NONE, nmax_atomic,    lock)            // plain `if`: the compiler chooses
+DCLP_BM(BM_dclp_uphint,   LAYOUT_HOT,  nmax_atomic,    lock)            // update hinted likely
+DCLP_BM(BM_dclp_sameline, LAYOUT_COLD, sameline.value, sameline.lock)   // BM_dclp with maximum + lock on one line
+
+// --- Contention dial: grow with work between offers --------------------------
+// `grow` offers back to back, which is the most contended the maximum can get;
+// `never` never touches the lock. Neither shows the regime where updates happen
+// but rarely collide, which is where the lock/maximum placement should matter:
+// with both on one line a writer pulls one line instead of two, but under
+// contention the readers' probe shares the line with the lock traffic. So the
+// placement question gets its own family: the grow feed with `work` units of
+// sin(cos(x)) before each offer (the same work unit as Spinlock's do_work();
+// kept local rather than including that harness), swept over work and threads.
+// The work result feeds the next unit and is pinned, so it cannot be dropped.
+static inline double do_work(double x, long work) {
+  for (long i = 0; i < work; ++i) x = std::sin(std::cos(x));
+  return x;
+} // do_work()
+
+#define DCLP_WORK_BM(NAME, MAXV, LOCK)                                          \
+  void NAME(benchmark::State& state) {                                         \
+    const long work = state.range(0);                                          \
+    if (state.thread_index() == 0)                                             \
+      MAXV.store(0, std::memory_order_relaxed);                                \
+    unsigned long n = state.thread_index(), dn = state.threads();              \
+    double x = 1.0 + state.thread_index();                                     \
+    for (auto _ : state) {                                                     \
+      x = do_work(x, work);                                                    \
+      n += dn;                                                                 \
+      if (LAYOUT_COLD(n > MAXV.load(std::memory_order_acquire))) {             \
+        std::lock_guard guard(LOCK);                                           \
+        if (n > MAXV.load(std::memory_order_relaxed))                          \
+          MAXV.store(n, std::memory_order_release);                            \
+      }                                                                        \
+    }                                                                          \
+    benchmark::DoNotOptimize(x);                                               \
+    benchmark::DoNotOptimize(MAXV.load());                                     \
+    state.SetItemsProcessed(state.iterations());                              \
+  } /* NAME */
+
+DCLP_WORK_BM(BM_dclp_work,          nmax_atomic,    lock)            // separate lines
+DCLP_WORK_BM(BM_dclp_sameline_work, sameline.value, sameline.lock)   // one line
 
 static const long numcpu = sysconf(_SC_NPROCESSORS_CONF);
 
@@ -236,8 +293,16 @@ static const long numcpu = sysconf(_SC_NPROCESSORS_CONF);
   BENCHMARK(BM_dclp##SUFFIX) ARGS;        \
   BENCHMARK(BM_dclp_nohint##SUFFIX) ARGS; \
   BENCHMARK(BM_dclp_uphint##SUFFIX) ARGS; \
+  BENCHMARK(BM_dclp_sameline##SUFFIX) ARGS; \
   BENCHMARK(BM_spinlock##SUFFIX) ARGS;
 REGISTER(_never)
 REGISTER(_grow)
+
+// The placement sweep: work {0, 3, 10, 30, 100, 300} x the thread range.
+#define WORK_ARGS \
+  ->ArgName("work")->Arg(0)->Arg(3)->Arg(10)->Arg(30)->Arg(100)->Arg(300) \
+  ARGS
+BENCHMARK(BM_dclp_work) WORK_ARGS;
+BENCHMARK(BM_dclp_sameline_work) WORK_ARGS;
 
 BENCHMARK_MAIN();

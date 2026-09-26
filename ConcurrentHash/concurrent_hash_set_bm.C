@@ -48,6 +48,13 @@
  *  - Insert_MostlyNew: every thread inserts sequential keys from its own
  *    disjoint range. Duplicate rate is exactly 0%. Every operation is a real
  *    insertion; the table walks through many doublings live, mid-measurement.
+ *    Every key is passed through mix() first (see there): with the identity
+ *    std::hash<int> and unmixed keys, thread t's n-th key t*kKeyStride + n
+ *    lands in bucket n for every t while the table has fewer than kKeyStride
+ *    buckets, so all threads walk and CAS the SAME bucket at the same moment
+ *    and every chain is T nodes long -- an O(T) cost per insert that the
+ *    campaign of 2026-09-25 measured as the hash table's scaling until the
+ *    arena-nodes-per-key counter showed no waste and the chains were found.
  *    Because every key is globally unique and attempted exactly once, every
  *    insert() MUST return true -- this is verified per thread, which makes the
  *    benchmark a standing regression test for the insert return-value
@@ -86,6 +93,18 @@
  */
 
 static const int num_cpu = sysconf(_SC_NPROCESSORS_CONF);
+
+// Bijective key mixer (the MurmurHash3 32-bit finalizer): every key that enters
+// a set, and every key looked up, goes through it, so a workload written in
+// terms of simple integers (sequential per thread, random in a range) reaches
+// the identity std::hash<int> as random-looking values and different threads'
+// keys spread over different buckets. A bijection keeps keys unique and hit
+// rates unchanged. The result may be negative as an int; that is a valid key.
+static inline int mix(int k) {
+    uint32_t x = static_cast<uint32_t>(k);
+    x ^= x >> 16; x *= 0x85ebca6bu; x ^= x >> 13; x *= 0xc2b2ae35u; x ^= x >> 16;
+    return static_cast<int>(x);
+}
 
 // Arena shard count for ConcurrentResizableHashSet, from the environment:
 // HASH_ARENA_SHARDS=<n> (0 or unset = the header's default, the hardware
@@ -133,6 +152,9 @@ public:
     // The second parameter mirrors ConcurrentResizableHashSet's arena_shards so
     // the fixtures can construct both containers the same way; it is ignored.
     explicit LockedHashSet(size_t initial_buckets = 1024, size_t /*arena_shards*/ = 0) : set_(initial_buckets) {}
+    // Mirrors the concurrent set's test accessor for the arena_nodes_per_key
+    // counter: the baseline has one node per key, so this is the key count.
+    size_t get_internal_node_count() const { return set_.size(); }
     bool insert(const T& v) {
         std::unique_lock lock(mtx_);
         return set_.insert(v).second;
@@ -197,7 +219,7 @@ public:
              * its own benchmark; it has no business inside a mean.
              */
             set = new SetType(2 * kPrefill, arena_shards_from_env());
-            for (int k = 0; k < kPrefill; ++k) set->insert(k);   // untimed
+            for (int k = 0; k < kPrefill; ++k) set->insert(mix(k));   // untimed
         }
     }
     void TearDown(const ::benchmark::State& state) override {
@@ -222,13 +244,23 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
         int next = 0;                                                         \
         int64_t ok = 0;                                                       \
         for (auto _ : state) {                                                \
-            ok += set->insert(base + next++);                                 \
+            ok += set->insert(mix(base + next++));                            \
         }                                                                     \
         if (ok != state.iterations()) {                                       \
             state.SkipWithError("insert() returned false for a unique key "   \
                                 "(resize return-value regression)");          \
         }                                                                     \
         state.SetItemsProcessed(state.iterations());                          \
+        /* Arena nodes per inserted key, read by thread 0 once every thread */ \
+        /* has left the loop (its end is a barrier): 1.0 means no waste;    */ \
+        /* above it are split copies and subchains abandoned by splitters   */ \
+        /* that lost the publishing CAS. Measures how redundant the         */ \
+        /* cooperative splits get as the thread count grows.                */ \
+        if (state.thread_index() == 0) {                                      \
+            state.counters["arena_nodes_per_key"] = benchmark::Counter(       \
+                double(set->get_internal_node_count()) /                      \
+                (double(state.iterations()) * state.threads()));              \
+        }                                                                     \
     }                                                                         \
     BENCHMARK_REGISTER_F(MostlyNewFixture, NAME)                              \
         ->ThreadRange(1, num_cpu)->Iterations(kNewIters);
@@ -252,9 +284,9 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
             if (++op == kInsertEvery) {                                       \
                 op = 0;                                                       \
                 ++tries;                                                      \
-                ok += set->insert(base + next++);                             \
+                ok += set->insert(mix(base + next++));                        \
             } else {                                                          \
-                hit = set->contains((int)(rng.next() & kLookupMask));         \
+                hit = set->contains(mix((int)(rng.next() & kLookupMask)));    \
                 benchmark::DoNotOptimize(hit);                                \
             }                                                                 \
         }                                                                     \

@@ -61,26 +61,32 @@ In its proper domain, the numbers are the argument. The baseline is the
 textbook answer: `std::unordered_set` behind a `std::shared_mutex`.
 
 Lookup-dominated workload (99% `contains()`, 1% `insert()`, half the lookups
-missing): single-threaded, 19 ns per lookup against the baseline's 41 ns.
+missing; measured before the key mixer, with keys that were already random):
+single-threaded, 19 ns per lookup against the baseline's 41 ns.
 Under concurrency the baseline collapses first — down to ~6 million lookups/s
 at 4 threads (750 ns each) as the reader count bounces between cores — while
 this set scales to **490 million lookups per second** on a 16-core desktop
 Ryzen and **1.1 billion lookups per second** on a large Granite Rapids server.
 
 Insert-dominated workload (all keys new, table doubling live mid-benchmark):
-comparable to the baseline at one thread, then sharply divergent — the
-throughput amortizes allocation and lazy rehashing across threads. Those
-numbers were measured when every new node — including every node copied by a
-lazy split — was appended to one arena deque under one spinlock, and at the
-peak the benchmark was measuring that lock. One shared per-node atomic of any
-kind turned out to be the ceiling: a lock-free counter in its place was
-slower still. The arena is now sharded, one append-only deque per hardware
-thread by default, each thread always appending to the shard its thread
-number selects, so a shard's lock is contended only when thread numbers
-collide modulo the shard count. On a 16-thread desktop that took a
-pre-sized table from about 170 to about 520 million inserts per second. The
-bucket table is still doubled under one lock, once per doubling. The insert
-numbers above are to be re-measured.
+the benchmark inserts each thread's keys through a bijective mixer, so that
+inserts land on random buckets and every insert into a large table is a
+cache miss on its bucket head. An earlier version of the benchmark inserted
+sequential keys under the identity hash, which streams through consecutive
+bucket heads and lets every thread's n-th key share bucket n with every
+other thread's: that measured the prefetcher and chains as long as the
+thread count, and its numbers, once quoted here, were wrong by an order of
+magnitude. Under random access, every new node — including every node
+copied by a lazy split — used to be appended to one arena deque under one
+spinlock, and one shared per-node atomic of any kind turned out to be the
+ceiling: a lock-free counter in its place was slower still. The arena is
+now sharded, one append-only deque per hardware thread by default, each
+thread always appending to the shard its thread number selects, so a
+shard's lock is contended only when thread numbers collide modulo the shard
+count. On a 16-thread desktop that took a pre-sized 8M-bucket table from
+about 30 to about 95 million random inserts per second at 16 threads,
+against 12 to 14 million single-threaded. The bucket table is still doubled
+under one lock, once per doubling.
 
 While these benchmarks run, the CPU fans rev up. Under the reader-writer-lock
 baseline, the machine stays quiet: at 32 threads its threads spend over 95% of

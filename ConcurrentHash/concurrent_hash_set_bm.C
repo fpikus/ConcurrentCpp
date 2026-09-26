@@ -192,6 +192,27 @@ public:
 };
 template <typename SetType> SetType* MostlyNewFixture<SetType>::set = nullptr;
 
+// The same insert workload into a table constructed with kPresizedBuckets
+// buckets, so that no doubling and no lazy split happens until the arena holds
+// 2*kPresizedBuckets nodes (16.7M: beyond 64 threads' worth of kNewIters). Added
+// 2026-09-25 to separate the allocator's own cost from the doubling and split
+// path: with the table geometry fixed, the arena (its lock or its shards) is the
+// only shared state on the insert path, and this is the fixture the README's
+// allocator numbers come from. Every insert is still a random bucket-head miss.
+static constexpr size_t kPresizedBuckets = size_t(1) << 23;
+template <typename SetType>
+class MostlyNewPresizedFixture : public benchmark::Fixture {
+public:
+    static SetType* set;
+    void SetUp(const ::benchmark::State& state) override {
+        if (state.thread_index() == 0) set = new SetType(kPresizedBuckets, arena_shards_from_env());
+    }
+    void TearDown(const ::benchmark::State& state) override {
+        if (state.thread_index() == 0) { delete set; set = nullptr; }
+    }
+};
+template <typename SetType> SetType* MostlyNewPresizedFixture<SetType>::set = nullptr;
+
 template <typename SetType>
 class MostlyOldFixture : public benchmark::Fixture {
 public:
@@ -234,11 +255,12 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
 
 /*
  * Insert_MostlyNew: pure insertion, zero duplicates by construction.
- * Thread t inserts kNewBase-free keys t*kKeyStride, t*kKeyStride+1, ...
+ * Thread t inserts mix() of the kNewBase-free keys t*kKeyStride, t*kKeyStride+1, ...
  * Invariant checked per thread: every insert() returned true.
  */
-#define DEFINE_MOSTLY_NEW(NAME, SET_TYPE)                                     \
-    BENCHMARK_TEMPLATE_DEFINE_F(MostlyNewFixture, NAME, SET_TYPE)             \
+#define DEFINE_MOSTLY_NEW(NAME, SET_TYPE) DEFINE_MOSTLY_NEW_ON(MostlyNewFixture, NAME, SET_TYPE)
+#define DEFINE_MOSTLY_NEW_ON(FIXTURE, NAME, SET_TYPE)                         \
+    BENCHMARK_TEMPLATE_DEFINE_F(FIXTURE, NAME, SET_TYPE)                      \
     (benchmark::State& state) {                                               \
         const int base = state.thread_index() * kKeyStride;                   \
         int next = 0;                                                         \
@@ -262,7 +284,7 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
                 (double(state.iterations()) * state.threads()));              \
         }                                                                     \
     }                                                                         \
-    BENCHMARK_REGISTER_F(MostlyNewFixture, NAME)                              \
+    BENCHMARK_REGISTER_F(FIXTURE, NAME)                                       \
         ->ThreadRange(1, num_cpu)->Iterations(kNewIters);
 
 /*
@@ -306,6 +328,9 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
 // ---------------------------------------------------------------------------
 DEFINE_MOSTLY_NEW(Insert_MostlyNew_Concurrent, ConcurrentSet)
 DEFINE_MOSTLY_NEW(Insert_MostlyNew_RWLocked,   LockedSet)
+
+DEFINE_MOSTLY_NEW_ON(MostlyNewPresizedFixture, Insert_MostlyNew_Presized_Concurrent, ConcurrentSet)
+DEFINE_MOSTLY_NEW_ON(MostlyNewPresizedFixture, Insert_MostlyNew_Presized_RWLocked,   LockedSet)
 
 DEFINE_MOSTLY_OLD(Lookup_MostlyOld_Concurrent, ConcurrentSet)
 DEFINE_MOSTLY_OLD(Lookup_MostlyOld_RWLocked,   LockedSet)

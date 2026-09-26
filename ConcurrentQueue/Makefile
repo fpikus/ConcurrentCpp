@@ -7,6 +7,27 @@
 # unchanged.
 include ../config.mk
 
+# Compilers and run-time library paths. The per-machine config may select a
+# toolset compiler whose libstdc++ is not on the default library path; a binary
+# it links then builds cleanly and fails at run time with "GLIBCXX_x.y.z not
+# found" against the system libstdc++. So every link embeds an rpath to the
+# directory of the libstdc++ that the linking compiler itself uses, derived from
+# the compiler rather than from config.mk so it is right for any compiler on any
+# machine: `-print-file-name=libstdc++.so` prints that library's full path, or
+# the bare name when the compiler knows none, in which case RPATH_OF adds no
+# flag. For a system compiler the directory may hold only the link-time symlink;
+# the loader finds no libstdc++.so.6 there and falls through to the default path.
+# The sanitizer tests are built with SAN_CXX, which config.mk may point at a
+# separate toolchain and which defaults to CXX; a config.mk that sets SAN_RPATH
+# overrides the rpath derived for SAN_CXX.
+# The commas of the flag go through $(comma): a literal one would split the
+# arguments of $(if).
+SAN_CXX ?= $(CXX)
+comma := ,
+RPATH_OF = $(strip $(if $(findstring /,$(1)),-Wl$(comma)-rpath$(comma)$(dir $(1))))
+CXX_RPATH := $(call RPATH_OF,$(shell $(CXX) -print-file-name=libstdc++.so))
+SAN_CXX_RPATH := $(if $(SAN_RPATH),$(SAN_RPATH),$(call RPATH_OF,$(shell $(SAN_CXX) -print-file-name=libstdc++.so)))
+
 # Per-host build directory: several hosts build concurrently in the same
 # NFS-shared tree, so binaries must not overwrite each other. Same convention as
 # the Spinlock and DCLP directories.
@@ -67,27 +88,27 @@ tests: $(TESTS)
 
 # Google Benchmark throughput benchmark
 $(TARGET_GMBM): concurrent_queue_gmbm.C $(HEADERS) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) -o $@
+	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) $(CXX_RPATH) -o $@
 
 # Custom latency benchmark (push->pop handoff under contention)
 $(TARGET_LMBM): concurrent_queue_lmbm.C $(HEADERS) $(LAT_HEADERS) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) -o $@
+	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) $(CXX_RPATH) -o $@
 
 # Custom hand-rolled throughput benchmark (gmbm's twin)
 $(TARGET_MBM): concurrent_queue_mbm.C $(HEADERS) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) -o $@
+	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) $(CXX_RPATH) -o $@
 
 # Ping-pong latency benchmark (1P/1C round trip)
 $(TARGET_PPMBM): concurrent_queue_ppmbm.C $(HEADERS) $(LAT_HEADERS) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) -o $@
+	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) $(CXX_RPATH) -o $@
 
 # ASan test
 $(TARGET_TEST_ASAN): concurrent_queue_test.C $(HEADERS) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS_TEST_ASAN) $< $(LIBS_TEST) -o $@
+	$(SAN_CXX) $(CXXFLAGS_TEST_ASAN) $< $(LIBS_TEST) $(SAN_CXX_RPATH) -o $@
 
 # TSan test
 $(TARGET_TEST_TSAN): concurrent_queue_test.C $(HEADERS) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS_TEST_TSAN) $< $(LIBS_TEST) -o $@
+	$(SAN_CXX) $(CXXFLAGS_TEST_TSAN) $< $(LIBS_TEST) $(SAN_CXX_RPATH) -o $@
 
 # Run tests
 run_tests: tests

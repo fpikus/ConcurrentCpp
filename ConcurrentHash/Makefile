@@ -4,6 +4,27 @@
 # this include is machine-independent and ships unchanged.
 include ../config.mk
 
+# Compilers and run-time library paths. The per-machine config may select a
+# toolset compiler whose libstdc++ is not on the default library path; a binary
+# it links then builds cleanly and fails at run time with "GLIBCXX_x.y.z not
+# found" against the system libstdc++. So every link embeds an rpath to the
+# directory of the libstdc++ that the linking compiler itself uses, derived from
+# the compiler rather than from config.mk so it is right for any compiler on any
+# machine: `-print-file-name=libstdc++.so` prints that library's full path, or
+# the bare name when the compiler knows none, in which case RPATH_OF adds no
+# flag. For a system compiler the directory may hold only the link-time symlink;
+# the loader finds no libstdc++.so.6 there and falls through to the default path.
+# The sanitizer tests are built with SAN_CXX, which config.mk may point at a
+# separate toolchain and which defaults to CXX; a config.mk that sets SAN_RPATH
+# overrides the rpath derived for SAN_CXX.
+# The commas of the flag go through $(comma): a literal one would split the
+# arguments of $(if).
+SAN_CXX ?= $(CXX)
+comma := ,
+RPATH_OF = $(strip $(if $(findstring /,$(1)),-Wl$(comma)-rpath$(comma)$(dir $(1))))
+CXX_RPATH := $(call RPATH_OF,$(shell $(CXX) -print-file-name=libstdc++.so))
+SAN_CXX_RPATH := $(if $(SAN_RPATH),$(SAN_RPATH),$(call RPATH_OF,$(shell $(SAN_CXX) -print-file-name=libstdc++.so)))
+
 # Per-host build directory: several hosts build concurrently in the same
 # NFS-shared tree, so binaries must not overwrite each other. Same convention as
 # the Spinlock, DCLP, ConcurrentDeque, and ConcurrentQueue directories: per-host
@@ -73,19 +94,19 @@ tests: $(TESTS)
 
 # Build benchmark
 $(TARGET_BM): concurrent_hash_set_bm.C $(HEADERS) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) -o $@
+	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) $(CXX_RPATH) -o $@
 
 # Build ASan test
 $(TARGET_TEST_ASAN): concurrent_hash_set_test.C $(HEADERS) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS_TEST_ASAN) $< $(LIBS_TEST) -o $@
+	$(SAN_CXX) $(CXXFLAGS_TEST_ASAN) $< $(LIBS_TEST) $(SAN_CXX_RPATH) -o $@
 
 # Build TSan test
 $(TARGET_TEST_TSAN): concurrent_hash_set_test.C $(HEADERS) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS_TEST_TSAN) $< $(LIBS_TEST) -o $@
+	$(SAN_CXX) $(CXXFLAGS_TEST_TSAN) $< $(LIBS_TEST) $(SAN_CXX_RPATH) -o $@
 
 # Build the -O3, no-sanitizer store-buffering test (see CXXFLAGS_TEST_TSO above)
 $(TARGET_TEST_TSO): concurrent_hash_set_tso_test.C $(HEADERS) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS_TEST_TSO) $< $(LIBS_TEST) -o $@
+	$(CXX) $(CXXFLAGS_TEST_TSO) $< $(LIBS_TEST) $(CXX_RPATH) -o $@
 
 # Run tests
 run_tests: tests

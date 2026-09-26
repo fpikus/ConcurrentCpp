@@ -4,6 +4,27 @@
 # independent, so this Makefile ships to any machine unchanged.
 include ../config.mk
 
+# Compilers and run-time library paths. The per-machine config may select a
+# toolset compiler whose libstdc++ is not on the default library path; a binary
+# it links then builds cleanly and fails at run time with "GLIBCXX_x.y.z not
+# found" against the system libstdc++. So every link embeds an rpath to the
+# directory of the libstdc++ that the linking compiler itself uses, derived from
+# the compiler rather than from config.mk so it is right for any compiler on any
+# machine: `-print-file-name=libstdc++.so` prints that library's full path, or
+# the bare name when the compiler knows none, in which case RPATH_OF adds no
+# flag. For a system compiler the directory may hold only the link-time symlink;
+# the loader finds no libstdc++.so.6 there and falls through to the default path.
+# The sanitizer tests are built with SAN_CXX, which config.mk may point at a
+# separate toolchain and which defaults to CXX; a config.mk that sets SAN_RPATH
+# overrides the rpath derived for SAN_CXX.
+# The commas of the flag go through $(comma): a literal one would split the
+# arguments of $(if).
+SAN_CXX ?= $(CXX)
+comma := ,
+RPATH_OF = $(strip $(if $(findstring /,$(1)),-Wl$(comma)-rpath$(comma)$(dir $(1))))
+CXX_RPATH := $(call RPATH_OF,$(shell $(CXX) -print-file-name=libstdc++.so))
+SAN_CXX_RPATH := $(if $(SAN_RPATH),$(SAN_RPATH),$(call RPATH_OF,$(shell $(SAN_CXX) -print-file-name=libstdc++.so)))
+
 # Per-host build directory: several hosts build concurrently in the same
 # NFS-shared tree, so binaries must not overwrite each other. Same convention
 # as results/<hostname>/ in run_sets.sh: per-host subdirectories under build/.
@@ -81,47 +102,47 @@ tests: $(TESTS)
 
 # Build benchmark (SpinLock vs atomic and mutex across the contention range)
 $(TARGET_BM): spinlock_bm.C $(HEADERS) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) -o $@
+	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) $(CXX_RPATH) -o $@
 
 # Build tuning benchmark (back-off ladder parameter exploration)
 $(TARGET_TUNE_BM): spinlock_tune_bm.C $(HEADERS) $(TUNE_HEADERS) $(TUNE_CONFIGS) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) -o $@
+	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) $(CXX_RPATH) -o $@
 
 # Build read/write tuning benchmark (separate ladders for readers and writers)
 $(TARGET_RW_TUNE_BM): spinlock_rw_tune_bm.C $(HEADERS) $(TUNE_HEADERS) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) -o $@
+	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) $(CXX_RPATH) -o $@
 
 # Build overhead benchmark (spinlock vs atomic vs CAS loop across the work dial)
 $(TARGET_OVERHEAD_BM): overhead_bm.C $(HEADERS) $(TUNE_HEADERS) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) -o $@
+	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) $(CXX_RPATH) -o $@
 
 # Build memory-work tuning benchmark (the ladder sweep against streaming work)
 $(TARGET_MEM_BM): spinlock_mem_bm.C $(HEADERS) $(TUNE_HEADERS) $(TUNE_CONFIGS) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) -o $@
+	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) $(CXX_RPATH) -o $@
 
 # Build lock/payload cache-line layout benchmark
 $(TARGET_LAYOUT_BM): spinlock_layout_bm.C $(HEADERS) $(TUNE_HEADERS) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) -o $@
+	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) $(CXX_RPATH) -o $@
 
 # Build sequence-lock benchmark (seqlock vs spinlock vs atomic, read/write mix)
 $(TARGET_SEQLOCK_BM): seqlock_bm.C $(HEADERS) $(TUNE_HEADERS) $(SEQLOCK_HEADERS) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) -o $@
+	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) $(CXX_RPATH) -o $@
 
 # Build ASan test
 $(TARGET_TEST_ASAN): spinlock_test.C $(HEADERS) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS_TEST_ASAN) $< $(LIBS_TEST) -o $@
+	$(SAN_CXX) $(CXXFLAGS_TEST_ASAN) $< $(LIBS_TEST) $(SAN_CXX_RPATH) -o $@
 
 # Build TSan test
 $(TARGET_TEST_TSAN): spinlock_test.C $(HEADERS) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS_TEST_TSAN) $< $(LIBS_TEST) -o $@
+	$(SAN_CXX) $(CXXFLAGS_TEST_TSAN) $< $(LIBS_TEST) $(SAN_CXX_RPATH) -o $@
 
 # Build SeqLock ASan test
 $(TARGET_SEQLOCK_TEST_ASAN): seqlock_test.C $(HEADERS) $(TUNE_HEADERS) $(SEQLOCK_HEADERS) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS_TEST_ASAN) $< $(LIBS_TEST) -o $@
+	$(SAN_CXX) $(CXXFLAGS_TEST_ASAN) $< $(LIBS_TEST) $(SAN_CXX_RPATH) -o $@
 
 # Build SeqLock TSan test
 $(TARGET_SEQLOCK_TEST_TSAN): seqlock_test.C $(HEADERS) $(TUNE_HEADERS) $(SEQLOCK_HEADERS) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS_TEST_TSAN) $< $(LIBS_TEST) -o $@
+	$(SAN_CXX) $(CXXFLAGS_TEST_TSAN) $< $(LIBS_TEST) $(SAN_CXX_RPATH) -o $@
 
 # Run tests
 run_tests: tests

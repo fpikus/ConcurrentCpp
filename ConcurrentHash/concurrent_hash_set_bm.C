@@ -22,6 +22,7 @@
 // SOFTWARE.
 //
 #include <benchmark/benchmark.h>
+#include <cstdlib>
 #include <unistd.h>
 #include <atomic>
 #include <cstdint>
@@ -86,6 +87,19 @@
 
 static const int num_cpu = sysconf(_SC_NPROCESSORS_CONF);
 
+// Arena shard count for ConcurrentResizableHashSet, from the environment:
+// HASH_ARENA_SHARDS=<n> (0 or unset = the header's default, the hardware
+// concurrency rounded up to a power of two). Exists so one binary can measure
+// how many shards a machine with many cores actually needs: the same
+// workload is run with 16 shards and with one per hardware thread.
+static size_t arena_shards_from_env() {
+    const char* s = getenv("HASH_ARENA_SHARDS");
+    long n = s ? atol(s) : 0;
+    if (n < 0) n = 0;                  // nonsense means "the default"
+    if (n > (1L << 16)) n = 1L << 16;  // the header's own cap
+    return static_cast<size_t>(n);
+}
+
 // ---------------------------------------------------------------------------
 // Workload parameters
 // ---------------------------------------------------------------------------
@@ -116,7 +130,9 @@ class LockedHashSet {
     std::unordered_set<T, Hash> set_;
     mutable std::shared_mutex mtx_;
 public:
-    explicit LockedHashSet(size_t initial_buckets = 1024) : set_(initial_buckets) {}
+    // The second parameter mirrors ConcurrentResizableHashSet's arena_shards so
+    // the fixtures can construct both containers the same way; it is ignored.
+    explicit LockedHashSet(size_t initial_buckets = 1024, size_t /*arena_shards*/ = 0) : set_(initial_buckets) {}
     bool insert(const T& v) {
         std::unique_lock lock(mtx_);
         return set_.insert(v).second;
@@ -146,7 +162,7 @@ class MostlyNewFixture : public benchmark::Fixture {
 public:
     static SetType* set;
     void SetUp(const ::benchmark::State& state) override {
-        if (state.thread_index() == 0) set = new SetType(1024);
+        if (state.thread_index() == 0) set = new SetType(1024, arena_shards_from_env());
     }
     void TearDown(const ::benchmark::State& state) override {
         if (state.thread_index() == 0) { delete set; set = nullptr; }
@@ -169,7 +185,7 @@ public:
              * large population of UNINITIALIZED buckets whose lazy splits
              * have not happened yet. Those splits are then performed INSIDE
              * the timed region, cooperatively, BY THE READERS -- and every
-             * split allocates through the arena deque's spinlock_. The
+             * split allocates through its arena shard's spinlock_. The
              * nominally lock-free lookup benchmark degenerates into a
              * spinlock convoy (wall time grows with threads while CPU
              * stays flat).
@@ -180,7 +196,7 @@ public:
              * Resize behavior under load is a tail-latency story and gets
              * its own benchmark; it has no business inside a mean.
              */
-            set = new SetType(2 * kPrefill);
+            set = new SetType(2 * kPrefill, arena_shards_from_env());
             for (int k = 0; k < kPrefill; ++k) set->insert(k);   // untimed
         }
     }

@@ -32,12 +32,27 @@
 #include <type_traits>
 #include <bit>
 #include <vector>
+#include <memory>
 #include "concurrent_deque.h"
 #include <thread>
 #include <mutex>
 #include "spinlock.h"
 
 struct empty_struct {};
+
+namespace concurrent_hash_detail {
+// Process-wide sequential thread numbering, shared by every instantiation of
+// ConcurrentResizableHashSet: a thread's number is assigned on its first
+// allocation and never changes. Sequential (not hashed) on purpose: threads
+// started together get consecutive numbers, so `number mod shards` spreads a
+// batch of up to `shards` threads over distinct arena shards with no
+// collisions, however many earlier threads have come and gone.
+inline std::atomic<unsigned> next_thread_number{0};
+inline unsigned thread_number() {
+    static thread_local unsigned number = next_thread_number.fetch_add(1, std::memory_order_relaxed);
+    return number;
+}
+} // namespace concurrent_hash_detail
 
 template <typename T, typename... Args>
 using DefaultConcurrentDeque = ConcurrentAppendDeque<T, 1024>;
@@ -51,13 +66,23 @@ using DefaultConcurrentDeque = ConcurrentAppendDeque<T, 1024>;
 // per-bucket splitting that copies (never moves) live nodes into new buckets.
 //
 // STORAGE
-//   data_    : append-only arena of Node (a ConcurrentAppendDeque). A node is
-//              never moved, never freed, and (apart from the two state bits of
-//              its link, see below) never mutated once published. Nodes are
-//              addressed by POINTER: the arena is segmented and its blocks never
-//              move, so a node's address is stable for the life of the set. The
-//              deque's index is used exactly once, to obtain that address at
-//              allocation; no read path ever goes through the deque.
+//   arenas_  : the node arena, SHARDED: an array of append-only deques of Node
+//              (ConcurrentAppendDeque), a thread always appending to the shard
+//              its thread number selects (see alloc_node()). A node is never
+//              moved, never freed, and (apart from the two state bits of its
+//              link, see below) never mutated once published. Nodes are
+//              addressed by POINTER: a deque is segmented and its blocks never
+//              move, so a node's address is stable for the life of the set, and
+//              nothing that reads the structure knows or cares which shard a
+//              node lives in. The deque's index is used exactly once, to obtain
+//              that address at allocation; no read path ever goes through a
+//              deque. Sharding exists because one shared per-node atomic of any
+//              kind (a lock, a counter) was measured to be the insert ceiling;
+//              a shard's lock is contended only by the threads whose numbers
+//              collide modulo the shard count.
+//   node_count_ : arena occupancy, OVER-counted by up to 255 per touched shard
+//              (each shard adds 256 when it appends a node whose index is a
+//              multiple of 256, index 0 included); the resize hint.
 //   buckets_ : array of atomic bucket heads. buckets_[j] holds the address of
 //              the first node of bucket j's singly linked chain (or a
 //              sentinel), plus the bucket's SEAL LEVEL. buckets_ only ever grows.
@@ -198,8 +223,9 @@ using DefaultConcurrentDeque = ConcurrentAppendDeque<T, 1024>;
 // PROGRESS: this structure is lock-free on the pure read/traverse path, but it
 // is NOT wait-free and not lock-free end to end: contains(), insert() and
 // erase() all fall into split_bucket() when they meet an UNINITIALIZED bucket,
-// and split_bucket() allocates through the arena's internal SpinLock, as does
-// every insert() (alloc_node()); resize itself is serialized by resize_lock_.
+// and split_bucket() allocates through its arena shard's internal SpinLock, as
+// does every insert() (alloc_node()); with one thread per shard that lock is
+// uncontended, but it is a lock. Resize itself is serialized by resize_lock_.
 //
 // Template parameters:
 //   T           : element (key) type; must be equality-comparable and hashable.
@@ -268,6 +294,9 @@ private:
     static constexpr word_t PTR_MASK = ~(LEVEL_MASK | word_t{7});
     static constexpr word_t EMPTY = 0;
     static constexpr word_t UNINITIALIZED = 8;
+    // Largest arena shard count the constructor accepts (a power of two); more
+    // shards than this serve no thread count that exists.
+    static constexpr size_t MAX_ARENA_SHARDS = size_t{1} << 16;
     static_assert(PTR_MASK == 0x03FFFFFFFFFFFFF8, "bit diagram above and the masks disagree");
     static_assert(std::atomic<word_t>::is_always_lock_free, "head and link words must be lock-free atomics");
 
@@ -301,9 +330,12 @@ private:
     // plus the bucket's seal level (see the word encoding).
     Container<std::atomic<word_t>> buckets_;
 
-    // The monotonically growing block allocator that stores all Node objects.
-    // Nodes are appended block-by-block and never destructed until the set is destroyed.
-    Container<Node> data_;
+    // The node arena: arena_mask_ + 1 (a power of two) append-only deques. A
+    // thread appends to arenas_[thread_number & arena_mask_]. Nodes are appended
+    // block-by-block within a shard and never destructed until the set is
+    // destroyed. Fixed at construction; the array itself is never resized.
+    std::unique_ptr<Container<Node>[]> arenas_;
+    size_t arena_mask_;
 
     // The current logical size (number of buckets) of the hash table. Always a power of 2.
     std::atomic<size_t> table_size_;
@@ -312,6 +344,18 @@ private:
     // Only one thread can expand the buckets_ array at a time.
     SpinLock resize_lock_;
 
+    // Total nodes ever allocated, over-counted by up to 255 per touched shard:
+    // a shard adds 256 when the index of a node it appends is a multiple of
+    // 256, index 0 included, so a shard's first node counts as 256. The error
+    // is one-sided on purpose: an over-count doubles the table early (memory:
+    // a set touched by k shards grows to at least 128k buckets, small next to
+    // the k node blocks the shards themselves hold), where an under-count
+    // would let chains grow long before a doubling. The resize hint in
+    // insert() reads it; the exact count is the sum of the shards' sizes
+    // (get_internal_node_count()), which is too many acquire loads of
+    // frequently written lines to do per insert. On its own cache line: it is
+    // written from every shard, and table_size_ is read by every operation.
+    alignas(64) std::atomic<size_t> node_count_{0};
 
     // Seal level stored in the head word `head`.
     static constexpr size_t level_of(word_t head) { return (head & LEVEL_MASK) >> LEVEL_SHIFT; }
@@ -329,15 +373,16 @@ private:
     // The bare word for a node: its address, no tag bits, level 0.
     static word_t word_of(const Node* n) { return reinterpret_cast<word_t>(n); }
 
-    // Thread-safe bump allocator. It pushes a new node to the data_ deque
-    // and returns the node's address, which is stable for the life of the set.
-    // The index emplace_back() returns is the one place the arena is indexed:
-    // it is converted to the address here and never used again. There is no
-    // separate node counter to fall out of step with the deque if the append
-    // throws; data_.size() is the node count.
+    // Thread-safe bump allocator. It pushes a new node to the calling thread's
+    // arena shard and returns the node's address, which is stable for the life
+    // of the set. The index emplace_back() returns is the one place a shard is
+    // indexed: it is converted to the address here, used to keep node_count_
+    // current, and never used again. If the append throws nothing has changed.
     Node* alloc_node(const T& val, word_t next) {
-        size_t idx = data_.emplace_back(val, next);
-        Node* node = &data_[idx];   // the deque's index is used exactly here, once
+        Container<Node>& shard = arenas_[concurrent_hash_detail::thread_number() & arena_mask_];
+        size_t idx = shard.emplace_back(val, next);
+        if ((idx & 255) == 0) node_count_.fetch_add(256, std::memory_order_relaxed);
+        Node* node = &shard[idx];   // the deque's index is used exactly here, once
         // The address must fit the pointer field of a word: no tag bits (the
         // node is 8-aligned, see the static_assert), no level bits (bits 63..58
         // of a user-space address are zero on every supported platform), and
@@ -494,7 +539,22 @@ public:
     // parent to split from. table_size_ is released LAST so that any thread
     // which later acquires it is guaranteed to see the fully initialized bucket
     // array.
-    ConcurrentResizableHashSet(size_t initial_capacity = 4) {
+    //
+    // arena_shards: number of arena shards, rounded up to a power of two;
+    // 0 (the default) means the hardware concurrency, rounded up. As many
+    // shards as threads that allocate concurrently makes every shard lock
+    // uncontended (see alloc_node()); fewer shards trade contention for
+    // memory (an untouched shard costs one small object, a touched one at
+    // least a block of nodes).
+    ConcurrentResizableHashSet(size_t initial_capacity = 4, size_t arena_shards = 0) {
+        if (arena_shards == 0) arena_shards = std::thread::hardware_concurrency();
+        if (arena_shards == 0) arena_shards = 1;   // hardware_concurrency() may report 0
+        // Cap before rounding: bit_ceil() of a value above 2^63 has no
+        // representable result, and no machine has that many threads anyway.
+        if (arena_shards > MAX_ARENA_SHARDS) arena_shards = MAX_ARENA_SHARDS;
+        arena_shards = std::bit_ceil(arena_shards);
+        arenas_ = std::make_unique<Container<Node>[]>(arena_shards);
+        arena_mask_ = arena_shards - 1;
         if (initial_capacity < 4) initial_capacity = 4;
         initial_capacity = std::bit_ceil(initial_capacity);
         buckets_.resize(initial_capacity);
@@ -506,7 +566,7 @@ public:
 
     // Membership test. Lock-free on the fast path (a plain chain walk with no
     // atomic writes); it can, however, fall into split_bucket() -- which
-    // allocates under the arena lock -- if it lands on an UNINITIALIZED bucket,
+    // allocates under its arena shard's lock -- if it lands on an UNINITIALIZED bucket,
     // so it is not lock-free/wait-free in general (see the class overview).
     // Logically deleted nodes are skipped via the MARK_BIT test. The head's seal
     // level and a node's FROZEN bit are deliberately IGNORED here (they are only
@@ -569,9 +629,9 @@ public:
     // insert() returns true per absent->present transition of the key, across
     // any number of concurrent resizes. Returns false if the key was present at
     // some instant during the call. Not lock-free: every new node is allocated
-    // under the arena's SpinLock (alloc_node()), a bucket that is still
+    // under its arena shard's SpinLock (alloc_node()), a bucket that is still
     // UNINITIALIZED is split first, and a successful insert may perform the
-    // DCLP-guarded doubling when data_.size() exceeds twice the table size.
+    // DCLP-guarded doubling when the node count exceeds twice the table size.
     //
     // The decision is the publishing CAS on the bucket head, and the geometry is
     // validated by that same CAS: its expected value includes the head's seal
@@ -673,21 +733,22 @@ public:
                 // to the table_size_ store of a concurrent resize.
                 //
                 // Resize trigger, guarded by Double-Checked Locking. The unlocked
-                // test `data_.size() > ts*2` is a hint; the decision is remade under
-                // resize_lock_ against a fresh table_size_ so only ONE thread
-                // doubles per epoch (current_ts == ts). NOTE: data_.size() is TOTAL
-                // arena occupancy -- it counts tombstones, stale split copies and
-                // abandoned subchains -- so this is an arena-consumption trigger,
+                // test `node_count_ > ts*2` is a hint (relaxed, and exact only to
+                // within 256 per shard); the decision is remade under resize_lock_
+                // against a fresh table_size_ so only ONE thread doubles per epoch
+                // (current_ts == ts). NOTE: node_count_ is TOTAL arena occupancy --
+                // it counts tombstones, stale split copies and abandoned
+                // subchains -- so this is an arena-consumption trigger,
                 // not a live-load-factor trigger: a delete-heavy workload grows the
                 // table although the live key count does not. New buckets are
                 // marked UNINITIALIZED (relaxed) and then table_size_ is released,
                 // so any thread that later acquires the new size is guaranteed to
                 // observe those markers (channel 2).
-                if (data_.size() > ts * 2) {
+                if (node_count_.load(std::memory_order_relaxed) > ts*2) {
                     std::lock_guard lock(resize_lock_);
                     size_t current_ts = table_size_.load(std::memory_order_relaxed);
                     if (current_ts == ts) {
-                        size_t new_ts = ts * 2;
+                        size_t new_ts = ts*2;
                         buckets_.resize(new_ts);
                         for (size_t i = ts; i < new_ts; ++i) {
                             buckets_[i].store(UNINITIALIZED, std::memory_order_relaxed);
@@ -781,12 +842,17 @@ public:
         } // while (true)
     } // erase()
 
-    // Test-only accessor: total nodes ever allocated in the arena (live + dead).
-    // Used by InsertContention_NoMemoryLeak to detect the CAS-retry leak, since a
-    // leak inflates this count far above the number of distinct keys inserted.
+    // Test-only accessor: total nodes ever allocated in the arena (live + dead),
+    // exact: the sum of the shards' sizes. Used by InsertContention_NoMemoryLeak
+    // to detect the CAS-retry leak, since a leak inflates this count far above
+    // the number of distinct keys inserted.
     size_t get_internal_node_count() const {
-        return data_.size();
+        size_t n = 0;
+        for (size_t i = 0; i <= arena_mask_; ++i) n += arenas_[i].size();
+        return n;
     }
+    // Test-only accessor: the number of arena shards (a power of two).
+    size_t get_internal_arena_shards() const { return arena_mask_ + 1; }
 }; // class ConcurrentResizableHashSet
 
 #endif // CONCURRENT_HASH_SET_H

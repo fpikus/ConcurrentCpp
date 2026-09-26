@@ -5,8 +5,8 @@ for any number of threads, in any mix of operations, with no external
 synchronization. Lookups take no lock and write no shared memory, except when a
 lookup is the first to touch a bucket after a resize and performs its lazy
 split. Inserts publish with a single CAS but allocate their node under the
-arena's spinlock (see [Performance](#performance)), so insertion is not
-lock-free.
+spinlock of the calling thread's arena shard (see
+[Performance](#performance)), so insertion is not lock-free.
 
 If you have ever tried to design a concurrent hash table, you know that two
 problems dominate the effort: safe memory reclamation (when may a node be
@@ -69,13 +69,18 @@ Ryzen and **1.1 billion lookups per second** on a large Granite Rapids server.
 
 Insert-dominated workload (all keys new, table doubling live mid-benchmark):
 comparable to the baseline at one thread, then sharply divergent — the
-throughput amortizes allocation and lazy rehashing across threads until it
-peaks between 8 and 16 threads, at which point the benchmark is no longer
-measuring the hash table at all, only the physical limit of the arena
-allocator's spinlock. There are two locks, and they are taken at very
-different rates: the bucket table is doubled under a lock once per doubling,
-but every new node — including every node copied by a lazy split — is
-appended to the arena deque under its lock, one acquisition per element.
+throughput amortizes allocation and lazy rehashing across threads. Those
+numbers were measured when every new node — including every node copied by a
+lazy split — was appended to one arena deque under one spinlock, and at the
+peak the benchmark was measuring that lock. One shared per-node atomic of any
+kind turned out to be the ceiling: a lock-free counter in its place was
+slower still. The arena is now sharded, one append-only deque per hardware
+thread by default, each thread always appending to the shard its thread
+number selects, so a shard's lock is contended only when thread numbers
+collide modulo the shard count. On a 16-thread desktop that took a
+pre-sized table from about 170 to about 520 million inserts per second. The
+bucket table is still doubled under one lock, once per doubling. The insert
+numbers above are to be re-measured.
 
 While these benchmarks run, the CPU fans rev up. Under the reader-writer-lock
 baseline, the machine stays quiet: at 32 threads its threads spend over 95% of

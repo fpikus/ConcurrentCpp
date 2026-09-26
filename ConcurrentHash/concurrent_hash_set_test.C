@@ -42,6 +42,7 @@
 #include <thread>
 #include <vector>
 #include <atomic>
+#include <bit>
 #include <string>
 #include <barrier>
 #include <memory>
@@ -107,6 +108,36 @@ TEST(ConcurrentHashSetTest, BasicOperations) {
     EXPECT_TRUE(set.contains(2));
     EXPECT_FALSE(set.contains(3));
 }
+
+// The arena_shards constructor parameter: rounded up to a power of two, 0 means
+// the hardware concurrency. A set works with any shard count, including one
+// shard shared by every thread; the node count accessor, which sums the shards,
+// sees every inserted key (split copies add nodes, so it is a lower bound here).
+// Keys are scrambled so the doublings inside the loop split chains (see scramble()).
+TEST(ConcurrentHashSetTest, ArenaShardsParameter) {
+    ConcurrentResizableHashSet<int> by_default;
+    EXPECT_GE(by_default.get_internal_arena_shards(), 1u);
+    EXPECT_TRUE(std::has_single_bit(by_default.get_internal_arena_shards()));
+    ConcurrentResizableHashSet<int> three(4, 3);
+    EXPECT_EQ(three.get_internal_arena_shards(), size_t(4));
+
+    const int T = 4, N = 2000;
+    for (size_t shards : {size_t(1), size_t(2), size_t(64)}) {
+        ConcurrentResizableHashSet<int> set(4, shards);
+        EXPECT_EQ(set.get_internal_arena_shards(), shards);
+        std::atomic<int> inserted{0};
+        run_threads(T, [&set, &inserted](int t) {
+            for (int k = t; k < N; k += T) {
+                if (set.insert(scramble(k))) inserted.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+        EXPECT_EQ(inserted.load(), N);
+        for (int k = 0; k < N; ++k) EXPECT_TRUE(set.contains(scramble(k)));
+        EXPECT_FALSE(set.contains(scramble(N)));
+        // Every inserted key has a node; split copies add more, never fewer.
+        EXPECT_GE(set.get_internal_node_count(), size_t(N));
+    } // for each shard count
+} // ArenaShardsParameter
 
 // Single-threaded correctness across many table doublings: every inserted key must
 // be found, duplicates must report false, and absent keys must not be found.

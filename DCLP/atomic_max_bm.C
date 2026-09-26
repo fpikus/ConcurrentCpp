@@ -192,9 +192,12 @@ void BM_spinlock_grow(benchmark::State& state) {
 // plain `if` needs the hint depends on the compiler: Clang lays it out 1-1
 // without a hint, while GCC always uses the 2-0 layout, which is fast or slow
 // depending on the order of the branches -- lucky with this code, unlucky if
-// the if/else were reversed. The hint makes the layout independent of both,
-// and BM_dclp_uphint forces the wrong layout, which is how to see what the
-// plain `if` would cost if the compiler did not get lucky.
+// the if/else were reversed. (1-1 and 2-0 count the taken jumps on the two
+// paths of the branch, update and no update: 1-1 is one jump on each path, 2-0
+// is both jumps on one path and none on the other, which path depending on the
+// branch order.) The hint makes the layout independent of both, and
+// BM_dclp_uphint forces the wrong layout, which is how to see what the plain
+// `if` would cost if the compiler did not get lucky.
 // Measured with no updates (2026-09-24, 3 runs x 10 reps): on linda (Zen 5,
 // GCC 16.2) the unhinted DCLP equals the cold-hinted one (1.00x) at every
 // thread count -- GCC chose the fast layout for this `if` -- and forcing the

@@ -111,9 +111,10 @@ the maximum — the arrangement that wins for an ordinary lock and its data at l
 contention — never pays off here: on the 128-thread Zen 5 server it ties at low
 contention and loses up to half the throughput under contention
 (`BM_dclp_sameline_work` against `BM_dclp_work`, with a work dial between
-offers). DCLP's offers mostly only read the maximum, and every lock acquisition
-by a writer drags the readers' copy of that line away even when it ends up not
-writing. When the contention is not known in advance, keep them apart.
+offers). The likely reason, not yet confirmed with counters: DCLP's offers
+mostly only read the maximum, and every lock acquisition by a writer drags the
+readers' copy of that line away even when it ends up not writing. When the
+contention is not known in advance, keep them apart.
 
 Timing says *that* DCLP wins on `grow`; `atomic_max_count.C` says *why*. It
 runs the same feed through instrumented copies of the CAS loop and the DCLP
@@ -150,7 +151,7 @@ the repository rather than a private copy.
 
 - `atomic_max.h` — the lock-free maximum (the shipped facility)
 - `atomic_max_test.C` — unit tests (built with ASan and TSan)
-- `atomic_max_bm.C` — the three mechanisms (CAS and DCLP each with and without the branch hint) across two workloads and the thread range
+- `atomic_max_bm.C` — the three mechanisms, with CAS and DCLP each in three branch layouts (update hinted unlikely, not hinted, hinted likely), across two workloads and the thread range; plus the lock-placement sweep (`BM_dclp_work` / `BM_dclp_sameline_work`) with a work dial between offers
 - `atomic_max_count.C` — per-offer outcomes (dodged / updated / wasted) of CAS and DCLP on the `grow` feed; `atomic_max_count [nthreads [iters]]`
 
 ## The book

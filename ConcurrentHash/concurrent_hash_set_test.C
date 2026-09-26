@@ -277,7 +277,7 @@ TEST(ConcurrentHashSetTest, SplitContention) {
 
     // Insert 1 more element: arena occupancy now exceeds ts*2, so this insert
     // doubles the table to 8. Buckets 4..7 are published UNINITIALIZED (their
-    // encoded value UNINITIALIZED, distinct from a real index) and will be split
+    // encoded value UNINITIALIZED, distinct from a real address) and will be split
     // lazily by whichever thread below touches them first.
     set.insert(200);
 

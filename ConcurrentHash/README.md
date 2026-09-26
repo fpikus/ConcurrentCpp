@@ -31,11 +31,11 @@ Everything else follows: no hazard pointers, no epochs, no reference counts,
 no reader registration of any kind. Readers *validate* instead of
 *registering* — a trailing re-check of the table size asks "did the geometry
 change under me?" and retries on the rare "yes". No use-after-free is possible
-under any interleaving; no ABA problem is possible because integer indices are
-never recycled. The elements live in an append-only node arena built on the
-`ConcurrentAppendDeque` (from `../ConcurrentDeque`), which decouples the hash
-geometry from data placement entirely: when the table grows, only small
-integers move — the payload data sits still, forever.
+under any interleaving; no ABA problem is possible because a node's address is
+never reused. The elements live in an append-only node arena built on the
+`ConcurrentAppendDeque` (from `../ConcurrentDeque`), whose blocks never move,
+which decouples the hash geometry from data placement entirely: when the table
+grows, only pointers move — the payload data sits still, forever.
 
 ## The domain of applicability
 

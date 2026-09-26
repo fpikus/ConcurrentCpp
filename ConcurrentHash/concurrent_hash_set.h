@@ -27,6 +27,7 @@
 #include <atomic>
 #include <cassert>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <type_traits>
 #include <bit>
@@ -46,17 +47,19 @@ using DefaultConcurrentDeque = ConcurrentAppendDeque<T, 1024>;
 //
 // A closed-addressing (chained) hash set that grows by doubling, without ever
 // stopping the world and without a global rehash pass. The two big ideas are
-// (1) an append-only node arena addressed by index, and (2) lazy, cooperative,
+// (1) an append-only node arena in which nothing ever moves, and (2) lazy, cooperative,
 // per-bucket splitting that copies (never moves) live nodes into new buckets.
 //
 // STORAGE
 //   data_    : append-only arena of Node (a ConcurrentAppendDeque). A node is
 //              never moved, never freed, and (apart from the two state bits of
 //              its link, see below) never mutated once published. Nodes are
-//              addressed by their arena index, NOT by pointer -- indices are
-//              stable because the arena is segmented and blocks never move.
-//   buckets_ : array of atomic bucket heads. buckets_[j] holds the arena index
-//              of the first node of bucket j's singly linked chain (or a
+//              addressed by POINTER: the arena is segmented and its blocks never
+//              move, so a node's address is stable for the life of the set. The
+//              deque's index is used exactly once, to obtain that address at
+//              allocation; no read path ever goes through the deque.
+//   buckets_ : array of atomic bucket heads. buckets_[j] holds the address of
+//              the first node of bucket j's singly linked chain (or a
 //              sentinel), plus the bucket's SEAL LEVEL. buckets_ only ever grows.
 //   table_size_ : current number of buckets, always a power of two, and
 //              MONOTONICALLY NON-DECREASING. This monotonicity is load-bearing
@@ -64,8 +67,10 @@ using DefaultConcurrentDeque = ConcurrentAppendDeque<T, 1024>;
 //              valid lower bound forever.
 //
 // WORD ENCODING (see the constants below for the exact bit layout)
-//   Bucket heads and node links are 64-bit words whose low 57 bits (IDX_MASK)
-//   are an arena index or a sentinel. The high bits differ by kind of word:
+//   Bucket heads and node links are 64-bit words holding a node address or a
+//   sentinel, plus tag bits in the parts of the word a user-space address never
+//   uses: the low three bits (nodes are 8-aligned) and the top six (bits 63..58
+//   are zero on every supported platform). The tags differ by kind of word:
 //     - a NODE LINK carries two state bits that describe THIS node (not its
 //       successor, which is the more familiar Harris convention):
 //         MARK_BIT   : tombstone, "this node is logically deleted";
@@ -76,8 +81,8 @@ using DefaultConcurrentDeque = ConcurrentAppendDeque<T, 1024>;
 //     - a BUCKET HEAD carries a 6-bit SEAL LEVEL: log2 of the largest table size
 //       for which a child split has SEALED this bucket's chain (the seal comes
 //       first; the snapshot follows, and a splitter may stall in between).
-//   Real arena indices are small, so they never collide with the EMPTY /
-//   UNINITIALIZED sentinels, which sit at the top of the 57-bit range.
+//   The EMPTY / UNINITIALIZED sentinels are the values 0 and 8: no node can
+//   live at either address.
 //
 // LAZY SPLIT REHASH (the heart of the structure; see split_bucket())
 //   On a resize from N to 2N buckets, the new buckets [N, 2N) are published as
@@ -91,9 +96,9 @@ using DefaultConcurrentDeque = ConcurrentAppendDeque<T, 1024>;
 //   on demand.
 //
 // WHY COPY INSTEAD OF UNLINK/MOVE
-//   Because nodes are copied and never unlinked, a node index observed by any
+//   Because nodes are copied and never unlinked, a node address observed by any
 //   traversing thread stays valid for the whole life of the set. That is what
-//   lets the read path dereference arena indices with no hazard pointers, no
+//   lets the read path dereference node pointers with no hazard pointers, no
 //   reference counts, and no reclamation protocol at all -- the memory is
 //   simply never reclaimed until the whole set is destroyed. The only nodes
 //   ever "wasted" are (a) stale parent copies after a split and (b) speculative
@@ -139,21 +144,24 @@ using DefaultConcurrentDeque = ConcurrentAppendDeque<T, 1024>;
 //      Publishing a node (or a split result) into a bucket head with release,
 //      and reading the head with acquire, transfers everything the publisher
 //      did first -- crucially the node's construction in the arena -- to the
-//      reader. This is why a reader may dereference data_[idx].value safely.
+//      reader. This is why a reader may dereference node->value safely.
 //   2. table_size_ store is release; every load is acquire. A resize stores the
 //      UNINITIALIZED bucket markers (relaxed) and THEN releases table_size_, so
 //      any thread that acquires the new size is guaranteed to see the markers.
 //   3. The arena. ConcurrentAppendDeque's rule is that a thread may index an
 //      element only after it has learned, with an acquire, how many elements
 //      exist: from size(), or from the return value of its own emplace_back().
-//      No read path here calls data_.size(); instead the thread that appended
-//      the node (and so knows its index) hands the index to readers through
-//      channel 1 -- a release CAS on a bucket head or a release store into a
-//      link, read with acquire -- which is the same handoff size() performs,
-//      with the head or link word in the role of size_. operator[] then does
-//      its own acquire load of the block directory. Likewise buckets_[j] is
-//      indexed on the strength of channel 2 (table_size_ is released after
-//      buckets_.resize()), never of buckets_.size().
+//      Only alloc_node() indexes the arena, with the index its own emplace_back()
+//      returned, and it does so once, to take the node's address. From then on
+//      the node is reached by pointer only: the thread that constructed it hands
+//      the address to readers through channel 1 -- a release CAS on a bucket
+//      head, read with acquire (a node reached through a link was published
+//      by the head CAS of the node that links to it, or of a later prepend)
+//      -- and that acquire is what makes the node's construction visible to
+//      the reader.
+//      The deque's directory is never consulted on a read path. buckets_[j], by
+//      contrast, IS indexed, on the strength of channel 2 (table_size_ is
+//      released after buckets_.resize()), never of buckets_.size().
 //   4. A node link's state bits are set by a release CAS and read by acquire
 //      loads: an operation that returns after erase() returned sees the
 //      tombstone, and a thread that sees FROZEN or a raised seal level is
@@ -201,8 +209,8 @@ using DefaultConcurrentDeque = ConcurrentAppendDeque<T, 1024>;
 //                 no-ops and every chain is append-only.
 //   Hash        : hash functor; must return the SAME hash for a key every call
 //                 (the split math re-hashes keys under wider masks).
-//   Container   : the append-only, index-stable arena template (see the
-//                 requirements the channels above impose on it).
+//   Container   : the append-only, address-stable arena template: elements
+//                 never move once constructed (see channel 3).
 // ===========================================================================
 template <
     typename T,
@@ -212,79 +220,86 @@ template <
 >
 class ConcurrentResizableHashSet {
 private:
-    // Word encoding. Both kinds of word keep an arena index, or one of two
-    // sentinels placed at the very top of the index range (so they can never
-    // alias a real, small arena index), in their low 57 bits:
+    // Word encoding. Both kinds of word keep a node address, or one of two
+    // sentinel values no node can have as its address, in the bits a user-space
+    // pointer occupies; the tag bits sit where such a pointer is always zero:
     //
-    //   bit      63      62     61..57     56..0
-    //   LINK   MARK    FROZEN   zero       successor index | EMPTY
-    //   HEAD   zero    [  seal level  ]    first-node index | EMPTY | UNINITIALIZED
-    //                  (bits 62..57)
+    //   bit     63..58      57..3            2      1       0
+    //   LINK    zero        successor address | EMPTY   zero  FROZEN  MARK
+    //   HEAD    [ seal level ]  first-node address | EMPTY | UNINITIALIZED  zero
     //
-    //   IDX_MASK      = 0x01FFFFFFFFFFFFFF : the index field of either word.
-    //   EMPTY         = 0x01FFFFFFFFFFFFFF : end-of-chain / "no node" sentinel
-    //                                        (numerically equal to IDX_MASK).
-    //   UNINITIALIZED = 0x01FFFFFFFFFFFFFE : bucket exists but its lazy split
+    //   PTR_MASK      = ~(LEVEL_MASK | 7)  : the address field of either word.
+    //   EMPTY         = 0                  : end-of-chain / "no node" sentinel
+    //                                        (a null pointer).
+    //   UNINITIALIZED = 8                  : bucket exists but its lazy split
     //                                        has not run yet (see split_bucket).
-    //                   The largest usable arena index is therefore 2^57 - 3.
-    //   MARK_BIT      = 1 << 63 (links only): the node's tombstone. Set by
-    //                   erase() with one CAS whose expected value is the LIVE
-    //                   link (no MARK, no FROZEN).
-    //   FROZEN_BIT    = 1 << 62 (links only): the node has been, or is about to
-    //                   be, copied into a child bucket by split_bucket(); it can
+    //                   A node is a heap object of at least 16 bytes, so its
+    //                   address is neither 0 nor 8; 8 is 8-aligned, so it
+    //                   survives PTR_MASK and is compared through addr_of()
+    //                   like an address.
+    //   MARK_BIT      = 1 (links only): the node's tombstone. Set by erase()
+    //                   with one CAS whose expected value is the LIVE link (no
+    //                   MARK, no FROZEN).
+    //   FROZEN_BIT    = 2 (links only): the node has been, or is about to be,
+    //                   copied into a child bucket by split_bucket(); it can
     //                   never be marked afterwards. Set with one CAS whose
     //                   expected value is the LIVE link. MARK and FROZEN are
     //                   therefore mutually exclusive and both terminal.
-    //   LEVEL_MASK    = 0x3F << 57 (heads only): the seal level, log2 of the
+    //   LEVEL_MASK    = 0x3F << 58 (heads only): the seal level, log2 of the
     //                   largest table size for which a child split has SEALED
     //                   this chain (the snapshot that follows the seal may not
-    //                   have been taken yet); 0 = never sealed. Levels
-    //                   only grow. Six bits hold any log2 of a 64-bit size. The
-    //                   level bits of a head overlap FROZEN_BIT of a link, so a
-    //                   head word is never stored into a link without masking
-    //                   (see insert()) and vice versa.
+    //                   have been taken yet); 0 = never sealed. Levels only
+    //                   grow. Six bits hold any log2 of a 64-bit size. A head
+    //                   word is never stored into a link without addr_of()
+    //                   (see insert()), so a level never reaches a link.
     //
     // GOTCHA that dictates every traversal condition: the LAST node of a chain
-    // holds EMPTY in its index field, and once it is tombstoned or frozen its
-    // link is EMPTY | MARK_BIT or EMPTY | FROZEN_BIT. A naive
+    // holds EMPTY in its address field, and once it is tombstoned or frozen its
+    // link is EMPTY | MARK_BIT or EMPTY | FROZEN_BIT, which is not EMPTY. A naive
     // `while (curr != EMPTY)` would then keep going and dereference garbage.
-    // Every loop therefore tests `(curr & IDX_MASK) != EMPTY`, i.e. compares
-    // only the index bits, and every dereference uses `curr & IDX_MASK`.
-    static constexpr size_t MARK_BIT = 1ULL << 63;
-    static constexpr size_t FROZEN_BIT = 1ULL << 62;
-    static constexpr unsigned LEVEL_SHIFT = 57;
-    static constexpr size_t LEVEL_MASK = 0x3FULL << LEVEL_SHIFT;
-    static constexpr size_t IDX_MASK = (1ULL << LEVEL_SHIFT) - 1;
-    static constexpr size_t EMPTY = IDX_MASK;
-    static constexpr size_t UNINITIALIZED = EMPTY - 1;
+    // Every loop therefore tests `addr_of(curr) != EMPTY`, i.e. compares only
+    // the address bits, and every dereference goes through node_of(curr).
+    using word_t = std::uintptr_t;
+    static_assert(sizeof(word_t) == 8, "the word encoding assumes 64-bit pointers");
+    static constexpr word_t MARK_BIT = 1;
+    static constexpr word_t FROZEN_BIT = 2;
+    static constexpr unsigned LEVEL_SHIFT = 58;
+    static constexpr word_t LEVEL_MASK = word_t{0x3F} << LEVEL_SHIFT;
+    static constexpr word_t PTR_MASK = ~(LEVEL_MASK | word_t{7});
+    static constexpr word_t EMPTY = 0;
+    static constexpr word_t UNINITIALIZED = 8;
+    static_assert(PTR_MASK == 0x03FFFFFFFFFFFFF8, "bit diagram above and the masks disagree");
+    static_assert(std::atomic<word_t>::is_always_lock_free, "head and link words must be lock-free atomics");
 
 public:
     struct Node {
         // The stored key. Written once at construction, then immutable -- readers
         // compare against it with no synchronization beyond the acquire load of
-        // the index that reached this node (see synchronization channel 1).
+        // the address that reached this node (see synchronization channel 1).
         T value;
-        // Encoded link to the next node in this bucket's chain: the low 57 bits
-        // (IDX_MASK) are the successor's arena index or the EMPTY sentinel; bit
-        // 63 (MARK_BIT) is THIS node's tombstone and bit 62 (FROZEN_BIT) says
+        // Encoded link to the next node in this bucket's chain: the address
+        // bits (PTR_MASK) are the successor's address or the EMPTY sentinel; bit
+        // 0 (MARK_BIT) is THIS node's tombstone and bit 1 (FROZEN_BIT) says
         // THIS node was superseded by a copy in a child bucket. Atomic because
         // erase() and split_bucket() set those bits via CAS while readers
         // traverse concurrently, and because it is the field that
-        // publishes/observes chain structure. The index bits never change once
-        // the node is published.
-        std::atomic<size_t> next_bucket_node_idx;
+        // publishes/observes chain structure. The address bits never change
+        // once the node is published.
+        std::atomic<word_t> link;
 
         // Default ctor: an unlinked live node whose successor is EMPTY. Rarely
         // used -- the arena is filled via the (val, next) ctor below; this
         // exists only for the container's value-initialization path.
-        Node() : value(), next_bucket_node_idx(EMPTY) {}
-        Node(const T& val, size_t next) : value(val), next_bucket_node_idx(next) {}
+        Node() : value(), link(EMPTY) {}
+        Node(const T& val, word_t next) : value(val), link(next) {}
     };
+    static_assert(alignof(Node) >= 8, "the low three bits of a node address are the link's tag bits");
 
 private:
     // The dynamically resizable array of atomic bucket heads.
-    // Each index stores the offset of the first node in the bucket's linked list.
-    Container<std::atomic<size_t>> buckets_;
+    // Each entry holds the address of the first node in the bucket's chain,
+    // plus the bucket's seal level (see the word encoding).
+    Container<std::atomic<word_t>> buckets_;
 
     // The monotonically growing block allocator that stores all Node objects.
     // Nodes are appended block-by-block and never destructed until the set is destroyed.
@@ -299,27 +314,42 @@ private:
 
 
     // Seal level stored in the head word `head`.
-    static constexpr size_t level_of(size_t head) { return (head & LEVEL_MASK) >> LEVEL_SHIFT; }
+    static constexpr size_t level_of(word_t head) { return (head & LEVEL_MASK) >> LEVEL_SHIFT; }
     // Seal level that corresponds to the table size `ts` (a power of two): a
     // thread working with table size ts may publish into a bucket only while
     // level_of(head) <= level_for(ts).
     static constexpr size_t level_for(size_t ts) { return static_cast<size_t>(std::countr_zero(ts)); }
+    // The address field of a head or link word: the node address, EMPTY or
+    // UNINITIALIZED, with the tag bits (MARK/FROZEN of a link, level of a head)
+    // cleared. This is what every traversal condition compares.
+    static constexpr word_t addr_of(word_t w) { return w & PTR_MASK; }
+    // The node a head or link word points to. Only valid when addr_of(w) is a
+    // real address, i.e. neither EMPTY nor UNINITIALIZED.
+    static Node* node_of(word_t w) { return reinterpret_cast<Node*>(addr_of(w)); }
+    // The bare word for a node: its address, no tag bits, level 0.
+    static word_t word_of(const Node* n) { return reinterpret_cast<word_t>(n); }
 
     // Thread-safe bump allocator. It pushes a new node to the data_ deque
-    // and returns its contiguous index offset.
-    // ARCHITECTURE NOTE: We intentionally use the return value of data_.emplace_back()
-    // instead of a separate atomic node_counter_. If we used a separate node_counter_
-    // and incremented it before emplace_back(), an std::bad_alloc thrown by the deque
-    // would permanently desynchronize the counter from the actual node count.
-    // Returning the size from the internal locked section gives us strict
-    // exception safety and negative overhead (by removing an atomic fetch_add).
-    size_t alloc_node(const T& val, size_t next) {
+    // and returns the node's address, which is stable for the life of the set.
+    // The index emplace_back() returns is the one place the arena is indexed:
+    // it is converted to the address here and never used again. There is no
+    // separate node counter to fall out of step with the deque if the append
+    // throws; data_.size() is the node count.
+    Node* alloc_node(const T& val, word_t next) {
         size_t idx = data_.emplace_back(val, next);
-        // The index field is 57 bits wide and the two top values are sentinels
-        // (see the constants): 2^57 - 3 is the largest index a link or head can
-        // hold. Unreachable in practice; checked in debug builds only.
-        assert(idx < UNINITIALIZED);
-        return idx;
+        Node* node = &data_[idx];   // the deque's index is used exactly here, once
+        // The address must fit the pointer field of a word: no tag bits (the
+        // node is 8-aligned, see the static_assert), no level bits (bits 63..58
+        // of a user-space address are zero on every supported platform), and
+        // not the UNINITIALIZED sentinel. Checked unconditionally, not by
+        // assert(): a platform that tags heap pointers in the high bits (MTE,
+        // HWASan) would otherwise fail silently or by livelock in an NDEBUG
+        // build, and one AND per allocation is unmeasurable next to the
+        // arena lock the allocation just took.
+        if ((word_of(node) & ~PTR_MASK) != 0 || word_of(node) == UNINITIALIZED) {
+            std::abort();   // the word encoding cannot represent this address
+        }
+        return node;
     } // alloc_node()
 
     // Cooperative lazy split: populate the UNINITIALIZED bucket `j` on first
@@ -366,7 +396,7 @@ private:
     //      with the copy, and the freeze is compiled out.)
     //   3. Publish the subchain with one CAS on bucket j's head.
     // The parent chain is never relinked -- this is what keeps already-observed
-    // node indices valid forever (see the class overview).
+    // node addresses valid forever (see the class overview).
     void split_bucket(size_t j) {
         // Bucket 0 has no parent and is published EMPTY by the constructor, so
         // it can never be UNINITIALIZED and never reaches here. The guard
@@ -376,8 +406,8 @@ private:
         size_t parent = j - std::bit_floor(j);
         size_t N = std::bit_floor(j);
         size_t mask = (N << 1) - 1;   // == 2N-1, the mask for the table that created j
-        size_t parent_head = buckets_[parent].load(std::memory_order_acquire);
-        if ((parent_head & IDX_MASK) == UNINITIALIZED) {
+        word_t parent_head = buckets_[parent].load(std::memory_order_acquire);
+        if (addr_of(parent_head) == UNINITIALIZED) {
             split_bucket(parent);
             // The parent is published now and a published head never returns to
             // UNINITIALIZED, so the seal below never seals an unsplit bucket.
@@ -394,7 +424,7 @@ private:
         // Weak CAS: we are in a retry loop anyway.
         const size_t seal = level_for(N << 1);
         while (level_of(parent_head) < seal) {
-            size_t sealed = (parent_head & ~LEVEL_MASK) | (seal << LEVEL_SHIFT);
+            word_t sealed = (parent_head & ~LEVEL_MASK) | (word_t{seal} << LEVEL_SHIFT);
             if (buckets_[parent].compare_exchange_weak(parent_head, sealed, std::memory_order_release, std::memory_order_acquire)) {
                 parent_head = sealed;
             }
@@ -403,13 +433,13 @@ private:
         // Steps 2 and 3. Build the child subchain privately. It is invisible to
         // every other thread until (and unless) the publishing CAS below
         // succeeds, so no synchronization is needed while constructing it.
-        size_t new_subchain_head = EMPTY;
-        size_t curr = parent_head;
+        word_t new_subchain_head = EMPTY;
+        word_t curr = parent_head;
 
-        while ((curr & IDX_MASK) != EMPTY) {   // traverse parent chain
-            size_t actual_curr = curr & IDX_MASK;
-            T val = data_[actual_curr].value;
-            size_t next_raw = data_[actual_curr].next_bucket_node_idx.load(std::memory_order_acquire);
+        while (addr_of(curr) != EMPTY) {   // traverse parent chain
+            Node* node = node_of(curr);
+            const T& val = node->value;   // immutable once published, never freed: a reference is safe
+            word_t next_raw = node->link.load(std::memory_order_acquire);
             if (!(next_raw & MARK_BIT)) {          // skip logically deleted nodes
                 if ((Hash{}(val) & mask) == j) {   // key belongs to bucket j now
                     if constexpr (AllowDelete) {
@@ -426,14 +456,14 @@ private:
                         // relaxed: both outcomes are decided by the returned
                         // bits alone, we need nothing else its writer did.
                         if (!(next_raw & FROZEN_BIT)) {
-                            if (data_[actual_curr].next_bucket_node_idx.compare_exchange_strong(next_raw, next_raw | FROZEN_BIT, std::memory_order_release, std::memory_order_relaxed)) {
+                            if (node->link.compare_exchange_strong(next_raw, next_raw | FROZEN_BIT, std::memory_order_release, std::memory_order_relaxed)) {
                                 next_raw |= FROZEN_BIT;
                             }
                         } // if not frozen yet
                     } // if erase() exists
                     if (!(next_raw & MARK_BIT)) {
                         // Prepend a fresh live copy to the child subchain.
-                        new_subchain_head = alloc_node(val, new_subchain_head);
+                        new_subchain_head = word_of(alloc_node(val, new_subchain_head));
                     }
                 } // if key belongs to bucket j
             } // if not tombstoned
@@ -443,12 +473,12 @@ private:
         // Publish with a single CAS: only if bucket j is still UNINITIALIZED do
         // we install our subchain (release, so a reader that acquires the head
         // sees every node we constructed). The child starts at seal level 0
-        // (UNINITIALIZED carries none and new_subchain_head is a bare index or
+        // (UNINITIALIZED carries none and new_subchain_head is a bare address or
         // EMPTY). If the CAS fails, another thread already published its own,
         // equivalent split of j; our subchain was never linked anywhere and is
         // simply abandoned -- benign wasted arena space, never reachable. The
         // nodes we froze stay frozen, which is correct: the winner copied them.
-        size_t expected = UNINITIALIZED;
+        word_t expected = UNINITIALIZED;
         if (buckets_[j].compare_exchange_strong(expected, new_subchain_head, std::memory_order_release, std::memory_order_relaxed)) {
             // CAS succeeded: our subchain is now bucket j's authoritative head.
         } else {
@@ -480,7 +510,7 @@ public:
     // so it is not lock-free/wait-free in general (see the class overview).
     // Logically deleted nodes are skipped via the MARK_BIT test. The head's seal
     // level and a node's FROZEN bit are deliberately IGNORED here (they are only
-    // masked off the index): contains() publishes nothing, so a stale geometry
+    // masked off the address): contains() publishes nothing, so a stale geometry
     // cannot make it corrupt anything, and its answers stay linearizable:
     //   - FOUND returns true immediately, WITHOUT re-reading table_size_, for a
     //     matching node that is not tombstoned, FROZEN or not. If the node is
@@ -505,21 +535,21 @@ public:
         size_t ts = table_size_.load(std::memory_order_acquire);
         while (true) {
             size_t j = Hash{}(key) & (ts - 1);
-            size_t head = buckets_[j].load(std::memory_order_acquire) & IDX_MASK;
+            word_t head = addr_of(buckets_[j].load(std::memory_order_acquire));
             if (head == UNINITIALIZED) {
                 split_bucket(j);
-                head = buckets_[j].load(std::memory_order_acquire) & IDX_MASK;
+                head = addr_of(buckets_[j].load(std::memory_order_acquire));
             }
 
             bool found = false;
-            size_t curr = head;
-            while ((curr & IDX_MASK) != EMPTY) {   // walk bucket j's chain
-                size_t actual_curr = curr & IDX_MASK;
+            word_t curr = head;
+            while (addr_of(curr) != EMPTY) {   // walk bucket j's chain
+                Node* node = node_of(curr);
                 // Load the successor link once: it is both the tombstone flag for
                 // THIS node and the pointer to the next one, so a single acquire
                 // load serves the mark check and the advance.
-                size_t check_curr = data_[actual_curr].next_bucket_node_idx.load(std::memory_order_acquire);
-                if (data_[actual_curr].value == key && !(check_curr & MARK_BIT)) {
+                word_t check_curr = node->link.load(std::memory_order_acquire);
+                if (node->value == key && !(check_curr & MARK_BIT)) {
                     found = true;
                     break;
                 }
@@ -554,12 +584,12 @@ public:
         // the node, causing a massive memory leak. By allocating once and reusing the node on CAS
         // failure (mutating its next pointer), we achieve a zero-overhead fix that dramatically
         // improves performance under contention.
-        size_t new_node = EMPTY;
+        Node* new_node = nullptr;
         while (true) {
             size_t ts = table_size_.load(std::memory_order_acquire);
             size_t j = Hash{}(key) & (ts - 1);
-            size_t head = buckets_[j].load(std::memory_order_acquire);
-            if ((head & IDX_MASK) == UNINITIALIZED) {
+            word_t head = buckets_[j].load(std::memory_order_acquire);
+            if (addr_of(head) == UNINITIALIZED) {
                 split_bucket(j);
                 continue; // Retry after split (re-read head, which is now published)
             }
@@ -586,11 +616,11 @@ public:
             // the truth at that instant; an "absent" verdict is validated by the
             // publishing CAS below.
             bool exists = false;
-            size_t curr = head & IDX_MASK;
-            while ((curr & IDX_MASK) != EMPTY) {   // walk bucket j's chain
-                size_t actual_curr = curr & IDX_MASK;
-                size_t check_curr = data_[actual_curr].next_bucket_node_idx.load(std::memory_order_acquire);
-                if (data_[actual_curr].value == key && !(check_curr & MARK_BIT)) {
+            word_t curr = addr_of(head);
+            while (addr_of(curr) != EMPTY) {   // walk bucket j's chain
+                Node* node = node_of(curr);
+                word_t check_curr = node->link.load(std::memory_order_acquire);
+                if (node->value == key && !(check_curr & MARK_BIT)) {
                     exists = true;
                     break;
                 }
@@ -599,7 +629,7 @@ public:
             if (exists) {
                 /*
                  * ARCHITECTURE NOTE: Rare single-node memory leak
-                 * If new_node != EMPTY, we allocated a node, failed our CAS, and upon retrying,
+                 * If new_node != nullptr, we allocated a node, failed our CAS, and upon retrying,
                  * discovered another thread just inserted this exact key. We return false here,
                  * permanently orphaning our pre-allocated node. Because we removed global free
                  * lists to achieve zero-overhead, accepting this incredibly rare, single-node
@@ -614,22 +644,23 @@ public:
             // link at the freshly observed head. The relaxed store is safe
             // precisely because the node is still thread-private -- the release
             // CAS below is what publishes both the link and the node. The link
-            // gets the head's INDEX only: the head's level bits overlap the
-            // link's FROZEN bit and must not leak into it.
-            if (new_node == EMPTY) {
-                new_node = alloc_node(key, head & IDX_MASK);
+            // gets the head's ADDRESS only: a level is a head's business and a
+            // link's tag bits are its own (they are at the other end of the
+            // word, so nothing could alias, but the rule is the same).
+            if (new_node == nullptr) {
+                new_node = alloc_node(key, addr_of(head));
             } else {
-                data_[new_node].next_bucket_node_idx.store(head & IDX_MASK, std::memory_order_relaxed);
+                new_node->link.store(addr_of(head), std::memory_order_relaxed);
             }
 
             // Publish: prepend by swinging the bucket head from `head` to our
             // node, keeping the bucket's seal level (release). The expected value
-            // is the FULL word we validated above, index and level, so the CAS
+            // is the FULL word we validated above, address and level, so the CAS
             // fails if another writer prepended a node OR a splitter sealed the
             // bucket since we read it; either way loop and retry from the
             // table_size_ load, reusing new_node. Failure is relaxed: the
             // returned value is not used.
-            if (buckets_[j].compare_exchange_strong(head, new_node | (head & LEVEL_MASK), std::memory_order_release, std::memory_order_relaxed)) {
+            if (buckets_[j].compare_exchange_strong(head, word_of(new_node) | (head & LEVEL_MASK), std::memory_order_release, std::memory_order_relaxed)) {
                 // No post-publish geometry recheck. The head we replaced carried a
                 // level <= level_for(ts), so at the instant of this CAS no split
                 // for a table larger than `ts` had snapshotted this chain: any
@@ -671,7 +702,7 @@ public:
 
     // Tombstone deletion (compiled only when AllowDelete). Finds the live node
     // for `key` and logically deletes it with a single CAS that sets MARK_BIT on
-    // its own next link, preserving the successor index. Thereafter contains()
+    // its own next link, preserving the successor address. Thereafter contains()
     // skips it and no split ever copies it. Returns true iff THIS call set the
     // tombstone: exactly one erase() returns true per present->absent transition
     // of the key, across any number of concurrent resizes. A key that is absent
@@ -706,21 +737,21 @@ public:
         size_t ts = table_size_.load(std::memory_order_acquire);
         while (true) {
             size_t j = Hash{}(key) & (ts - 1);
-            size_t head = buckets_[j].load(std::memory_order_acquire) & IDX_MASK;
+            word_t head = addr_of(buckets_[j].load(std::memory_order_acquire));
             if (head == UNINITIALIZED) {
                 split_bucket(j);
-                head = buckets_[j].load(std::memory_order_acquire) & IDX_MASK;
+                head = addr_of(buckets_[j].load(std::memory_order_acquire));
             }
 
             // Set when this chain proved stale for the key (FROZEN node found):
             // a miss in it is then NOT authoritative even if table_size_ reads
             // unchanged.
             bool stale = false;
-            size_t curr = head;
-            while ((curr & IDX_MASK) != EMPTY) {   // walk bucket j's chain
-                size_t actual_curr = curr & IDX_MASK;
-                size_t check_curr = data_[actual_curr].next_bucket_node_idx.load(std::memory_order_acquire);
-                if (data_[actual_curr].value == key && !(check_curr & MARK_BIT)) {
+            word_t curr = head;
+            while (addr_of(curr) != EMPTY) {   // walk bucket j's chain
+                Node* node = node_of(curr);
+                word_t check_curr = node->link.load(std::memory_order_acquire);
+                if (node->value == key && !(check_curr & MARK_BIT)) {
                     // Live (or frozen) node of our key. If live, set MARK_BIT while
                     // keeping the same successor. Success is release: operations
                     // that acquire this link afterwards see the key as deleted.
@@ -728,7 +759,7 @@ public:
                     // reload table_size_, and the acquire orders that reload after
                     // the freezer's view of the table (see "Retry bound" above).
                     if (!(check_curr & FROZEN_BIT) &&
-                        data_[actual_curr].next_bucket_node_idx.compare_exchange_strong(check_curr, check_curr | MARK_BIT, std::memory_order_release, std::memory_order_acquire)) {
+                        node->link.compare_exchange_strong(check_curr, check_curr | MARK_BIT, std::memory_order_release, std::memory_order_acquire)) {
                         return true;   // this CAS is THE deletion of the key
                     }
                     // Not marked by us; check_curr holds the link's current value.

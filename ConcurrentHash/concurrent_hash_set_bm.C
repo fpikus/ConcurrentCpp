@@ -366,7 +366,7 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
 // Reclaimed (no doubling in either prefill), so there the free lists are the
 // only difference. The GROWTH cells do not: the Reclaimed prefill inserts twice
 // the keys through the same doublings, so its table is one doubling larger
-// (2^22 buckets against the Control's 2^21, measured on naptime), with a
+// (2^22 buckets against the Control's 2^21 with 16 shards), with a
 // different population of pending lazy splits, which the timed inserts then
 // perform and which allocate their copies from the same free lists; and its
 // node_count_ restarts from the live count, so its next doubling comes later.
@@ -384,9 +384,9 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
 //   insert fixtures: kChurnPairs = 2^21 victims (plus the growth fixture's split
 //     copies, ~0.4 per prefilled key) over S shards, against kNewIters = 2^18
 //     inserts per thread: S = 16 -> 2^17 pops, half the run; S = 32 -> a quarter;
-//     S = 128 -> 6%; S = 256 -> 3%. The run_all.sh of the fleet run repeats the
-//     Del benchmarks with HASH_ARENA_SHARDS=16 to get the half-and-half regime on
-//     the big machines too.
+//     S = 128 -> 6%; S = 256 -> 3%. On a machine whose default shard count is
+//     large, run the Del benchmarks again with HASH_ARENA_SHARDS=16 to get the
+//     half-and-half regime.
 //   lookup fixture: kPrefill = 2^20 victims over S shards, against
 //     kOldIters/kInsertEvery = 10486 inserts per thread: all pops for S <= 64,
 //     8192 pops then appends at S = 128, 4096 at S = 256.

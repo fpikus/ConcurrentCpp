@@ -101,10 +101,12 @@ magnitude. Under random access, every new node — including every node
 copied by a lazy split — used to be appended to one arena deque under one
 spinlock, and that lock was the ceiling. (A lock-free counter in its place
 measured slower still, but only with the flawed keys; that comparison has
-not been repeated.) The arena is now sharded, one append-only deque per hardware thread by default, each
-thread always appending to the shard its thread number selects, so a
-shard's lock is contended only when thread numbers collide modulo the shard
-count. On a 16-thread laptop (Ryzen 7940HS) that took the pre-sized
+not been repeated.) The arena is now sharded: by default one append-only
+deque per hardware thread, the count rounded up to a power of two, and each
+thread allocates from the shard its thread number selects, popping a node from
+that shard's free list when `reclaim()` has left one there and otherwise
+appending under the shard's lock, so the lock is contended only when thread
+numbers collide modulo the shard count. On a 16-thread laptop (Ryzen 7940HS) that took the pre-sized
 8M-bucket fixture (`Insert_MostlyNew_Presized`) from about 30 to 77-95
 million random inserts per second at 16 threads (two runs a day apart), against 12 to 14 million
 single-threaded; on a 256-thread Granite Rapids server one shard collapses to

@@ -786,43 +786,43 @@ private:
         word_t curr = parent_head;
 
         try {
-        while (addr_of(curr) != EMPTY) {   // traverse parent chain
-            Node* node = node_of(curr);
-            // Immutable while reachable, and reachable nodes are unlinked only
-            // at a quiescent point, never during this call: a reference is safe.
-            const T& val = node->value;
-            word_t next_raw = node->link.load(std::memory_order_acquire);
-            if (!(next_raw & MARK_BIT)) {          // skip logically deleted nodes
-                if ((Hash{}(val) & mask) == j) {   // key belongs to bucket j now
-                    if constexpr (AllowDelete) {
-                        // FREEZE before copying. Expected value: the live link
-                        // we just read. Strong CAS, so failure means the link
-                        // really changed, and a published link changes only by
-                        // gaining MARK (an eraser won: skip the node) or FROZEN
-                        // (another splitter of j won: copy it, as that splitter
-                        // does). On failure next_raw is the value that failed
-                        // the comparison, i.e. one of those two final states.
-                        // Success is release: a stale eraser that acquires the
-                        // FROZEN link is thereby ordered after our caller's
-                        // acquire of table_size_ >= 2N (channel 4). Failure is
-                        // relaxed: both outcomes are decided by the returned
-                        // bits alone, we need nothing else its writer did.
-                        if (!(next_raw & FROZEN_BIT)) {
-                            if (node->link.compare_exchange_strong(next_raw, next_raw | FROZEN_BIT, std::memory_order_release, std::memory_order_relaxed)) {
-                                next_raw |= FROZEN_BIT;
-                            }
-                        } // if not frozen yet
-                    } // if erase() exists
-                    if (!(next_raw & MARK_BIT)) {
-                        // Prepend a fresh live copy to the child subchain.
-                        Node* copy = alloc_node(val, new_subchain_head);
-                        if (new_subchain_tail == nullptr) new_subchain_tail = copy;
-                        new_subchain_head = word_of(copy);
-                    }
-                } // if key belongs to bucket j
-            } // if not tombstoned
-            curr = next_raw;
-        } // walk parent chain
+            while (addr_of(curr) != EMPTY) {   // traverse parent chain
+                Node* node = node_of(curr);
+                // Immutable while reachable, and reachable nodes are unlinked only
+                // at a quiescent point, never during this call: a reference is safe.
+                const T& val = node->value;
+                word_t next_raw = node->link.load(std::memory_order_acquire);
+                if (!(next_raw & MARK_BIT)) {          // skip logically deleted nodes
+                    if ((Hash{}(val) & mask) == j) {   // key belongs to bucket j now
+                        if constexpr (AllowDelete) {
+                            // FREEZE before copying. Expected value: the live link
+                            // we just read. Strong CAS, so failure means the link
+                            // really changed, and a published link changes only by
+                            // gaining MARK (an eraser won: skip the node) or FROZEN
+                            // (another splitter of j won: copy it, as that splitter
+                            // does). On failure next_raw is the value that failed
+                            // the comparison, i.e. one of those two final states.
+                            // Success is release: a stale eraser that acquires the
+                            // FROZEN link is thereby ordered after our caller's
+                            // acquire of table_size_ >= 2N (channel 4). Failure is
+                            // relaxed: both outcomes are decided by the returned
+                            // bits alone, we need nothing else its writer did.
+                            if (!(next_raw & FROZEN_BIT)) {
+                                if (node->link.compare_exchange_strong(next_raw, next_raw | FROZEN_BIT, std::memory_order_release, std::memory_order_relaxed)) {
+                                    next_raw |= FROZEN_BIT;
+                                }
+                            } // if not frozen yet
+                        } // if erase() exists
+                        if (!(next_raw & MARK_BIT)) {
+                            // Prepend a fresh live copy to the child subchain.
+                            Node* copy = alloc_node(val, new_subchain_head);
+                            if (new_subchain_tail == nullptr) new_subchain_tail = copy;
+                            new_subchain_head = word_of(copy);
+                        }
+                    } // if key belongs to bucket j
+                } // if not tombstoned
+                curr = next_raw;
+            } // walk parent chain
         } catch (...) {
             if (new_subchain_head != EMPTY) push_limbo(my_shard(), node_of(new_subchain_head), new_subchain_tail);
             throw;
@@ -968,120 +968,120 @@ public:
         // in the class overview).
         Node* new_node = nullptr;
         try {
-        while (true) {
-            size_t ts = table_size_.load(std::memory_order_acquire);
-            size_t j = Hash{}(key) & (ts - 1);
-            word_t head = buckets_[j].load(std::memory_order_acquire);
-            if (addr_of(head) == UNINITIALIZED) {
-                split_bucket(j);
-                continue; // Retry after split (re-read head, which is now published)
-            }
-            // GEOMETRY CHECK. A seal level above ours means a child split for a
-            // larger table has snapshotted (or is about to snapshot) this chain:
-            // `ts` is stale and the key may no longer belong here, so neither a
-            // "present" nor an "absent" verdict from this chain can be trusted.
-            // Reload table_size_ and start over. Termination: the sealer acquired
-            // the larger size before its release CAS of this head, and we
-            // acquired the head, so the reload returns a size whose level is at
-            // least the one we saw (channel 4); table_size_ is monotone and every
-            // level in a head is the level of a size that was already stored.
-            // A level <= ours is fine: it says only that keys which hash
-            // elsewhere under OUR mask have been moved out.
-            if (level_of(head) > level_for(ts)) continue;
-
-            // Scan bucket j for the key. A tombstoned node counts as absent, so a
-            // key that was erased and is being re-inserted is treated as new (we
-            // prepend a fresh live node rather than trying to resurrect the mark).
-            // FROZEN needs no test here: a node of OUR key in OUR bucket can be
-            // frozen only by a split for a table size above `ts`, which sealed
-            // this head first. We read a head that was not sealed that high, so
-            // the node was still live when we read the head, and "present" was
-            // the truth at that instant; an "absent" verdict is validated by the
-            // publishing CAS below.
-            bool exists = false;
-            word_t curr = addr_of(head);
-            while (addr_of(curr) != EMPTY) {   // walk bucket j's chain
-                Node* node = node_of(curr);
-                word_t check_curr = node->link.load(std::memory_order_acquire);
-                if (node->value == key && !(check_curr & MARK_BIT)) {
-                    exists = true;
-                    break;
+            while (true) {
+                size_t ts = table_size_.load(std::memory_order_acquire);
+                size_t j = Hash{}(key) & (ts - 1);
+                word_t head = buckets_[j].load(std::memory_order_acquire);
+                if (addr_of(head) == UNINITIALIZED) {
+                    split_bucket(j);
+                    continue; // Retry after split (re-read head, which is now published)
                 }
-                curr = check_curr;
-            } // walk chain
-            if (exists) {
-                // A non-null new_node means an earlier attempt allocated it,
-                // lost its CAS, and this retry found the key published by
-                // another thread. The node was never published; it is orphaned
-                // onto our shard's limbo list for reclaim() to recycle.
-                if (new_node != nullptr) push_limbo(my_shard(), new_node, new_node);
-                return false;
-            } // if the key is present
+                // GEOMETRY CHECK. A seal level above ours means a child split for a
+                // larger table has snapshotted (or is about to snapshot) this chain:
+                // `ts` is stale and the key may no longer belong here, so neither a
+                // "present" nor an "absent" verdict from this chain can be trusted.
+                // Reload table_size_ and start over. Termination: the sealer acquired
+                // the larger size before its release CAS of this head, and we
+                // acquired the head, so the reload returns a size whose level is at
+                // least the one we saw (channel 4); table_size_ is monotone and every
+                // level in a head is the level of a size that was already stored.
+                // A level <= ours is fine: it says only that keys which hash
+                // elsewhere under OUR mask have been moved out.
+                if (level_of(head) > level_for(ts)) continue;
 
-            // Prepare the node to prepend. On the first attempt we allocate it;
-            // on a CAS-retry we REUSE the same still-private node (its CAS never
-            // succeeded, so it was never published) and only repoint its next
-            // link at the freshly observed head. The relaxed store is safe
-            // precisely because the node is still thread-private -- the release
-            // CAS below is what publishes both the link and the node. The link
-            // gets the head's ADDRESS only: a level is a head's business and a
-            // link's tag bits are its own (they are at the other end of the
-            // word, so nothing could alias, but the rule is the same).
-            if (new_node == nullptr) {
-                new_node = alloc_node(key, addr_of(head));
-            } else {
-                new_node->link.store(addr_of(head), std::memory_order_relaxed);
-            }
+                // Scan bucket j for the key. A tombstoned node counts as absent, so a
+                // key that was erased and is being re-inserted is treated as new (we
+                // prepend a fresh live node rather than trying to resurrect the mark).
+                // FROZEN needs no test here: a node of OUR key in OUR bucket can be
+                // frozen only by a split for a table size above `ts`, which sealed
+                // this head first. We read a head that was not sealed that high, so
+                // the node was still live when we read the head, and "present" was
+                // the truth at that instant; an "absent" verdict is validated by the
+                // publishing CAS below.
+                bool exists = false;
+                word_t curr = addr_of(head);
+                while (addr_of(curr) != EMPTY) {   // walk bucket j's chain
+                    Node* node = node_of(curr);
+                    word_t check_curr = node->link.load(std::memory_order_acquire);
+                    if (node->value == key && !(check_curr & MARK_BIT)) {
+                        exists = true;
+                        break;
+                    }
+                    curr = check_curr;
+                } // walk chain
+                if (exists) {
+                    // A non-null new_node means an earlier attempt allocated it,
+                    // lost its CAS, and this retry found the key published by
+                    // another thread. The node was never published; it is orphaned
+                    // onto our shard's limbo list for reclaim() to recycle.
+                    if (new_node != nullptr) push_limbo(my_shard(), new_node, new_node);
+                    return false;
+                } // if the key is present
 
-            // Publish: prepend by swinging the bucket head from `head` to our
-            // node, keeping the bucket's seal level (release). The expected value
-            // is the FULL word we validated above, address and level, so the CAS
-            // fails if another writer prepended a node OR a splitter sealed the
-            // bucket since we read it; either way loop and retry from the
-            // table_size_ load, reusing new_node. Failure is relaxed: the
-            // returned value is not used.
-            if (buckets_[j].compare_exchange_strong(head, word_of(new_node) | (head & LEVEL_MASK), std::memory_order_release, std::memory_order_relaxed)) {
-                new_node = nullptr;   // published: no longer ours to send to limbo
-                // No post-publish geometry recheck. The head we replaced carried a
-                // level <= level_for(ts), so at the instant of this CAS no split
-                // for a table larger than `ts` had snapshotted this chain: any
-                // such split seals after us, takes its snapshot from the sealed
-                // head, and therefore sees this node (or a successor that links
-                // to it). The key cannot be stranded, no other thread can have
-                // published it elsewhere without first copying this chain, and
-                // this CAS is the one and only publication of the key: `true` is
-                // exact. Nothing here depends on how this CAS is ordered relative
-                // to the table_size_ store of a concurrent resize.
-                //
-                // Resize trigger, guarded by Double-Checked Locking. The unlocked
-                // test `node_count_ > ts*2` is a hint (relaxed, and exact only to
-                // within 256 per shard); the decision is remade under resize_lock_
-                // against a fresh table_size_ so only ONE thread doubles per epoch
-                // (current_ts == ts). NOTE: node_count_ is arena occupancy since
-                // the last reclaim() (or ever, if none was called) -- it counts
-                // tombstones, stale split copies, lost subchains and orphans
-                // until a reclaim() recycles them -- so this is an
-                // arena-consumption trigger, not a live-load-factor trigger: a
-                // delete-heavy workload without reclaim() calls grows the table
-                // although the live key count does not. New buckets are
-                // marked UNINITIALIZED (relaxed) and then table_size_ is released,
-                // so any thread that later acquires the new size is guaranteed to
-                // observe those markers (channel 2).
-                if (node_count_.load(std::memory_order_relaxed) > ts*2) {
-                    std::lock_guard lock(resize_lock_);
-                    size_t current_ts = table_size_.load(std::memory_order_relaxed);
-                    if (current_ts == ts) {
-                        size_t new_ts = ts*2;
-                        buckets_.resize(new_ts);
-                        for (size_t i = ts; i < new_ts; ++i) {
-                            buckets_[i].store(UNINITIALIZED, std::memory_order_relaxed);
-                        }
-                        table_size_.store(new_ts, std::memory_order_release);
-                    } // if still the same epoch under the lock
-                } // if resize threshold crossed
-                return true;
-            } // if publishing CAS succeeded
-        } // insert retry loop
+                // Prepare the node to prepend. On the first attempt we allocate it;
+                // on a CAS-retry we REUSE the same still-private node (its CAS never
+                // succeeded, so it was never published) and only repoint its next
+                // link at the freshly observed head. The relaxed store is safe
+                // precisely because the node is still thread-private -- the release
+                // CAS below is what publishes both the link and the node. The link
+                // gets the head's ADDRESS only: a level is a head's business and a
+                // link's tag bits are its own (they are at the other end of the
+                // word, so nothing could alias, but the rule is the same).
+                if (new_node == nullptr) {
+                    new_node = alloc_node(key, addr_of(head));
+                } else {
+                    new_node->link.store(addr_of(head), std::memory_order_relaxed);
+                }
+
+                // Publish: prepend by swinging the bucket head from `head` to our
+                // node, keeping the bucket's seal level (release). The expected value
+                // is the FULL word we validated above, address and level, so the CAS
+                // fails if another writer prepended a node OR a splitter sealed the
+                // bucket since we read it; either way loop and retry from the
+                // table_size_ load, reusing new_node. Failure is relaxed: the
+                // returned value is not used.
+                if (buckets_[j].compare_exchange_strong(head, word_of(new_node) | (head & LEVEL_MASK), std::memory_order_release, std::memory_order_relaxed)) {
+                    new_node = nullptr;   // published: no longer ours to send to limbo
+                    // No post-publish geometry recheck. The head we replaced carried a
+                    // level <= level_for(ts), so at the instant of this CAS no split
+                    // for a table larger than `ts` had snapshotted this chain: any
+                    // such split seals after us, takes its snapshot from the sealed
+                    // head, and therefore sees this node (or a successor that links
+                    // to it). The key cannot be stranded, no other thread can have
+                    // published it elsewhere without first copying this chain, and
+                    // this CAS is the one and only publication of the key: `true` is
+                    // exact. Nothing here depends on how this CAS is ordered relative
+                    // to the table_size_ store of a concurrent resize.
+                    //
+                    // Resize trigger, guarded by Double-Checked Locking. The unlocked
+                    // test `node_count_ > ts*2` is a hint (relaxed, and exact only to
+                    // within 256 per shard); the decision is remade under resize_lock_
+                    // against a fresh table_size_ so only ONE thread doubles per epoch
+                    // (current_ts == ts). NOTE: node_count_ is arena occupancy since
+                    // the last reclaim() (or ever, if none was called) -- it counts
+                    // tombstones, stale split copies, lost subchains and orphans
+                    // until a reclaim() recycles them -- so this is an
+                    // arena-consumption trigger, not a live-load-factor trigger: a
+                    // delete-heavy workload without reclaim() calls grows the table
+                    // although the live key count does not. New buckets are
+                    // marked UNINITIALIZED (relaxed) and then table_size_ is released,
+                    // so any thread that later acquires the new size is guaranteed to
+                    // observe those markers (channel 2).
+                    if (node_count_.load(std::memory_order_relaxed) > ts*2) {
+                        std::lock_guard lock(resize_lock_);
+                        size_t current_ts = table_size_.load(std::memory_order_relaxed);
+                        if (current_ts == ts) {
+                            size_t new_ts = ts*2;
+                            buckets_.resize(new_ts);
+                            for (size_t i = ts; i < new_ts; ++i) {
+                                buckets_[i].store(UNINITIALIZED, std::memory_order_relaxed);
+                            }
+                            table_size_.store(new_ts, std::memory_order_release);
+                        } // if still the same epoch under the lock
+                    } // if resize threshold crossed
+                    return true;
+                } // if publishing CAS succeeded
+            } // insert retry loop
         } catch (...) {
             if (new_node != nullptr) push_limbo(my_shard(), new_node, new_node);
             throw;

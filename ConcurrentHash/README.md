@@ -2,10 +2,11 @@
 
 A chained concurrent hash set with optional deletion and live resizing — safe
 for any number of threads, in any mix of operations, with no external
-synchronization. Lookups take no lock and write no shared memory, except when a
+synchronization (the one exception, `reclaim()`, is described below). Lookups take no lock and write no shared memory, except when a
 lookup is the first to touch a bucket after a resize and performs its lazy
-split. Inserts publish with a single CAS but allocate their node under the
-spinlock of the calling thread's arena shard (see
+split. Inserts publish with a single CAS; their node is popped, lock-free,
+from the free list of the calling thread's arena shard when `reclaim()` has
+left one there, and otherwise appended under the shard's spinlock (see
 [Performance](#performance)), so insertion is not lock-free.
 
 If you have ever tried to design a concurrent hash table, you know that two
@@ -18,11 +19,10 @@ either problem; it arranges for neither problem to exist.
 
 ## Design principles
 
-The entire design rests on three refusals, each stated in one line (and each
-earning its own section in the book):
+The entire design rests on three refusals, each stated in one line:
 
-1. Nodes, once allocated, are never freed, moved, or reused before the set
-   itself is destroyed.
+1. Nodes, once allocated, are never freed, moved, or reused while any
+   operation can see them.
 2. A growing table never relinks its chains; new buckets are populated lazily,
    by copying.
 3. Deletion sets a mark on the node rather than physically unlinking it.
@@ -32,28 +32,49 @@ no reader registration of any kind. Readers *validate* instead of
 *registering* — a trailing re-check of the table size asks "did the geometry
 change under me?" and retries on the rare "yes". No use-after-free is possible
 under any interleaving; no ABA problem is possible because a node's address is
-never reused. The elements live in an append-only node arena built on the
+never reused while any operation is running. The elements live in an append-only node arena built on the
 `ConcurrentAppendDeque` (from `../ConcurrentDeque`), whose blocks never move,
 which decouples the hash geometry from data placement entirely: when the table
 grows, only pointers move — the payload data sits still, forever.
+
+The one exception to the refusals is `reclaim()`, and it is an exception in
+time, not in mechanism: the caller may run it only when nothing else is
+running on the set. It takes no lock; quiescence is the caller's promise.
+`reclaim()` unlinks tombstones and superseded split copies, collects the nodes
+that lost races left behind, and deals them all out to per-shard free lists
+that later inserts pop from. Every guarantee above holds within one period
+bounded by `reclaim()` calls. The client keeps no references into the table
+during or across `reclaim()` (the API hands out none), and the only thing that
+carries across it is membership: a value in the set is still in it, a value
+not in it still is not. No ABA problem can reach the client, and none reaches
+the free lists either: nothing but `reclaim()` pushes onto a free list, and no
+CAS can be held across a `reclaim()` call, because nothing else runs during it.
 
 ## The domain of applicability
 
 The limits are as much a part of the design as the speed, and they are strict:
 
-- **Memory is reclaimed exactly once, at destruction.** Tombstoned nodes,
-  stale parent-chain copies, and lost speculative splits all remain allocated
-  until the set dies. This is the right trade for build-heavy, delete-light
-  workloads with a bounded lifetime. For a long-lived table with continuous
-  churn, it is the wrong structure — use a simple mutex-protected table and
+- **Memory is recycled only at quiescent points.** Tombstoned nodes, stale
+  parent-chain copies, and lost speculative splits remain allocated until the
+  next `reclaim()`, which recycles them for later inserts; without one, until
+  the set dies. `reclaim()` never returns memory to the system and never
+  shrinks the table. This is the right trade for build-heavy, delete-light
+  workloads, and for churn that comes in rounds with a natural point where
+  every thread stops. For a long-lived table with continuous churn and no such
+  point, it is the wrong structure — use a simple mutex-protected table and
   keep your memory.
 - `erase()` exists only when the `AllowDelete` template parameter says so;
   with the default `false`, the delete-free usage pattern is enforced by the
   type system at zero runtime cost.
 - There is no `size()`, no iteration, no `clear()` — deliberately. Every
-  operation offered is transactional; those are not.
+  concurrent operation offered is transactional; those are not. (`reclaim()`
+  returns the exact element count: at a quiescent point, exactness is free.)
 - The hash functor must be stateless; element copies must be equivalent to
-  their originals; the destructor is not a concurrent operation.
+  their originals; elements must be copy-assignable, because a recycled node
+  is reused by assignment; an erased element's resources are released when
+  its node is reused (the assignment overwrites it) and its destructor runs
+  only when the set dies, never in `erase()`; the destructor and
+  `reclaim()` are not concurrent operations.
 
 ## Performance
 

@@ -22,6 +22,7 @@
 // SOFTWARE.
 //
 #include <benchmark/benchmark.h>
+#include <cstdio>
 #include <cstdlib>
 #include <unistd.h>
 #include <atomic>
@@ -293,8 +294,9 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
  * range, so the workload composition is constant for the whole run.
  * Invariant checked per thread: every insert() returned true.
  */
-#define DEFINE_MOSTLY_OLD(NAME, SET_TYPE)                                     \
-    BENCHMARK_TEMPLATE_DEFINE_F(MostlyOldFixture, NAME, SET_TYPE)             \
+#define DEFINE_MOSTLY_OLD(NAME, SET_TYPE) DEFINE_MOSTLY_OLD_ON(MostlyOldFixture, NAME, SET_TYPE)
+#define DEFINE_MOSTLY_OLD_ON(FIXTURE, NAME, SET_TYPE)                         \
+    BENCHMARK_TEMPLATE_DEFINE_F(FIXTURE, NAME, SET_TYPE)                      \
     (benchmark::State& state) {                                               \
         XorShift32 rng(0x1234567u + 0x9e3779b9u * state.thread_index());      \
         const int base = kNewBase + state.thread_index() * kKeyStride;        \
@@ -320,8 +322,196 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
         state.counters["inserts"] =                                           \
             benchmark::Counter((double)tries, benchmark::Counter::kDefaults); \
     }                                                                         \
-    BENCHMARK_REGISTER_F(MostlyOldFixture, NAME)                              \
+    BENCHMARK_REGISTER_F(FIXTURE, NAME)                                       \
         ->ThreadRange(1, num_cpu)->Iterations(kOldIters);
+
+// ---------------------------------------------------------------------------
+// Reclamation benchmarks (added 2026-09-27, with reclaim()).
+//
+// The three workloads above are re-run on the AllowDelete == true instantiation
+// in three states of the set, and every cell has a purpose:
+//
+//   *_Del            the workload above, on an EMPTY AllowDelete == true set (the
+//                    MostlyOld fixture prefills as before). Against the
+//                    AllowDelete == false rows this is the price of compiling
+//                    erase() in: the FROZEN handling in the split, the mark
+//                    tests on the read paths. Nothing is erased.
+//   *_Del_Control    the same workload on a set PREFILLED (untimed, by thread 0)
+//                    with a population of live keys and nothing else: no erase,
+//                    no reclaim(), every free list empty, so every allocation
+//                    in the timed region APPENDS to a deque as it always did.
+//   *_Del_Reclaimed  the same workload on a set that reached the same live
+//                    population by CHURN: twice as many keys were inserted,
+//                    interleaved (survivor, victim, survivor, victim, ... in
+//                    arena order), every victim was erased, and reclaim() ran.
+//                    The live keys and the timed workload are those of the
+//                    Control; what differs is the state of the arena: the
+//                    victims' slots (and, in the growth fixture, the split
+//                    copies the prefill made) sit on the shards' free lists,
+//                    dealt round-robin, and the survivors occupy every other
+//                    slot of the deque blocks thread 0 filled. The timed
+//                    allocations POP from the calling thread's shard's list
+//                    until it is empty and then append -- the mixed regime.
+//
+// Control vs Del separates "a resident population" from "AllowDelete"; Reclaimed
+// vs Control is the free lists in use: the pop path in alloc_node() (one CAS on
+// the shard's free head instead of the deque's lock and cursor) and the locality
+// of the popped slots, which come back in reverse dealing order at a stride of
+// 2*shards slots -- one new cache line per popped node, where an append fills a
+// line with four consecutive nodes. Why measure: the free lists are the point of
+// reclaim(), and nothing before this measured an insert that reuses a slot, nor
+// a lookup over chains that reclaim() relinked.
+//
+// The pre-sized and lookup cells share their bucket count between Control and
+// Reclaimed (no doubling in either prefill), so there the free lists are the
+// only difference. The GROWTH cells do not: the Reclaimed prefill inserts twice
+// the keys through the same doublings, so its table is one doubling larger
+// (2^22 buckets against the Control's 2^21, measured on naptime), with a
+// different population of pending lazy splits, which the timed inserts then
+// perform and which allocate their copies from the same free lists; and its
+// node_count_ restarts from the live count, so its next doubling comes later.
+// The growth Reclaimed row is therefore "churn, then growth" as a workload,
+// not a controlled measurement of the allocator; read the pre-sized row for
+// that. Neither prefill can be made to end at the other's geometry with the
+// same live keys: the doubling threshold is a slot count and the prefills
+// differ by 2x in slots.
+//
+// WHEN THE TIMED REGION CROSSES FROM POPS TO APPENDS. reclaim() deals the freed
+// nodes over ALL shards (the shard count is the hardware concurrency rounded up
+// to a power of two, or HASH_ARENA_SHARDS), and a thread pops only from its own
+// shard, so every timed thread starts with free/shards nodes to pop regardless
+// of the thread count, and appends after that:
+//   insert fixtures: kChurnPairs = 2^21 victims (plus the growth fixture's split
+//     copies, ~0.4 per prefilled key) over S shards, against kNewIters = 2^18
+//     inserts per thread: S = 16 -> 2^17 pops, half the run; S = 32 -> a quarter;
+//     S = 128 -> 6%; S = 256 -> 3%. The run_all.sh of the fleet run repeats the
+//     Del benchmarks with HASH_ARENA_SHARDS=16 to get the half-and-half regime on
+//     the big machines too.
+//   lookup fixture: kPrefill = 2^20 victims over S shards, against
+//     kOldIters/kInsertEvery = 10486 inserts per thread: all pops for S <= 64,
+//     8192 pops then appends at S = 128, 4096 at S = 256.
+// The fixture prints one line per configuration and process, before the first
+// row that uses it, with the free-list total it measured (see report_prep()).
+//
+// The prep is deterministic (single-threaded, fixed keys), so the arena state
+// at the start of the timed region is the same for every repetition and thread
+// count. The arena_nodes_per_key counter of the insert bodies divides the
+// TOTAL slot count, prep included, by the timed inserts: for the churn fixtures
+// read it as (prep slots + timed appends)/timed inserts -- a Reclaimed row whose
+// value equals its Control's minus the free-list share is a row that popped.
+// ---------------------------------------------------------------------------
+using ConcurrentSetDel = ConcurrentResizableHashSet<int, true, std::hash<int>>;
+
+// What the fixture does to the set after the prefill: nothing (Control), or
+// erase every victim and reclaim() (Reclaimed). Every Reclaimed configuration
+// has a Control with the same live keys and the same buckets.
+enum class Churn { Control, Reclaimed };
+
+// The insert fixtures' churn population: kChurnPairs survivors, and as many
+// victims for Reclaimed. Both live in the NEGATIVE keys, disjoint from every
+// timed key (the timed ranges are non-negative: see the workload parameters),
+// so no timed insert meets a prefilled key. The victim of pair k is inserted
+// right after its survivor so that they alternate in the arena.
+static constexpr int kChurnPairs = 1 << 21;
+
+// Churn configuration for the insert workloads: `Buckets` is the initial table
+// size (1024: the growth fixture's, so the prefill doubles the table as the
+// timed inserts would have, and leaves the pending lazy splits the growth
+// fixture would have left; kPresizedBuckets: no doubling at all, the
+// allocator alone). The prefill of 2^22 keys (Reclaimed) stays far below the
+// pre-sized doubling threshold of 2^24 slots.
+template <size_t Buckets, Churn C>
+struct InsertChurn {
+    using Set = ConcurrentSetDel;
+    static constexpr size_t buckets = Buckets;
+    static constexpr Churn  churn   = C;
+    static constexpr int    pairs   = kChurnPairs;
+    static int survivor(int k) { return -1 - 2*k; }
+    static int victim(int k)   { return -2 - 2*k; }
+}; // struct InsertChurn
+
+// Churn configuration for the lookup workload: the Control's prefill is
+// MostlyOldFixture's exactly (keys [0, kPrefill) at 2*kPrefill buckets), so
+// Lookup_MostlyOld_Del_Control is Lookup_MostlyOld_Del reached by another
+// fixture, a check on the fixture itself. The victims are the OTHER half of
+// the lookup range, [kPrefill, 2*kPrefill): the Reclaimed set once held every
+// key the lookups will miss, so the misses walk chains reclaim() relinked, and
+// the hit rate is the 50% of the workload above. 2*kPrefill prefilled nodes
+// stay below the doubling threshold of 4*kPrefill slots.
+template <Churn C>
+struct LookupChurn {
+    using Set = ConcurrentSetDel;
+    static constexpr size_t buckets = 2*kPrefill;
+    static constexpr Churn  churn   = C;
+    static constexpr int    pairs   = kPrefill;
+    static int survivor(int k) { return k; }
+    static int victim(int k)   { return k + kPrefill; }
+}; // struct LookupChurn
+
+// One name per configuration: the benchmark macros take the configuration as
+// one token, and Google Benchmark prints it in the benchmark name.
+using NewControl        = InsertChurn<1024, Churn::Control>;
+using NewReclaimed      = InsertChurn<1024, Churn::Reclaimed>;
+using PresizedControl   = InsertChurn<kPresizedBuckets, Churn::Control>;
+using PresizedReclaimed = InsertChurn<kPresizedBuckets, Churn::Reclaimed>;
+using OldControl        = LookupChurn<Churn::Control>;
+using OldReclaimed      = LookupChurn<Churn::Reclaimed>;
+
+// The churn fixture: builds the set described by Cfg (above) in thread 0's
+// SetUp(), untimed, under the same no-barrier CAUTION as the fixtures above.
+// The benchmark bodies are the unchanged macros, which see the set through
+// `set` exactly as they see the other fixtures'.
+template <typename Cfg>
+class ChurnFixture : public benchmark::Fixture {
+public:
+    using SetType = typename Cfg::Set;
+    static SetType* set;
+    void SetUp(const ::benchmark::State& state) override {
+        if (state.thread_index() != 0) return;
+        set = new SetType(Cfg::buckets, arena_shards_from_env());
+        // Every prep operation must succeed (the keys are distinct and the
+        // victims are present when erased); a failure would silently change
+        // the population, so it aborts the run instead.
+        long failed = 0;
+        for (int k = 0; k < Cfg::pairs; ++k) {
+            failed += !set->insert(mix(Cfg::survivor(k)));
+            if constexpr (Cfg::churn == Churn::Reclaimed) failed += !set->insert(mix(Cfg::victim(k)));
+        } // prefill, survivors and victims alternating
+        if constexpr (Cfg::churn == Churn::Reclaimed) {
+            for (int k = 0; k < Cfg::pairs; ++k) failed += !set->erase(mix(Cfg::victim(k)));
+            set->reclaim();
+        } // erase every victim, then reclaim
+        if (failed != 0) {
+            fprintf(stderr, "ChurnFixture: %ld prep operations failed in %s\n", failed, state.name().c_str());
+            abort();
+        } // if the prep did not build the population it describes
+        report_prep(state);
+    } // ChurnFixture::SetUp()
+    void TearDown(const ::benchmark::State& state) override {
+        if (state.thread_index() == 0) { delete set; set = nullptr; }
+    }
+private:
+    // Prints the arena state the timed region starts from, once per
+    // configuration and process (it is the same for every repetition and
+    // thread count: the prep is deterministic): slots ever appended, live
+    // keys, free-list and limbo totals, the sweep's consistency verdict, the
+    // shard count and the free nodes a timed thread can pop before its shard's
+    // list is empty. To stdout, so the line lands in the benchmark output
+    // before the first row that uses the configuration (Google Benchmark
+    // writes its console report to stdout too). The accounting sweep sorts
+    // every slot; a few hundred milliseconds, once, untimed.
+    static void report_prep(const ::benchmark::State& state) {
+        static bool reported = false;
+        if (reported) return;
+        reported = true;
+        const typename SetType::InternalAccounting a = set->get_internal_accounting();
+        const size_t shards = set->get_internal_arena_shards();
+        printf("# prep %s: slots=%zu reachable=%zu free=%zu limbo=%zu consistent=%d shards=%zu free_per_shard=%zu\n",
+               state.name().c_str(), a.slots, a.reachable, a.free_nodes, a.limbo, int(a.consistent), shards, a.free_nodes/shards);
+        fflush(stdout);
+    } // ChurnFixture::report_prep()
+}; // class ChurnFixture
+template <typename Cfg> typename Cfg::Set* ChurnFixture<Cfg>::set = nullptr;
 
 // ---------------------------------------------------------------------------
 // Registrations: identical workloads, two containers.
@@ -334,5 +524,20 @@ DEFINE_MOSTLY_NEW_ON(MostlyNewPresizedFixture, Insert_MostlyNew_Presized_RWLocke
 
 DEFINE_MOSTLY_OLD(Lookup_MostlyOld_Concurrent, ConcurrentSet)
 DEFINE_MOSTLY_OLD(Lookup_MostlyOld_RWLocked,   LockedSet)
+
+// The reclamation cells (see the section above): the AllowDelete == true set
+// empty, prefilled, and prefilled by churn, for each of the three workloads.
+// Nothing here changes a registration above.
+DEFINE_MOSTLY_NEW(Insert_MostlyNew_Del, ConcurrentSetDel)
+DEFINE_MOSTLY_NEW_ON(ChurnFixture, Insert_MostlyNew_Del_Control,   NewControl)
+DEFINE_MOSTLY_NEW_ON(ChurnFixture, Insert_MostlyNew_Del_Reclaimed, NewReclaimed)
+
+DEFINE_MOSTLY_NEW_ON(MostlyNewPresizedFixture, Insert_MostlyNew_Presized_Del, ConcurrentSetDel)
+DEFINE_MOSTLY_NEW_ON(ChurnFixture, Insert_MostlyNew_Presized_Del_Control,   PresizedControl)
+DEFINE_MOSTLY_NEW_ON(ChurnFixture, Insert_MostlyNew_Presized_Del_Reclaimed, PresizedReclaimed)
+
+DEFINE_MOSTLY_OLD(Lookup_MostlyOld_Del, ConcurrentSetDel)
+DEFINE_MOSTLY_OLD_ON(ChurnFixture, Lookup_MostlyOld_Del_Control,   OldControl)
+DEFINE_MOSTLY_OLD_ON(ChurnFixture, Lookup_MostlyOld_Del_Reclaimed, OldReclaimed)
 
 BENCHMARK_MAIN();

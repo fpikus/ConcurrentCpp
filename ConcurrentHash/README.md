@@ -84,8 +84,8 @@ not been repeated.) The arena is now sharded, one append-only deque per hardware
 thread always appending to the shard its thread number selects, so a
 shard's lock is contended only when thread numbers collide modulo the shard
 count. On a 16-thread laptop (Ryzen 7940HS) that took the pre-sized
-8M-bucket fixture (`Insert_MostlyNew_Presized`) from about 30 to about 95
-million random inserts per second at 16 threads, against 12 to 14 million
+8M-bucket fixture (`Insert_MostlyNew_Presized`) from about 30 to 77-95
+million random inserts per second at 16 threads (two runs a day apart), against 12 to 14 million
 single-threaded; on a 256-thread Granite Rapids server one shard collapses to
 3 million per second at 256 threads and the default shard count reaches about
 300 million. The bucket table is still doubled under one lock, once per

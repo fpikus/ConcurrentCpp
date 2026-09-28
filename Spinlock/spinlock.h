@@ -66,6 +66,45 @@ inline void spin_wait_long_sleep()  { nanosleep(&spin_wait_long,  nullptr); }
 //     holder did in its critical section happen-before the next holder's -- the
 //     standard lock handoff.
 //   - locked() is a relaxed, advisory peek and synchronizes nothing.
+//
+// Critical-section structure (a guideline):
+//   - Keep one or two cheap stores inside the critical section, before
+//     unlock(): typically your bookkeeping under the lock (advancing an index)
+//     and one store to the slot you just claimed (a key, a marker, a clear),
+//     even when that slot is yours alone; with both, unlock() also escapes
+//     the Intel penalty below. Do everything else that does not need the lock
+//     after unlock(), including expensive work such as constructing a value:
+//     more stores or more work inside only lengthen the serialized section,
+//     and you pay for them by Amdahl's law. The store to the slot fetches its
+//     cache line while the lock is still held; issued right after unlock(), it
+//     leaves the lock visibly free while its holder waits for the line, and
+//     under contention waiters take it. Later stores to that slot then find the
+//     line already there; a store to another line that misses costs something
+//     either way: inside it lengthens the critical section, right after
+//     unlock() it delays the next lock() unless other work comes first.
+//     Measured in the lock scope benchmarks (on both x86 servers measured: the
+//     Xeon 6767P at every thread count, the EPYC 9555 from 32 threads up; up to
+//     about 2.5x at 128 threads, with one slot per cache line; adding a second
+//     store that misses inside the critical section gained nothing) and in
+//     ConcurrentQueue (one store inside, the value constructed outside).
+//     At 1 thread it depends on the CPU: 1.3-1.5x faster on Broadwell,
+//     Emerald Rapids and Granite Rapids, slightly slower on Cascade Lake,
+//     neutral on AMD, about 10% slower on NVIDIA Grace. On Emerald Rapids and
+//     Granite Rapids the gain also needs nothing stored to another line
+//     between unlock() and the next lock(); a call to a lock() that is not
+//     inlined is enough to lose it.
+//   - The Intel fact behind the 1-thread gain: after lock()'s xchg, a store to
+//     the lock's cache line costs about 6-7 cycles more (11-13 on Broadwell
+//     for the lock word itself) if it is the first or second store after the
+//     xchg, counting stores to any line; two other stores in between remove
+//     it (on Broadwell, most of it). The count is in stores, not time:
+//     unlock() is such a store whenever the critical section makes fewer than
+//     two other stores, so a critical section that stores nothing but its
+//     bookkeeping (the index) pays it. Cascade Lake pays it too, but there a
+//     store to the slot after unlock() cancels it, so storing inside does not
+//     win at 1 thread.
+// The measurements, and the mechanisms behind them, are described in
+// Spinlock/spinlock_scope_common.h.
 class SpinLock {
   public:
   // Acquire the lock, blocking (spinning, then sleeping) until it is held.

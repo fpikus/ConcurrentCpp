@@ -59,13 +59,16 @@ TARGET_TEST_ASAN = $(BUILD_DIR)/spinlock_test_asan
 TARGET_TEST_TSAN = $(BUILD_DIR)/spinlock_test_tsan
 TARGET_SEQLOCK_TEST_ASAN = $(BUILD_DIR)/seqlock_test_asan
 TARGET_SEQLOCK_TEST_TSAN = $(BUILD_DIR)/seqlock_test_tsan
+TARGET_SPINLOCK_SCOPE_BM = $(BUILD_DIR)/spinlock_scope_bm
+TARGET_SPINLOCK_SCOPE_MBM = $(BUILD_DIR)/spinlock_scope_mbm
 
 # The two groups: `make benchmarks` needs only Google Benchmark and works on
 # machines without sanitizer runtimes; `make tests` needs GoogleTest and
 # ASan/TSan. `make all` is both.
 BENCHMARKS = $(TARGET_BM) $(TARGET_TUNE_BM) $(TARGET_RW_TUNE_BM) \
              $(TARGET_OVERHEAD_BM) $(TARGET_MEM_BM) $(TARGET_LAYOUT_BM) \
-             $(TARGET_SEQLOCK_BM)
+             $(TARGET_SEQLOCK_BM) $(TARGET_SPINLOCK_SCOPE_BM) \
+             $(TARGET_SPINLOCK_SCOPE_MBM)
 TESTS = $(TARGET_TEST_ASAN) $(TARGET_TEST_TSAN) \
         $(TARGET_SEQLOCK_TEST_ASAN) $(TARGET_SEQLOCK_TEST_TSAN)
 
@@ -83,6 +86,10 @@ TUNE_CONFIGS = spinlock_tune_configs.h
 # The sequence lock. It includes spinlock_tune.h (for spin_pause()), so its
 # users list $(TUNE_HEADERS) as well.
 SEQLOCK_HEADERS = seqlock.h
+# The lock scope benchmark's shared part: slot types, layout, the measured
+# operation and the variant list, used by its Google Benchmark harness and by
+# the hand-rolled twin.
+SCOPE_HEADERS = spinlock_scope_common.h
 
 .PHONY: all benchmarks tests clean run_tests run_benchmarks
 
@@ -128,6 +135,16 @@ $(TARGET_LAYOUT_BM): spinlock_layout_bm.C $(HEADERS) $(TUNE_HEADERS) | $(BUILD_D
 $(TARGET_SEQLOCK_BM): seqlock_bm.C $(HEADERS) $(TUNE_HEADERS) $(SEQLOCK_HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) $(CXX_RPATH) -o $@
 
+# Build lock scope benchmark (slot store before vs after unlock)
+$(TARGET_SPINLOCK_SCOPE_BM): spinlock_scope_bm.C $(HEADERS) $(SCOPE_HEADERS) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) $(CXX_RPATH) -o $@
+
+# Build the hand-rolled twin of the lock scope benchmark (every thread runs
+# until a common stop). It does not use Google Benchmark, so it links only the
+# common libraries.
+$(TARGET_SPINLOCK_SCOPE_MBM): spinlock_scope_mbm.C $(HEADERS) $(SCOPE_HEADERS) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS_BM) $< $(COMMON_LIBS) $(CXX_RPATH) -o $@
+
 # Build ASan test
 $(TARGET_TEST_ASAN): spinlock_test.C $(HEADERS) | $(BUILD_DIR)
 	$(SAN_CXX) $(CXXFLAGS_TEST_ASAN) $< $(LIBS_TEST) $(SAN_CXX_RPATH) -o $@
@@ -151,7 +168,9 @@ run_tests: tests
 	./$(TARGET_SEQLOCK_TEST_ASAN)
 	./$(TARGET_SEQLOCK_TEST_TSAN)
 
-# Run benchmarks
+# Run benchmarks. spinlock_scope_bm and spinlock_scope_mbm are left out: one
+# pass over all their cells takes minutes on the large servers, and
+# runs with repetitions take proportionally longer.
 run_benchmarks: benchmarks
 	./$(TARGET_BM)
 	./$(TARGET_TUNE_BM)

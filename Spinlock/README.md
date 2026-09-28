@@ -155,6 +155,9 @@ itself is machine-independent. The reference `config.mk` uses `clang++-22`,
 - `overhead_bm.C` — the lock against the atomic and the CAS loop, across the sharing:work grid, with compute-heavy and memory-streaming work
 - `spinlock_mem_bm.C` — the same ladder sweep with memory-streaming work in place of sin/cos
 - `spinlock_layout_bm.C` — whether the guarded payload belongs on the lock's cache line: the same payload at four distances from the lock
+- `spinlock_scope_bm.C` — whether a thread should store the ring slot it has just claimed inside the critical section or right after `unlock()` (the Google Benchmark harness)
+- `spinlock_scope_mbm.C` — the same with a hand-rolled harness that keeps every thread contending for the whole measurement window, counts lock handoffs, and can sample how long the lock is visibly free
+- `spinlock_scope_common.h` — what the two scope harnesses share: the measured operation, its variants and the shared layout; also contains detailed description of the observed results and underlying mechanisms
 - `seqlock.h` — a sequence lock: readers copy the payload out without writing to shared memory
 - `seqlock_test.C` — unit tests for the sequence lock (built with ASan and TSan)
 - `seqlock_bm.C` — the sequence lock against the spinlock and a bare atomic, across the same read:write mix

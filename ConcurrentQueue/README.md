@@ -134,20 +134,34 @@ by every directory in this repository and written once per machine; binaries
 go to `build/<hostname>/`. Requires Google Benchmark and GoogleTest.
 `make benchmarks` and `make tests` build either group alone.
 
-A warning for multithreaded Google Benchmark runs: `--benchmark_min_time=1s`
-is compared against real time summed over all threads, so at 128 threads it
-is a measurement window of about 8 ms per thread. An iteration count is per
-thread, so run one thread count at a time with `--benchmark_min_time=<N>x`
-and an `N` chosen for that thread count (the header of
-`concurrent_queue_gmbm.C` has the details). The queue's capacity in the
-throughput benchmark is 65536 slots, or the value of the `CQ_CAP` environment
-variable rounded down to a power of 2.
+Two warnings for multithreaded Google Benchmark runs. Google Benchmark
+compares `min_time` against real time summed over all threads, so 1 s at 128
+threads would be a measurement window of about 8 ms per thread;
+`concurrent_queue_gmbm` therefore registers every thread count with its own
+window (at least 1 s of wall clock, after a warm-up of at least 0.5 s) and
+ignores the seconds form of `--benchmark_min_time`. And every thread runs the same number of
+iterations, so threads, or a whole role, can finish early and leave the end of
+a run less contended than its start; `items_per_second` hides that, and the
+benchmark adds `wall_items_per_second`, `finish_spread`, `push_end` and
+`pop_end` to show it (the header of `concurrent_queue_gmbm.C` has the
+details). `concurrent_queue_mbm` runs the same operation with every thread
+contending until a common stop; its `items_per_s` corresponds to
+`wall_items_per_second` of the `*_balanced` rows. In both, the queue's capacity is 65536 slots,
+or the value of the `CQ_CAP` environment variable rounded down to a power of
+2, and the queue starts empty, or filled to the fraction of its capacity that
+`CQ_FILL` gives (in `concurrent_queue_gmbm`, every run starts that full; in
+`concurrent_queue_mbm`, the warm-up does, so use `--warmup=0` to measure from
+that start).
 
 - `concurrent_queue.h` — the queue
 - `concurrent_queue_test.C` — unit tests (built with ASan and TSan)
 - `concurrent_queue_gmbm.C` / `concurrent_queue_mbm.C` — throughput
-  benchmarks (Google Benchmark and a hand-rolled twin producing the same
-  measurement)
+  benchmarks (Google Benchmark, and a hand-rolled twin running the same
+  operation with every thread contending for the whole window; CSV on stdout).
+  The twin runs only the balanced rows (`*_balanced`, where a thread that
+  finds the queue full pops and one that finds it empty pushes): run for the
+  same time rather than the same number of operations, the role that is
+  faster otherwise pins the queue full or empty
 - `concurrent_queue_lmbm.C` — push-to-pop handoff latency under MPMC
   contention, using the hardware timestamp counter (x86 and ARM). Sweeps
   thread counts and all four slot alignments by default; `--threads=N` and

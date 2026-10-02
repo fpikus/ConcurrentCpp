@@ -124,11 +124,6 @@ are not in `$HOME/GoogleBench` and `$HOME/GoogleTest`.
 
 ## The book
 
-This directory accompanies Chapter 7 of *The Art of Writing Efficient
-Programs, Second Edition* by Fedor G. Pikus. The chapter holds what this
-README only gestures at: the ABA interleaving drawn step by step, the
-resurrection bug that forces the weaker algorithm on the standard pointer,
-why the destructor's `use_count() == 1` check is race-free in a chapter that
-spends a dozen pages sneering at check-then-act — and the ABA footnote hiding
-inside the very tool adopted to abolish ABA. The problem is never solved; it
-is only pushed down a level, and the bottom level always pays.
+Chapter 7 of *The Art of Writing Efficient Programs, Second Edition* by
+Fedor G. Pikus covers an earlier version of this code; the code here has
+moved on since.

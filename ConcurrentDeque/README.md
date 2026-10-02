@@ -92,8 +92,6 @@ a shared tree.
 
 ## The book
 
-This directory accompanies Chapter 7 of *The Art of Writing Efficient
-Programs, Second Edition* by Fedor G. Pikus. The README states the design
-decisions; the book explains why they are correct — including the memory
-ordering argument for why every intermediate state of a concurrent resize is
-safe, which is the part you actually want.
+Chapter 7 of *The Art of Writing Efficient Programs, Second Edition* by
+Fedor G. Pikus covers an earlier version of this code; the code here has
+moved on since.

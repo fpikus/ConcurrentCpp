@@ -139,11 +139,6 @@ go to `build/<hostname>/`. Requires Google Benchmark and GoogleTest.
 
 ## The book
 
-This directory accompanies Chapter 7 of *The Art of Writing Efficient
-Programs, Second Edition* by Fedor G. Pikus. The chapter contains what this
-README deliberately omits: the split-bucket arithmetic that makes stale
-copies mathematically incapable of resurrection, the insert-versus-resize race
-and the rule that resolves it (every decision is made on one atomic word, so
-the decision and the split that could invalidate it are totally ordered), and
-the benchmark that lied — a lazily-evaluated structure that made "setup" a
-fiction until the deferred work was forced to quiesce.
+Chapter 7 of *The Art of Writing Efficient Programs, Second Edition* by
+Fedor G. Pikus covers an earlier version of this code; the code here has
+moved on since.

@@ -258,9 +258,9 @@ DCLP_BM(BM_dclp_uphint,   LAYOUT_HOT,  nmax_atomic,    lock)            // updat
 //
 // Measured (linda, Zen 5, GCC 16.2, 2026-09-24, 3 runs x 10 reps): the shared
 // line never wins. It ties at one thread and at work 100-300 up to 32
-// threads, and loses elsewhere: 8-48% at work 0-30 from 8 threads (noisier
-// cells show more), and already about a third at 2-4 threads when the work
-// between offers is short (work 3-10). So separate lines is the choice when the
+// threads, and loses elsewhere: 7-48% at work 0-30 from 8 threads (noisier
+// cells show more), and already about a third at 2 threads when the work
+// between offers is short (work 3-10; at 4 threads 12-32%). So separate lines is the choice when the
 // contention is not known in advance: it costs nothing measurable anywhere and
 // avoids losing up to half. Unlike a lock guarding a payload (Spinlock's layout
 // benchmark, where the shared line wins at low contention), DCLP's operations

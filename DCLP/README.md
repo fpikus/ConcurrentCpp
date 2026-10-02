@@ -157,13 +157,6 @@ the repository rather than a private copy.
 
 ## The book
 
-This directory accompanies Chapter 6 of *The Art of Writing Efficient
-Programs, Second Edition* by Fedor G. Pikus. The chapter holds what this README
-only asserts: the double-checked locking pattern done correctly, with the
-acquire/release handoff traced through the memory model rather than bolted on;
-the minimum ordering each outcome actually requires, and what a needlessly
-strong barrier costs; the disassembly-level account of why a compare-exchange
-retry loop and a plain `if` compile to different fast paths, and why the effect
-that looks like a hardware branch predictor is really the compiler's basic-block
-layout; and the honest reckoning of when lock-free is worth it — where a lock
-that most threads dodge outruns an atomic that everyone must contend for.
+Chapter 6 of *The Art of Writing Efficient Programs, Second Edition* by
+Fedor G. Pikus covers an earlier version of this code; the code here has
+moved on since.

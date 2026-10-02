@@ -157,6 +157,7 @@ itself is machine-independent. The reference `config.mk` uses `clang++-22`,
 - `spinlock_layout_bm.C` — whether the guarded payload belongs on the lock's cache line: the same payload at four distances from the lock
 - `spinlock_scope_bm.C` — whether a thread should store the ring slot it has just claimed inside the critical section or right after `unlock()` (the Google Benchmark harness)
 - `spinlock_scope_mbm.C` — the same with a hand-rolled harness that keeps every thread contending for the whole measurement window, counts lock handoffs, and can sample how long the lock is visibly free
+- `spinlock_scope_demo.C` — the talk-sized version of the scope benchmark: two benchmarks, the slot store before `unlock()` and after it, self-contained apart from `spinlock.h`, with the thread counts at which a laptop shows the loss and a comment on why it needs them
 - `spinlock_scope_common.h` — what the two scope harnesses share: the measured operation, its variants and the shared layout; also contains detailed description of the observed results and underlying mechanisms
 - `seqlock.h` — a sequence lock: readers copy the payload out without writing to shared memory
 - `seqlock_test.C` — unit tests for the sequence lock (built with ASan and TSan)
@@ -166,14 +167,6 @@ itself is machine-independent. The reference `config.mk` uses `clang++-22`,
 
 ## The book
 
-This directory accompanies Chapter 6 of *The Art of Writing Efficient
-Programs, Second Edition* by Fedor G. Pikus. The chapter holds what this
-README only asserts: the cache-coherency forensics of why sleeping beats
-pausing, traced through the coherence states line by line; the
-performance-counter investigation that catches the spinlock red-handed
-poisoning the execution unit — store-buffer stalls by the hundred billion,
-and a reorder-buffer count that reads backward until you see why; the quiet
-reversal of a decade of conventional wisdom about where lock-free code
-actually earns its keep; and the parade every lock drags behind it —
-deadlock, livelock, convoying, priority inversion, lock hogging — with an
-account of which of them a spinlock escapes by construction.
+Chapter 6 of *The Art of Writing Efficient Programs, Second Edition* by
+Fedor G. Pikus covers an earlier version of this code; the code here has
+moved on since.

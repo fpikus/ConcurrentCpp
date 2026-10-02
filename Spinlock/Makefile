@@ -61,6 +61,7 @@ TARGET_SEQLOCK_TEST_ASAN = $(BUILD_DIR)/seqlock_test_asan
 TARGET_SEQLOCK_TEST_TSAN = $(BUILD_DIR)/seqlock_test_tsan
 TARGET_SPINLOCK_SCOPE_BM = $(BUILD_DIR)/spinlock_scope_bm
 TARGET_SPINLOCK_SCOPE_MBM = $(BUILD_DIR)/spinlock_scope_mbm
+TARGET_SPINLOCK_SCOPE_DEMO = $(BUILD_DIR)/spinlock_scope_demo
 
 # The two groups: `make benchmarks` needs only Google Benchmark and works on
 # machines without sanitizer runtimes; `make tests` needs GoogleTest and
@@ -68,7 +69,7 @@ TARGET_SPINLOCK_SCOPE_MBM = $(BUILD_DIR)/spinlock_scope_mbm
 BENCHMARKS = $(TARGET_BM) $(TARGET_TUNE_BM) $(TARGET_RW_TUNE_BM) \
              $(TARGET_OVERHEAD_BM) $(TARGET_MEM_BM) $(TARGET_LAYOUT_BM) \
              $(TARGET_SEQLOCK_BM) $(TARGET_SPINLOCK_SCOPE_BM) \
-             $(TARGET_SPINLOCK_SCOPE_MBM)
+             $(TARGET_SPINLOCK_SCOPE_MBM) $(TARGET_SPINLOCK_SCOPE_DEMO)
 TESTS = $(TARGET_TEST_ASAN) $(TARGET_TEST_TSAN) \
         $(TARGET_SEQLOCK_TEST_ASAN) $(TARGET_SEQLOCK_TEST_TSAN)
 
@@ -145,6 +146,12 @@ $(TARGET_SPINLOCK_SCOPE_BM): spinlock_scope_bm.C $(HEADERS) $(SCOPE_HEADERS) | $
 $(TARGET_SPINLOCK_SCOPE_MBM): spinlock_scope_mbm.C $(HEADERS) $(SCOPE_HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_BM) $< $(COMMON_LIBS) $(CXX_RPATH) -o $@
 
+# Build the lock scope demo (the two-benchmark, laptop-sized version of the
+# scope benchmark). Self-contained apart from spinlock.h, so it depends on
+# $(HEADERS) only, not on $(SCOPE_HEADERS).
+$(TARGET_SPINLOCK_SCOPE_DEMO): spinlock_scope_demo.C $(HEADERS) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) $(CXX_RPATH) -o $@
+
 # Build ASan test
 $(TARGET_TEST_ASAN): spinlock_test.C $(HEADERS) | $(BUILD_DIR)
 	$(SAN_CXX) $(CXXFLAGS_TEST_ASAN) $< $(LIBS_TEST) $(SAN_CXX_RPATH) -o $@
@@ -170,7 +177,10 @@ run_tests: tests
 
 # Run benchmarks. spinlock_scope_bm and spinlock_scope_mbm are left out: one
 # pass over all their cells takes minutes on the large servers, and
-# runs with repetitions take proportionally longer.
+# runs with repetitions take proportionally longer. spinlock_scope_demo is
+# left out too: its one pass is six 1-second runs, but one pass of a 2-5%
+# noisy WSL2 cell is not a result, and the demo is meant to be run by hand
+# with --benchmark_repetitions.
 run_benchmarks: benchmarks
 	./$(TARGET_BM)
 	./$(TARGET_TUNE_BM)

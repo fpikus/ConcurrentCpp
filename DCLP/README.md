@@ -52,8 +52,8 @@ retires one taken branch per cycle this roughly doubles the read-only fast
 path; on a core that already lays it out that way it costs nothing, and
 under a monotone-increasing feed — which a warmed-up maximum never sees — its
 cost is within noise on the fleet. The standard `[[unlikely]]` attribute on the
-loop body can say the same thing — with current GCC and Clang it produces the
-same code here — but its strength is left to the compiler, while the builtin
+loop body can say the same thing — with GCC 16 and Clang 22 (checked
+2026-09-24) it produces the same code here — but its strength is left to the compiler, while the builtin
 sets the edge's weight outright. With the right layout a real win and the wrong
 one largely harmless, the unambiguous form is the one to use. Why the layout matters so much — and why
 the memory barrier you first reach for is the wrong suspect — is in the book.
@@ -108,8 +108,9 @@ GCC on that server, half the throughput with Clang on a Zen 4 laptop.
 
 Where the lock goes matters too. Putting DCLP's lock on the same cache line as
 the maximum — the arrangement that wins for an ordinary lock and its data at low
-contention — never pays off here: on the 128-thread Zen 5 server it ties at low
-contention and loses up to half the throughput under contention
+contention — never pays off here: on the 128-thread Zen 5 server it ties only
+when offers are far apart, and loses up to half the throughput as they get
+frequent, a third already at two threads
 (`BM_dclp_sameline_work` against `BM_dclp_work`, with a work dial between
 offers). The likely reason, not yet confirmed with counters: DCLP's offers
 mostly only read the maximum, and every lock acquisition by a writer drags the

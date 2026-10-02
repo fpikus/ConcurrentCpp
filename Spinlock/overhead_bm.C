@@ -254,7 +254,8 @@ BENCHMARK_TEMPLATE(BM_update, CasUpdate, MemWork)
 
 // The shipped SpinLock under the same body: the chosen configuration measured
 // against what it would replace, not only against the atomics. Registered but
-// outside the default test sets (run_sets.sh selects lock-versus-lock-free);
+// outside the default test sets (the measurement scripts select
+// lock-versus-lock-free);
 // select it with --benchmark_filter='BM_shipped'.
 BENCHMARK_TEMPLATE(BM_update, GuardedUpdate<SpinLock>, SinCosWork)
     ->Name("BM_shipped") OVERHEAD_ARGS;

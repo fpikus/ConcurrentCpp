@@ -118,7 +118,7 @@ numbers.
 make benchmarks     # just the benchmarks — needs only Google Benchmark
 make                # benchmarks + ASan/TSan unit tests (needs GoogleTest)
 make run_tests      # run all four sanitizer test binaries
-make run_benchmarks # every benchmark, full grid — very long
+make run_benchmarks # every benchmark but the lock-scope ones, full grid — very long
 ```
 
 Every configuration is registered in every binary; a Google Benchmark filter
@@ -127,7 +127,8 @@ the reader confirmation, the low-contention probes, the overhead grid — and
 the measurement protocol is the standard `--benchmark_repetitions`,
 `--benchmark_report_aggregates_only`, and
 `--benchmark_enable_random_interleaving`. `make run_benchmarks` runs the full
-grid and prints Google Benchmark's console report. For machine-readable
+grid of every benchmark except the lock-scope harnesses and the demo (run those
+directly, with repetitions) and prints Google Benchmark's console report. For machine-readable
 results, run a binary directly and ask for JSON:
 
 ```sh

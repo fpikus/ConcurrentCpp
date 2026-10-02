@@ -79,9 +79,7 @@
 //     Measured with this file on that laptop (clang 22, -O3 -march=native;
 //     5 repetitions at the registered counts, 3 at the others; medians of
 //     items_per_second in M operations/s, before / after the unlock; the raw
-//     outputs of every number quoted in this comment are kept outside the
-//     repository, in results/naptime/scope_demo_2026-10-01/, see its
-//     README.txt):
+//     outputs are not part of this repository):
 //        threads      16     32     64    128    256    512   1024
 //        before      228    160    141    123     79     38     26
 //        after       239    164    141    105     54     28     22

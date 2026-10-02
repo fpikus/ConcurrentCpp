@@ -305,7 +305,7 @@ static const long numcpu = sysconf(_SC_NPROCESSORS_CONF);
 // ~1%, work:100 ~0.3%).
 //
 // The pure endpoints are what each experiment is actually about; a mix can only
-// interpolate between them, so the default test sets (run_sets.sh) run the
+// interpolate between them, so the default test sets (of the measurement scripts) run the
 // endpoints and leave the mixes for when the endpoints show a spread. For the
 // ladder sweep the endpoints are also self-calibrating: at reads:0/writes:1 the
 // read ladder is never used, so every `r:*` line must collapse onto the

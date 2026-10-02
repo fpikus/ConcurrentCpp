@@ -30,7 +30,7 @@
 //
 // Every configuration in spinlock_tune_configs.h (shared with
 // spinlock_mem_bm.C) is registered; which subset runs is decided at run time.
-// The named test sets live in run_sets.sh -- the saturation proof runs
+// The named test sets live in the measurement scripts -- the saturation proof runs
 // `sweep:(base|shape)` at work:0, where the spinning shapes must lose and the
 // margin is the finding; the low-contention probe runs the candidate groups at
 // work:30 and work:100, where the development machine reversed the saturation

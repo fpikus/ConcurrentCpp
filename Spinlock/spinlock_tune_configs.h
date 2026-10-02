@@ -12,8 +12,8 @@
 // header. `sweep` is the group tag used for filtering.
 //
 // EVERY configuration is registered; registration is cheap, and which subset
-// actually runs is decided at run time -- by the named test sets in
-// run_sets.sh, or by an ad-hoc --benchmark_filter. The comments below record
+// actually runs is decided at run time -- by the named test sets of the
+// measurement scripts, or by an ad-hoc --benchmark_filter. The comments below record
 // what the development machine (16-core Ryzen 9 9950X, uncontrolled thread
 // placement, sin/cos work) measured for each group, and the caveats that
 // should temper how the numbers are read; they are why the default test sets

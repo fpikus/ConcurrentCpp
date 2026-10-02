@@ -27,7 +27,8 @@ SAN_CXX_RPATH := $(if $(SAN_RPATH),$(SAN_RPATH),$(call RPATH_OF,$(shell $(SAN_CX
 
 # Per-host build directory: several hosts build concurrently in the same
 # NFS-shared tree, so binaries must not overwrite each other. Same convention
-# as results/<hostname>/ in run_sets.sh: per-host subdirectories under build/.
+# as results/<hostname>/ in the measurement scripts: per-host subdirectories
+# under build/.
 # clean removes only this host's subdirectory, never the other hosts'.
 BUILD_DIR = build/$(shell hostname)
 

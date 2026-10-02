@@ -153,10 +153,11 @@
 // environment variable (a fraction of the capacity in [0, 1]; 0 by default)
 // makes thread 0 push that many elements before the start barrier, so that
 // every run, the measured one included, starts that full. Why: at 2^16 slots
-// the queue can settle full or near empty, each state self-sustaining (see
-// HOW THE NUMBERS RELATE in concurrent_queue_mbm.C), and which one a run lands
-// in may depend on where it starts. The prefilled elements are not counted as
-// items. The run names do not show CQ_CAP or CQ_FILL; both are in the context
+// an unbalanced row can settle with the queue full or near empty, and the knob
+// lets a run choose where it starts. Where it starts turned out not to decide
+// where it settles: starting half-full changed neither harness (see WHY
+// BALANCED in concurrent_queue_mbm.C); what decides it is which role attempts
+// faster. The prefilled elements are not counted as items. The run names do not show CQ_CAP or CQ_FILL; both are in the context
 // at the top of the output (cq_cap, cq_fill).
 
 #include "concurrent_queue.h"

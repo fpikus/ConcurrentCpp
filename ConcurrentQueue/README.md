@@ -171,12 +171,6 @@ that start).
 
 ## The book
 
-This directory accompanies Chapter 7 of *The Art of Writing Efficient
-Programs, Second Edition* by Fedor G. Pikus. The chapter walks through the
-full implementation — including the wraparound race and how to actually
-reproduce it, why measuring queue latency by inverting throughput is
-meaningless, and the non-sequentially-consistent "queue pack" that trades
-strict ordering for another order of magnitude of scaling. The book describes
-the earlier key-and-flag slot protocol of the key-value queue; the code here
-has since replaced it with a per-slot sequence number, for the reason given
-above.
+Chapter 7 of *The Art of Writing Efficient Programs, Second Edition* by
+Fedor G. Pikus covers an earlier version of this code; the code here has
+moved on since.

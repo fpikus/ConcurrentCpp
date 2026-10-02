@@ -89,11 +89,14 @@ Measured on servers from 64 to 256 hardware threads, and stated plainly:
   update — throughput holds within ~10% of the single-thread rate from 1 to
   64 threads (~140 M guarded updates/s on our test servers). Flat is the
   ceiling for an inherently serial operation, and this lock sits at it.
-- That is 5–15× the standard mutex, and beyond a handful of threads it also
-  outruns the wait-free atomic increment, which has no way to back off and no
-  way to stop dragging the cache line across the machine. At 256 threads the
-  lock finally yields ground — and still leads the mutex by 3× and the
-  atomic by 6×.
+- That is 5–22× the standard mutex from two threads up, and from two threads
+  to the middle of the machine it also outruns the wait-free atomic increment
+  (by up to 4× on x86, 1.1–1.4× on Grace, up to 47× on Apple M3), which has
+  no way to back off and no way to stop dragging the cache line across the
+  machine. Toward the full machine the lock yields ground, and how much
+  varies a lot: at 256 threads on Granite Rapids it still leads the mutex by
+  7× and the atomic by 1.2×, while at full core count on the 128-core EPYC,
+  a 128-thread Zen 2 and Grace the atomic pulls ahead, by 2.3–3.7×.
 - Every alternative back-off was benchmarked and lost. No back-off at all
   collapses under contention by nearly two orders of magnitude, pause with
   it; `sched_yield` survives only to modest thread counts; single-tier sleeps

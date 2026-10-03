@@ -194,7 +194,9 @@
 // yields while the bit is set) or allocates one, and the thread's exit returns
 // its records under the same lock. With one record per load() and a thread
 // cache of 100 records (fast slot + 99), the miss happens once per thread, so
-// load/store/CAS are lock-free after a thread's first load. Retire is a
+// load/store/CAS are lock-free after a thread's first load -- except for loads
+// made while the thread runs its thread_local destructors, after mm_hp has
+// closed its cache: those go to the global pool again (see "Exception safety"). Retire is a
 // lock-free push plus a fetch_add; the scan (membarrier, a hash set of the
 // hazards, the deleters) runs on the thread that crosses the threshold and
 // waits on no other thread.
@@ -260,13 +262,14 @@
 // acquire orders above cost LDAR/LDAXR there; nil on x86-64).
 //
 // TSan cannot see hazard-pointer lifetime violations, even with mm_hp's
-// TSan-only patch (scan-side hazard loads acquire): every load() ends with a
-// release store to its hazard record, the scan acquires that record, and the
-// reader's whole earlier history -- including an unprotected access -- is
-// thereby ordered before the free. A clean TSan run of this pointer says
-// nothing about the protocol; model checking and deterministic seam tests
-// through the pointee's hooks are the oracles. TSan still checks everything
-// outside the protocol (callers, the count orders' visible effects).
+// TSan-only patch (scan-side hazard loads acquire): every load() that protects
+// an object ends with a release store to its hazard record, the scan acquires
+// that record, and the reader's whole earlier history -- including an
+// unprotected access -- is thereby ordered before the free. A clean TSan run of
+// this pointer says nothing about the protocol; model checking and
+// deterministic seam tests through the pointee's hooks are the oracles. TSan
+// still checks everything outside the protocol (callers, the count orders'
+// visible effects).
 //
 // ---------------------------------------------------------------------------
 // Exception safety

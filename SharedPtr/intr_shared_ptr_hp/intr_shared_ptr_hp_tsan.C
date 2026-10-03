@@ -2,7 +2,8 @@
 // counterpart of intr_shared_ptr/intr_shared_ptr_tsan.C. It runs concurrent
 // load()/store() traffic and checks the reference counts, but it is NOT a
 // lifetime test: TSan cannot see hazard-pointer lifetime violations (every
-// load() ends with a release store to its hazard record, which hides the race),
+// load() that protects an object ends with a release store to its hazard
+// record, which hides the race),
 // and with only three B objects mm_hp's scan threshold (1000 retirements) is
 // never crossed while the threads run, so no scan ever runs concurrently with
 // them. Retired B objects are destroyed by explicit drains (hp_drain.h) on the

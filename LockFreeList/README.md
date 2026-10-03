@@ -2,7 +2,8 @@
 
 A Harris-style lock-free singly-linked list that deletes for real: nodes are
 physically unlinked while other threads traverse them, and their memory is
-returned to the allocator at the earliest safe moment. Determining "the
+returned to the allocator at the earliest safe moment (or, with the
+hazard-pointer policy, at the next reclamation scan after it). Determining "the
 earliest safe moment" is the lock-free memory reclamation problem, and this
 directory is what its full solution looks like — in code and in benchmarks.
 
@@ -43,10 +44,15 @@ Stated here, earned in the book:
   of stack overflow on its way out.
 - Reference-count discipline: relaxed increments, acquire-release decrements.
   Relax the decrement and you have a use-after-free that strikes once a month
-  in production.
+  in production. The hazard-pointer policy adds a third operation, the
+  conditional increment `TryAddRef()` (increment only if the count is not
+  zero), whose zero-observing load and successful CAS are acquire by contract:
+  relax the load and a reader can re-read a stale pointer forever; relax the
+  CAS and it can end up owning a node whose `next` the list's destructor has
+  already torn down.
 
 The honest summary: this is not really a lock-free list at all — it is an
-atomic shared pointer written three different ways, with one simple list
+atomic shared pointer written four different ways, with one simple list
 balanced on top. The `AtomicPtr` policy parameter selects among:
 
 1. `std::atomic<std::shared_ptr<T>>` — the standard's answer, with a hidden
@@ -58,6 +64,13 @@ balanced on top. The `AtomicPtr` policy parameter selects among:
 3. Daniel Anderson's `parlay::atomic_shared_ptr`
    (`lock_free_shared_ptr/`) — genuinely lock-free, hazard pointers demoted
    to an implementation detail inside the pointer.
+4. A hazard-pointer intrusive pointer (`intr_shared_ptr_hp.h`) — the
+   intrusive pointer with the lock taken out: Maged Michael's hazard pointers
+   (`mm_hp/`) close the gap between reading a link and counting it, which
+   makes it lock-free once a thread has made its first load. The price is
+   deferred reclamation: a node whose count reaches zero is not destroyed
+   then, but later, in a batch, by whichever thread happens to trigger the
+   next reclamation scan.
 
 ## The domain of applicability
 
@@ -77,25 +90,25 @@ right lens for everything below.
 ## Performance
 
 Five workloads (read-heavy, write-heavy, graveyard, insertion-at-head,
-dispersed) were benchmarked across all three pointer policies, on hardware
-from a 16-core Ryzen desktop to a 72-core NVIDIA Grace server; the trends are
-remarkably consistent.
+dispersed) were benchmarked across the first three pointer policies, on
+hardware from a 16-core Ryzen desktop to a 72-core NVIDIA Grace server; the
+trends are remarkably consistent.
 
 - **Dispersed workloads** — threads working on mostly separate sections of
   the list, the design's true fast path — perform excellently: full
   concurrent insertion, deletion, and never-dangling traversal at a baseline
   cost that stays flat as threads are added.
-- **Read-heavy workloads**: the intrusive pointer scales best at moderate
-  thread counts — not by a better algorithm (it and the standard pointer both
-  hide a one-bit spinlock) but by a leaner implementation and a backoff policy
-  with manners; the difference between a spinlock with manners and one without
-  is two orders of magnitude. At high thread counts the genuinely lock-free
-  pointer keeps scaling after both spinlock-based pointers collapse — it is
-  bottlenecked by a per-core resource (the store buffer) rather than the
-  global coherency mesh.
+- **Read-heavy workloads**: the intrusive pointer (`intr_shared_ptr`) scales
+  best at moderate thread counts — not by a better algorithm (it and the
+  standard pointer both hide a one-bit spinlock) but by a leaner
+  implementation and a backoff policy with manners; the difference between a
+  spinlock with manners and one without is two orders of magnitude. At high
+  thread counts the genuinely lock-free parlay pointer keeps scaling after
+  both spinlock-based pointers collapse — it is bottlenecked by a per-core
+  resource (the store buffer) rather than the global coherency mesh.
 - **Insertion at the head** funnels every thread through one pointer and will
   never scale, on any implementation; there the simplest, tightest pointer
-  (the intrusive one) wins.
+  (the intrusive one, `intr_shared_ptr`) wins.
 
 The stark ledger against the hash set: the set refused to reclaim memory and
 its readers scaled without visible limit; the list reclaims perfectly — every
@@ -111,16 +124,31 @@ make            # benchmark + ASan/TSan unit tests
 make run_tests  # run both sanitizer test binaries
 ```
 
-Requires clang (the Makefile uses `clang++-22`, C++23), Google Benchmark and
-GoogleTest; point `GBENCH_DIR` and `GTEST_DIR` at your installations if they
-are not in `$HOME/GoogleBench` and `$HOME/GoogleTest`.
+Requires Linux, clang (the Makefile uses `clang++-22`, C++23), Google
+Benchmark and GoogleTest; point `GBENCH_DIR` and `GTEST_DIR` at your
+installations if they are not in `$HOME/GoogleBench` and `$HOME/GoogleTest`.
+Linux because every binary links Maged Michael's hazard pointers, which issue
+`membarrier(2)`.
 
 - `lock_free_list.h` — the list
 - `intr_shared_ptr.h` — the intrusive atomic shared pointer
+- `intr_shared_ptr_hp.h` — the hazard-pointer intrusive atomic shared pointer
+- `mm_hp/` — Maged Michael's hazard pointers, which it uses
 - `lock_free_shared_ptr/` — Daniel Anderson's lock-free atomic shared pointer
 - `atomic_shared_ptr_concept.h` — the concept the pointer policies model
+- `hp_drain.h`, `hp_drain_gtest.h` — drain the hazard pointers' pending
+  reclamations, so that a test can assert that a node is gone
 - `lock_free_list_test.C` — unit tests (built with ASan and TSan)
-- `lock_free_list_bm.C` — the benchmarks described above
+- `lock_free_list_bm.C` — the benchmarks described above; the row suffixes
+  `_StdAtomic`, `_IntrPtr`, `_HazardPtr` and `_IntrPtrHP` are the four
+  policies in the order listed above — `_HazardPtr` is the parlay pointer, a
+  name older than the hazard-pointer policy, whose rows are `_IntrPtrHP`
+- `lock_free_list_bugs.md` — the record of a correctness review of the list
+  algorithm: what broke, why, and what was done about it
+
+Everything above except the list itself, its tests and benchmarks, and the bug
+record is a symlink into `../SharedPtr`, where the pointers are tested on
+their own (see [../SharedPtr/README.md](../SharedPtr/README.md)).
 
 ## The book
 

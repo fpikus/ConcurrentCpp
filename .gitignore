@@ -42,4 +42,3 @@ prompt_list.txt
 # Daniel Anderson's atomic_shared_ptr: redistribution permission unclear,
 # fetch from https://github.com/DanielLiamAnderson/atomic_shared_ptr
 SharedPtr/lock_free_shared_ptr/parlay/
-SharedPtr/atomic_shared_ptr/

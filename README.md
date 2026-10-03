@@ -25,14 +25,17 @@ and may continue to evolve past the version printed in the book.
   free, never relink, never unlink.
 - **[LockFreeList](LockFreeList/)** — a Harris-style lock-free singly-linked
   list that reclaims memory for real, with never-invalidated iterators,
-  parameterized over three atomic shared pointer implementations.
+  parameterized over four atomic shared pointer implementations.
 
 Supporting components shared by the projects above:
 
 - **[SharedPtr](SharedPtr/)** — atomic reference-counted smart pointers: an
-  intrusive pointer with an embedded one-bit lock, and an adapter for Daniel
-  Anderson's genuinely lock-free `atomic_shared_ptr` (fetched separately;
-  see [SharedPtr/lock_free_shared_ptr](SharedPtr/lock_free_shared_ptr/)).
+  intrusive pointer with an embedded one-bit lock; its sibling with a hazard
+  pointer in place of the lock, lock-free after a thread's first load, built
+  on Maged Michael's hazard pointers (included, in
+  [SharedPtr/mm_hp](SharedPtr/mm_hp/)); and an adapter for Daniel Anderson's
+  genuinely lock-free `atomic_shared_ptr` (fetched separately; see
+  [SharedPtr/lock_free_shared_ptr](SharedPtr/lock_free_shared_ptr/)).
 - **[Spinlock](Spinlock/)** — the TTAS spinlock with a two-tier back-off
   used throughout, with the benchmarks that tuned it.
 
@@ -55,6 +58,8 @@ Requirements: a recent clang (the Makefiles use `clang++-22`, C++23),
 `GTEST_DIR` if they are not in `$HOME/GoogleBench` and `$HOME/GoogleTest`.
 The projects share headers via relative symlinks, so clone on a filesystem
 that supports them (on Windows, use WSL or enable `core.symlinks`).
+SharedPtr and LockFreeList build on Linux only: the hazard pointers they link
+issue `membarrier(2)`.
 
 ## License
 

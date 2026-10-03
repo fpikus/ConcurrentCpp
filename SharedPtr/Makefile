@@ -41,6 +41,9 @@ LIBS_TEST = $(GTEST_DIR)/lib/libgtest.a $(GTEST_DIR)/lib/libgtest_main.a $(COMMO
 
 # Target definitions
 TARGET_BM = atomic_shared_ptr_bm
+# The same benchmark with destruction-burst timing (see BM_COUNTER_FLAGS); built
+# on demand, not by `all` (named *_bm so that .gitignore covers it).
+TARGET_BM_BURSTS = atomic_shared_ptr_bursts_bm
 TARGET_TEST_ASAN = atomic_shared_ptr_test_asan
 TARGET_TEST_TSAN = atomic_shared_ptr_test_tsan
 TARGET_INTR_MBM = intr_shared_ptr/intr_shared_ptr_mbm
@@ -83,9 +86,27 @@ all: $(TARGET_BM) $(TARGET_TEST_ASAN) $(TARGET_TEST_TSAN) $(TARGET_INTR_MBM) $(T
      $(TARGET_INTR_HP_MBM) $(TARGET_INTR_HP_TSAN) $(TARGET_HP_DRAIN_SELFTEST_ASAN) $(TARGET_HP_DRAIN_SELFTEST_TSAN) \
      $(TARGET_HP_SEAM_TEST_ASAN) $(TARGET_HP_SEAM_TEST_TSAN)
 
+# Benchmark instrumentation (atomic_shared_ptr_bm.C, "Instrumentation counters").
+# INTR_HP_BM_COUNTERS (event counters: CAS results, destructions, and
+# intr_shared_ptr_hp's load-retry counters) is always on, because it measured
+# free; INTR_HP_BM_BURSTS (destruction-burst timing, one rdtsc per destroyed
+# pointee; x86-64 only) did not, so it has its own binary, used only for its
+# burst counters. Two paired measurements of WriteHeavy_IntrSharedHP, items/s of
+# the instrumented build over the plain one (one invocation per cell, 5 rounds
+# in ABBA order, Google Benchmark's default min_time, Ryzen 7940HS under WSL2,
+# clang-22, 2026-10-03): counters and burst timing together 0.895 at 1 thread
+# (every round 0.89-0.92), 1.050 at 2 threads, within the spread at 4, 8 and 16;
+# counters alone 0.993 at 1 thread (spread 2.6%) and 1.017 at 2 (spread 2.2%).
+BM_COUNTER_FLAGS = -DINTR_HP_BM_COUNTERS
+BM_BURST_FLAGS = $(BM_COUNTER_FLAGS) -DINTR_HP_BM_BURSTS
+
 # Build benchmark (every pointer policy; links mm_hp for intr_shared_ptr_hp)
 $(TARGET_BM): atomic_shared_ptr_bm.C $(HP_SOURCES) $(HEADERS)
-	$(CXX) $(CXXFLAGS_BM) $< $(HP_SOURCES) $(LIBS_BM) $(CXX_RPATH) -o $@
+	$(CXX) $(CXXFLAGS_BM) $(BM_COUNTER_FLAGS) $< $(HP_SOURCES) $(LIBS_BM) $(CXX_RPATH) -o $@
+
+# Build the benchmark with destruction-burst timing (`make atomic_shared_ptr_bursts_bm`)
+$(TARGET_BM_BURSTS): atomic_shared_ptr_bm.C $(HP_SOURCES) $(HEADERS)
+	$(CXX) $(CXXFLAGS_BM) $(BM_BURST_FLAGS) $< $(HP_SOURCES) $(LIBS_BM) $(CXX_RPATH) -o $@
 
 # Build ASan test (links mm_hp for intr_shared_ptr_hp)
 $(TARGET_TEST_ASAN): atomic_shared_ptr_test.C $(HP_SOURCES) $(HEADERS)
@@ -148,6 +169,6 @@ run_benchmarks: $(TARGET_BM) $(TARGET_INTR_MBM) $(TARGET_INTR_HP_MBM)
 
 # Clean build artifacts
 clean:
-	rm -f $(TARGET_BM) $(TARGET_TEST_ASAN) $(TARGET_TEST_TSAN) $(TARGET_INTR_MBM) $(TARGET_INTR_TSAN) \
+	rm -f $(TARGET_BM) $(TARGET_BM_BURSTS) $(TARGET_TEST_ASAN) $(TARGET_TEST_TSAN) $(TARGET_INTR_MBM) $(TARGET_INTR_TSAN) \
 	      $(TARGET_INTR_HP_MBM) $(TARGET_INTR_HP_TSAN) $(TARGET_HP_DRAIN_SELFTEST_ASAN) $(TARGET_HP_DRAIN_SELFTEST_TSAN) \
 	      $(TARGET_HP_SEAM_TEST_ASAN) $(TARGET_HP_SEAM_TEST_TSAN) *.bak *~

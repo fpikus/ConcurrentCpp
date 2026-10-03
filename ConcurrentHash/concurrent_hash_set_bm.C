@@ -356,9 +356,13 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
 // Control vs Del separates "a resident population" from "AllowDelete"; Reclaimed
 // vs Control is the free lists in use: the pop path in alloc_node() (one CAS on
 // the shard's free head instead of the deque's lock and cursor) and the locality
-// of the popped slots, which come back in reverse dealing order at a stride of
-// 2*shards slots -- one new cache line per popped node, where an append fills a
-// line with four consecutive nodes. Why measure: the free lists are the point of
+// of the popped slots. reclaim() deals the freed nodes round-robin over the
+// shards in the order it finds them (the limbo lists first, then the dead nodes
+// of its walk over the buckets), and each free list is LIFO, so a shard pops
+// them in reverse dealing order. Bucket order bears no relation to slot order
+// (every key goes through mix()), so consecutive pops land on scattered slots --
+// about one new cache line per popped node, where an append fills a line with
+// four consecutive nodes. Why measure: the free lists are the point of
 // reclaim(), and nothing before this measured an insert that reuses a slot, nor
 // a lookup over chains that reclaim() relinked.
 //

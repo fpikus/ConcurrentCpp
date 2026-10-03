@@ -101,7 +101,9 @@
 //   3. Light fence [p1202::asymmetric_thread_fence_light(): a compiler fence;
 //      the ordering against the reclaimer's hazard scan comes from the
 //      membarrier(2) heavy fence the scan executes -- mm_hp's design].
-//   4. Reload the word [acquire] and compare it with X with the mark masked.
+//   4. Reload the word [acquire; seq_cst when the caller's order is seq_cst --
+//      the same holds for the reloads of steps 5 and 6, see reload_order()]
+//      and compare it with X with the mark masked.
 //      On mismatch go back to 1 with the reloaded word (the hazard record is
 //      kept and re-aimed). On match X is protected: a retire of X must follow
 //      the store that unpublished X, and since our reload still saw X the scan
@@ -119,7 +121,8 @@
 //      fetch_add would resurrect it and its later release would retire it a
 //      second time; "fetch_add then undo on zero" is not a substitute either --
 //      the undo races a re-validation-failure release into a double retire).
-//      If the count was 0, reload the word [acquire] and go back to 1. The 0
+//      If the count was 0, reload the word [acquire, or seq_cst as in step 4]
+//      and go back to 1. The 0
 //      was read with ACQUIRE (TryAddRef's contract), so it synchronizes with
 //      the release sequence headed by the acq_rel DelRef that produced it, and
 //      that DelRef follows (in its thread, or through another acq_rel DelRef)
@@ -132,7 +135,8 @@
 //      the 0, and only an acquire reload synchronizes with that publisher as
 //      load(acquire) promises (a deterministic TSan test kills the relaxed
 //      form).
-//   6. Re-validate: reload the word [acquire]; if its unmarked address is no
+//   6. Re-validate: reload the word [acquire, or seq_cst as in step 4]; if its
+//      unmarked address is no
 //      longer X, leave the hazard scope (the record is cleared with a release
 //      store and returned to the thread cache), release the reference just
 //      taken (retire X on 1->0) and go back to 1 with the reloaded word. Why
@@ -311,10 +315,11 @@
 //   protocol, which re-reads the word.
 // - A failed CAS refreshes `expected` through load(failure) -- the caller's
 //   failure order applied to the first read of the word -- rather than the
-//   prototype's fixed load(acquire). The protocol's internal reloads are
-//   acquire regardless, so the two differ only in what the first read costs
-//   and promises (a relaxed failure order on a null word does not
-//   synchronize, exactly as std::atomic specifies).
+//   prototype's fixed load(acquire). The protocol's internal reloads are at
+//   least acquire regardless (seq_cst for a seq_cst failure order), so the
+//   two differ only in what the first read costs and promises (a relaxed
+//   failure order on a null word does not synchronize, exactly as std::atomic
+//   specifies) and in whether the refresh is a seq_cst operation.
 // - store() asserts its order to the set std::atomic::store accepts (relaxed,
 //   release, seq_cst); the exchange it uses would silently accept any order
 //   (and runs with the promoted order above). load() and the CAS failure
@@ -660,17 +665,19 @@ public:
     // holds. (consume is accepted because std::atomic::load accepts it; it is
     // deprecated in C++26 and treated as acquire by the compilers in use.)
     // `order` is applied to the FIRST read of the word; the protocol's reloads
-    // (steps 4, 5, 6) are acquire regardless. A null or marked null is returned
-    // from whichever read produced it -- the first read, or an acquire reload
-    // when the word became null during the protocol; a non-null word is always
-    // returned from an acquire reload. With acquire or seq_cst the call
-    // synchronizes with the store()/CAS that published the returned word, null
-    // words included. seq_cst buys no more than that: the returned non-null
-    // word comes from an acquire reload, so the call does not take part in the
-    // single total order of seq_cst operations the way one std::atomic load
-    // would; code needing that order across different atomics must not rely
-    // on load(seq_cst) here. relaxed and consume promise only what they say
-    // for a null returned from the first read.
+    // (steps 4, 5, 6) are acquire for every `order` except seq_cst, for which
+    // they are seq_cst too (reload_order()). A null or marked null is returned
+    // from whichever read produced it -- the first read, or a reload when the
+    // word became null during the protocol; a non-null word is always returned
+    // from a reload. With acquire or seq_cst the call synchronizes with the
+    // store()/CAS that published the returned word, null words included. With
+    // seq_cst every read that can produce the returned word is a seq_cst load,
+    // so load(seq_cst) takes part in the single total order of seq_cst
+    // operations as one std::atomic seq_cst load would (the extra reloads are
+    // further seq_cst reads of the same word, which the total order permits);
+    // the promotion costs nothing on x86-64 and nothing on aarch64 where
+    // acquire is already an LDAR. relaxed and consume promise only what they
+    // say for a null returned from the first read.
     //
     // Guarantee: strong. The only throw is std::bad_alloc from
     // make_hazard_pointer() on a thread-cache miss -- normally a thread's first
@@ -686,6 +693,7 @@ public:
         require_pointee();
         assert(is_load_order(order));
         uintptr_t word = aptr_.load(order);                     // step 1
+        const std::memory_order reload = reload_order(order);   // steps 4, 5, 6
         while (true) {
             U* x = unmarked_ptr(word);
             if (!x) return adopt_word(word);    // null or marked null: no count, no hazard
@@ -703,7 +711,7 @@ public:
                 while (true) {
                     hp.reset_protection(x);                     // step 2: release store, typed U*
                     p1202::asymmetric_thread_fence_light();                // step 3
-                    uintptr_t reloaded = aptr_.load(std::memory_order_acquire); // step 4
+                    uintptr_t reloaded = aptr_.load(reload);    // step 4
                     if (unmarked_ptr(reloaded) != x) {
                         INTR_HP_COUNT_RETRY_(validation_mismatch);
                         word = reloaded;
@@ -715,15 +723,16 @@ public:
                     INTR_HP_COUNT_RETRY_(zero_count);
                     // The acquire read of 0 synchronizes with the DelRef that
                     // produced it, which follows the store that unpublished X:
-                    // this reload sees a different word. Acquire here because
-                    // the word it returns (possibly null, returned below) may
-                    // come from a later store than that one, and load(acquire)
-                    // must synchronize with whoever published what it returns.
-                    word = aptr_.load(std::memory_order_acquire);
+                    // this reload sees a different word. At least acquire here
+                    // because the word it returns (possibly null, returned
+                    // below) may come from a later store than that one, and
+                    // load(acquire) must synchronize with whoever published
+                    // what it returns; seq_cst when the caller asked for it.
+                    word = aptr_.load(reload);
                     x = unmarked_ptr(word);
                     if (!x) return adopt_word(word);
                 } // protect-and-validate loop, one hazard record re-aimed on every retry
-                word = aptr_.load(std::memory_order_acquire);              // step 6
+                word = aptr_.load(reload);                      // step 6
                 if (unmarked_ptr(word) == x) return adopt_word(word);   // step 7: re-validated mark
                 INTR_HP_COUNT_RETRY_(revalidation_mismatch);
                 revalidation_victim = x;
@@ -900,6 +909,22 @@ private:
     static bool is_load_order(std::memory_order order) noexcept {
         return order == std::memory_order_relaxed || order == std::memory_order_consume ||
                order == std::memory_order_acquire || order == std::memory_order_seq_cst;
+    }
+
+    // The order of load()'s reloads of the word (steps 4, 5, 6), the reads
+    // that can produce the returned word: acquire, which the protocol needs
+    // regardless of the caller's `order` (publication of the pointee and of a
+    // mark-only change; the word published after a count hit 0), or seq_cst
+    // when the caller asked for seq_cst, so that the returned word is read by a
+    // seq_cst load and load(seq_cst) takes its place in the single total order
+    // of seq_cst operations as a std::atomic load would. Cost of the promotion:
+    // nil on x86-64 (both are a plain MOV); on aarch64 both are LDAR (unless
+    // the compiler emits LDAPR for acquire). The CAS failure refresh goes
+    // through load(failure) and inherits this: a seq_cst `failure` gives
+    // seq_cst reloads.
+    static std::memory_order reload_order(std::memory_order order) noexcept {
+        return order == std::memory_order_seq_cst ? std::memory_order_seq_cst
+                                                  : std::memory_order_acquire;
     }
 
     // The order of a publishing RMW (store()'s exchange, the CASes' success):

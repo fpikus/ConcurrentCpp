@@ -14,6 +14,25 @@ namespace mm_hp_detail {
 
 using mo = std::memory_order;
 
+// TSAN-PATCH: TSan does not model the asymmetric fence pair. Under TSan the
+// scan-side loads of hazard slots are acquire, so that a reader's release of
+// its hazard happens-before the scan's free of the object; the unpatched code
+// relies on the hardware not performing the free, which depends on these
+// relaxed loads, before they resolve. Non-TSan builds are unchanged.
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define MM_HP_TSAN 1
+#endif
+#endif
+#if defined(__SANITIZE_THREAD__)
+#define MM_HP_TSAN 1
+#endif
+#ifdef MM_HP_TSAN
+constexpr mo k_hp_scan_order = mo::acquire;
+#else
+constexpr mo k_hp_scan_order = mo::relaxed;
+#endif
+
 namespace { constinit thread_local bool t_reclaiming{false}; }
 
 struct hp_domain {
@@ -171,7 +190,7 @@ struct hp_domain {
     std::unordered_set<const hp_obj*> protected_set;
     protected_set.reserve(hcount_.load(mo::relaxed));
     for (hp_rec* rec = hp_recs; rec; rec = rec->next_) {
-      const hp_obj* ptr = rec->hp_.load(mo::relaxed);
+      const hp_obj* ptr = rec->hp_.load(k_hp_scan_order);
       if (ptr) protected_set.insert(ptr);
     }
     return protected_set;
@@ -179,7 +198,7 @@ struct hp_domain {
 
   bool is_protected(hp_obj* obj, hp_rec* hp_recs) noexcept {
     for (hp_rec* rec = hp_recs; rec; rec = rec->next_) {
-      if (rec->hp_.load(mo::relaxed) == obj) return true;
+      if (rec->hp_.load(k_hp_scan_order) == obj) return true;
     }
     return false;
   }

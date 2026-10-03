@@ -270,21 +270,25 @@ TYPED_TEST(LockFreeListTest, StressTest) {
 #ifndef NDEBUG
     // Debug-only invariant check: with all threads joined, a drain loop must
     // empty the list completely, dead nodes included. This is the regression
-    // check for the helping path in erase_after(): without helping, a stuck
-    // logically-deleted node wedges erase_after() into returning false while
-    // live nodes remain reachable (lock_free_list_bugs.md, bug 1) -- a state
-    // this test cannot see otherwise, because a false return also
-    // legitimately means "list empty".
+    // check for the helping path in erase_after(): without helping, a marked
+    // node whose unlink CAS lost to a concurrent insert stays linked forever,
+    // and erase_after() over that edge keeps returning false while live nodes
+    // remain reachable behind it -- a state this test cannot see otherwise,
+    // because a false return also legitimately means "list empty" (details:
+    // `lock_free_list_bugs.md`, bug 1).
     while (list.erase_after(list.before_begin())) {}
     EXPECT_EQ(list.begin(), list.end());
 #endif // NDEBUG
 }
 
-// Regression hammer for lock_free_list_bugs.md bug 1: one pure inserter and one
-// pure eraser collide on the same anchor, maximizing the chance that an insert
-// lands inside an eraser's window between its mark CAS and its unlink CAS. The
-// mixed-op StressTest above is too diffuse to hit that interleaving reliably;
-// this shape strands marked nodes within a few thousand operations pre-helping.
+// Regression hammer for the helping path in erase_after(): one pure inserter and
+// one pure eraser collide on the same anchor, maximizing the chance that an
+// insert lands inside an eraser's window between its mark CAS and its unlink
+// CAS. The unlink CAS then fails, and without helping the marked node stays
+// linked for good, wedging the drain below. The mixed-op StressTest above is
+// too diffuse to hit that interleaving reliably; this shape strands marked
+// nodes within a few thousand operations pre-helping (details:
+// `lock_free_list_bugs.md`, bug 1).
 TYPED_TEST(LockFreeListTest, InsertEraseHammer) {
     typename TestFixture::List list(this->factory.template operator()<typename TestFixture::Node>());
     constexpr int num_inserts = 50000;

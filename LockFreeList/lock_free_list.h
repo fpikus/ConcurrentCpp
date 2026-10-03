@@ -49,8 +49,10 @@
 //    can lose to a concurrent insert or to the erasure of the anchor itself. An
 //    erase_after that finds an already-marked successor unlinks it and retries
 //    on the new successor, so a dead node left behind by a failed unlink is
-//    removed by the next erasure over the same edge instead of staying linked
-//    forever (see lock_free_list_bugs.md, bug 1).
+//    removed by the next erasure over the same edge. Without helping, such a
+//    node would stay linked forever and every erase_after over that edge would
+//    return false, so a drain loop would stop with live nodes still reachable
+//    (details: `lock_free_list_bugs.md`, bug 1).
 //
 // Marking convention: "X is logically deleted" is recorded in X's *own* next
 // pointer, so the mark bit travels with the value loaded *from* X->next. In
@@ -307,7 +309,8 @@ public:
             // successor Y can still swing H -> Y after another thread erased Y
             // (its CAS of X->next: Y -> Z succeeded and returned true). Y is
             // then back in the list even though its erase reported success.
-            // Unfixable without a mark bit; see lock_free_list_bugs.md, bug 2.
+            // Unfixable without a mark bit (details: `lock_free_list_bugs.md`,
+            // bug 2).
             auto target = anchor.curr_->next.load(std::memory_order_acquire);
             while (target) {
                 auto target_next = target->next.load(std::memory_order_acquire);

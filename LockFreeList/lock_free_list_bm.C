@@ -384,12 +384,15 @@ BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, MassiveHeadInsert_HazardPtr, ParlayWrap
 // Note for the StdAtomic variant: this is the only benchmark whose mutation
 // anchors are erasable nodes, and StdAtomicSharedPtrAdapter has
 // supports_marking = false. It therefore exercises the documented non-marking
-// limitations (black-hole inserts, and the erase/erase resurrect race of
-// lock_free_list_bugs.md bug 2) that the head-anchored benchmarks never could.
+// limitations that the head-anchored benchmarks never could: an insert after a
+// concurrently erased anchor lands in a detached "black hole" chain, and
+// concurrent erases at adjacent positions can resurrect an erased node (an
+// eraser that read its target's successor before a concurrent erase removed
+// that successor still swings the anchor to it, putting it back in the list).
 // Both are memory-safe here -- every involved node is pinned by strong
 // references -- but an occasional insert can vanish into a detached chain and
 // an occasional erase can fail to shrink the list, so the StdAtomic numbers
-// carry that semantic slack.
+// carry that semantic slack (details: `lock_free_list_bugs.md`, bug 2).
 BENCHMARK_TEMPLATE_DEFINE_F(DispersedListFixture, ReadDispersed_StdAtomic, StdAtomicWrapper)(benchmark::State& state) {
     SETUP_RNG;
     using Node = LockFreeList<int, StdAtomicWrapper::template ptr_type>::Node;

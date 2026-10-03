@@ -58,11 +58,14 @@ concept AtomicSharedPtr = requires(ASP a, typename ASP::shared_ptr_type p) {
 // Wrapper for std::atomic<std::shared_ptr<T>> that conforms to the interface
 // but supports_marking = false.
 // Note: without marking, a lock-free list built on this type cannot exclude two
-// anomalies (see LockFreeList and LockFreeList/lock_free_list_bugs.md, bug 2):
+// anomalies (see LockFreeList):
 // - an insert after a concurrently erased node lands in a detached "black hole"
 //   chain and silently vanishes once the last reference to that chain drops
 //   (not a memory leak -- reference counting still reclaims the chain);
-// - concurrent erases at adjacent positions can resurrect an already-erased node.
+// - concurrent erases at adjacent positions can resurrect an already-erased
+//   node: an eraser that read its target's successor before a concurrent erase
+//   removed that successor still swings the anchor to it, putting it back in
+//   the list (details: `../LockFreeList/lock_free_list_bugs.md`, bug 2).
 template <typename T>
 class StdAtomicSharedPtrAdapter : public std::atomic<std::shared_ptr<T>> {
 public:

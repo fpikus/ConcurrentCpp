@@ -66,6 +66,20 @@ TESTS = $(TARGET_TEST_ASAN) $(TARGET_TEST_TSAN)
 # make follows them, so a change to the shipped header rebuilds here.
 HEADERS = lock_free_list.h intr_shared_ptr.h lock_free_shared_ptr/atomic_shared_ptr.hpp ../config.mk
 
+# Maged Michael's hazard pointers (vendored in ../SharedPtr/mm_hp), used by the
+# intr_shared_ptr_hp policy and the drain helper. Every name below is a symlink
+# into ../SharedPtr (mm_hp/ is a directory symlink); make follows them, as for
+# HEADERS. mm_hp is a header plus one source file. Every target that links it
+# lists HP_SOURCES twice: as a prerequisite, so editing mm_hp.cpp rebuilds the
+# target, and explicitly in the recipe after $<, so mm_hp.cpp is compiled in the
+# same command with the same flags (optimization, sanitizer) as the TU it links
+# with; a separately built object would need one build per flavour and
+# per-flavour rules. Compiling it again per target is cheap (~240 lines). Linux
+# only: mm_hp issues membarrier(2).
+HP_SOURCES = mm_hp/mm_hp.cpp
+HP_HEADERS = intr_shared_ptr_hp.h mm_hp/mm_hp.hpp mm_hp/asymmetric_fence.hpp hp_drain.h hp_drain_gtest.h
+HEADERS += $(HP_HEADERS)
+
 .PHONY: all benchmarks tests clean run_tests run_benchmarks
 
 # The first rule in a Makefile is the default goal; without this line it would
@@ -82,17 +96,17 @@ benchmarks: $(BENCHMARKS)
 
 tests: $(TESTS)
 
-# Build benchmark
-$(TARGET_BM): lock_free_list_bm.C $(HEADERS) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) $(CXX_RPATH) -o $@
+# Build benchmark (links mm_hp for the intr_shared_ptr_hp policy)
+$(TARGET_BM): lock_free_list_bm.C $(HP_SOURCES) $(HEADERS) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS_BM) $< $(HP_SOURCES) $(LIBS_BM) $(CXX_RPATH) -o $@
 
-# Build ASan test
-$(TARGET_TEST_ASAN): lock_free_list_test.C $(HEADERS) | $(BUILD_DIR)
-	$(SAN_CXX) $(CXXFLAGS_TEST_ASAN) $< $(LIBS_TEST) $(SAN_CXX_RPATH) -o $@
+# Build ASan test (links mm_hp for the intr_shared_ptr_hp policy)
+$(TARGET_TEST_ASAN): lock_free_list_test.C $(HP_SOURCES) $(HEADERS) | $(BUILD_DIR)
+	$(SAN_CXX) $(CXXFLAGS_TEST_ASAN) $< $(HP_SOURCES) $(LIBS_TEST) $(SAN_CXX_RPATH) -o $@
 
-# Build TSan test
-$(TARGET_TEST_TSAN): lock_free_list_test.C $(HEADERS) | $(BUILD_DIR)
-	$(SAN_CXX) $(CXXFLAGS_TEST_TSAN) $< $(LIBS_TEST) $(SAN_CXX_RPATH) -o $@
+# Build TSan test (links mm_hp for the intr_shared_ptr_hp policy)
+$(TARGET_TEST_TSAN): lock_free_list_test.C $(HP_SOURCES) $(HEADERS) | $(BUILD_DIR)
+	$(SAN_CXX) $(CXXFLAGS_TEST_TSAN) $< $(HP_SOURCES) $(LIBS_TEST) $(SAN_CXX_RPATH) -o $@
 
 # Run tests
 run_tests: tests

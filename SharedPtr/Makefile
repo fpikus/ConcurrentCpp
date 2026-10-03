@@ -52,6 +52,10 @@ TARGET_INTR_HP_TSAN = intr_shared_ptr_hp/intr_shared_ptr_hp_tsan
 # Self-test of the mm_hp drain helper (hp_drain.h), one build per sanitizer.
 TARGET_HP_DRAIN_SELFTEST_ASAN = hp_drain_selftest_asan
 TARGET_HP_DRAIN_SELFTEST_TSAN = hp_drain_selftest_tsan
+# White-box seam tests of intr_shared_ptr_hp (deterministic, through the
+# pointee's hooks), one build per sanitizer.
+TARGET_HP_SEAM_TEST_ASAN = intr_shared_ptr_hp_seam_test_asan
+TARGET_HP_SEAM_TEST_TSAN = intr_shared_ptr_hp_seam_test_tsan
 
 # Headers every target depends on; editing them must trigger a rebuild.
 # Recipes use $< (the source file), not $^, so the headers are prerequisites
@@ -76,7 +80,8 @@ HEADERS += $(HP_HEADERS)
 .PHONY: all clean run_tests run_benchmarks
 
 all: $(TARGET_BM) $(TARGET_TEST_ASAN) $(TARGET_TEST_TSAN) $(TARGET_INTR_MBM) $(TARGET_INTR_TSAN) \
-     $(TARGET_INTR_HP_MBM) $(TARGET_INTR_HP_TSAN) $(TARGET_HP_DRAIN_SELFTEST_ASAN) $(TARGET_HP_DRAIN_SELFTEST_TSAN)
+     $(TARGET_INTR_HP_MBM) $(TARGET_INTR_HP_TSAN) $(TARGET_HP_DRAIN_SELFTEST_ASAN) $(TARGET_HP_DRAIN_SELFTEST_TSAN) \
+     $(TARGET_HP_SEAM_TEST_ASAN) $(TARGET_HP_SEAM_TEST_TSAN)
 
 # Build benchmark (every pointer policy; links mm_hp for intr_shared_ptr_hp)
 $(TARGET_BM): atomic_shared_ptr_bm.C $(HP_SOURCES) $(HEADERS)
@@ -114,15 +119,26 @@ $(TARGET_HP_DRAIN_SELFTEST_ASAN): hp_drain_selftest.C $(HP_SOURCES) $(HEADERS)
 $(TARGET_HP_DRAIN_SELFTEST_TSAN): hp_drain_selftest.C $(HP_SOURCES) $(HEADERS)
 	$(SAN_CXX) $(CXXFLAGS_TEST_TSAN) $< $(HP_SOURCES) $(LIBS_TEST) $(SAN_CXX_RPATH) -o $@
 
+# Build the hazard-pointer intrusive pointer's seam tests, ASan
+$(TARGET_HP_SEAM_TEST_ASAN): intr_shared_ptr_hp_seam_test.C $(HP_SOURCES) $(HEADERS)
+	$(SAN_CXX) $(CXXFLAGS_TEST_ASAN) $< $(HP_SOURCES) $(LIBS_TEST) $(SAN_CXX_RPATH) -o $@
+
+# Build the hazard-pointer intrusive pointer's seam tests, TSan
+$(TARGET_HP_SEAM_TEST_TSAN): intr_shared_ptr_hp_seam_test.C $(HP_SOURCES) $(HEADERS)
+	$(SAN_CXX) $(CXXFLAGS_TEST_TSAN) $< $(HP_SOURCES) $(LIBS_TEST) $(SAN_CXX_RPATH) -o $@
+
 # Run tests
 run_tests: $(TARGET_TEST_ASAN) $(TARGET_TEST_TSAN) $(TARGET_INTR_TSAN) $(TARGET_INTR_HP_TSAN) \
-           $(TARGET_HP_DRAIN_SELFTEST_ASAN) $(TARGET_HP_DRAIN_SELFTEST_TSAN)
+           $(TARGET_HP_DRAIN_SELFTEST_ASAN) $(TARGET_HP_DRAIN_SELFTEST_TSAN) \
+           $(TARGET_HP_SEAM_TEST_ASAN) $(TARGET_HP_SEAM_TEST_TSAN)
 	./$(TARGET_TEST_ASAN)
 	./$(TARGET_TEST_TSAN)
 	./$(TARGET_INTR_TSAN)
 	./$(TARGET_INTR_HP_TSAN)
 	./$(TARGET_HP_DRAIN_SELFTEST_ASAN)
 	./$(TARGET_HP_DRAIN_SELFTEST_TSAN)
+	./$(TARGET_HP_SEAM_TEST_ASAN)
+	./$(TARGET_HP_SEAM_TEST_TSAN)
 
 # Run benchmarks
 run_benchmarks: $(TARGET_BM) $(TARGET_INTR_MBM) $(TARGET_INTR_HP_MBM)
@@ -133,4 +149,5 @@ run_benchmarks: $(TARGET_BM) $(TARGET_INTR_MBM) $(TARGET_INTR_HP_MBM)
 # Clean build artifacts
 clean:
 	rm -f $(TARGET_BM) $(TARGET_TEST_ASAN) $(TARGET_TEST_TSAN) $(TARGET_INTR_MBM) $(TARGET_INTR_TSAN) \
-	      $(TARGET_INTR_HP_MBM) $(TARGET_INTR_HP_TSAN) $(TARGET_HP_DRAIN_SELFTEST_ASAN) $(TARGET_HP_DRAIN_SELFTEST_TSAN) *.bak *~
+	      $(TARGET_INTR_HP_MBM) $(TARGET_INTR_HP_TSAN) $(TARGET_HP_DRAIN_SELFTEST_ASAN) $(TARGET_HP_DRAIN_SELFTEST_TSAN) \
+	      $(TARGET_HP_SEAM_TEST_ASAN) $(TARGET_HP_SEAM_TEST_TSAN) *.bak *~

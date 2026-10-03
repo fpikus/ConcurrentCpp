@@ -71,24 +71,86 @@
 // erased, so before_begin() always yields a valid anchor.
 template <typename T, template<typename> class AtomicPtr>
 class LockFreeList {
+private:
+    // Pointee base supplied by the pointer policy. An AtomicPtr that needs
+    // its pointee to derive from a base class (intr_shared_ptr_hp: the
+    // hazard pointer base std::hazard_pointer_obj_base<Node>) declares a
+    // nested alias `pointee_base`; pointee_base_of<ASP>::type yields it.
+    // For the other policies -- std adapter, intr_shared_ptr, parlay --
+    // which declare no such alias, it yields the empty struct below, and
+    // the empty-base optimization keeps their Node byte-identical to
+    // today's. Private: Node is the only user and no new global name is
+    // introduced. Detection is a constrained partial specialization (one
+    // argument), which instantiates nothing beyond what
+    // `AtomicPtr<Node> next;` already forces -- so it compiles while Node
+    // is still incomplete at its own base clause.
+    struct empty_pointee_base {};
+    template <typename ASP> struct pointee_base_of { using type = empty_pointee_base; };
+    template <typename ASP> requires requires { typename ASP::pointee_base; }
+    struct pointee_base_of<ASP> { using type = typename ASP::pointee_base; };
+
 public:
-    struct Node {
+    // Node derives from the policy's pointee base (empty for three of the
+    // four policies; the hazard pointer base, 24 bytes, for
+    // intr_shared_ptr_hp -- sizeof(Node<int>) 32/24/24/48 for
+    // std/intr/parlay/hp).
+    struct Node : pointee_base_of<AtomicPtr<Node>>::type {
         T value;
         AtomicPtr<Node> next;
         
-        // Intrusive refcount hooks, used only when AtomicPtr is the intrusive
-        // shared pointer (which requires them on the pointee); for the other
-        // pointer types they are 8 bytes of dead weight per node, accepted so
-        // that Node does not have to know which pointer it is instantiated
-        // with. The count starts at 0: a freshly new'ed node is owned by no
-        // one until the first shared_ptr_type adopts it (0 -> 1); every owner
-        // thereafter counts itself via AddRef. DelRef() returns true on the
-        // 1 -> 0 transition; its acq_rel order makes all prior writes to the
-        // node visible to the deleter.
+        // Intrusive refcount hooks, used only by the two intrusive policies
+        // (intr_shared_ptr, intr_shared_ptr_hp), which require them on the
+        // pointee; TryAddRef() is used by intr_shared_ptr_hp alone. For the
+        // other pointer types they are 8 bytes of dead weight per node,
+        // accepted so that Node does not have to know which pointer it is
+        // instantiated with. The count starts at 0: a freshly new'ed node is
+        // owned by no one until the first shared_ptr_type adopts it (0 -> 1);
+        // every owner thereafter counts itself via AddRef. DelRef() returns
+        // true on the 1 -> 0 transition; its acq_rel order makes all prior
+        // writes to the node visible to the deleter.
         std::atomic<long> ref_count{0};
-        void AddRef() { ref_count.fetch_add(1, std::memory_order_relaxed); }
-        bool DelRef() { return ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1; }
-        long use_count() const { return ref_count.load(std::memory_order_relaxed); }
+        void AddRef() noexcept { ref_count.fetch_add(1, std::memory_order_relaxed); }
+        bool DelRef() noexcept { return ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1; }
+        // TryAddRef(): increment the strong count if and only if it is nonzero.
+        // Returns true iff it incremented; returns false iff it observed a count of
+        // 0, in which case the count is left at 0 (an object at 0 is retired, or
+        // about to be retired, and must never be revived). Required only by
+        // intr_shared_ptr_hp; the other pointer policies never call it. Memory
+        // orders, all load-bearing: the load that observes 0 is ACQUIRE; the CAS is
+        // ACQUIRE on success and relaxed on failure; a failed CAS whose refreshed
+        // value is 0 re-reads the count with an acquire load before returning false,
+        // so EVERY observed 0 was read with acquire. Why: intr_shared_ptr_hp::load()
+        // calls this on an object pinned only by a hazard pointer. An observed 0
+        // must synchronize with the release sequence headed by the DelRef that
+        // produced it, so that the loader's next acquire reload of the word is
+        // guaranteed to see the store that unpublished the object; with a relaxed
+        // zero-observation the loader can re-read the stale word forever (model
+        // checked: livelock). The ACQUIRE on CAS success makes the loader's
+        // post-increment re-validation of the word see a swing that released the
+        // word's own reference. The value a successful CAS consumes need not have
+        // been read with acquire: a failed CAS refreshes it with a relaxed read (only
+        // a refreshed 0 is re-read with acquire), and other threads' RMWs may have
+        // rewritten it. A CAS that succeeds with relaxed order on a value it read
+        // from the release sequence headed by the swing's DelRef does not
+        // synchronize with that DelRef, so the re-validation reload may return the
+        // stale word and LockFreeList::~Node's walk can judge a node exclusive
+        // (count 1) that this loader then owns with a stale next (model checked:
+        // assertion failure). Every operation on the count is an RMW. Cost: nil on
+        // x86-64; LDAR/LDAXR on aarch64.
+        bool TryAddRef() noexcept {
+            long count = ref_count.load(std::memory_order_acquire);
+            while (count != 0) {
+                if (ref_count.compare_exchange_weak(count, count + 1,
+                        std::memory_order_acquire, std::memory_order_relaxed)) {
+                    return true;
+                }
+                // The failed CAS refreshed `count` with a relaxed read; a 0
+                // seen that way does not synchronize. Re-read it with acquire.
+                if (count == 0) count = ref_count.load(std::memory_order_acquire);
+            } // CAS loop while the count is nonzero
+            return false;
+        } // TryAddRef()
+        long use_count() const noexcept { return ref_count.load(std::memory_order_relaxed); }
         
         Node(T val) : value(std::move(val)) {}
         Node() : value() {}
@@ -104,6 +166,33 @@ public:
         // can ever acquire it and we may dismantle it. If the count is higher
         // we stop: whichever holder releases last re-enters this destructor
         // and resumes the walk from there.
+        //
+        // That "no other thread can ever acquire it" is a PRECONDITION on the
+        // AtomicPtr policy, not a property of this walk, and it has two parts:
+        // (1) a word's reference is counted BEFORE the word is published and
+        // released AFTER the word is unpublished (store, CAS, the adopting
+        // constructor), so count == 1 here means no word points at the node
+        // now or later; and (2) a loader that takes a reference optimistically
+        // -- intr_shared_ptr_hp: hazard pointer, then TryAddRef on the count --
+        // RE-VALIDATES the word after its increment and gives the reference
+        // back if the word no longer names the node. Without (2) a loader that
+        // read the word, stalled, and incremented the count after the word was
+        // swung away and the word's reference released would own this node
+        // AFTER we judged it exclusive and nulled its next: a dead node whose
+        // graveyard successor is gone, so its ++ yields end() instead of the
+        // live suffix (no UB, a silent iterator-contract violation; found by
+        // model checking the swinger/walker/loader race). The spinlock pointer
+        // satisfies (2) trivially (its loader holds the lock across load and
+        // AddRef, so the word cannot move in between), as does the std adapter
+        // (std::atomic<shared_ptr>::load is one atomic step). parlay's
+        // atomic_shared_ptr::load() (lock_free_shared_ptr/atomic_shared_ptr.hpp)
+        // is hazard-protect plus increment_strong_count_if_nonzero() with NO
+        // re-validation after the increment -- the same shape as the HP
+        // pointer without step (2) -- so whether this walk's exclusivity test
+        // holds under the parlay policy is NOT established here: no claim is
+        // made either way. The HP pointer's re-validation reload and its TryAddRef
+        // CAS success are acquire so that the re-validation sees the swing
+        // that released the word's reference; see its header.
         //
         // Nulling curr->next *before* advancing is what keeps this iterative:
         // the `curr = ...` assignment deletes the old node, whose own ~Node()

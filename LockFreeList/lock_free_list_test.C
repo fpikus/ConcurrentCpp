@@ -22,12 +22,16 @@
 // SOFTWARE.
 //
 #include <gtest/gtest.h>
+#include <cstdio>
 #include <thread>
 #include <vector>
 #include <random>
 
 #include "atomic_shared_ptr_concept.h"
+#include "hp_drain.h"
+#include "hp_drain_gtest.h"
 #include "intr_shared_ptr.h"
+#include "intr_shared_ptr_hp.h"
 #include "lock_free_shared_ptr/atomic_shared_ptr.hpp"
 #include "lock_free_list.h"
 
@@ -59,9 +63,12 @@ struct IntrPtrWrapper {
 struct ParlayWrapper {
     template <typename U> using ptr_type = parlay::atomic_shared_ptr<U>;
 };
+struct IntrPtrHPWrapper {
+    template <typename U> using ptr_type = intr_shared_ptr_hp<U, U>;
+};
 
-// Uniform node factory: the three pointer families construct their
-// shared_ptr_type differently (std adapter: from make_shared; intrusive:
+// Uniform node factory: the pointer families construct their shared_ptr_type
+// differently (std adapter: from make_shared; the two intrusive pointers:
 // adopting a raw new, since the count lives in the node; parlay: from
 // parlay::make_shared). Tests funnel all node creation through this one
 // callable, which dispatches on the concrete shared_ptr_type at compile time.
@@ -72,7 +79,8 @@ struct Factory {
         using SharedPtr = typename Wrapper::template ptr_type<Node>::shared_ptr_type;
         if constexpr (std::is_same_v<SharedPtr, typename StdAtomicSharedPtrAdapter<Node>::shared_ptr_type>) {
             return SharedPtr(std::make_shared<Node>(v));
-        } else if constexpr (std::is_same_v<SharedPtr, typename intr_shared_ptr<Node, Node>::shared_ptr_type>) {
+        } else if constexpr (std::is_same_v<SharedPtr, typename intr_shared_ptr<Node, Node>::shared_ptr_type> ||
+                             std::is_same_v<SharedPtr, typename intr_shared_ptr_hp<Node, Node>::shared_ptr_type>) {
             return SharedPtr(new Node(v));
         } else {
             return SharedPtr(parlay::make_shared<Node>(v));
@@ -80,19 +88,61 @@ struct Factory {
     }
 };
 
+// Fixture: brackets every test with mm_hp drains, for every pointer policy (a
+// drain is ~1000 filler retirements, milliseconds; the policies without
+// deferred reclamation are unaffected, so there is no per-policy branch).
+// Under intr_shared_ptr_hp a released node is only retired, and a dropped list
+// is a destructor CASCADE: the dummy node's ~Node() walk retires the chain it
+// owns, which a second scan destroys (ReclaimsEntireChain pins exactly two
+// rounds), and a graveyard chain held elsewhere can add a layer. So:
+// - SetUp() drains `setup_drain_rounds` whole rounds and only then captures the
+//   Tracked base. Most tests here use int lists, which have no live counter to
+//   drain against; fixed rounds also clear their pending layers, so that a
+//   test starts with (almost) nothing pending and no scan fires in the middle
+//   of a test that counts drains.
+// - TearDown() drains until every Tracked node a test created is gone
+//   (drain_until() with the live-count predicate, which returns at once when
+//   nothing is pending), so a leak fails as that one test.
+// GoogleTest runs TearDown() BEFORE it destroys the fixture's data members, so
+// a member owning a list would still hold its nodes at the drain. The only
+// member here is the stateless factory; lists live in the test bodies, which
+// have ended by then. Keep it that way, or reset such a member in TearDown()
+// before the drain.
 template <typename Wrapper>
 class LockFreeListTest : public ::testing::Test {
 protected:
     using List = LockFreeList<int, Wrapper::template ptr_type>;
     using Node = typename List::Node;
-    
-    Factory<Wrapper> factory;
-};
+
+    // Whole drain rounds in SetUp(): a dropped list needs two, plus one for a
+    // graveyard layer; extra rounds cost milliseconds each.
+    static constexpr int setup_drain_rounds = 3;
+    // Round cap of TearDown()'s drain_until(); above any cascade these tests
+    // leave, so reaching it means a leak.
+    static constexpr int teardown_drain_rounds = 8;
+
+    // Tracked::alive after SetUp()'s drains.
+    int tracked_base_ = 0;
+
+    void SetUp() override {
+        for (int round = 0; round < setup_drain_rounds; ++round) drain_reclamation();
+        tracked_base_ = Tracked::alive.load();
+    }
+
+    void TearDown() override {
+        ASSERT_TRUE(drain_until([this] { return Tracked::alive.load() == tracked_base_; }, teardown_drain_rounds))
+            << Tracked::alive.load() - tracked_base_ << " Tracked node payloads still alive after "
+            << teardown_drain_rounds << " drain rounds";
+    }
+
+    Factory<Wrapper> factory;   // stateless node factory
+}; // class LockFreeListTest
 
 using PtrWrappers = ::testing::Types<
     StdAtomicWrapper,
     IntrPtrWrapper,
-    ParlayWrapper
+    ParlayWrapper,
+    IntrPtrHPWrapper
 >;
 
 TYPED_TEST_SUITE(LockFreeListTest, PtrWrappers);
@@ -203,12 +253,50 @@ TYPED_TEST(LockFreeListTest, InsertAfterDeletedAnchorFails) {
     }
 }
 
+// Node::TryAddRef(), the production hook intr_shared_ptr_hp::load() relies on
+// to never revive a node whose count reached 0: from 0 it returns false and
+// leaves 0; from n >= 1 it returns true and leaves n + 1. The hooks are the same
+// code for every policy's Node (which is why the test runs for all of them),
+// and are noexcept (the hazard-pointer pointer requires it). Also prints
+// sizeof(Node) for int, which differs only by the policy's pointee base: the
+// hazard pointer base adds 24 bytes to the intr_shared_ptr_hp Node and the
+// empty base adds nothing to the others.
+TYPED_TEST(LockFreeListTest, NodeTryAddRef) {
+    using Node = typename TestFixture::Node;
+    std::printf("[          ] sizeof(Node) = %zu\n", sizeof(Node));
+
+    Node node(7);
+    static_assert(noexcept(node.AddRef()) && noexcept(node.DelRef()) &&
+                  noexcept(node.TryAddRef()) && noexcept(node.use_count()));
+    EXPECT_EQ(node.use_count(), 0);
+    EXPECT_FALSE(node.TryAddRef()) << "TryAddRef() incremented from 0";
+    EXPECT_EQ(node.use_count(), 0) << "a failed TryAddRef() changed the count";
+
+    node.AddRef();
+    for (long n = 1; n <= 3; ++n) {
+        EXPECT_EQ(node.use_count(), n);
+        EXPECT_TRUE(node.TryAddRef()) << "TryAddRef() failed at count " << n;
+        EXPECT_EQ(node.use_count(), n + 1);
+    } // loop over starting counts 1..3
+
+    // Back to 0 (DelRef() true only on the 1 -> 0), so the node is destroyed
+    // as a node that no pointer ever adopted.
+    for (long n = 4; n > 1; --n) EXPECT_FALSE(node.DelRef());
+    EXPECT_TRUE(node.DelRef());
+    EXPECT_EQ(node.use_count(), 0);
+} // NodeTryAddRef
+
 // Whole-chain reclamation: build a list with a tracked payload, churn it, then drop
 // the list and every iterator. The iterative ~Node() must free the entire chain
 // (including any logically-deleted graveyard nodes) with no payload left alive.
 TYPED_TEST(LockFreeListTest, ReclaimsEntireChain) {
     using TList = LockFreeList<Tracked, TypeParam::template ptr_type>;
     using TNode = typename TList::Node;
+    using TPtr = typename TypeParam::template ptr_type<TNode>;
+    // True for a policy that declares `deferred_reclamation = true`
+    // (intr_shared_ptr_hp). A nested requirement, so that a policy without the
+    // member yields false instead of a hard error.
+    constexpr bool deferred = requires { requires TPtr::deferred_reclamation; };
 
     const int base = Tracked::alive.load();
     {
@@ -226,8 +314,26 @@ TYPED_TEST(LockFreeListTest, ReclaimsEntireChain) {
         EXPECT_GT(Tracked::alive.load(), base); // nodes still alive while in scope
         // `mid`, `list` go out of scope here.
     }
-    EXPECT_EQ(Tracked::alive.load(), base); // every node payload reclaimed
-}
+    if constexpr (!deferred) {
+        EXPECT_EQ(Tracked::alive.load(), base); // every node payload reclaimed
+    } else {
+        // Deferred reclamation: EXACTLY two drains, a white-box oracle that the
+        // ~Node() walk still turns the chain into one batch under hazard
+        // pointers. Traced: the erased front node 49 was retired when it was
+        // unlinked and, still pending, holds the graveyard 48..30 and through
+        // 30->next the live 29..0; dropping the list retires the dummy last.
+        // The retired list is LIFO, so drain 1 destroys the dummy first: its
+        // walk stops at 29, which 30->next still holds; then node 49, whose
+        // walk carries 48..0 down the chain, retiring each node (51 payloads
+        // alive -> 49). Drain 2 destroys those 49 (-> 0). A third drain would
+        // find nothing, so do not add one: needing it would mean the walk
+        // stopped working and the chain is dying one node per scan.
+        drain_reclamation();
+        EXPECT_GT(Tracked::alive.load(), base) << "one drain reclaimed the whole chain";
+        drain_reclamation();
+        EXPECT_EQ(Tracked::alive.load(), base) << "two drains did not reclaim the whole chain";
+    } // deferred reclamation: exactly two drains
+} // ReclaimsEntireChain
 
 TYPED_TEST(LockFreeListTest, StressTest) {
     typename TestFixture::List list(this->factory.template operator()<typename TestFixture::Node>());
@@ -263,7 +369,7 @@ TYPED_TEST(LockFreeListTest, StressTest) {
         });
     }
     
-    for (auto& t : threads) {
+    for (std::thread& t : threads) {
         t.join();
     }
 
@@ -313,3 +419,55 @@ TYPED_TEST(LockFreeListTest, InsertEraseHammer) {
     EXPECT_EQ(list.begin(), list.end());
 #endif // NDEBUG
 } // InsertEraseHammer
+
+// Leak check under concurrency for every policy: threads insert, erase and
+// traverse a list of Tracked payloads, traversers parking iterators on nodes
+// that others erase (graveyard pins); then the list is dropped and every node
+// payload must be gone. Under intr_shared_ptr_hp nodes are destroyed by mm_hp
+// scans, on whichever thread crosses the threshold (including the workers,
+// while they run), so after the joins and the list's destruction the test
+// drains until the count is back to its base: the live count after drains is
+// the leak oracle for retired nodes (LeakSanitizer does not see retired but
+// unreclaimed objects). For the synchronous policies the predicate already
+// holds and no drain runs.
+TYPED_TEST(LockFreeListTest, NoNodeLeakUnderStress) {
+    using TList = LockFreeList<Tracked, TypeParam::template ptr_type>;
+    using TNode = typename TList::Node;
+    constexpr int num_threads = 6;
+    constexpr int num_iters = 3000;
+    // Round cap: a dropped list needs two rounds and graveyard layers a few
+    // more; reaching the cap means a leak.
+    constexpr int max_drain_rounds = 8;
+
+    const int base = Tracked::alive.load();
+    {
+        TList list(this->factory.template operator()<TNode>());
+        std::vector<std::thread> threads;
+        for (int i = 0; i < num_threads; ++i) {
+            threads.emplace_back([&, i]() {
+                std::mt19937 rng(i);
+                std::uniform_int_distribution<int> dist(0, 99);
+                typename TList::iterator parked;   // pins a node across iterations
+                for (int j = 0; j < num_iters; ++j) {
+                    int op = dist(rng);
+                    if (op < 45) {
+                        list.insert_after(list.before_begin(), this->factory.template operator()<TNode>(j));
+                    } else if (op < 80) {
+                        list.erase_after(list.before_begin());
+                    } else if (op < 90) {
+                        parked = list.begin();     // later erasures turn it into a graveyard pin
+                    } else {
+                        int count = 0;
+                        for (auto it = parked.curr_ ? parked : list.begin(); it != list.end() && count < 10; ++it) {
+                            ++count;
+                            EXPECT_GE((*it).v, 0);
+                        } // walk at most 10 nodes, possibly through the graveyard
+                    }
+                } // loop over operations
+            });
+        } // loop over threads
+        for (std::thread& t : threads) t.join();
+    } // list dropped
+    ASSERT_TRUE(drain_until([base] { return Tracked::alive.load() == base; }, max_drain_rounds))
+        << Tracked::alive.load() - base << " node payloads still alive after " << max_drain_rounds << " drain rounds";
+} // NoNodeLeakUnderStress

@@ -31,12 +31,33 @@
 // Reference API for atomic shared pointers with Harris-style marking.
 //
 // These concepts document the contract that lock-free data structures (e.g.
-// LockFreeList) are designed against; pointer implementations (the
-// std::atomic<std::shared_ptr> adapter below, intr_shared_ptr, parlay's
-// atomic_shared_ptr) are then plugged in through a template parameter. They
-// are deliberately *not* enforced as constraints on the containers: they
-// serve as the design reference, and as an opt-in conformance check for a
-// new implementation (static_assert(AtomicSharedPtr<MyPtr<Node>>)).
+// LockFreeList) are designed against; pointer implementations -- the
+// std::atomic<std::shared_ptr> adapter below, intr_shared_ptr (intrusive
+// count, one-bit spinlock), parlay's atomic_shared_ptr
+// (lock_free_shared_ptr/) and intr_shared_ptr_hp (intrusive count, hazard
+// pointers; lock-free after a thread's first load) -- are then plugged in
+// through a template parameter. They are deliberately *not* enforced as
+// constraints on the containers: they serve as the design reference, and as
+// an opt-in conformance check for a new implementation
+// (static_assert(AtomicSharedPtr<MyPtr<Node>>)).
+//
+// Optional members. Beyond the concept, a policy MAY provide:
+//   - `using pointee_base = ...;` -- a class the pointee must derive from
+//     publicly. LockFreeList detects it (pointee_base_of) and makes Node
+//     derive from it; without it Node gets an empty base.
+//     intr_shared_ptr_hp: std::hazard_pointer_obj_base<U>.
+//   - `static constexpr bool deferred_reclamation;` -- true when a pointee
+//     whose strong count reaches 0 is destroyed later (at a reclamation scan,
+//     on whichever thread triggers it) rather than synchronously. Absent means
+//     false. Tests of such a policy drain before asserting live counts
+//     (SharedPtr/hp_drain.h). intr_shared_ptr_hp: true.
+//   - `bool compare_exchange_weak(expected, desired, success, failure);` -- a
+//     single-attempt CAS that may fail spuriously (std semantics), refreshing
+//     `expected` with a live reference on failure. The containers use
+//     compare_exchange_strong only.
+// Detection of an optional member must be a constrained partial
+// specialization or a `requires` expression in a constant expression: a plain
+// `ASP::deferred_reclamation` hard-errors on a policy without it.
 
 // A shared pointer object that may hold mark bits in the least significant bit.
 template <typename SP>

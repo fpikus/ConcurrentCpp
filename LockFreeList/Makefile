@@ -62,9 +62,10 @@ TESTS = $(TARGET_TEST_ASAN) $(TARGET_TEST_TSAN)
 # are not passed to the compiler. The machine configuration is on the list for
 # the same reason: a changed compiler or -march must rebuild everything, or
 # stale binaries get measured.
-# intr_shared_ptr.h and lock_free_shared_ptr/ are symlinks into ../SharedPtr;
-# make follows them, so a change to the shipped header rebuilds here.
-HEADERS = lock_free_list.h intr_shared_ptr.h lock_free_shared_ptr/atomic_shared_ptr.hpp ../config.mk
+# atomic_shared_ptr_concept.h, intr_shared_ptr.h and lock_free_shared_ptr/ are
+# symlinks into ../SharedPtr; make follows them, so a change to a shipped header
+# rebuilds here.
+HEADERS = lock_free_list.h atomic_shared_ptr_concept.h intr_shared_ptr.h lock_free_shared_ptr/atomic_shared_ptr.hpp ../config.mk
 
 # Maged Michael's hazard pointers (vendored in ../SharedPtr/mm_hp), used by the
 # intr_shared_ptr_hp policy and the drain helper. Every name below is a symlink

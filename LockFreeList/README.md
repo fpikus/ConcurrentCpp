@@ -124,7 +124,7 @@ make            # benchmark + ASan/TSan unit tests
 make run_tests  # run both sanitizer test binaries
 ```
 
-Requires Linux, clang (the Makefile uses `clang++-22`, C++23), Google
+Requires Linux, clang (`../config.mk` selects `clang++-22` and C++23), Google
 Benchmark and GoogleTest; point `GBENCH_DIR` and `GTEST_DIR` at your
 installations if they are not in `$HOME/GoogleBench` and `$HOME/GoogleTest`.
 Linux because every binary links Maged Michael's hazard pointers, which issue

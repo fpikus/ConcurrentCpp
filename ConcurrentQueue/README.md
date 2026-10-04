@@ -116,8 +116,11 @@ Grace, and won about 2x only on Cascade Lake with packed slots. With the store
 back, the new key-value queue against the old one, at 2^16, 2^22 and 2^26
 slots: faster in most cells on Arm — up to 1.85x on that Grace and 2.6x on an
 Apple M3 Ultra (24 performance cores, Linux in a VM), with 15 of 156 cells
-slightly slower (0.84-0.99x) — and broadly even on x86 (EPYC 9555, Xeon
-6767P), with losses of 0.6-0.9x in the packed layouts at some thread counts.
+slightly slower (0.84-0.99x) — and mixed on x86 (EPYC 9555, Xeon 6767P):
+gains of up to 2.5x, mostly with padded slots, and losses down to 0.6x,
+mostly with packed slots and at the highest thread counts. At 2 threads the
+result depends on where the two threads land, and the x86 ratios scatter from
+0.24x to 2.6x.
 Push-to-pop latency is unchanged. These are throughput ratios from
 `concurrent_queue_gmbm` with `<uint64_t, uint64_t>` elements, and every one of
 them belongs to this spinlock's back-off: retune the back-off and measure

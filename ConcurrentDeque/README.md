@@ -65,10 +65,11 @@ The single-threaded result is nearly 15x faster, before contention even enters
 the picture, and the scaling is nearly linear until NUMA effects take over —
 while the locked baseline, unable to do anything concurrently, only sinks as
 threads are added. In the dynamic pattern — every thread repeatedly reserves a
-new range with `resize()` and then works on it — the locked baseline degrades
-into serialized execution around 100–130 M elements/s, while the concurrent
-deque reaches 30 G elements/s at 128 threads. The same shape repeats on ARM
-(NVIDIA Grace) and on a desktop Ryzen; only the absolute numbers change.
+new range with `resize()` and then works on it — the locked baseline is
+serialized from the start and sinks the same way, from 132 M elements/s on one
+thread to 104 M/s at 32 threads and 43 M/s at 128, while the concurrent deque
+reaches 30 G elements/s at 128 threads. The same shape repeats on ARM (NVIDIA
+Grace); only the absolute numbers change.
 
 ## Building and testing
 

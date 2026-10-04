@@ -79,9 +79,9 @@ private:
     // For the other policies -- std adapter, intr_shared_ptr, parlay --
     // which declare no such alias, it yields the empty struct below, and
     // the empty-base optimization keeps their Node byte-identical to
-    // today's. Private: Node is the only user and no new global name is
-    // introduced. Detection is a constrained partial specialization (one
-    // argument), which instantiates nothing beyond what
+    // a Node without this base. Private: Node is the only user and no new
+    // global name is introduced. Detection is a constrained partial
+    // specialization (one argument), which instantiates nothing beyond what
     // `AtomicPtr<Node> next;` already forces -- so it compiles while Node
     // is still incomplete at its own base clause.
     struct empty_pointee_base {};

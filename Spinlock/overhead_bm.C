@@ -108,7 +108,7 @@
 //         Ryzen 9 9950X): 244 M updates/s at 8 threads and 256 at 32, against
 //         the shipped ladder's 216 and 192, at identical single-thread cost.
 //   s8 -- the shipped SpinLock ladder itself. On a 2-socket 128-core Granite
-//         Rapids (leslie), s1 turned out bistable at saturation -- two
+//         Rapids server, s1 turned out bistable at saturation -- two
 //         identical-by-construction instantiations measured 70 and 37 M/s,
 //         both far below this ladder's 132 -- so the dev-machine choice did
 //         not transfer, and both configurations are measured everywhere.
@@ -228,7 +228,8 @@ void BM_update(benchmark::State& state) {
 // grid -- including the shared-heavy 100:1 and 10:1 ratios, which are where
 // the lock's domain lives. Both lock configurations run under both kinds of
 // work: comparing BM_spinlock_s1 against BM_spinlock_s8 in the same run also
-// measures the instantiation-level sensitivity that unmasked s1 on leslie.
+// measures the instantiation-level sensitivity that unmasked s1 on the 2-socket
+// Granite Rapids server.
 BENCHMARK_TEMPLATE(BM_update, GuardedUpdate<OverheadSpinLockS1>, SinCosWork)
     ->Name("BM_spinlock_s1") OVERHEAD_ARGS;
 BENCHMARK_TEMPLATE(BM_update, GuardedUpdate<OverheadSpinLockS8>, SinCosWork)

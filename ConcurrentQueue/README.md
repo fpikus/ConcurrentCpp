@@ -107,20 +107,21 @@ One line in the file is worth more than any other: the store to the slot that
 every successful push and pop makes before releasing its lock. The key-value
 protocol was once rewritten without it. On a 144-core Arm server (Grace: two
 Neoverse-V2 dies) that version ran at 0.19-0.42x of the old one at 4-32
-threads, and at about 0.4x on a two-socket EPYC 9555 at 128 threads (both with
-64- and 128-byte slots). Instrumenting the lock showed why: with the store,
-0.00% of lock acquisitions changed hands on that Grace; without it, 30-42%. It
-had happened before, in the key-only queue, where unlocking before the key
-store lost up to 8x on Zen 4 and on a 72-thread Grace, and won about 2x only
-on Cascade Lake with packed slots. With the store back, the new key-value
-queue against the old one, at 2^16, 2^22 and 2^26 slots: faster in most cells
-on Arm — up to 1.85x on that Grace and 2.6x on an Apple M3 Ultra (24
-performance cores, Linux in a VM), with 15 of 156 cells slightly slower
-(0.84-0.99x) — and broadly even on x86 (EPYC 9555, Xeon 6767P), with losses of
-0.6-0.9x in the packed layouts at some thread counts. Push-to-pop latency is
-unchanged. These are throughput ratios from `concurrent_queue_gmbm` with
-`<uint64_t, uint64_t>` elements, and every one of them belongs to this
-spinlock's back-off: retune the back-off and measure again.
+threads, and at 0.39x (64-byte slots) and 0.51x (128-byte slots) on a
+two-socket EPYC 9555 at 128 threads. Instrumenting the lock showed why: with
+the store, 0.00% of lock acquisitions changed hands on that Grace; without it,
+28-48% at 4-8 threads. It had happened before, in the key-only queue, where
+unlocking before the key store lost up to 8x on Zen 4 and on a 72-thread
+Grace, and won about 2x only on Cascade Lake with packed slots. With the store
+back, the new key-value queue against the old one, at 2^16, 2^22 and 2^26
+slots: faster in most cells on Arm — up to 1.85x on that Grace and 2.6x on an
+Apple M3 Ultra (24 performance cores, Linux in a VM), with 15 of 156 cells
+slightly slower (0.84-0.99x) — and broadly even on x86 (EPYC 9555, Xeon
+6767P), with losses of 0.6-0.9x in the packed layouts at some thread counts.
+Push-to-pop latency is unchanged. These are throughput ratios from
+`concurrent_queue_gmbm` with `<uint64_t, uint64_t>` elements, and every one of
+them belongs to this spinlock's back-off: retune the back-off and measure
+again.
 
 ## Building and testing
 

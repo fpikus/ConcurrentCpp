@@ -969,7 +969,7 @@ public:
             // construction). INVARIANT (I)'s chain does NOT need this
             // release (the retire push below is sequenced after the unlink
             // and carries it); the graveyard rule needs it too (reasoned,
-            // not yet model-checked): with three or more erasers, a dead
+            // not yet model-checked): with two or more erasers, a dead
             // node's successor can be unlinked through a word other than
             // the one a parked reader read, and only this release orders
             // that unlink before the reader. On failure anchor->next

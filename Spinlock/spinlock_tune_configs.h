@@ -55,7 +55,7 @@ TUNE_CONFIG("ntry", 32, 0, 0, 8, NS_1ms);
 // pipeline resources to the sibling thread, so a run where every core carries
 // two threads measures something different than one where each thread has a
 // core to itself.
-// 128 and 256 chase a finding from the Granite Rapids runs (leslie, Sept
+// 128 and 256 chase a finding from the 2-socket Granite Rapids runs (Sept
 // 2026): with memory-streaming work at ~1% occupancy the gain was still
 // rising at 64 rounds -- the axis had not plateaued at the edge of the
 // original grid. (With sin/cos work it plateaus by 16.)

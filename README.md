@@ -42,6 +42,12 @@ Supporting components shared by the projects above:
 New projects added after the book's publication will be exactly that — new,
 and documented on their own terms.
 
+- **[LockFreeListRCU](LockFreeListRCU/)** — the LockFreeList algorithm with
+  the reference counts taken out: memory is reclaimed by generations, every
+  operation runs under a handle, erased nodes are recycled through a free
+  list by a caller-driven `reclaim()`, and an iterator stays valid until the
+  handle it was obtained under is destroyed, refreshed or move-assigned over.
+
 ## Building
 
 Each project builds independently with its own Makefile:

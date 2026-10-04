@@ -75,10 +75,11 @@
 // "graveyard" chain such an iterator can still walk out through -- stays
 // allocated and keeps its value: no node whose unlink the handle might not
 // have seen is ever freed or reused while the handle lives. A handle protects
-// for as long as it lives or until `refresh()` moves it to the current
-// generation, whichever comes first. The cost of this protection is that
-// nothing retired at or after the handle's generation can be reclaimed while
-// the handle stays put (see RECLAIM below).
+// for as long as it lives, or until `refresh()` moves it to the current
+// generation or a move assignment ends its session, whichever comes first.
+// The cost of this protection is that nothing retired at or after the
+// handle's generation can be reclaimed while the handle stays put (see
+// RECLAIM below).
 //
 // ITERATOR VALIDITY. An iterator is valid until the handle it was obtained
 // under is destroyed, refreshed, or move-assigned over; a MOVED handle keeps
@@ -115,8 +116,8 @@
 // their values and moves the nodes to a free list from which
 // `insert_after()`/`emplace_after()` take nodes before calling `new`. Hence
 // a node's `~T` runs inside `reclaim()`, not inside `erase_after()`, and only
-// once the generation that could observe it has no live handle. A node is in
-// exactly one of four populations at any time: linked from the head (live,
+// once no handle that could observe it is alive. A node is in exactly one
+// of four populations at any time: linked from the head (live,
 // marked-but-linked, or stranded), on the retired list, in a sealed
 // generation's bag, or on the free list; `get_internal_accounting()` reports
 // all four.
@@ -152,18 +153,17 @@
 // `{kGenerations - 1, kGenerations - 1, advanced}`; with nothing pinned,
 // `{kGenerations, kGenerations, advanced}` -- the closing bag is freed too);
 // `nothing_retired` and `ring_full` do not imply that nothing was freed. A
-// refusal
-// (`nothing_retired`, `ring_full`, `contended`) costs nothing and is retried
-// by calling again: `contended` after the other call returns, `ring_full`
-// after the pinning handles are destroyed or refreshed -- there is no
-// automatic recovery. A `ring_full` result is stale on return in exactly one
-// case: the pin went away between step R1's free pass and step R3's (a
-// handle released, or a joiner's transient increment undone); step R3 then
-// frees it and the NEXT call advances (a pin released before the call never
-// yields `ring_full`). A thread that HOLDS a handle and calls `reclaim()`
-// frees nothing at or after that handle's generation, because its own
-// handle pins it; the recommended sequence for a thread that both operates
-// on the list and reclaims is `h.refresh(); list.reclaim();`.
+// refusal (`nothing_retired`, `ring_full`, `contended`) costs nothing and is
+// retried by calling again: `contended` after the other call returns,
+// `ring_full` after the pinning handles are destroyed or refreshed -- there
+// is no automatic recovery. A `ring_full` result is stale on return in
+// exactly one case: the pin went away between step R1's free pass and step
+// R3's (a handle released, or a joiner's transient increment undone); step
+// R3 then frees it and the NEXT call advances (a pin released before the
+// call never yields `ring_full`). A thread that HOLDS a handle and calls
+// `reclaim()` frees nothing at or after that handle's generation, because
+// its own handle pins it; the recommended sequence for a thread that both
+// operates on the list and reclaims is `h.refresh(); list.reclaim();`.
 //
 // PROGRESS. List operations, the handle join (`new_handle()`, `refresh()`),
 // the retire push, the free-list pop and the bag splice are lock-free.
@@ -219,12 +219,13 @@
 // operational contract; both are documented at their declarations.
 //
 // FOOTPRINT. 8832 bytes (about 8.6 KiB) for `LockFreeListRCU<int>` at the
-// default kGenerations = 64: 64 generation blocks of 128 bytes each (one
-// cache line per block so adjacent reference counts do not share a line)
-// plus five private 128-byte lines. Nodes are 24 bytes for `int` (value,
-// next, retire link) in release builds -- the size of the reference-counted
-// list's node under its intrusive-pointer policy (the retire link takes the
-// slot of that node's count word).
+// default kGenerations = 64, in release and debug builds alike: 64
+// generation blocks of 128 bytes each (a pair of 64-byte lines on x86, so
+// adjacent reference counts share neither a line nor an adjacent-line
+// prefetch) plus five private 128-byte lines. Nodes are 24 bytes for `int`
+// (value, next, retire link) in release builds -- the size of the
+// reference-counted list's node under its intrusive-pointer policy (the
+// retire link takes the slot of that node's count word).
 //
 // ---------------------------------------------------------------------------
 // PROTOCOL OVERVIEW (the implementation; the public contract is above). The
@@ -243,11 +244,12 @@
 // reclaimer: `bag` (the retired nodes of this generation once it is sealed),
 // `state` (EMPTY, CURRENT, SEALED) and `gen` (the generation number the slot
 // currently represents). `current_` points at the CURRENT block. Behind it
-// sits a contiguous run of SEALED blocks whose numbers decrease by one,
-// starting at index `oldest_`; every other slot is EMPTY. The ring is fixed
-// because a joiner that has loaded `current_` but not yet incremented its
-// count may increment a block that was closed in between: the block must
-// still exist for that stale increment to land somewhere harmless.
+// sits a contiguous run of SEALED blocks whose numbers decrease by one per
+// slot going back, down to the oldest at index `oldest_`; every other slot
+// is EMPTY. The ring is fixed because a joiner that has loaded `current_`
+// but not yet incremented its count may increment a block that was closed
+// in between: the block must still exist for that stale increment to land
+// somewhere harmless.
 //
 // THE JOIN (`join()`, from `new_handle()` and `refresh()`'s slow path): load
 // `current_` -> B; `B->refs.fetch_add(1, seq_cst)`; re-verify with a seq_cst
@@ -259,21 +261,20 @@
 // re-verify, a joiner ends up reading a node in a bag the reclaimer is
 // freeing). Two invariants make the stale increment harmless: (J1) between
 // its `fetch_add` and a successful re-verify a joiner touches NO node, head
-// or bag, so a
-// count it leaves on a just-closed or recycled block can delay that block's
-// freeing but can never be the count that protects a dereference; (J2)
-// `refs` is modified ONLY by RMWs -- +1 by joiners, -1 by leave and by the
-// join's undo -- and is never stored: the reclaimer only reads it, and does
-// NOT reset it when it recycles a slot. A reset would wipe a stale +1 and
-// the matching -1 would then drive the count negative or to zero under a
-// live handle (model-checked: a reclaimer that stores 0 on recycle lets a
-// later handle hold a block whose count is 0 while its bag is freed). Hence
-// every -1 follows its own +1 and the count never goes negative (debug-
-// asserted at every `fetch_sub`). Pointer equality suffices across a ring
-// wrap: a joiner whose re-verify reads block B again after B was freed,
-// recycled and republished has synchronized with that LATER publish and, by
-// J1, looked at nothing before -- its join is legitimate for the new
-// generation.
+// or bag, so a count it leaves on a just-closed or recycled block can delay
+// that block's freeing but can never be the count that protects a
+// dereference; (J2) `refs` is modified ONLY by RMWs -- +1 by joiners, -1 by
+// leave and by the join's undo -- and is never stored: the reclaimer only
+// reads it, and does NOT reset it when it recycles a slot. A reset would
+// wipe a stale +1 and the matching -1 would then drive the count negative
+// or to zero under a live handle (model-checked: a reclaimer that stores 0
+// on recycle lets a later handle hold a block whose count is 0 while its bag
+// is freed). Hence every -1 follows its own +1 and the count never goes
+// negative (debug-asserted at every `fetch_sub`). Pointer equality suffices
+// across a ring wrap: a joiner whose re-verify reads block B again after B
+// was freed, recycled and republished has synchronized with that LATER
+// publish and, by J1, looked at nothing before -- its join is legitimate for
+// the new generation.
 //
 // ONE RECLAIMER. `reclaim()` runs under the global try-flag `reclaiming_`:
 // `exchange(true, acquire)` at entry (a caller that finds it set returns
@@ -298,24 +299,24 @@
 // tests; one moved to between the publish and that hook has no deterministic
 // test (model checker and order review only; stress tests under
 // ThreadSanitizer catch it sometimes). The flag's acquire/release pair has
-// two duties: it is the ONLY
-// synchronization on the plain fields `state`, `bag`, `gen` and `oldest_`
-// between successive reclaimers, and it orders a holder's publish before a
-// later holder's `refs` loads (so the store-buffering argument holds across
-// flag holders, not only inside one call); model-checked: with relaxed flag
-// orders, or without the flag, two callers race on the plain fields at once.
+// two duties: it is the ONLY synchronization on the plain fields `state`,
+// `bag`, `gen` and `oldest_` between successive reclaimers, and it orders a
+// holder's publish before a later holder's `refs` loads (so the
+// store-buffering argument holds across flag holders, not only inside one
+// call); model-checked: with relaxed flag orders, or without the flag, two
+// callers race on the plain fields at once.
 // Concurrent reclaimers were rejected after model checking demonstrated the
 // hazards of every variant tried -- two advancers writing one closing bag,
 // an advance order that wedges the ring after one wrap, a stale snapshot of
 // the current block orphaning a retired chain, a free walk passing a block
 // still current, and a skipped in-progress block with no happens-before to
 // its generation's leave -- and their repairs bought concurrency nobody
-// needs at the price of a state machine. Refusal and retry:
-// `contended`, `ring_full` and `nothing_retired` consume no slot and burn
-// nothing; the caller simply calls again (`ring_full` after the pinning
-// handles leave or refresh -- and it is stale on return exactly when the pin
-// was released between the in-advance free pass and the final one: the final
-// pass then frees it and the next call advances).
+// needs at the price of a state machine. Refusal and retry: `contended`,
+// `ring_full` and `nothing_retired` consume no slot and burn nothing; the
+// caller simply calls again (`ring_full` after the pinning handles leave or
+// refresh -- and it is stale on return exactly when the pin was released
+// between the in-advance free pass and the final one: the final pass then
+// frees it and the next call advances).
 //
 // INVARIANT. Two directions. (I) A handle of generation g never observes a
 // node in a bag of generation < g. Chain: unlink CAS, sequenced before the
@@ -345,9 +346,9 @@
 // its `next`, and it is pushed onto the retired list, from which it re-enters
 // the free list only through a bag. It is never pushed back onto the free
 // list -- model-checked: a stale pop CAS then succeeds by ABA and the node
-// is handed out twice -- and never deleted, because a losing
-// popper may still read its `retire_link`. A freshly `new`ed node that does
-// not get linked is deleted after `~T`.
+// is handed out twice -- and never deleted, because a losing popper may
+// still read its `retire_link`. A freshly `new`ed node that does not get
+// linked is deleted after `~T`.
 //
 // DEBUG ASSERTS (all compiled out under NDEBUG), with their messages: the
 // handle belongs to this list ("handle of another list") and is live ("empty
@@ -497,7 +498,9 @@ private:
     enum class State { EMPTY, CURRENT, SEALED };
 
     // One generation: a status block in the fixed ring (never deallocated).
-    // One cache line per block: adjacent `refs` would otherwise share a line.
+    // 128 bytes per block (a pair of 64-byte lines on x86, so the adjacent-line
+    // prefetcher does not couple neighbours): adjacent `refs` would otherwise
+    // share a line.
     // `bag`, `state` and `gen` are PLAIN fields written and read only by the
     // holder of `reclaiming_`, by the destructor and by the quiescent
     // accounting sweep; the flag's acquire/release is their only
@@ -585,9 +588,8 @@ public:
         // handle's own earlier read of `current_`, and `block_` cannot be
         // republished while this handle pins it), which keeps the handle in
         // a just-closed generation -- safe and conservative (see the
-        // postcondition). Slow path: join the current
-        // block first, then leave the old one (the order is free; nothing
-        // relies on it).
+        // postcondition). Slow path: join the current block first, then
+        // leave the old one (the order is free; nothing relies on it).
         bool refresh() noexcept {
             assert(block_ != nullptr && "empty handle");
 #ifndef NDEBUG
@@ -764,7 +766,7 @@ public:
     // list is alive; no `reclaim()` is in progress; no concurrent operation.
     //
     // Every node is in exactly one population, so each is deleted once: the
-    // chain from the head (live, dead-but-linked, stranded), the retired
+    // chain from the head (live, marked-but-linked, stranded), the retired
     // list, every SEALED block's bag, the free list. Values are destroyed in
     // the first three (constructed) populations, not on the free list (raw
     // storage, unpoisoned before delete). All loads are relaxed: the
@@ -852,8 +854,8 @@ public:
     // the call returns false and that T is destroyed -- immediately, and the
     // node deleted, for a freshly allocated node (nothing is retired); at a
     // later `reclaim()` for a node reused from the free list, which goes to
-    // the retired list (it is not an erase: `erase_after()`'s count is
-    // unaffected) and is counted by that `reclaim()` in `freed_nodes`.
+    // the retired list (it is not an erase: no `erase_after()` call returns
+    // true for it) and is counted by that `reclaim()` in `freed_nodes`.
     // static_assert: `std::is_nothrow_move_constructible_v<T>`.
     // Exceptions: may throw only `std::bad_alloc`, from `new` when the free
     // list is empty -- including on a deleted anchor that would otherwise
@@ -971,8 +973,8 @@ public:
             // node's successor can be unlinked through a word other than
             // the one a parked reader read, and only this release orders
             // that unlink before the reader. On failure anchor->next
-            // changed under us -- an insert landed after anchor,
-            // or anchor itself was erased -- and the dead node stays linked
+            // changed under us -- an insert landed after anchor, or anchor
+            // itself was erased -- and the dead node stays linked
             // ("stranded") until the next erase_after() over this edge helps
             // it out. The updated `target` is discarded (a retry reloads
             // it), hence the relaxed failure order. ABA on this CAS (anchor
@@ -1311,9 +1313,9 @@ private:
     // the loop stops when `ring_[oldest_]` is CURRENT (nothing sealed is
     // left; the `!= SEALED` test also covers EMPTY defensively, which the
     // index never points at) or when its `refs` is not 0 (a handle of that
-    // generation -- or a stale increment, J2 --
-    // pins it and, by the cumulative rule, every younger bag). A freed
-    // block's `refs` is left untouched (J2).
+    // generation -- or a stale increment, J2 -- pins it and, by the
+    // cumulative rule, every younger bag). A freed block's `refs` is left
+    // untouched (J2).
     void free_oldest(ReclaimResult& result) noexcept {
         while (true) {
             GenerationBlock& block = ring_[oldest_];

@@ -39,11 +39,11 @@
 // batch of mm_hp's hazard-pointer scan). This list pays instead once per
 // handle join or refresh (a seq_cst increment of one generation's count, or a
 // relaxed load when the handle is already current), one retire push per erase
-// onto a global list,
-// and caller-driven reclamation that destroys values in batches and recycles
-// nodes through a global free list instead of returning them to malloc. Which
-// of the two costs more depends on the operation mix and the thread count;
-// that is the question every row here answers against its counterpart there.
+// onto a global list, and caller-driven reclamation that destroys values in
+// batches and recycles nodes through a global free list instead of returning
+// them to malloc. Which of the two costs more depends on the operation mix
+// and the thread count; that is the question every row here answers against
+// its counterpart there.
 //
 // The five workloads are the reference-counted list's, operation for
 // operation: the same mixes, the same per-thread seeds (SETUP_RNG: thread i
@@ -56,8 +56,8 @@
 //
 // Each workload runs in up to three regimes, named by the row suffix (see
 // Regime below): _RCU (the intended use: a long-lived handle per thread,
-// refreshed, and reclaim() called by every thread after R = 256 of its own
-// successful erases), _RCU_NoReclaim (never reclaims) and _RCU_OpHandle (a
+// refreshed, and reclaim() called by every thread after every R = 256 of its
+// own successful erases), _RCU_NoReclaim (never reclaims) and _RCU_OpHandle (a
 // fresh handle per operation; head-anchored workloads only).
 //
 // Rates are Google Benchmark's standard items/s (SetItemsProcessed with one
@@ -115,10 +115,11 @@
 //                      thread preempted while holding its handle (in the
 //                      OpHandle rows, while holding a per-operation handle).
 //                      [Estimate] at ~4 M successful erases/s (16-thread
-//                      WriteHeavy and Graveyard _RCU rows of a smoke run:
-//                      10-14 M iterations/s x 0.3-0.45 successful erases per
-//                      iteration) 16k erases take ~4 ms: a stall of a few
-//                      milliseconds suffices
+//                      WriteHeavy and Graveyard _RCU rows, smoke run and
+//                      2026-10-04 campaign alike: 10-14 M iterations/s x
+//                      0.3-0.45 successful erases per iteration) 16k
+//                      erases take ~4 ms: a stall of a few milliseconds
+//                      suffices
 //   minor_faults       minor page faults taken by the benchmark threads during
 //                      the run (getrusage before and after the state loop):
 //                      first touches of fresh heap, mostly. It depends on the
@@ -201,8 +202,8 @@ public:
     // Every handle leaves before the list is deleted (the list's destructor
     // requires that no handle is alive); a handle its thread already released
     // on its last iteration is empty, and destroying it does nothing. Runs
-    // after thread 0's stop barrier;
-    // the other threads only set counters after their loops.
+    // after thread 0's stop barrier; the other threads only set counters
+    // after their loops.
     void TearDown(const ::benchmark::State& state) override {
         if (state.thread_index() == 0) {
             recs.clear();
@@ -671,11 +672,12 @@ void RcuDispersedFixture::ReadDispersedBody(benchmark::State& state) {
 //   and the footprint grows for the whole run, against the _RCU row's
 //   cross-core free-list pop (a LIFO stack hands an inserter a node last
 //   touched by whichever thread freed its bag), its contention on the one
-//   free-list head word, and the reclaim() calls themselves. [Hypothesis]
-//   first-touch page faults are under 1% of the NoReclaim rows' time at the
-//   campaign's window; minor_faults (times a fault's cost, against the run's
-//   time) decides, for the runs where malloc had no pre-touched free memory
-//   left by earlier runs of the same process (see minor_faults above). On
+//   free-list head word, and the reclaim() calls themselves. First-touch page
+//   faults, measured 2026-10-04 (WSL2): the median repetition takes none or
+//   a negligible number (none in 63 of 70 RCU cells, at most 0.14 per 1000
+//   iterations), because earlier runs of the same process pre-touch the
+//   heap; a repetition that runs on fresh heap is 19-42% slower. Read
+//   minor_faults alongside the rate (see minor_faults above). On
 //   MassiveHeadInsert, which never erases, _RCU and _RCU_NoReclaim execute
 //   identical code: that pair is a labelled control, and its difference is
 //   the noise floor of the comparison.

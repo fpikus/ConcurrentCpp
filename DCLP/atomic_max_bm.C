@@ -31,7 +31,8 @@
 // 1.3-1.7x on Zen 5 and nothing on Intel (whose compiler output already has
 // that layout), which makes CAS equal to DCLP; with updates it has no
 // consistent effect, and DCLP beats CAS by 1.5-80x at every thread count above
-// one except leslie's 256 (full SMT), a cell where CAS swings 4x between runs.
+// one except the 256-thread Intel server at its full SMT count of 256, a cell
+// where CAS swings 4x between runs.
 //
 // Two workloads bracket the interesting range of how often the maximum actually
 // changes -- which is what decides whether DCLP's fast path pays off:
@@ -198,12 +199,12 @@ void BM_spinlock_grow(benchmark::State& state) {
 // branch order.) The hint makes the layout independent of both, and
 // BM_dclp_uphint forces the wrong layout, which is how to see what the plain
 // `if` would cost if the compiler did not get lucky.
-// Measured with no updates (2026-09-24, 3 runs x 10 reps): on linda (Zen 5,
-// GCC 16.2) the unhinted DCLP equals the cold-hinted one (1.00x) at every
+// Measured with no updates (2026-09-24, 3 runs x 10 reps): on the 128-thread
+// Zen 5 server (GCC 16.2) the unhinted DCLP equals the cold-hinted one (1.00x) at every
 // thread count -- GCC chose the fast layout for this `if` -- and forcing the
 // other layout (BM_dclp_uphint) costs 12-15%. GCC's unhinted CAS loop, by
 // contrast, matches the HOT layout (~0.63x of cold), which is why the shipped
-// hint is worth 1.5-1.6x there. On naptime (Zen 4, clang++-22, one short run)
+// hint is worth 1.5-1.6x there. On a 16-thread laptop (Zen 4, clang++-22, one short run)
 // the unhinted DCLP also equals the cold hint, and the forced hot layout halves
 // its throughput. Whether the 12-15% vs 2x difference is the compiler or the
 // core has not been separated.
@@ -256,7 +257,7 @@ DCLP_BM(BM_dclp_uphint,   LAYOUT_HOT,  nmax_atomic,    lock)            // updat
 // kept local rather than including that harness), swept over work and threads.
 // The work result feeds the next unit and is pinned, so it cannot be dropped.
 //
-// Measured (linda, Zen 5, GCC 16.2, 2026-09-24, 3 runs x 10 reps): the shared
+// Measured (128-thread Zen 5 server, GCC 16.2, 2026-09-24, 3 runs x 10 reps): the shared
 // line never wins. It ties at one thread and at work 100-300 up to 32
 // threads, and loses elsewhere: 7-48% at work 0-30 from 8 threads (noisier
 // cells show more), and already about a third at 2 threads when the work

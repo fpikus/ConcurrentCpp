@@ -83,20 +83,25 @@ honest boundaries:
 
 ## Performance
 
-Measured on servers from 64 to 256 hardware threads, and stated plainly:
+Measured on machines from 24 to 256 hardware threads, and stated plainly:
 
 - Under maximum contention — the critical section is a single shared
-  update — throughput holds within ~10% of the single-thread rate from 1 to
-  64 threads (~140 M guarded updates/s on our test servers). Flat is the
-  ceiling for an inherently serial operation, and this lock sits at it.
+  update — throughput does not collapse from 1 to 64 threads: it stays within
+  ~10% of the single-thread rate on most of our test machines, sags by up to
+  17% on the Zen 2 servers and rises by up to 57% on Grace (~135–210 M
+  guarded updates/s on the x86 and Grace servers). Flat is what an inherently
+  serial operation should look like, and this lock is at or near it
+  everywhere.
 - That is 5–22× the standard mutex from two threads up, and from two threads
-  to the middle of the machine it also outruns the wait-free atomic increment
-  (by up to 4× on x86, 1.1–1.4× on Grace, up to 47× on Apple M3), which has
-  no way to back off and no way to stop dragging the cache line across the
-  machine. Toward the full machine the lock yields ground, and how much
-  varies a lot: at 256 threads on Granite Rapids it still leads the mutex by
-  7× and the atomic by 1.2×, while at full core count on the 128-core EPYC,
-  a 128-thread Zen 2 and Grace the atomic pulls ahead, by 2.3–3.7×.
+  it also outruns the wait-free atomic increment (by up to 4× on x86, 1.1–1.4×
+  on Grace up to 16 threads, 44–48× on Apple M3 from 16 threads to all 24
+  cores), which has no way to back off and no way to stop dragging the cache
+  line across the machine. At higher thread counts the lock yields ground,
+  and where and how much varies a lot: at 256 threads on Granite Rapids it
+  still leads the mutex by 7× and the atomic by 1.2×; on Grace the atomic
+  already leads at 32 threads, on the 128-core EPYC from 64; at full core
+  count on the 128-core EPYC, a 128-thread Zen 2 and Grace the atomic is
+  ahead by 2.3–3.7×.
 - Every alternative back-off was benchmarked and lost. No back-off at all
   collapses under contention by nearly two orders of magnitude, pause with
   it; `sched_yield` survives only to modest thread counts; single-tier sleeps

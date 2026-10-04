@@ -3,8 +3,9 @@
 A fixed-capacity, multi-producer multi-consumer (MPMC) ring-buffer queue with
 a transactional interface, two isolated spinlock domains, and a lock-free
 handoff between producers and consumers. (In the book it appears under the
-shorter name `RingQueue`; the class in `concurrent_queue.h` is the same
-design.)
+shorter name `RingQueue`; the class in `concurrent_queue.h` keeps its
+structure but has a different key-value protocol: see the wraparound race
+below.)
 
 The starting point is an interface observation: `std::queue`'s
 `empty()`/`front()`/`pop()` triple is as hostile to concurrency as an API can

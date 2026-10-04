@@ -32,10 +32,10 @@ Supporting components shared by the projects above:
 - **[SharedPtr](SharedPtr/)** — atomic reference-counted smart pointers: an
   intrusive pointer with an embedded one-bit lock; its sibling with a hazard
   pointer in place of the lock, lock-free after a thread's first load, built
-  on Maged Michael's hazard pointers (included, in
-  [SharedPtr/mm_hp](SharedPtr/mm_hp/)); and an adapter for Daniel Anderson's
-  genuinely lock-free `atomic_shared_ptr` (fetched separately; see
-  [SharedPtr/lock_free_shared_ptr](SharedPtr/lock_free_shared_ptr/)).
+  on Maged Michael's hazard pointers; and an adapter for Daniel Anderson's
+  genuinely lock-free `atomic_shared_ptr`. Both are built from their
+  upstream repositories with small patches of ours (see
+  [SharedPtr](SharedPtr/), "Third-party code").
 - **[Spinlock](Spinlock/)** — the TTAS spinlock with a two-tier back-off
   used throughout, with the benchmarks that tuned it.
 
@@ -65,7 +65,9 @@ Requirements: a recent clang (the Makefiles use `clang++-22`, C++23),
 The projects share headers via relative symlinks, so clone on a filesystem
 that supports them (on Windows, use WSL or enable `core.symlinks`).
 SharedPtr and LockFreeList build on Linux only: the hazard pointers they link
-issue `membarrier(2)`.
+issue `membarrier(2)`. Before their first build, clone the third-party code
+they use and run `SharedPtr/make_third_party.sh` (SharedPtr's README,
+"Third-party code").
 
 ## License
 

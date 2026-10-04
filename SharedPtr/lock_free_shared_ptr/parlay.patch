@@ -1,0 +1,161 @@
+Our changes to Daniel Anderson's parlay::atomic_shared_ptr internals, applied by
+make_third_party.sh to copies of upstream's files (AtomicSharedPtr 3c213ef). Nothing
+outside the two files below is changed; ParlayLib is used as is.
+
+details/hazard_pointers.hpp -- folly removed:
+  - folly::F14FastSet -> std::unordered_set for the protected-pointer set of the
+    reclamation scan (upstream uses only construct-with-bucket-count, insert,
+    count, clear and swap, all std::unordered_set API).
+  - folly's asymmetric light/heavy fence pair -> a seq_cst thread fence on both
+    sides (protect() and cleanup()).
+  - <parlay/portability.h> -> "../portability.h": ParlayLib's headers are copied
+    into the same parlay/ directory, so no include path is needed.
+  - the GCC-only "-Winterference-size" pragmas are guarded from clang.
+shared_ptr.hpp -- Harris mark support and include path:
+  - get_unmarked_control_block() masks bit 0 of the control-block pointer; the
+    reference-count helpers of smart_ptr_base (use_count, increment/decrement
+    of the strong and weak counts) go through it, so a shared_ptr whose control
+    block carries the list's delete mark (lock_free_shared_ptr/atomic_shared_ptr.hpp
+    shared_ptr_type::set_mark()) can be copied and destroyed. Not covered:
+    weak_ptr's converting constructors (weak_ptr<T2> to weak_ptr<T>), which call
+    the counts directly; nothing here uses parlay::weak_ptr.
+  - <parlay/alloc.h> -> "alloc.h" (ParlayLib's allocator, same directory).
+  - [[maybe_unused]] on control_block_inplace::operator new's size argument,
+    which only an assert reads: unused under -DNDEBUG, and the builds use -Werror.
+
+diff -ru a/details/hazard_pointers.hpp b/details/hazard_pointers.hpp
+--- a/details/hazard_pointers.hpp
++++ b/details/hazard_pointers.hpp
+@@ -11,21 +11,24 @@
+ #include <type_traits>
+ #include <utility>
+ 
+-#include <folly/container/F14Set.h>
+-#include <folly/synchronization/AsymmetricThreadFence.h>
++#include <unordered_set>
+ 
+-#include <parlay/portability.h>
++#include "../portability.h"
+ 
+ namespace parlay {
+ 
+ #ifdef __cpp_lib_hardware_interference_size
+ 
++#if !defined(__clang__)
+ #pragma GCC diagnostic push
+ #pragma GCC diagnostic ignored "-Winterference-size"
++#endif
+ 
+ inline constexpr std::size_t CACHE_LINE_ALIGNMENT = 2 * std::hardware_destructive_interference_size;
+ 
++#if !defined(__clang__)
+ #pragma GCC diagnostic pop
++#endif
+ 
+ #else
+ inline constexpr std::size_t CACHE_LINE_ALIGNMENT = 128;
+@@ -71,7 +74,7 @@
+   constexpr static std::size_t cleanup_threshold = 2000;
+ 
+   using garbage_type = GarbageType;
+-  using protected_set_type = folly::F14FastSet<garbage_type*>;
++  using protected_set_type = std::unordered_set<garbage_type*>;
+ 
+   // The retired list is an intrusive linked list of retired blocks. It takes advantage
+   // of the available managed object pointer in the control block to store the next pointers.
+@@ -297,7 +300,7 @@
+       }
+       PARLAY_PREFETCH(ptr_to_protect, 0, 0);
+       slot.store(ptr_to_protect, protection_order);
+-      folly::asymmetric_thread_fence_light(std::memory_order_seq_cst);    /*  Fast-side fence  */
++      std::atomic_thread_fence(std::memory_order_seq_cst);    /*  Fast-side fence  */
+ 
+       U current_value = src.load(std::memory_order_acquire);
+       if (current_value == result) [[likely]] {
+@@ -419,7 +422,7 @@
+ 
+   PARLAY_NOINLINE void cleanup(HazardSlot& slot) {
+     slot.num_retires_since_cleanup = 0;
+-    folly::asymmetric_thread_fence_heavy(std::memory_order_seq_cst);
++    std::atomic_thread_fence(std::memory_order_seq_cst);
+     scan_hazard_pointers([&](auto p) { slot.protected_set.insert(p); });
+     slot.retired_list.cleanup([&](auto p) { return slot.protected_set.count(p) > 0; });
+     slot.protected_set.clear();    // Does not free memory, only clears contents
+diff -ru a/shared_ptr.hpp b/shared_ptr.hpp
+--- a/shared_ptr.hpp
++++ b/shared_ptr.hpp
+@@ -19,7 +19,7 @@
+ #include "details/hazard_pointers.hpp"
+ #include "details/wait_free_counter.hpp"
+ 
+-#include <parlay/alloc.h>
++#include "alloc.h"
+ 
+ namespace parlay {
+ 
+@@ -177,7 +177,7 @@
+ 
+   // TODO: Don't hardcode an allocator override here.  Should just
+   // use allocate_shared and pass in an appropriate allocator.
+-  static void* operator new(std::size_t sz) {
++  static void* operator new([[maybe_unused]] std::size_t sz) {
+     assert(sz == sizeof(control_block_inplace));
+     return parlay::type_allocator<control_block_inplace>::alloc();
+   }
+@@ -336,7 +336,7 @@
+   using element_type = T;
+   
+   [[nodiscard]] long use_count() const noexcept {
+-    return control_block ? control_block->get_use_count() : 0;
++    return get_unmarked_control_block() ? get_unmarked_control_block()->get_use_count() : 0;
+   }
+   
+   // Comparator for sorting shared pointers.  Ordering is based on the address of the control blocks.
+@@ -381,31 +381,38 @@
+     std::swap(control_block, other.control_block);
+   }
+   
++  [[nodiscard]] control_block_base* get_unmarked_control_block() const noexcept {
++    return reinterpret_cast<control_block_base*>(reinterpret_cast<uintptr_t>(control_block) & ~1ULL);
++  }
++
+   void increment_strong() const noexcept {
+-    if (control_block) {
+-      control_block->increment_strong_count();
++    if (auto cb = get_unmarked_control_block()) {
++      cb->increment_strong_count();
+     }
+   }
+   
+   [[nodiscard]] bool increment_if_nonzero() const noexcept {
+-    return control_block && control_block->increment_strong_count_if_nonzero();
++    if (auto cb = get_unmarked_control_block()) {
++      return cb->increment_strong_count_if_nonzero();
++    }
++    return false;
+   }
+   
+   void decrement_strong() noexcept {
+-    if (control_block) {
+-      control_block->decrement_strong_count();
++    if (auto cb = get_unmarked_control_block()) {
++      cb->decrement_strong_count();
+     }
+   }
+   
+   void increment_weak() const noexcept {
+-    if (control_block) {
+-      control_block->increment_weak_count();
++    if (auto cb = get_unmarked_control_block()) {
++      cb->increment_weak_count();
+     }
+   }
+   
+   void decrement_weak() noexcept {
+-    if (control_block) {
+-      control_block->decrement_weak_count();
++    if (auto cb = get_unmarked_control_block()) {
++      cb->decrement_weak_count();
+     }
+   }
+ 

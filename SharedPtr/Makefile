@@ -63,12 +63,14 @@ TARGET_HP_SEAM_TEST_TSAN = intr_shared_ptr_hp_seam_test_tsan
 # Headers every target depends on; editing them must trigger a rebuild.
 # Recipes use $< (the source file), not $^, so the headers are prerequisites
 # only and are not passed to the compiler command line.
-# Note: lock_free_shared_ptr/atomic_shared_ptr.hpp requires Daniel Anderson's
-# parlay/ headers, which are not distributed with this repository (see
-# lock_free_shared_ptr/README.md for where to get them).
+# Note: lock_free_shared_ptr/atomic_shared_ptr.hpp needs lock_free_shared_ptr/parlay/,
+# which is not in the repository: make_third_party.sh makes it (README.md,
+# "Third-party code"). Neither parlay/ nor mm_hp/ tracks what changed upstream
+# (git archive keeps upstream's dates), so after re-running the script, rebuild
+# with make -B.
 HEADERS = atomic_shared_ptr_concept.h intr_shared_ptr.h intr_shared_ptr/intr_shared_ptr.h lock_free_shared_ptr/atomic_shared_ptr.hpp
 
-# Maged Michael's hazard pointers (mm_hp/, vendored), used by intr_shared_ptr_hp
+# Maged Michael's hazard pointers (mm_hp/, made by make_third_party.sh), used by intr_shared_ptr_hp
 # and the drain helper. mm_hp is a header plus one source file. Every target that
 # links it lists HP_SOURCES twice: as a prerequisite, so editing mm_hp.cpp
 # rebuilds the target, and explicitly in the recipe after $<, so mm_hp.cpp is

@@ -2,9 +2,21 @@
 
 #include <atomic>
 
+// ParlayLib's type_traits.h (reached through parlay/alloc.h) uses the builtin
+// __is_trivially_relocatable, which clang 22 deprecates; the warning would fail
+// every -Werror build. Silenced for these headers only: clang applies a
+// diagnostic pragma by the location of the warning, so instantiations made
+// later from our code are covered too.
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-builtins"
+#endif
 #include "parlay/details/atomic_details.hpp"
 #include "parlay/details/hazard_pointers.hpp"
 #include "parlay/shared_ptr.hpp"
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
 namespace parlay {
 

@@ -28,10 +28,6 @@ results/
 # Book chapter drafts
 B32053_*.pdf
 
-# Local tool settings and session files
-.claude/
-prompt_list.txt
-
 # WSL/Windows download metadata
 *Zone.Identifier
 
@@ -39,6 +35,9 @@ prompt_list.txt
 *.md
 !README.md
 
-# Daniel Anderson's atomic_shared_ptr: redistribution permission unclear,
-# fetch from https://github.com/DanielLiamAnderson/atomic_shared_ptr
+# Third-party code: ThirdParty/<name> holds the upstream git clones, the one
+# source; SharedPtr/make_third_party.sh derives the directories the build uses
+# from them (with our patches), so those are not tracked either.
+/ThirdParty/
 SharedPtr/lock_free_shared_ptr/parlay/
+SharedPtr/mm_hp/

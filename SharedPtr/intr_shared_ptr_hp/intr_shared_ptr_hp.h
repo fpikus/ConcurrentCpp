@@ -32,8 +32,9 @@
 #include <type_traits>
 #include <utility>
 
-// Maged Michael's hazard pointers (vendored in mm_hp/ beside this header's
-// directory). How the quoted include resolves: a TU that opens the header
+// Maged Michael's hazard pointers (mm_hp/ beside this header's directory,
+// made from upstream by SharedPtr/make_third_party.sh). How the quoted
+// include resolves: a TU that opens the header
 // through the symlink SharedPtr/intr_shared_ptr_hp.h or
 // LockFreeList/intr_shared_ptr_hp.h looks next to the symlink AS SPELLED,
 // where each directory keeps mm_hp/ (a directory symlink in LockFreeList/);
@@ -251,7 +252,7 @@
 // ---------------------------------------------------------------------------
 //
 // mm_hp defines std::hazard_pointer and std::hazard_pointer_obj_base itself
-// (adding names to namespace std -- accepted here as a vendored
+// (adding names to namespace std -- accepted here as a third-party
 // implementation of the proposal). A program using this header must not also
 // use a real <hazard_pointer>, and because of the try_protect note above a
 // standard <hazard_pointer> is not a drop-in replacement anyway.

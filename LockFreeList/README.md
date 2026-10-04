@@ -128,12 +128,15 @@ Requires Linux, clang (`../config.mk` selects `clang++-22` and C++23), Google
 Benchmark and GoogleTest; point `GBENCH_DIR` and `GTEST_DIR` at your
 installations if they are not in `$HOME/GoogleBench` and `$HOME/GoogleTest`.
 Linux because every binary links Maged Michael's hazard pointers, which issue
-`membarrier(2)`.
+`membarrier(2)`. Those, and Daniel Anderson's pointer, are made from their
+upstream repositories by `../SharedPtr/make_third_party.sh`: run it once before
+the first build (see SharedPtr's README, "Third-party code").
 
 - `lock_free_list.h` — the list
 - `intr_shared_ptr.h` — the intrusive atomic shared pointer
 - `intr_shared_ptr_hp.h` — the hazard-pointer intrusive atomic shared pointer
-- `mm_hp/` — Maged Michael's hazard pointers, which it uses
+- `mm_hp/` — Maged Michael's hazard pointers, which it uses (made by
+  `../SharedPtr/make_third_party.sh`)
 - `lock_free_shared_ptr/` — Daniel Anderson's lock-free atomic shared pointer
 - `atomic_shared_ptr_concept.h` — the concept the pointer policies model
 - `hp_drain.h`, `hp_drain_gtest.h` — drain the hazard pointers' pending

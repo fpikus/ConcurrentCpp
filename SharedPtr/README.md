@@ -39,8 +39,9 @@ derive from (`pointee_base`) and that its pointees die late
    be; a list built on it is still lock-free in the algorithmic sense.
 3. Daniel Anderson's `parlay::atomic_shared_ptr` (`lock_free_shared_ptr/`) —
    genuinely lock-free, with hazard pointers demoted to an implementation
-   detail inside the pointer. His headers are fetched separately; see
-   [lock_free_shared_ptr/README.md](lock_free_shared_ptr/README.md).
+   detail inside the pointer. His code is not in this repository: it is
+   built from his repository with a small patch of ours (see "Third-party
+   code" below and [lock_free_shared_ptr/README.md](lock_free_shared_ptr/README.md)).
 4. `intr_shared_ptr_hp` (`intr_shared_ptr_hp/`) — the intrusive pointer with
    the lock taken out: the gap is closed by a hazard pointer (Maged Michael's
    `mm_hp`, below), and the increment is conditional — `TryAddRef()` adds a
@@ -63,19 +64,20 @@ derive from (`pointee_base`) and that its pointees die late
 ## Maged Michael's hazard pointers (`mm_hp/`)
 
 The hazard pointers under `intr_shared_ptr_hp` are Maged Michael's `mm_hp`, an
-implementation of the C++26 hazard pointers (`[saferecl.hp]`). Unlike Daniel
-Anderson's code, this one *is* in the repository: `mm_hp/` is a copy of
+implementation of the C++26 hazard pointers (`[saferecl.hp]`). Like Daniel
+Anderson's code, it is not in the repository: `mm_hp/` is made from
 
 https://github.com/magedm/mm_hp
 
-at commit `b26e5ed`, together with its README and license files. The code is
+at commit `b26e5ed`, together with its README and license files, by
+`make_third_party.sh` (see "Third-party code" below). The code is
 dual-licensed, MIT or Apache 2.0 with LLVM exception at the user's option (see
 `mm_hp/LICENSES`); we use it under the MIT license. The README in `mm_hp/` is
 upstream's and is left exactly as upstream wrote it; our notes are here.
 
-- **One local change.** `mm_hp.cpp` carries a ThreadSanitizer-only patch
-  (marked `TSAN-PATCH`): under TSan, the scan loads the hazard slots with
-  acquire instead of relaxed. TSan does not model `mm_hp`'s asymmetric fence
+- **One local change.** `mm_hp.cpp` gets a ThreadSanitizer-only patch
+  (`mm_hp.patch`, marked `TSAN-PATCH` in the code): under TSan, the scan
+  loads the hazard slots with acquire instead of relaxed. TSan does not model `mm_hp`'s asymmetric fence
   pair (`membarrier(2)` on the scanning side), and without the patch it
   reports false races between a reader and the deleter. Builds without TSan
   are unchanged.
@@ -117,8 +119,33 @@ make atomic_shared_ptr_bursts_bm  # on demand: + destruction-burst counters
 Requires Linux, clang (the Makefile uses `clang++-22`, C++23), Google
 Benchmark and GoogleTest; point `GBENCH_DIR` and `GTEST_DIR` at your
 installations if they are not in `$HOME/GoogleBench` and `$HOME/GoogleTest`.
-The pointer benchmark and the unit tests also need Daniel Anderson's `parlay/`
-headers (see above).
+
+### Third-party code
+
+Other people's code is used from their repositories, never copied into this
+one. Clone each into `ThirdParty/` at the top of this repository, at the
+commit our patches were made against, then let `make_third_party.sh` make the
+directories the build uses. From `SharedPtr/`:
+
+```sh
+mkdir -p ../ThirdParty && cd ../ThirdParty
+git clone https://github.com/magedm/mm_hp HazardPtr
+git -C HazardPtr checkout b26e5ed
+git clone https://github.com/DanielLiamAnderson/atomic_shared_ptr AtomicSharedPtr
+git -C AtomicSharedPtr checkout 3c213ef
+git clone https://github.com/cmuparlay/parlaylib ParlayLib
+git -C ParlayLib checkout 5101769
+cd ../SharedPtr && ./make_third_party.sh
+```
+
+It makes `mm_hp/` (Maged Michael's hazard pointers plus `mm_hp.patch`) and
+`lock_free_shared_ptr/parlay/` (Daniel Anderson's `parlay::shared_ptr` and
+hazard pointers plus `lock_free_shared_ptr/parlay.patch`, with ParlayLib's
+headers for its pool allocator). Each patch begins with what each change is
+for. Every binary here needs `mm_hp/`, and the pointer benchmark and the unit
+tests also need `parlay/`. LockFreeList uses both through symlinks, so the same
+step serves it. The script refuses a clone at any other commit, since a patch
+may not fit other code; set `THIRD_PARTY` if the clones live elsewhere.
 
 - `atomic_shared_ptr_concept.h` — the concepts, and the `std::atomic` adapter
 - `intr_shared_ptr/` — the spinlock intrusive pointer, with its
@@ -127,9 +154,12 @@ headers (see above).
 - `intr_shared_ptr_hp/` — the hazard-pointer intrusive pointer, with the same
   two companions (`intr_shared_ptr_hp_mbm.C`, `intr_shared_ptr_hp_tsan.C`);
   `intr_shared_ptr_hp.h` is a symlink to its header
-- `lock_free_shared_ptr/` — our adapter over Daniel Anderson's pointer (his
-  headers fetched separately)
-- `mm_hp/` — Maged Michael's hazard pointers, vendored (above)
+- `lock_free_shared_ptr/` — our adapter over Daniel Anderson's pointer, and
+  `parlay.patch`; its `parlay/` is made by `make_third_party.sh` (above)
+- `mm_hp/` — Maged Michael's hazard pointers, made by `make_third_party.sh`
+  with `mm_hp.patch` (above)
+- `make_third_party.sh`, `mm_hp.patch` — make the two directories above from
+  the upstream clones
 - `hp_drain.h` — drains `mm_hp`'s pending reclamations on demand, so that a
   test can assert that an object is gone: `mm_hp` has no public flush, and
   without one "destroyed" means "at some later scan"

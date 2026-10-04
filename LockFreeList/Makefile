@@ -67,7 +67,8 @@ TESTS = $(TARGET_TEST_ASAN) $(TARGET_TEST_TSAN)
 # rebuilds here.
 HEADERS = lock_free_list.h atomic_shared_ptr_concept.h intr_shared_ptr.h lock_free_shared_ptr/atomic_shared_ptr.hpp ../config.mk
 
-# Maged Michael's hazard pointers (vendored in ../SharedPtr/mm_hp), used by the
+# Maged Michael's hazard pointers (../SharedPtr/mm_hp, made by
+# ../SharedPtr/make_third_party.sh), used by the
 # intr_shared_ptr_hp policy and the drain helper. Every name below is a symlink
 # into ../SharedPtr (mm_hp/ is a directory symlink); make follows them, as for
 # HEADERS. mm_hp is a header plus one source file. Every target that links it

@@ -2,20 +2,30 @@
 
 #include <atomic>
 
-// ParlayLib's type_traits.h (reached through parlay/alloc.h) uses the builtin
-// __is_trivially_relocatable, which clang 22 deprecates; the warning would fail
-// every -Werror build. Silenced for these headers only: clang applies a
-// diagnostic pragma by the location of the warning, so instantiations made
-// later from our code are covered too.
+// Two warnings from the parlay headers would fail every -Werror build; each is
+// silenced for these headers only. Both compilers apply a diagnostic pragma by
+// the location the warning is attributed to (for GCC, including the inlining
+// chain), so code instantiated or inlined later from our code is covered too.
+// - clang 22: ParlayLib's type_traits.h (reached through parlay/alloc.h) uses
+//   the deprecated builtin __is_trivially_relocatable.
+// - GCC with -fsanitize=thread: -Wtsan rejects std::atomic_thread_fence, which
+//   parlay's reference counting and hazard pointers use (TSan does not model
+//   fences; clang's TSan does not either, it just does not warn). Our own code
+//   keeps the warning.
 #if defined(__clang__)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-builtins"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wtsan"
 #endif
 #include "parlay/details/atomic_details.hpp"
 #include "parlay/details/hazard_pointers.hpp"
 #include "parlay/shared_ptr.hpp"
 #if defined(__clang__)
 #pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
 #endif
 
 namespace parlay {

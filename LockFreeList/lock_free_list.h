@@ -119,8 +119,9 @@ public:
         bool DelRef() noexcept { return ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1; }
         // TryAddRef(): the reference form of the hook contract stated once, in
         // ../IntrSharedPtr/intr_pointee.h (increment iff nonzero; every observed 0
-        // read with acquire; the CAS acquire on success -- each order load-bearing
-        // for intr_shared_ptr_hp::load(), see that header's protocol). Used by
+        // read with acquire; the CAS acquire on success -- the orders
+        // intr_shared_ptr_hp::load() relies on; that header says which are
+        // load-bearing and which is a choice). Used by
         // intr_shared_ptr_hp alone; the other policies never call it.
         bool TryAddRef() noexcept {
             long count = ref_count.load(std::memory_order_acquire);

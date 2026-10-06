@@ -202,7 +202,7 @@ the failure path (`casal` vs `casl`), unmeasurable in the benchmarks above.
 
 Originally used to demonstrate bug 1; now serves as a regression check
 (exit code 0 = healthy). Build standalone against the list headers, e.g.
-`clang++ -std=c++23 -O1 -fsanitize=address -I. stuck_node_repro.C -lpthread`.
+`clang++ -std=c++23 -O1 -fsanitize=address -I. -I../IntrSharedPtr -I../SharedPtr stuck_node_repro.C -lpthread`.
 
 ```cpp
 // Interleaving exercised (2 threads hammering the same anchor H):

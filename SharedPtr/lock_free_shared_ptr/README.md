@@ -13,11 +13,12 @@ SharedPtr/lock_free_shared_ptr/
 ├── atomic_shared_ptr.hpp     (our adapter: parlay::atomic_shared_ptr with a
 │                              Harris mark in bit 0 of the control-block pointer)
 ├── parlay.patch              (our changes to his internals)
-└── parlay/                   (made by ../make_third_party.sh; not in the repository)
+└── parlay/                   (made by make imports in SharedPtr/; not in the repository)
 ```
 
-His code is not copied into this repository. `../make_third_party.sh` makes
-`parlay/` from a clone of his repository plus `parlay.patch`, and adds the
+His code is not copied into this repository. `make imports` in `SharedPtr/`
+(every build there depends on it; the rules are in `../../third_party.mk`)
+makes `parlay/` from a clone of his repository plus `parlay.patch`, and adds the
 headers of ParlayLib (https://github.com/cmuparlay/parlaylib), whose pool
 allocator his `shared_ptr` uses; SharedPtr's README, "Third-party code", has
 the commands. The patch's header says what each change is for:

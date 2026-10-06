@@ -392,8 +392,8 @@ TYPED_TEST(LockFreeListTest, StressTest) {
 // insert lands inside an eraser's window between its mark CAS and its unlink
 // CAS. The unlink CAS then fails, and without helping the marked node stays
 // linked for good, wedging the drain below. The mixed-op StressTest above is
-// too diffuse to hit that interleaving reliably; this shape strands marked
-// nodes within a few thousand operations pre-helping (details:
+// too diffuse to hit that interleaving reliably; without helping, this shape
+// strands marked nodes quickly under contention (details:
 // `lock_free_list_bugs.md`, bug 1).
 TYPED_TEST(LockFreeListTest, InsertEraseHammer) {
     typename TestFixture::List list(this->factory.template operator()<typename TestFixture::Node>());

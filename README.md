@@ -22,19 +22,26 @@ and may continue to evolve past the version printed in the book.
 - **[ConcurrentHash](ConcurrentHash/)** — `ConcurrentResizableHashSet`, a
   chained hash set with lock-free lookups and live resizing (inserts publish
   with one CAS but allocate under a spinlock), built on three refusals: never
-  free, never relink, never unlink.
+  free, never relink, never unlink (the one exception, `reclaim()`, runs when
+  the caller has quiesced the set).
 - **[LockFreeList](LockFreeList/)** — a Harris-style lock-free singly-linked
   list that reclaims memory for real, with never-invalidated iterators,
   parameterized over four atomic shared pointer implementations.
 
 Supporting components shared by the projects above:
 
-- **[SharedPtr](SharedPtr/)** — atomic reference-counted smart pointers: an
-  intrusive pointer with an embedded one-bit lock; its sibling with a hazard
-  pointer in place of the lock, lock-free after a thread's first load, built
-  on Maged Michael's hazard pointers; and an adapter for Daniel Anderson's
-  genuinely lock-free `atomic_shared_ptr`. Both are built from their
-  upstream repositories with small patches of ours (see
+- **[IntrSharedPtr](IntrSharedPtr/)** — atomic intrusively
+  reference-counted smart pointers, a reusable component: one with an
+  embedded one-bit lock, and its sibling with a hazard pointer in place of
+  the lock, lock-free after a thread's first load, built on Maged Michael's
+  hazard pointers; the pointee supplies the count through a base class or
+  hand-written hooks checked by a concept.
+- **[SharedPtr](SharedPtr/)** — the atomic shared pointer concepts
+  LockFreeList is written against, adapters that fit
+  `std::atomic<std::shared_ptr>` and Daniel Anderson's genuinely lock-free
+  `atomic_shared_ptr` to them, and the harness that tests and benchmarks all
+  four pointers side by side. Maged Michael's and Daniel Anderson's code are
+  built from their upstream repositories with small patches of ours (see
   [SharedPtr](SharedPtr/), "Third-party code").
 - **[Spinlock](Spinlock/)** — the TTAS spinlock with a two-tier back-off
   used throughout, with the benchmarks that tuned it.
@@ -62,12 +69,17 @@ Requirements: a recent clang (the Makefiles use `clang++-22`, C++23),
 [Google Benchmark](https://github.com/google/benchmark) and
 [GoogleTest](https://github.com/google/googletest); set `GBENCH_DIR` and
 `GTEST_DIR` if they are not in `$HOME/GoogleBench` and `$HOME/GoogleTest`.
-The projects share headers via relative symlinks, so clone on a filesystem
-that supports them (on Windows, use WSL or enable `core.symlinks`).
-SharedPtr and LockFreeList build on Linux only: the hazard pointers they link
-issue `membarrier(2)`. Before their first build, clone the third-party code
-they use and run `SharedPtr/make_third_party.sh` (SharedPtr's README,
-"Third-party code").
+Some projects (ConcurrentDeque, ConcurrentHash, ConcurrentQueue) share headers
+via relative symlinks, so clone on a filesystem that supports them (on Windows,
+use WSL or enable `core.symlinks`); SharedPtr and LockFreeList include their
+sibling projects' headers through `-I` instead.
+IntrSharedPtr, SharedPtr and LockFreeList build on Linux only: the hazard
+pointers they link issue `membarrier(2)`. Before their first build, clone the
+third-party code they use (SharedPtr's README, "Third-party code"); their
+first `make` then makes the patched copies the build uses. `make imports` makes
+only those copies: in IntrSharedPtr its `mm_hp/`, in SharedPtr its
+`lock_free_shared_ptr/parlay/`, and in LockFreeList both (by asking those two
+projects).
 
 ## License
 

@@ -50,7 +50,7 @@
 //     whose strong count reaches 0 is destroyed later (at a reclamation scan,
 //     on whichever thread triggers it) rather than synchronously. Absent means
 //     false. Tests of such a policy drain before asserting live counts
-//     (SharedPtr/hp_drain.h). intr_shared_ptr_hp: true.
+//     (IntrSharedPtr/hp_drain.h). intr_shared_ptr_hp: true.
 //   - `bool compare_exchange_weak(expected, desired, success, failure);` -- a
 //     single-attempt CAS that may fail spuriously (std semantics), refreshing
 //     `expected` with a live reference on failure. The containers use

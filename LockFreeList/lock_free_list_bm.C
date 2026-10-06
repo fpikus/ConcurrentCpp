@@ -32,22 +32,13 @@
 // - IntrPtr: intr_shared_ptr, intrusive count; a one-bit spinlock in the
 //   pointer word covers the gap between reading the word and the AddRef.
 // - HazardPtr: parlay::atomic_shared_ptr (Daniel Anderson's,
-//   lock_free_shared_ptr/). The suffix is historical: it does NOT mean
-//   intr_shared_ptr_hp, the hazard-pointer policy below.
+//   lock_free_shared_ptr/), which protects its loads with its own hazard
+//   pointers. The suffix does NOT mean intr_shared_ptr_hp, the hazard-pointer
+//   policy below.
 // - IntrPtrHP: intr_shared_ptr_hp, intrusive count; the gap is covered by a
 //   hazard pointer (Maged Michael's mm_hp), and a released node is destroyed
 //   later, in a batch, by whichever thread's retire crosses mm_hp's scan
 //   threshold.
-//
-// Benchmark Performance Summary -- SUPERSEDED: measured before the IntrPtrHP
-// rows existed; kept only until a new measurement of every row replaces it.
-// Do not quote.
-// - IntrPtr: The fastest and lowest-overhead for insertions, deletions, and 
-//   graveyard traversal (~25 ns).
-// - StdAtomic (std::atomic<std::shared_ptr>): Provided strong baseline speeds 
-//   (~53 ns for writes, ~28 ns for graveyard) thanks to libstdc++ improvements.
-// - HazardPtr (parlay): Slower than the other two due to the overhead of 
-//   Hazard Pointer allocations and control block traversals (~100 ns writes, ~50 ns graveyard).
 
 #include "atomic_shared_ptr_concept.h"
 #include "intr_shared_ptr.h"

@@ -1,6 +1,7 @@
 Our changes to Daniel Anderson's parlay::atomic_shared_ptr internals, applied by
-make_third_party.sh to copies of upstream's files (AtomicSharedPtr 3c213ef). Nothing
-outside the two files below is changed; ParlayLib is used as is.
+SharedPtr's `make imports` (../../third_party.mk) to copies of upstream's files
+(AtomicSharedPtr 3c213ef). Nothing outside the two files below is changed;
+ParlayLib is used as is.
 
 details/hazard_pointers.hpp -- folly removed:
   - folly::F14FastSet -> std::unordered_set for the protected-pointer set of the

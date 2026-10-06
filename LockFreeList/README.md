@@ -49,7 +49,12 @@ Stated here, earned in the book:
   zero), whose zero-observing load and successful CAS are acquire by contract:
   relax the load and a reader can re-read a stale pointer forever; relax the
   CAS and it can end up owning a node whose `next` the list's destructor has
-  already torn down.
+  already torn down. The hooks' contract, orders included, is stated once in
+  `../IntrSharedPtr/intr_pointee.h`; `Node` here writes the hooks by hand
+  rather than inheriting the component's `intr_pointee_base`, because one
+  `Node` serves all four policies, and a count supplied by a policy base
+  would change the size of the `std::atomic` and parlay policies' nodes,
+  which do not use it.
 
 The honest summary: this is not really a lock-free list at all — it is an
 atomic shared pointer written four different ways, with one simple list
@@ -129,18 +134,11 @@ Benchmark and GoogleTest; point `GBENCH_DIR` and `GTEST_DIR` at your
 installations if they are not in `$HOME/GoogleBench` and `$HOME/GoogleTest`.
 Linux because every binary links Maged Michael's hazard pointers, which issue
 `membarrier(2)`. Those, and Daniel Anderson's pointer, are made from their
-upstream repositories by `../SharedPtr/make_third_party.sh`: run it once before
-the first build (see SharedPtr's README, "Third-party code").
+upstream repositories by the `make imports` targets of `../IntrSharedPtr` and
+`../SharedPtr`, which the first build here runs; clone the upstream
+repositories first (see SharedPtr's README, "Third-party code").
 
 - `lock_free_list.h` — the list
-- `intr_shared_ptr.h` — the intrusive atomic shared pointer
-- `intr_shared_ptr_hp.h` — the hazard-pointer intrusive atomic shared pointer
-- `mm_hp/` — Maged Michael's hazard pointers, which it uses (made by
-  `../SharedPtr/make_third_party.sh`)
-- `lock_free_shared_ptr/` — Daniel Anderson's lock-free atomic shared pointer
-- `atomic_shared_ptr_concept.h` — the concept the pointer policies model
-- `hp_drain.h`, `hp_drain_gtest.h` — drain the hazard pointers' pending
-  reclamations, so that a test can assert that a node is gone
 - `lock_free_list_test.C` — unit tests (built with ASan and TSan)
 - `lock_free_list_bm.C` — the benchmarks described above; the row suffixes
   `_StdAtomic`, `_IntrPtr`, `_HazardPtr` and `_IntrPtrHP` are the four
@@ -149,9 +147,29 @@ the first build (see SharedPtr's README, "Third-party code").
 - `lock_free_list_bugs.md` — the record of a correctness review of the list
   algorithm: what broke, why, and what was done about it
 
-Everything above except the list itself, its tests and benchmarks, and the bug
-record is a symlink into `../SharedPtr`, where the pointers are tested on
-their own (see [../SharedPtr/README.md](../SharedPtr/README.md)).
+The pointer policies come from two sibling projects, through
+`-I../IntrSharedPtr -I../SharedPtr`:
+
+- `../IntrSharedPtr/intr_shared_ptr.h` — the intrusive atomic shared pointer
+- `../IntrSharedPtr/intr_shared_ptr_hp.h` — the hazard-pointer intrusive
+  atomic shared pointer
+- `../IntrSharedPtr/intr_pointee.h` — the contract of the hooks `Node`
+  implements (and the base class a node not shared between policies would
+  inherit instead)
+- `../IntrSharedPtr/mm_hp/` — Maged Michael's hazard pointers, which it uses
+  (made by `make imports` in `../IntrSharedPtr`)
+- `../IntrSharedPtr/hp_drain.h`, `../IntrSharedPtr/hp_drain_gtest.h` — drain
+  the hazard pointers' pending reclamations, so that a test can assert that a
+  node is gone
+- `../SharedPtr/lock_free_shared_ptr/` — Daniel Anderson's lock-free atomic
+  shared pointer (its `parlay/` made by `make imports` in `../SharedPtr`)
+- `../SharedPtr/atomic_shared_ptr_concept.h` — the concept the pointer
+  policies model
+
+The pointers are tested on their own in `../SharedPtr` (see
+[../SharedPtr/README.md](../SharedPtr/README.md)) and `../IntrSharedPtr` (see
+[../IntrSharedPtr/README.md](../IntrSharedPtr/README.md), which also says how
+to build a structure of your own on the intrusive pointers).
 
 ## The book
 

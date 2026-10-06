@@ -66,32 +66,10 @@ struct Data : std::hazard_pointer_obj_base<Data> {
         } // 0 -> 1 on an object that was adopted before: resurrection
     } // AddRef()
 
-    // TryAddRef(): increment the strong count if and only if it is nonzero.
-    // Returns true iff it incremented; returns false iff it observed a count of
-    // 0, in which case the count is left at 0 (an object at 0 is retired, or
-    // about to be retired, and must never be revived). Required only by
-    // intr_shared_ptr_hp; the other pointer policies never call it. Memory
-    // orders, all load-bearing: the load that observes 0 is ACQUIRE; the CAS is
-    // ACQUIRE on success and relaxed on failure; a failed CAS whose refreshed
-    // value is 0 re-reads the count with an acquire load before returning false,
-    // so EVERY observed 0 was read with acquire. Why: intr_shared_ptr_hp::load()
-    // calls this on an object pinned only by a hazard pointer. An observed 0
-    // must synchronize with the release sequence headed by the DelRef that
-    // produced it, so that the loader's next acquire reload of the word is
-    // guaranteed to see the store that unpublished the object; with a relaxed
-    // zero-observation the loader can re-read the stale word forever (model
-    // checked: livelock). The ACQUIRE on CAS success makes the loader's
-    // post-increment re-validation of the word see a swing that released the
-    // word's own reference. The value a successful CAS consumes need not have
-    // been read with acquire: a failed CAS refreshes it with a relaxed read (only
-    // a refreshed 0 is re-read with acquire), and other threads' RMWs may have
-    // rewritten it. A CAS that succeeds with relaxed order on a value it read
-    // from the release sequence headed by the swing's DelRef does not
-    // synchronize with that DelRef, so the re-validation reload may return the
-    // stale word and LockFreeList::~Node's walk can judge a node exclusive
-    // (count 1) that this loader then owns with a stale next (model checked:
-    // assertion failure). Every operation on the count is an RMW. Cost: nil on
-    // x86-64; LDAR/LDAXR on aarch64.
+    // TryAddRef(): the reference form of the hook contract in
+    // IntrSharedPtr/intr_pointee.h (increment iff nonzero; every observed 0 read
+    // with acquire; the CAS acquire on success). No resurrection check needed: it
+    // never increments from 0.
     bool TryAddRef() noexcept {
         int count = ref_count.load(std::memory_order_acquire);
         while (count != 0) {
@@ -264,9 +242,9 @@ TYPED_TEST(AtomicSharedPtrTest, MarkedPointerLoadCrash) {
         ptr.store(marked_null);
         
         // 2. Load the marked nullptr.
-        // In the buggy implementation, this crashed because unmarked_cb became nullptr 
-        // after stripping the mark bit, and increment_strong_count_if_nonzero() was 
-        // called on nullptr, causing a SEGV.
+        // Stripping the mark bit leaves a null control block, which the load
+        // must not pass to increment_strong_count_if_nonzero(): that is a
+        // SEGV.
         auto loaded_null = ptr.load();
         EXPECT_TRUE(loaded_null.is_marked());
         EXPECT_FALSE(loaded_null); // should still evaluate to false (nullptr)
@@ -277,9 +255,10 @@ TYPED_TEST(AtomicSharedPtrTest, MarkedPointerLoadCrash) {
         ptr.store(marked_valid);
 
         // 4. Load the marked valid pointer.
-        // In the buggy implementation, this crashed because the copy constructor of
-        // parlay::shared_ptr attempted to increment the reference count of an unmasked
-        // control block (with the mark bit still attached), causing pointer corruption.
+        // The copy constructor of parlay::shared_ptr must increment the
+        // reference count of the control block with the mark bit stripped;
+        // incrementing through the address with the mark bit still attached
+        // corrupts memory.
         auto loaded_valid = ptr.load();
         EXPECT_TRUE(loaded_valid.is_marked());
         EXPECT_TRUE(loaded_valid);
@@ -299,8 +278,9 @@ TYPED_TEST(AtomicSharedPtrTest, CompareExchangeMemoryOrderUB) {
     
     ptr.store(expected);
     
-    // CAS with acq_rel. std::atomic::store cannot take acq_rel!
-    // This used to cause an assertion failure/UB in intr_shared_ptr.
+    // CAS with acq_rel. std::atomic::store cannot take acq_rel, so a pointer
+    // whose successful CAS publishes with a store (intr_shared_ptr) must not
+    // pass the success order to that store unchanged.
     bool res = ptr.compare_exchange_strong(expected, desired, std::memory_order_acq_rel, std::memory_order_acquire);
     EXPECT_TRUE(res);
     EXPECT_EQ(ptr.load()->value, 2);

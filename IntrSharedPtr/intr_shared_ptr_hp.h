@@ -32,26 +32,30 @@
 #include <type_traits>
 #include <utility>
 
-// Maged Michael's hazard pointers (mm_hp/ beside this header's directory,
-// made from upstream by SharedPtr/make_third_party.sh). How the quoted
-// include resolves: a TU that opens the header
-// through the symlink SharedPtr/intr_shared_ptr_hp.h or
-// LockFreeList/intr_shared_ptr_hp.h looks next to the symlink AS SPELLED,
-// where each directory keeps mm_hp/ (a directory symlink in LockFreeList/);
-// the TUs inside intr_shared_ptr_hp/ itself (the microbenchmark and the TSan
-// program) include the header by its real path, and for them mm_hp/ resolves
-// through the Makefile's -I. (SharedPtr/). It defines std::hazard_pointer,
-// std::hazard_pointer_obj_base and std::make_hazard_pointer ITSELF -- see
-// "mm_hp, the standard and the platform" below.
+#include "intr_pointee.h"           // IntrusivePointee, intr_pointee_base
+#include "intr_shared_ptr_common.h" // the value type and helpers shared with intr_shared_ptr
+
+// Maged Michael's hazard pointers (mm_hp/ beside this header, made from
+// upstream by `make imports` in this directory; ../third_party.mk). The quoted
+// include resolves relative to this header's own directory first, so it finds
+// mm_hp/ beside it whether the TU is in this directory or reaches the header
+// through -I../IntrSharedPtr (SharedPtr, LockFreeList). It defines
+// std::hazard_pointer, std::hazard_pointer_obj_base and
+// std::make_hazard_pointer ITSELF -- see "mm_hp, the standard and the
+// platform" below.
 #include "mm_hp/mm_hp.hpp"
 
 // intr_shared_ptr_hp: an atomic, intrusively-reference-counted shared pointer
 // with Harris-style pointer marking, whose load->AddRef gap is closed by a
 // hazard pointer instead of intr_shared_ptr's one-bit spinlock. It conforms to
-// the AtomicSharedPtr concept (atomic_shared_ptr_concept.h) and is the fourth
-// AtomicPtr policy of LockFreeList. It started as a complete copy of
-// intr_shared_ptr and was modified as needed; the two headers are deliberately
-// independent for now (complete copy first, reuse later).
+// the AtomicSharedPtr concept (../SharedPtr/atomic_shared_ptr_concept.h) and
+// is the fourth AtomicPtr policy of LockFreeList. It shares its value type
+// (shared_ptr_type) and the helpers around it with intr_shared_ptr through
+// intr_shared_ptr_common.h, where the one difference between the two -- what
+// happens to an object whose count reaches 0: delete there, retire() here -- is
+// the Disposal policy (retire_disposal below). The atomic operations, their
+// orders and the word layout are this header's own and differ entirely from
+// the spinlock pointer's.
 //
 // Template parameters:
 //   T - the interface type seen through the smart pointer: operator*, operator->
@@ -60,7 +64,9 @@
 //   U - the concrete stored type (defaults to T). The atomic word holds a U*
 //       (plus the mark bit); U* must convert implicitly to T* (U is T or is
 //       publicly derived from T). U carries the intrusive count and the hazard
-//       pointer base: it must satisfy HpIntrusivePointee<U> (below). U is the
+//       pointer base: it must satisfy HpIntrusivePointee<U> (below) -- by
+//       hand-written hooks plus std::hazard_pointer_obj_base<U>, or by
+//       deriving from intr_pointee_base_hp<U> (below). U is the
 //       DYNAMIC type of every pointee: reclamation runs std::default_delete<U>,
 //       i.e. `delete static_cast<U*>(p)`, so an object of a type derived from U
 //       is destroyed through U's destructor (virtual or not -- the hazard
@@ -115,59 +121,58 @@
 //      retired and freed, and a NEW object may occupy the same address and be
 //      published (ABA on the address). The masked compare then matches the new
 //      occupant, and with a relaxed reload step 5 reads its count with no
-//      happens-before to its construction (model-checked: dies by address
-//      reuse; clean with acquire).
+//      happens-before to its construction.
 //   5. TryAddRef() X: increment the count iff it is nonzero. A count of 0 means
 //      X is retired or about to be retired and must never be revived (a plain
 //      fetch_add would resurrect it and its later release would retire it a
 //      second time; "fetch_add then undo on zero" is not a substitute either --
 //      the undo races a re-validation-failure release into a double retire).
 //      If the count was 0, reload the word [acquire, or seq_cst as in step 4]
-//      and go back to 1. The 0
-//      was read with ACQUIRE (TryAddRef's contract), so it synchronizes with
-//      the release sequence headed by the acq_rel DelRef that produced it, and
-//      that DelRef follows (in its thread, or through another acq_rel DelRef)
-//      the store that unpublished X: the reload is guaranteed to see the word
-//      changed. This is what makes the retry lock-free rather than a spin: a
-//      model-checked interleaving with a RELAXED zero-observing load re-reads
-//      the stale word forever (livelock). The reload itself must be ACQUIRE
-//      too, for a different reason: the word it returns (a null, say) may have
-//      been published by a LATER store than the one whose release produced
-//      the 0, and only an acquire reload synchronizes with that publisher as
-//      load(acquire) promises (a deterministic TSan test kills the relaxed
-//      form).
+//      and go back to 1. The 0 was read with ACQUIRE (TryAddRef's contract),
+//      so it synchronizes with the release sequence headed by the acq_rel
+//      DelRef that produced it, and that DelRef follows (in its thread, or
+//      through another acq_rel DelRef) the store that unpublished X: the
+//      reload is guaranteed to see the word changed. This is what makes the
+//      retry lock-free rather than a spin: with a RELAXED zero-observing load
+//      there is an interleaving that re-reads the stale word forever
+//      (livelock). The reload itself must be ACQUIRE too, for a different
+//      reason: the word it returns (a null, say) may have been published by a
+//      LATER store than the one whose release produced the 0, and only an
+//      acquire reload synchronizes with that publisher as load(acquire)
+//      promises (the deterministic TSan test
+//      AcquireLoadOfNullAfterZeroCountSynchronizes in
+//      intr_shared_ptr_hp_seam_test.C catches the relaxed form).
 //   6. Re-validate: reload the word [acquire, or seq_cst as in step 4]; if its
-//      unmarked address is no
-//      longer X, leave the hazard scope (the record is cleared with a release
-//      store and returned to the thread cache), release the reference just
-//      taken (retire X on 1->0) and go back to 1 with the reloaded word. Why
-//      this step exists: LockFreeList::~Node's iterative walk judges a node
-//      exclusive when its count is exactly 1. A loader that validated X and
-//      then stalled can increment X AFTER the word was swung away and the
-//      word's reference released, i.e. after the walk saw count 1 and froze
-//      X's `next`; the loader would then own a dead node with a destroyed
-//      `next`. With this step that loader releases X again instead: a word's
-//      reference is counted before the word is published and released after
-//      it is unpublished (store(), both CASes, the adopting constructor), so
-//      count == 1 at the walk's test means no word points at X then or later,
-//      and the re-validation fails. TryAddRef's CAS must be ACQUIRE on
-//      success for this to hold. The value a successful CAS consumes is not
-//      necessarily one this thread read with acquire: TryAddRef's failed CAS
-//      refreshes it with a relaxed read and feeds that into the next attempt
-//      (only a refreshed 0 is re-read with acquire), and other threads' RMWs
-//      may have rewritten the count meanwhile. A relaxed success on a value
-//      read from the release sequence headed by the swing's DelRef does not
-//      synchronize with it, nothing orders this loader after the swing's
-//      release, and the acquire re-validation reload may still return the
-//      stale X (model-checked: assertion failure). The reload itself must be
-//      ACQUIRE for a second reason,
-//      independent of the walk: the word it returns IS the loaded value, and a
-//      publisher may have changed only the MARK (plain writes, then a release
-//      CAS X -> X|1); the pointee's construction was already acquired by the
-//      step-4 reload, but the mark-only publication is acquired by nobody else,
-//      so a relaxed re-validation reload breaks load(acquire)'s promise for
-//      X|1 (killed by a deterministic TSan test; model checkers that do not
-//      model mark-only publication let it survive).
+//      unmarked address is no longer X, leave the hazard scope (the record is
+//      cleared with a release store and returned to the thread cache), release
+//      the reference just taken (retire X on 1->0) and go back to 1 with the
+//      reloaded word. Why this step exists: LockFreeList::~Node's iterative
+//      walk judges a node exclusive when its count is exactly 1. A loader that
+//      validated X and then stalled can increment X AFTER the word was swung
+//      away and the word's reference released, i.e. after the walk saw count
+//      1 and froze X's `next`; the loader would then own a dead node with a
+//      destroyed `next`. With this step that loader releases X again instead:
+//      a word's reference is counted before the word is published and
+//      released after it is unpublished (store(), both CASes, the adopting
+//      constructor), so count == 1 at the walk's test means no word points at
+//      X then or later, and the re-validation fails. TryAddRef's CAS must be
+//      ACQUIRE on success for this to hold. The value a successful CAS
+//      consumes is not necessarily one this thread read with acquire:
+//      TryAddRef's failed CAS refreshes it with a relaxed read and feeds that
+//      into the next attempt (only a refreshed 0 is re-read with acquire), and
+//      other threads' RMWs may have rewritten the count meanwhile. A relaxed
+//      success on a value read from the release sequence headed by the swing's
+//      DelRef does not synchronize with it, nothing orders this loader after
+//      the swing's release, and the acquire re-validation reload may still
+//      return the stale X. The reload itself must be ACQUIRE for a second
+//      reason, independent of the walk: the word it returns IS the loaded
+//      value, and a publisher may have changed only the MARK (plain writes,
+//      then a release CAS X -> X|1); the pointee's construction was already
+//      acquired by the step-4 reload, but the mark-only publication is acquired
+//      by nobody else, so a relaxed re-validation reload breaks load(acquire)'s
+//      promise for X|1 (the deterministic TSan test
+//      AcquireLoadSeesMarkOnlyPublication in intr_shared_ptr_hp_seam_test.C
+//      catches the relaxed form).
 //   7. Return the re-validated word's mark state with the one reference taken.
 //      The hazard record is cleared [release store] and returned on scope exit,
 //      after the increment -- never before it.
@@ -197,36 +202,40 @@
 // cache of 100 records (fast slot + 99), the miss happens once per thread, so
 // load/store/CAS are lock-free after a thread's first load -- except for loads
 // made while the thread runs its thread_local destructors, after mm_hp has
-// closed its cache: those go to the global pool again (see "Exception safety"). Retire is a
-// lock-free push plus a fetch_add; the scan (membarrier, a hash set of the
-// hazards, the deleters) runs on the thread that crosses the threshold and
-// waits on no other thread.
+// closed its cache: those go to the global pool again (see "Exception
+// safety"). Retire is a lock-free push plus a fetch_add; the scan (membarrier,
+// a hash set of the hazards, the deleters) runs on the thread that crosses the
+// threshold and waits on no other thread.
 //
 // ---------------------------------------------------------------------------
 // Deferred reclamation
 // ---------------------------------------------------------------------------
 //
 // A pointee whose count reaches 0 is NOT deleted; the releaser that made the
-// 1->0 transition calls retire() on it (release() below is the one place).
-// mm_hp pushes retired objects onto a global list and scans it when a retire
-// brings the pending count to the threshold (max(1000, 2 x the number of
-// hazard records)): the scan runs INSIDE that retire(), on WHICHEVER thread
+// 1->0 transition calls retire() on it (retire_disposal::release() below is the
+// one place). mm_hp pushes retired objects onto a global list and scans it when
+// a retire brings the pending count to the threshold (max(1000, 2 x the number
+// of hazard records)): the scan runs INSIDE that retire(), on WHICHEVER thread
 // made it -- possibly a thread that never touched this pointer or its list --
 // executes membarrier(2), collects the published hazards and runs the deleter
 // (std::default_delete<U>: ~U, hence ~T) of every retired object that is not
 // protected. Objects retired by destructors running inside a scan are pushed
 // but do not start a nested scan; they are reclaimed in the NEXT scan, so a
-// chain of objects whose destructors release each other dies one layer per
-// scan (which is why LockFreeList::~Node walks its chain iteratively instead
-// of relying on the cascade). Precisely, a scan runs at exactly two kinds of
-// point: inside a retire() whose push brings the pending count to the
-// threshold (and only if the retiring thread is not itself inside a scan),
-// and once at process exit (a static destructor of mm_hp). A THREAD's exit is
-// NOT a scan point: the thread's cached hazard records go back to the global
-// pool, nothing is reclaimed. Objects retired by destructors inside the exit
-// pass stay allocated, reachable from mm_hp's retired list, and are not
-// reported by LSan. Tests that need "it is destroyed now" retire enough
-// fillers to cross the threshold (hp_drain.h).
+// chain of objects whose destructors release each other dies one layer per scan
+// (which is why LockFreeList::~Node walks its chain iteratively instead of
+// relying on the cascade). Precisely, a scan runs at exactly two kinds of
+// point: inside a retire() whose push brings the pending count to the threshold
+// (and only if the retiring thread is not itself inside a scan), and once at
+// process exit (a static destructor of mm_hp). A THREAD's exit is NOT a scan
+// point: the thread's cached hazard records go back to the global pool, nothing
+// is reclaimed. Objects retired by destructors inside the exit pass stay
+// allocated, reachable from mm_hp's retired list, and are not reported by LSan.
+// Tests that need "it is destroyed now" retire enough fillers to cross the
+// threshold (hp_drain.h). A scan takes the whole retired list and resets the
+// pending count to zero (objects it finds protected are pushed back and counted
+// again), so after a scan -- after a drain, in particular -- a single
+// retirement does not run another one; the next scan comes after another
+// threshold's worth of retirements.
 //
 // Consequences, all part of the contract: (a) use_count() of a live handle
 // never reads 0, but "the object is gone" happens only at a later scan --
@@ -246,6 +255,19 @@
 // thread already running its thread-local destructors), every
 // make_hazard_pointer() goes to the global pool and may allocate (and throw)
 // at any load().
+//
+// A RETIRED pointee (count 0, retire() called, not yet reclaimed) has no
+// owner, and this pointer grants nobody the right to read it: it is destroyed
+// at the next scan, which any thread's retire() may run at any moment, so a
+// read of it races that destruction. The one circumstance in which such an
+// object is readable is one in which no scan can run: no other thread
+// retires or scans, and the reading thread itself retires nothing before it
+// is done -- the quiescence hp_drain.h's drain requires, and the situation of
+// a single-threaded test between a release and its drain. There the object
+// is alive, unowned, pending, and destroyed by the next scan; copying it
+// (intr_pointee_base_hp's copy constructor) yields a fresh, unretired object
+// that owes nothing to the original. Nothing in a program with concurrent
+// releases may rely on this.
 //
 // ---------------------------------------------------------------------------
 // mm_hp, the standard and the platform
@@ -267,10 +289,10 @@
 // an object ends with a release store to its hazard record, the scan acquires
 // that record, and the reader's whole earlier history -- including an
 // unprotected access -- is thereby ordered before the free. A clean TSan run of
-// this pointer says nothing about the protocol; model checking and
-// deterministic seam tests through the pointee's hooks are the oracles. TSan
-// still checks everything outside the protocol (callers, the count orders'
-// visible effects).
+// this pointer says nothing about the protocol; the deterministic seam tests
+// through the pointee's hooks (intr_shared_ptr_hp_seam_test.C) are the oracle.
+// TSan still checks everything outside the protocol (callers, the count
+// orders' visible effects).
 //
 // ---------------------------------------------------------------------------
 // Exception safety
@@ -287,62 +309,59 @@
 // caller's is changed: strong guarantee. The CAS failure paths refresh
 // `expected` through load() and inherit that guarantee (see each CAS).
 // Public members declared noexcept: the two trivial constructors of the
-// atomic, shared_ptr_type's move constructor and move assignment,
-// is_marked(), get_raw(), get() and operator bool; the destructors are
-// implicitly noexcept (the private helpers are noexcept as well). The other
-// public members cannot throw either once this thread has a cached hazard
-// record, but are not declared so.
+// atomic and every member of shared_ptr_type (intr_shared_ptr_common.h; the
+// hooks are noexcept by contract and ~U is required to be nothrow -- a U whose
+// destructor is declared noexcept(false) is rejected at compile time); the
+// destructors are implicitly noexcept (the private helpers and the disposal's
+// release() are noexcept as well). load(), store() and the CASes cannot throw
+// either once this thread has a cached hazard record, but are not declared so.
 //
 // ---------------------------------------------------------------------------
-// Design notes: where this differs from the obvious or from the earlier
-// prototype of the same protocol
+// Design notes: where this differs from the obvious
 // ---------------------------------------------------------------------------
 //
 // - The hazard record is acquired once per load() call and kept across the
 //   validation-mismatch and zero-count retries (re-aimed with
 //   reset_protection); it is returned to the thread cache BEFORE the one
-//   release load() can perform (step 6) and re-acquired for the retry. The
-//   prototype acquired a record per retry round and released the reference
-//   while still holding it; the order here is what keeps a nested load inside
-//   the resulting reclamation from allocating.
+//   release load() can perform (step 6) and re-acquired for the retry.
+//   Releasing the reference while still holding the record would make a
+//   nested load inside the resulting reclamation miss the thread cache and
+//   allocate; this order keeps it from allocating.
 // - The publishing RMWs (store()'s exchange, the CASes' success) use the
 //   caller's order promoted to at least ACQ_REL, not release: release so that
 //   a loader's acquire validation reload sees the pointee's construction,
 //   acquire because the same RMW hands the caller the OLD occupant, whose
 //   count it then decrements and whose destructor it may run -- without the
 //   acquire half those accesses have no happens-before with the old
-//   occupant's publisher (a data race TSan reports, see publish_order()). The
-//   earlier prototype used seq_cst for both CAS orders and did not have the
-//   problem; a design that promotes only to release does. The CAS failure
-//   order is acquire and is not load-bearing: the word a failed CAS reports is
-//   discarded, because a reference to it can only be taken through the load
-//   protocol, which re-reads the word.
+//   occupant's publisher (a data race TSan reports, see publish_order()).
+//   seq_cst for both CAS orders would avoid the problem as well; promoting only
+//   to release does not. The CAS failure order is acquire and is not
+//   load-bearing: the word a failed CAS reports is discarded, because a
+//   reference to it can only be taken through the load protocol, which re-reads
+//   the word.
 // - A failed CAS refreshes `expected` through load(failure) -- the caller's
-//   failure order applied to the first read of the word -- rather than the
-//   prototype's fixed load(acquire). The protocol's internal reloads are at
-//   least acquire regardless (seq_cst for a seq_cst failure order), so the
-//   two differ only in what the first read costs and promises (a relaxed
-//   failure order on a null word does not synchronize, exactly as std::atomic
-//   specifies) and in whether the refresh is a seq_cst operation.
+//   failure order applied to the first read of the word -- rather than a
+//   fixed load(acquire). The protocol's internal reloads are at least acquire
+//   regardless (seq_cst for a seq_cst failure order), so the two differ only in
+//   what the first read costs and promises (a relaxed failure order on a null
+//   word does not synchronize, exactly as std::atomic specifies) and in whether
+//   the refresh is a seq_cst operation.
 // - store() asserts its order to the set std::atomic::store accepts (relaxed,
 //   release, seq_cst); the exchange it uses would silently accept any order
 //   (and runs with the promoted order above). load() and the CAS failure
 //   order are asserted to the set std::atomic::load accepts.
-// - TryAddRef() (a pointee hook, see HpIntrusivePointee) re-reads the count
-//   with acquire when a failed CAS reports 0 before returning false, so that
-//   EVERY observed 0 is an acquire read. A form that returns false on the
-//   relaxed value the failed CAS reports is also safe and lock-free -- the
-//   next round's initial acquire load must, by coherence, read 0 (0 is
-//   terminal) and synchronize then -- but it costs one wasted protocol round
-//   (hazard store, fence, two reloads) instead of one acquire load, and it
-//   makes the proof two steps instead of one.
+// - TryAddRef() (a pointee hook; its contract and reference form are in
+//   intr_pointee.h) re-reads the count with acquire when a failed CAS reports
+//   0 before returning false, so that EVERY observed 0 is an acquire read.
+//   The alternative form and its cost are discussed there.
 // - `aptr_` is not `mutable`: load() never writes the word (the spinlock
-//   pointer's load() had to).
+//   pointer's load() does).
 
 // HpIntrusivePointee<U>: what intr_shared_ptr_hp requires of its stored type U.
-// Checked by static_assert INSIDE member function bodies (require_pointee()
-// below), NEVER at class scope: LockFreeList::Node is incomplete at its own
-// base clause `struct Node : pointee_base_of<AtomicPtr<Node>>::type`, where
+// Checked by static_assert INSIDE member function bodies (require_pointee() of
+// the common base, through retire_disposal below), NEVER at class scope:
+// LockFreeList::Node is incomplete at its own base clause
+// `struct Node : pointee_base_of<AtomicPtr<Node>>::type`, where
 // intr_shared_ptr_hp<Node> is first named, and a class-level constraint makes
 // Node ill-formed.
 //
@@ -352,81 +371,118 @@
 //     std::default_delete<U>, so U is the dynamic type of every pointee. The
 //     base may sit at any offset inside U: the pointer forms the hazard address
 //     through the typed reset_protection<U>(U*), never from the raw word.
-//   - The four hooks, all noexcept, all RMWs on one atomic count (a plain store
-//     to the count would break the release sequence that TryAddRef's acquire
-//     zero-load synchronizes with -- protocol step 5):
-//       void AddRef() noexcept;          increment (relaxed suffices); the return
-//                                        value, if any, is ignored
-//       bool TryAddRef() noexcept;       increment iff nonzero -- contract below
-//       bool DelRef() noexcept;          decrement, acq_rel; true iff this call
-//                                        made the 1 -> 0 transition. Both halves
-//                                        are load-bearing: release heads the
-//                                        sequence TryAddRef's acquire reads
-//                                        synchronize with; acquire gives the
-//                                        thread that reaches 0 (and retires) the
-//                                        history of the thread that unpublished
-//                                        the object, which the hazard-pointer
-//                                        safety argument needs (unpublish
-//                                        happens-before retire)
-//       long use_count() const noexcept; current count (diagnostics/tests only;
-//                                        a snapshot, stale by the time it returns)
-//     The count starts at 0 for a freshly constructed object and is taken to 1
-//     by its first owner (shared_ptr_type(U*)); 0 is reached again exactly once,
-//     by the DelRef() that returns true, whose caller must retire() the object.
+//   - The three hooks of IntrusivePointee<U> (intr_pointee.h) plus
+//     `bool TryAddRef() noexcept`, all with the semantics and the memory orders
+//     stated in intr_pointee.h, which is the normative text for every hook:
+//     AddRef relaxed; DelRef acq_rel with both halves load-bearing (release
+//     heads the sequence TryAddRef's acquire reads synchronize with; acquire
+//     gives the thread that reaches 0 (and retires) the history of the thread
+//     that unpublished the object, which the hazard-pointer safety argument
+//     needs: unpublish happens-before retire); use_count a relaxed snapshot;
+//     TryAddRef increment-iff-nonzero with every observed 0 read with acquire
+//     and an acquire CAS success (protocol steps 5 and 6 above say why each
+//     order is load-bearing for THIS pointer). Every operation on the count is
+//     an RMW: a plain store would break the release sequence that TryAddRef's
+//     acquire zero-load synchronizes with (step 5). The count starts at 0 for
+//     a freshly constructed object and is taken to 1 by its first owner
+//     (shared_ptr_type(U*)); 0 is reached again exactly once, by the DelRef()
+//     that returns true, whose caller must retire() the object
+//     (retire_disposal::release() does).
 //
-// TryAddRef() contract (carried into every implementation's comment):
-//
-//   TryAddRef(): increment the strong count if and only if it is nonzero.
-//   Returns true iff it incremented; returns false iff it observed a count of
-//   0, in which case the count is left at 0 (an object at 0 is retired, or
-//   about to be retired, and must never be revived). Required only by
-//   intr_shared_ptr_hp; the other pointer policies never call it. Memory
-//   orders, all load-bearing: the load that observes 0 is ACQUIRE; the CAS is
-//   ACQUIRE on success and relaxed on failure; a failed CAS whose refreshed
-//   value is 0 re-reads the count with an acquire load before returning false,
-//   so EVERY observed 0 was read with acquire. Why: intr_shared_ptr_hp::load()
-//   calls this on an object pinned only by a hazard pointer. An observed 0
-//   must synchronize with the release sequence headed by the DelRef that
-//   produced it, so that the loader's next acquire reload of the word is
-//   guaranteed to see the store that unpublished the object; with a relaxed
-//   zero-observation the loader can re-read the stale word forever (model
-//   checked: livelock). The ACQUIRE on CAS success makes the loader's
-//   post-increment re-validation of the word see a swing that released the
-//   word's own reference. The value a successful CAS consumes need not have
-//   been read with acquire: a failed CAS refreshes it with a relaxed read (only
-//   a refreshed 0 is re-read with acquire), and other threads' RMWs may have
-//   rewritten it. A CAS that succeeds with relaxed order on a value it read
-//   from the release sequence headed by the swing's DelRef does not
-//   synchronize with that DelRef, so the re-validation reload may return the
-//   stale word and LockFreeList::~Node's walk can judge a node exclusive
-//   (count 1) that this loader then owns with a stale next (model checked:
-//   assertion failure). Every operation on the count is an RMW. Cost: nil on
-//   x86-64; LDAR/LDAXR on aarch64.
-//
-// Reference form:
-//
-//   bool TryAddRef() noexcept {
-//       long count = ref_count.load(std::memory_order_acquire);
-//       while (count != 0) {
-//           if (ref_count.compare_exchange_weak(count, count + 1,
-//                   std::memory_order_acquire, std::memory_order_relaxed)) {
-//               return true;
-//           }
-//           // The failed CAS refreshed `count` with a relaxed read; a 0 seen
-//           // that way does not synchronize. Re-read it with acquire.
-//           if (count == 0) count = ref_count.load(std::memory_order_acquire);
-//       } // CAS loop while the count is nonzero
-//       return false;
-//   } // TryAddRef()
+// intr_pointee_base_hp<U> (below) satisfies all of this. A hand-written U
+// derives from std::hazard_pointer_obj_base<U> itself and implements the four
+// hooks; the reference form of TryAddRef is intr_pointee_base::TryAddRef.
 template <typename U>
 concept HpIntrusivePointee =
+    IntrusivePointee<U> &&
     std::derived_from<U, std::hazard_pointer_obj_base<U>> &&
-    requires(U& u, const U& cu) {
-        { u.AddRef() } noexcept;
+    requires(U& u) {
         { u.TryAddRef() } noexcept -> std::same_as<bool>;
-        { u.DelRef() } noexcept -> std::same_as<bool>;
-        { cu.use_count() } noexcept -> std::same_as<long>;
     };
+
+// intr_pointee_base_hp<U, Count>: the pointee base for intr_shared_ptr_hp --
+// the four hooks of intr_pointee_base<Count> (intr_pointee.h: AddRef, TryAddRef,
+// DelRef, use_count, over a Count defaulting to long) plus the hazard pointer
+// base std::hazard_pointer_obj_base<U>. CRTP on U, the FINAL pointee type (the
+// dynamic type of every object the pointer stores: reclamation deletes a U*),
+// exactly as std::hazard_pointer_obj_base<U> itself is used:
+//
+//   struct Node : intr_pointee_base_hp<Node> {
+//       intr_shared_ptr_hp<Node> next;
+//       ...
+//   };
+//
+// This must be U's ONLY hazard pointer base (a second one, direct or through
+// another base, makes the derived_from check of HpIntrusivePointee ambiguous
+// and the type unusable with the pointer). The hazard pointer subobject may sit
+// at any offset inside U -- the pointer never forms its address from the raw
+// word -- so other bases may precede this one. The count base comes first in
+// the layout, then the hazard pointer base. Normative: alignof(U) >= 2, so
+// that bit 0 of a U* is free for the mark -- guaranteed here because the
+// hazard pointer base holds pointers (alignof >= 8). Informative only, mm_hp's
+// current layout: that base is 24 bytes, 8-aligned.
+//
+// Special members: protected, as for both bases (this class is only ever a
+// base; its destructor is non-virtual), and all noexcept. The count semantics
+// are intr_pointee_base's: a copy is a NEW object with count 0, assignment
+// leaves *this's count alone. The hazard pointer subobject follows the same
+// rule, by hand: the copy constructor VALUE-initializes it (the
+// mem-initializer `std::hazard_pointer_obj_base<U>()`; that base's default
+// constructor is not user-provided and mm_hp's hp_obj has none, so all three
+// of its words -- the retired-list link, the reclaim function, the reserved
+// word -- are zeroed) instead of copying the source's: a fresh, never retired
+// object (after `new U` the first two words are indeterminate and only the
+// reserved one is null, so the copy is, if anything, better defined). mm_hp's
+// link and reclaim function are meaningful only after retire(), and a copy
+// made of a retired object (legal only while no scan can run: "Deferred
+// reclamation" above says exactly when) must not inherit them. The assignment
+// leaves *this's untouched. Both cost nothing: three zero stores where the
+// defaulted copy would copy three words. Moves fall back to these copy
+// operations.
+template <typename U, typename Count = long>
+class intr_pointee_base_hp : public intr_pointee_base<Count>,
+                             public std::hazard_pointer_obj_base<U> {
+protected:
+    intr_pointee_base_hp() noexcept = default;
+    // A copy is a fresh object: count 0 (the count base), hazard pointer
+    // subobject as after construction (not the source's).
+    intr_pointee_base_hp(const intr_pointee_base_hp&) noexcept
+        : intr_pointee_base<Count>(), std::hazard_pointer_obj_base<U>() {}
+    // Assignment touches neither the count nor the hazard pointer subobject.
+    intr_pointee_base_hp& operator=(const intr_pointee_base_hp&) noexcept { return *this; }
+    ~intr_pointee_base_hp() = default;
+}; // class intr_pointee_base_hp
+
+namespace intr_shared_ptr_detail {
+
+// The Disposal policy of intr_shared_ptr_hp for common_base (see
+// intr_shared_ptr_common.h): the pointee concept it asserts, and the release
+// of a reference with retire() as what happens to an object whose count
+// reached 0.
+struct retire_disposal {
+    // The pointer's pointee concept, with its own diagnostic.
+    template <typename U>
+    static constexpr void require_pointee() noexcept {
+        static_assert(HpIntrusivePointee<U>,
+            "intr_shared_ptr_hp<T, U>: U must derive publicly from std::hazard_pointer_obj_base<U> "
+            "and provide noexcept AddRef(), bool TryAddRef(), bool DelRef(), "
+            "long use_count() const (intr_pointee.h; intr_pointee_base_hp<U> provides all of it)");
+    } // retire_disposal::require_pointee()
+
+    // Release one reference to the unmarked pointee p (null: no-op): DelRef,
+    // and on 1->0 retire() the object -- deferred reclamation: never delete,
+    // another thread may hold a hazard on the object and be about to read its
+    // count; mm_hp deletes it at a scan once no hazard names it. The one place
+    // reclamation is triggered from; the retire may cross mm_hp's threshold
+    // and run that scan on the calling thread. noexcept: DelRef and retire()
+    // are.
+    template <typename U>
+    static void release(U* p) noexcept {
+        if (p && p->DelRef()) p->retire();
+    }
+}; // struct retire_disposal
+
+} // namespace intr_shared_ptr_detail
 
 // Retry counters for benchmarks, compiled only under -DINTR_HP_BM_COUNTERS.
 // One thread_local instance per thread, shared by every instantiation of the
@@ -450,9 +506,19 @@ inline thread_local intr_shared_ptr_hp_retry_counters intr_shared_ptr_hp_retries
 #endif
 
 template <typename T, typename U = T>
-class intr_shared_ptr_hp {
+class intr_shared_ptr_hp
+    : private intr_shared_ptr_detail::common_base<T, U, intr_shared_ptr_detail::retire_disposal> {
+    using base = intr_shared_ptr_detail::common_base<T, U, intr_shared_ptr_detail::retire_disposal>;
+    using disposal = intr_shared_ptr_detail::retire_disposal;
+    // The helpers shared with intr_shared_ptr (intr_shared_ptr_common.h):
+    // the pointee check and the word <-> pointer <-> handle conversions.
+    using base::require_pointee;
+    using base::unmarked_ptr;
+    using base::adopt_word;
+
 public:
-    // Optional policy members (atomic_shared_ptr_concept.h, "Optional members"):
+    // Optional policy members (../SharedPtr/atomic_shared_ptr_concept.h,
+    // "Optional members"):
     //
     // pointee_base: the base class a pointee must derive from. LockFreeList's
     // pointee_base_of trait detects this alias and makes Node derive from it;
@@ -471,149 +537,10 @@ public:
     // The non-atomic "value" type handed out by load() and accepted by store()
     // and the CASes. It owns one strong reference to its pointee (AddRef on
     // acquire, DelRef on release; retire() on 1->0) and may carry the mark bit
-    // in bit 0 of its raw pointer. Identical in interface to
-    // intr_shared_ptr::shared_ptr_type.
-    //
-    // Special members: rule of five, by hand, because the object owns a counted
-    // reference. Copy = AddRef; move = steal (source becomes null); destroy =
-    // release. Value semantics with mark-as-identity (operator== compares the
-    // raw word including the mark).
-    class shared_ptr_type {
-    public:
-        // Null. Postcondition: !*this, !is_marked(), use_count() == 0.
-        shared_ptr_type() : p_(nullptr) {}
-        shared_ptr_type(std::nullptr_t) : p_(nullptr) {}
-
-        // Adopt a raw pointer and become one of its owners: AddRef once (0 -> 1
-        // for a freshly new'ed object; n -> n+1 for an object that already has
-        // owners -- adoption and sharing are the same operation because the
-        // count lives in the object, so there is no control block to allocate
-        // or find). Bit 0 of `p` may carry the mark; it is kept. Precondition:
-        // `p` is null, or points to a live U whose count is nonzero, or to a
-        // fresh U whose count is 0 and that has never been owned (an owned
-        // object whose count reached 0 has been retired and must not be
-        // revived). A raw marked null (the bit pattern 1) is allowed and yields
-        // marked null, with no count traffic. Postcondition: get() == unmarked
-        // p, is_marked() == (p & 1).
-        explicit shared_ptr_type(U* p) : p_(p) {
-            require_pointee();
-            if (get_unmarked_ptr()) get_unmarked_ptr()->AddRef();
-        }
-
-        // Copy: AddRef the shared pointee (if non-null). Postcondition:
-        // *this == x; x.use_count() grew by one if non-null.
-        shared_ptr_type(const shared_ptr_type& x) : p_(x.p_) {
-            require_pointee();
-            if (get_unmarked_ptr()) get_unmarked_ptr()->AddRef();
-        }
-
-        // Move: steal x's reference. Postcondition: *this holds x's old word,
-        // x is null (unmarked null, even if x was marked null).
-        shared_ptr_type(shared_ptr_type&& x) noexcept : p_(x.p_) {
-            x.p_ = nullptr;
-        }
-
-        // Release: DelRef the pointee (if non-null); on 1->0 retire() it (it
-        // is destroyed at a later scan, on some thread -- see the overview).
-        ~shared_ptr_type() {
-            release(get_unmarked_ptr());
-        }
-
-        // AddRef the new pointee *before* releasing the old one: `this` and `x`
-        // can be distinct shared_ptr_type objects holding the same pointee --
-        // often as marked and unmarked variants of one pointer, which the
-        // mark-as-identity design (get_unmarked(), set_mark() return copies)
-        // makes routine. Releasing first could drop the last reference and
-        // retire the very object we are about to AddRef; the self-assignment
-        // check catches only `a = a`, not that aliasing.
-        shared_ptr_type& operator=(const shared_ptr_type& x) {
-            if (this == &x) return *this;
-            U* new_ptr = unmarked_ptr(reinterpret_cast<uintptr_t>(x.p_));
-            if (new_ptr) new_ptr->AddRef();
-            release(get_unmarked_ptr());
-            p_ = x.p_;
-            return *this;
-        }
-
-        // Move assignment needs no AddRef-first dance: x's reference is being
-        // transferred, so even when *this and x share the pointee the count
-        // includes x's reference until p_ is overwritten and stays >= 1
-        // through the release below.
-        shared_ptr_type& operator=(shared_ptr_type&& x) noexcept {
-            if (this == &x) return *this;
-            release(get_unmarked_ptr());
-            p_ = x.p_;
-            x.p_ = nullptr;
-            return *this;
-        }
-
-        // Access through the UNMARKED pointer, as T. Precondition for * and ->:
-        // non-null (get() != nullptr); undefined otherwise. A marked handle
-        // dereferences like its unmarked twin.
-        T& operator*() const { return *get_unmarked_ptr(); }
-        T* operator->() const { return get_unmarked_ptr(); }
-        T* get() const noexcept { return get_unmarked_ptr(); }
-        explicit operator bool() const noexcept { return get_unmarked_ptr() != nullptr; }
-
-        // Identity comparison of the raw word: pointer AND mark. Marked and
-        // unmarked handles to one object compare unequal; marked null != null.
-        bool operator==(const shared_ptr_type& rhs) const { return p_ == rhs.p_; }
-        bool operator!=(const shared_ptr_type& rhs) const { return p_ != rhs.p_; }
-
-        // The pointee's current count (0 for null and marked null): a snapshot
-        // for diagnostics and tests; never 0 for a non-null handle (this handle
-        // is one owner).
-        long use_count() const {
-            U* ptr = get_unmarked_ptr();
-            return ptr ? ptr->use_count() : 0;
-        }
-
-        // Harris marking API. The mark lives in bit 0 of the raw pointer and is
-        // considered part of the pointer's identity (operator== compares it too),
-        // so a marked and unmarked pointer to the same object are *not* equal.
-        bool is_marked() const noexcept { return (reinterpret_cast<uintptr_t>(p_) & 1ULL) != 0; }
-
-        // Two overloads: the lvalue one must copy (an AddRef/DelRef round
-        // trip; the source is untouched); the rvalue one clears the bit in
-        // place and MOVES the reference into the result, so the source is
-        // left null (unmarked null) -- which is what makes the ubiquitous
-        // `next.load(...).get_unmarked()` refcount-churn-free. Postcondition
-        // of both: result.get() == get(), !result.is_marked().
-        shared_ptr_type get_unmarked() const & {
-            shared_ptr_type res(*this);
-            res.p_ = res.get_unmarked_ptr();
-            return res;
-        }
-
-        shared_ptr_type get_unmarked() && {
-            p_ = get_unmarked_ptr();
-            return std::move(*this);
-        }
-
-        // Copy with the mark set. Legal on null (yields marked null).
-        shared_ptr_type set_mark() const {
-            shared_ptr_type res(*this);
-            res.p_ = reinterpret_cast<U*>(reinterpret_cast<uintptr_t>(res.p_) | 1ULL);
-            return res;
-        }
-
-        // Raw pointer with the mark bit still attached (the word's bit pattern).
-        // Do not dereference. Used by the atomic owner and by tests comparing
-        // identities.
-        U* get_raw() const noexcept { return p_; }
-
-    private:
-        friend class intr_shared_ptr_hp;
-
-        // The raw word: U* with the mark in bit 0. Null when no reference is owned.
-        U* p_;
-
-        // The pointer with the mark bit cleared: safe to dereference and to
-        // pass to the hooks.
-        U* get_unmarked_ptr() const noexcept {
-            return unmarked_ptr(reinterpret_cast<uintptr_t>(p_));
-        }
-    }; // class shared_ptr_type
+    // in bit 0 of its raw pointer. The same class template as
+    // intr_shared_ptr::shared_ptr_type, instantiated with the retire disposal;
+    // documented in intr_shared_ptr_common.h.
+    using typename base::shared_ptr_type;
 
     // Null atomic.
     constexpr intr_shared_ptr_hp() noexcept : aptr_(0) {}
@@ -627,7 +554,7 @@ public:
     // *this; publishing *this to other threads is the caller's job.
     explicit(false) intr_shared_ptr_hp(shared_ptr_type desired) {
         require_pointee();
-        U* new_unmarked = desired.get_unmarked_ptr();
+        U* new_unmarked = unmarked_ptr(desired);
         if (new_unmarked) new_unmarked->AddRef();
         aptr_.store(reinterpret_cast<uintptr_t>(desired.get_raw()), std::memory_order_relaxed);
     }
@@ -647,7 +574,7 @@ public:
     // ~threshold unrelated retired objects run inside this destructor.
     ~intr_shared_ptr_hp() {
         require_pointee();
-        release(unmarked_ptr(aptr_.load(std::memory_order_relaxed)));
+        disposal::release(unmarked_ptr(aptr_.load(std::memory_order_relaxed)));
     }
 
     // Atomically snapshot the word and take a strong reference to its pointee
@@ -681,7 +608,12 @@ public:
     // further seq_cst reads of the same word, which the total order permits);
     // the promotion costs nothing on x86-64 and nothing on aarch64 where
     // acquire is already an LDAR. relaxed and consume promise only what they
-    // say for a null returned from the first read.
+    // say for a null returned from the first read. Plainly: a NON-NULL handle
+    // returned by load() synchronizes with the publisher of its word whatever
+    // `order` is, because a non-null word is always returned from one of the
+    // protocol's reloads, which are at least acquire; only a null (or marked
+    // null) that the FIRST read produced is a plain read in the caller's
+    // order.
     //
     // Guarantee: strong. The only throw is std::bad_alloc from
     // make_hazard_pointer() on a thread-cache miss -- normally a thread's first
@@ -741,7 +673,7 @@ public:
                 INTR_HP_COUNT_RETRY_(revalidation_mismatch);
                 revalidation_victim = x;
             } // ~hp: the record is cleared (release) and returned to the thread cache
-            release(revalidation_victim);       // may retire X and run a scan here
+            disposal::release(revalidation_victim);     // may retire X and run a scan here
         } // retry with the re-validated word
     } // load()
 
@@ -750,11 +682,11 @@ public:
     // `desired`'s pointee is AddRef'd for the word BEFORE the word is written
     // (the word's reference must be counted before any loader can find it: an
     // uncounted published reference can be released by a concurrent store()
-    // and the object retired while the caller still holds it -- model checked,
-    // dies); `desired` itself keeps its reference until the parameter dies at
-    // return. Postcondition: a subsequent load() returns a value equal to the
-    // `desired` passed in (same pointer, same mark) until the next store/CAS;
-    // the old pointee's count dropped by one.
+    // and the object retired while the caller still holds it); `desired` itself
+    // keeps its reference until the parameter dies at return. Postcondition: a
+    // subsequent load() returns a value equal to the `desired` passed in (same
+    // pointer, same mark) until the next store/CAS; the old pointee's count
+    // dropped by one.
     //
     // order: MUST be relaxed, release or seq_cst (the rule for
     // std::atomic::store; asserted because the exchange used internally would
@@ -770,11 +702,11 @@ public:
         require_pointee();
         assert(order == std::memory_order_relaxed || order == std::memory_order_release ||
                order == std::memory_order_seq_cst);
-        U* new_unmarked = desired.get_unmarked_ptr();
+        U* new_unmarked = unmarked_ptr(desired);
         if (new_unmarked) new_unmarked->AddRef();   // the word's reference, counted first
         uintptr_t old_word = aptr_.exchange(reinterpret_cast<uintptr_t>(desired.get_raw()),
                                             publish_order(order));
-        release(unmarked_ptr(old_word));                 // released only after it is unpublished
+        disposal::release(unmarked_ptr(old_word));  // released only after it is unpublished
     } // store()
 
     // Compare-and-swap on the FULL value (pointer and mark): succeeds iff the
@@ -865,49 +797,6 @@ private:
     // load() needs no mutable member.
     std::atomic<uintptr_t> aptr_;
 
-    // The pointee check, called at the top of every member that can first
-    // produce a non-null handle or first touch a hook on a word it reads --
-    // load, store, both CASes, the destructor, the adopting constructor, and
-    // shared_ptr_type's adopting and copy constructors. (The other hook users,
-    // shared_ptr_type's assignments, destructor and use_count() and release(),
-    // only operate on handles one of those produced, so the check has already
-    // fired by the time they are instantiated with a bad U.) A static_assert in a
-    // member BODY is evaluated when that body is instantiated, i.e. only once
-    // U is complete; the class definition itself (instantiated by
-    // `AtomicPtr<Node> next;` while Node is incomplete) is unconstrained.
-    static constexpr void require_pointee() noexcept {
-        static_assert(HpIntrusivePointee<U>,
-            "intr_shared_ptr_hp<T, U>: U must derive publicly from std::hazard_pointer_obj_base<U> "
-            "and provide noexcept AddRef(), bool TryAddRef(), bool DelRef(), "
-            "long use_count() const");
-        static_assert(std::is_convertible_v<U*, T*>,
-            "intr_shared_ptr_hp<T, U>: U* must convert implicitly to T*");
-    } // require_pointee()
-
-    // The word with the mark bit cleared, as the pointer it is: safe to
-    // dereference and to pass to the hooks. Null for null and marked null.
-    static U* unmarked_ptr(uintptr_t word) noexcept {
-        return reinterpret_cast<U*>(word & ~1ULL);
-    }
-
-    // Wrap a raw word (pointer and mark) in a shared_ptr_type WITHOUT touching
-    // the count: the reference it will own was already taken (TryAddRef in
-    // load()) or does not exist (null, marked null).
-    static shared_ptr_type adopt_word(uintptr_t word) noexcept {
-        shared_ptr_type res;
-        res.p_ = reinterpret_cast<U*>(word);
-        return res;
-    }
-
-    // Release one reference: DelRef; on 1->0 retire() (never delete -- another
-    // thread may hold a hazard on the object and be about to read its count).
-    // Null is a no-op. The one place reclamation is triggered from; the retire
-    // may cross mm_hp's threshold and run a scan on the calling thread.
-    // noexcept: DelRef and retire() are.
-    static void release(U* unmarked) noexcept {
-        if (unmarked && unmarked->DelRef()) unmarked->retire();
-    }
-
     // The set std::atomic::load accepts; load()'s `order` and the CASes'
     // `failure` are asserted against it.
     static bool is_load_order(std::memory_order order) noexcept {
@@ -939,13 +828,14 @@ private:
     // releases the old occupant -- a DelRef on its count and, on 1->0, a
     // retire that may run its destructor -- so it must synchronize with the
     // publisher of the OLD occupant, or it touches an object whose construction
-    // it has no happens-before with (TSan demonstrates it: with a release-only
-    // exchange, a storer's DelRef races with the allocation and construction of
-    // the object another thread had published through a CAS -- a data race on
-    // the count's initialization, and through the retire chain on every plain
-    // field the destructor writes). intr_shared_ptr had this acquire for free
-    // from its lock CAS. Cost: nil on x86-64 (every locked RMW is a full
-    // barrier); LDAXR instead of LDXR on aarch64. Only seq_cst is stronger.
+    // it has no happens-before with (with a release-only exchange, a storer's
+    // DelRef races with the allocation and construction of the object another
+    // thread published through a CAS -- a data race on the count's
+    // initialization, which TSan reports, and through the retire chain on
+    // every plain field the destructor writes). intr_shared_ptr has this
+    // acquire for free from its lock CAS. Cost: nil on x86-64 (every locked
+    // RMW is a full barrier); LDAXR instead of LDXR on aarch64. Only seq_cst
+    // is stronger.
     static std::memory_order publish_order(std::memory_order order) noexcept {
         return order == std::memory_order_seq_cst ? std::memory_order_seq_cst
                                                   : std::memory_order_acq_rel;
@@ -977,17 +867,17 @@ private:
         assert(is_load_order(failure));
         const uintptr_t original = reinterpret_cast<uintptr_t>(expected.get_raw());
         const uintptr_t new_word = reinterpret_cast<uintptr_t>(desired.get_raw());
-        U* const d = desired.get_unmarked_ptr();    // captured before `expected` can change
+        U* const d = unmarked_ptr(desired);    // captured before `expected` can change
         const std::memory_order cas_order = publish_order(success);
         while (true) {
             if (d) d->AddRef();                              // the word's reference, counted first
             uintptr_t observed = original;
             if (aptr_.compare_exchange_strong(observed, new_word, cas_order,
                                               std::memory_order_acquire)) {
-                release(unmarked_ptr(observed));    // == original; unpublished, now released
+                disposal::release(unmarked_ptr(observed));   // == original; unpublished, now released
                 return true;
             } // the word was swapped
-            release(d);                                      // undo the pre-count; never 0 here
+            disposal::release(d);                            // undo the pre-count; never 0 here
             shared_ptr_type current = load(failure);    // may throw: counts balanced, no change
             const uintptr_t refreshed = reinterpret_cast<uintptr_t>(current.get_raw());
             expected = std::move(current);              // `d`, `new_word` stay valid if aliased

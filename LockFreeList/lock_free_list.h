@@ -107,36 +107,21 @@ public:
         // owned by no one until the first shared_ptr_type adopts it (0 -> 1);
         // every owner thereafter counts itself via AddRef. DelRef() returns
         // true on the 1 -> 0 transition; its acq_rel order makes all prior
-        // writes to the node visible to the deleter.
+        // writes to the node visible to the deleter. The hooks' contract
+        // (semantics and memory orders) is stated once, in
+        // ../IntrSharedPtr/intr_pointee.h; they are hand-written here rather
+        // than inherited from intr_pointee_base<> because Node is one struct
+        // for four policies, and a count taken from a policy base would change
+        // the std and parlay Nodes' size and break the comparability of the
+        // benchmark rows.
         std::atomic<long> ref_count{0};
         void AddRef() noexcept { ref_count.fetch_add(1, std::memory_order_relaxed); }
         bool DelRef() noexcept { return ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1; }
-        // TryAddRef(): increment the strong count if and only if it is nonzero.
-        // Returns true iff it incremented; returns false iff it observed a count of
-        // 0, in which case the count is left at 0 (an object at 0 is retired, or
-        // about to be retired, and must never be revived). Required only by
-        // intr_shared_ptr_hp; the other pointer policies never call it. Memory
-        // orders, all load-bearing: the load that observes 0 is ACQUIRE; the CAS is
-        // ACQUIRE on success and relaxed on failure; a failed CAS whose refreshed
-        // value is 0 re-reads the count with an acquire load before returning false,
-        // so EVERY observed 0 was read with acquire. Why: intr_shared_ptr_hp::load()
-        // calls this on an object pinned only by a hazard pointer. An observed 0
-        // must synchronize with the release sequence headed by the DelRef that
-        // produced it, so that the loader's next acquire reload of the word is
-        // guaranteed to see the store that unpublished the object; with a relaxed
-        // zero-observation the loader can re-read the stale word forever (model
-        // checked: livelock). The ACQUIRE on CAS success makes the loader's
-        // post-increment re-validation of the word see a swing that released the
-        // word's own reference. The value a successful CAS consumes need not have
-        // been read with acquire: a failed CAS refreshes it with a relaxed read (only
-        // a refreshed 0 is re-read with acquire), and other threads' RMWs may have
-        // rewritten it. A CAS that succeeds with relaxed order on a value it read
-        // from the release sequence headed by the swing's DelRef does not
-        // synchronize with that DelRef, so the re-validation reload may return the
-        // stale word and LockFreeList::~Node's walk can judge a node exclusive
-        // (count 1) that this loader then owns with a stale next (model checked:
-        // assertion failure). Every operation on the count is an RMW. Cost: nil on
-        // x86-64; LDAR/LDAXR on aarch64.
+        // TryAddRef(): the reference form of the hook contract stated once, in
+        // ../IntrSharedPtr/intr_pointee.h (increment iff nonzero; every observed 0
+        // read with acquire; the CAS acquire on success -- each order load-bearing
+        // for intr_shared_ptr_hp::load(), see that header's protocol). Used by
+        // intr_shared_ptr_hp alone; the other policies never call it.
         bool TryAddRef() noexcept {
             long count = ref_count.load(std::memory_order_acquire);
             while (count != 0) {
@@ -180,19 +165,20 @@ public:
         // swung away and the word's reference released would own this node
         // AFTER we judged it exclusive and nulled its next: a dead node whose
         // graveyard successor is gone, so its ++ yields end() instead of the
-        // live suffix (no UB, a silent iterator-contract violation; found by
-        // model checking the swinger/walker/loader race). The spinlock pointer
-        // satisfies (2) trivially (its loader holds the lock across load and
-        // AddRef, so the word cannot move in between), as does the std adapter
-        // (std::atomic<shared_ptr>::load is one atomic step). parlay's
-        // atomic_shared_ptr::load() (lock_free_shared_ptr/atomic_shared_ptr.hpp)
-        // is hazard-protect plus increment_strong_count_if_nonzero() with NO
-        // re-validation after the increment -- the same shape as the HP
-        // pointer without step (2) -- so whether this walk's exclusivity test
-        // holds under the parlay policy is NOT established here: no claim is
-        // made either way. The HP pointer's re-validation reload and its TryAddRef
-        // CAS success are acquire so that the re-validation sees the swing
-        // that released the word's reference; see its header.
+        // live suffix (no UB, a silent iterator-contract violation). The
+        // spinlock pointer satisfies (2) trivially (its loader holds the lock
+        // across load and AddRef, so the word cannot move in between), as does
+        // the std adapter (std::atomic<shared_ptr>::load is one atomic step).
+        // parlay's atomic_shared_ptr::load()
+        // (../SharedPtr/lock_free_shared_ptr/atomic_shared_ptr.hpp) is
+        // hazard-protect plus
+        // increment_strong_count_if_nonzero() with NO re-validation after the
+        // increment -- the same shape as the HP pointer without step (2) -- so
+        // whether this walk's exclusivity test holds under the parlay policy is
+        // NOT established here: no claim is made either way. The HP pointer's
+        // re-validation reload and its TryAddRef CAS success are acquire so
+        // that the re-validation sees the swing that released the word's
+        // reference; see its header.
         //
         // Nulling curr->next *before* advancing is what keeps this iterative:
         // the `curr = ...` assignment deletes the old node, whose own ~Node()

@@ -30,9 +30,9 @@
 #include <cstdlib>
 #include <thread>
 
-// Resolved relative to the directory of this header AS SPELLED by the includer:
-// SharedPtr/mm_hp/ directly, or LockFreeList/mm_hp/ (a directory symlink to it)
-// when a LockFreeList TU includes LockFreeList/hp_drain.h (a symlink to this file).
+// Resolved relative to this header's own directory first: IntrSharedPtr/mm_hp/,
+// for the TUs here and for those that reach this header through
+// -I../IntrSharedPtr alike.
 #include "mm_hp/mm_hp.hpp"
 
 // Deterministic draining of mm_hp's global hazard-pointer domain, for tests and
@@ -45,10 +45,9 @@
 // and mm_hp scans only when the number of pending retirements reaches a threshold
 // (max(1000, 2 * number of hazard records)) that a test cannot observe and that
 // grows with the number of hazard records ever allocated (records are never
-// freed; measured: with 3001 hazard records allocated, threshold 6002, a drain
-// needed 6001 fillers). A test that asserts a live count after a release must
-// first make the pending retirements run; mm_hp has no public flush, so the
-// drain builds one from its public API:
+// freed). A test that asserts a live count after a release must first make the
+// pending retirements run; mm_hp has no public flush, so the drain builds one
+// from its public API:
 //
 //   1. retire a SENTINEL object whose destructor sets a flag local to this call;
 //   2. retire empty FILLER objects, one at a time, until the flag is set.
@@ -84,10 +83,10 @@
 //   destructors during a scan are pushed onto the list after that scan took it,
 //   and mm_hp does not start a nested scan on a thread that is already scanning,
 //   so a cascade of depth d (each destroyed object retires the next) needs d
-//   drains (measured: depths 1/2/3/5 need 1/2/3/5 drains; hp_drain_selftest.C
-//   pins this). The same holds for an object that was protected when a scan
-//   collected the hazard pointers and whose protection a destructor run by that
-//   scan released: it is pushed back and reclaimed one round later.
+//   drains (hp_drain_selftest.C pins this). The same holds for an object that
+//   was protected when a scan collected the hazard pointers and whose
+//   protection a destructor run by that scan released: it is pushed back and
+//   reclaimed one round later.
 // - Never call a drain from inside a scan, i.e. from the destructor of an object
 //   mm_hp is reclaiming (directly or through anything that destructor calls).
 //   No retire() on that thread can start a scan while the scan is running, so the
@@ -138,13 +137,12 @@ inline constexpr long filler_cap = 1'000'000;
 // drain at the default threshold never pauses (it needs at most 999 fillers)
 // and one at a raised threshold pauses once per extra 1000 (e.g. 6 pauses,
 // ~12 ms, at threshold 6002). The pauses exist for drains outside the quiescence
-// precondition: retiring 1,000,000 fillers takes only 13-30 ms at -O1 (0.14-0.21
-// s under TSan; measured on a Ryzen 7940HS under WSL2), so without them the cap
-// fires as soon as another thread's scan holds the sentinel's list for that
-// long, which preemption alone can do (demonstrated). With 999 pauses the cap is
-// at least 2 s away (measured: 2.4 s at -O1, 2.6 s under TSan). A sleep,
-// not std::this_thread::yield(): a yield returns at once when nothing else is
-// runnable on this CPU and would not lengthen the window.
+// precondition: retiring a million fillers takes only tens of milliseconds, so
+// without them the cap fires as soon as another thread's scan holds the
+// sentinel's list for that long, which preemption alone can do. With 999 pauses
+// the cap is at least 2 s away. A sleep, not std::this_thread::yield(): a yield
+// returns at once when nothing else is runnable on this CPU and would not
+// lengthen the window.
 inline constexpr long fillers_per_pause = 1000;
 inline constexpr std::chrono::milliseconds pause_length{2};
 
@@ -217,10 +215,9 @@ template <typename Pred>
 //   static in p1202::asymmetric_thread_fence_heavy()); doing it here puts the
 //   registration at the same place in every run instead of inside whichever test
 //   first crosses the threshold. TSan's sensitivity to hazard-pointer misuse
-//   depends on when that registration happens (measured with deliberately broken
-//   protocols: with "no hazard at all", 0 of 30 runs reported with registration
-//   at the first scan during the test, 10 of 10 with one scan done before the
-//   reader thread started; the mechanism is not understood).
+//   depends on when that registration happens: it reports a deliberately broken
+//   protocol far more reliably when one scan has run before the reader threads
+//   start (the mechanism is not understood).
 // - At process start (nothing protected, no destructor that retires), leaves
 //   mm_hp's retired list empty at a known point. Later, protected objects and a
 //   cascade's next layer can remain pending, as after any drain.

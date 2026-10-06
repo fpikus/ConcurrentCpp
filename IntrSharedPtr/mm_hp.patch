@@ -1,6 +1,6 @@
 Our change to Maged Michael's hazard pointers (github.com/magedm/mm_hp at
-b26e5ed), applied by make_third_party.sh to a copy of upstream. Only mm_hp.cpp
-changes, and only under ThreadSanitizer.
+b26e5ed), applied by `make imports` (../third_party.mk) to a copy of upstream.
+Only mm_hp.cpp changes, and only under ThreadSanitizer.
 
 mm_hp.cpp -- TSan-only: TSan does not model the asymmetric fence pair
 (asymmetric_fence.hpp: a signal fence on the reader side, membarrier on the

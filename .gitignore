@@ -36,8 +36,12 @@ B32053_*.pdf
 !README.md
 
 # Third-party code: ThirdParty/<name> holds the upstream git clones, the one
-# source; SharedPtr/make_third_party.sh derives the directories the build uses
-# from them (with our patches), so those are not tracked either.
+# source; the `imports` targets of the Makefiles that include third_party.mk
+# derive the directories the build uses from them (with our patches), so those
+# are not tracked either; nor are the <output>.tmp.* leftovers of an import run
+# killed outright.
 /ThirdParty/
 SharedPtr/lock_free_shared_ptr/parlay/
-SharedPtr/mm_hp/
+SharedPtr/lock_free_shared_ptr/parlay.tmp.*
+IntrSharedPtr/mm_hp/
+IntrSharedPtr/mm_hp.tmp.*

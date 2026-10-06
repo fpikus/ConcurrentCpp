@@ -1,4 +1,4 @@
-// White-box seam tests of intr_shared_ptr_hp (intr_shared_ptr_hp/intr_shared_ptr_hp.h).
+// White-box seam tests of intr_shared_ptr_hp (intr_shared_ptr_hp.h).
 // Built twice, with ASan and with TSan (both at -O0), linked with mm_hp/mm_hp.cpp.
 //
 // What a "seam" is here. Every interleaving that can break the pointer's
@@ -321,9 +321,7 @@ using GoneFlag = std::shared_ptr<const std::atomic<bool>>;
 // most 4 accesses per 8 bytes and evicts one at random when a fifth arrives; an
 // int that shares its 8 bytes with locals the other thread writes (the hand-over
 // results) can lose the record of the racing write before the racing read, and
-// the report then appears in only some runs (measured: a stack `int payload`
-// next to such locals was reported in 0-20 of 20 runs depending on the stack
-// layout; isolated, 20 of 20).
+// the report then appears in only some runs, depending on the stack layout.
 struct alignas(64) LonePayload {
     int value = 0;   // written by one thread, read by the other
 };
@@ -754,10 +752,10 @@ TYPED_TEST(SeamTest, AliasWeak) {
 // - but store() takes `desired` by value and releases that parameter's
 //   reference when it returns: an acq_rel decrement of the published pointee's
 //   count. A reader whose TryAddRef reads the count after that decrement
-//   synchronizes with it and hides the defect (measured: such a test caught a
-//   relaxed exchange in 1 of 21 runs). So StorePublishesPointee stops the main
-//   thread INSIDE store(), between the exchange and the return, in the release
-//   hook of the replaced value W, and lets the reader do all its work there;
+//   synchronizes with it and hides the defect, and without a stop nearly
+//   every run's reader does. So StorePublishesPointee stops the main thread
+//   INSIDE store(), between the exchange and the return, in the release hook
+//   of the replaced value W, and lets the reader do all its work there;
 // - the two threads hand over with relaxed atomic flags, which carry no edge;
 // - the compare-exchange takes `desired` by const reference and keeps no
 //   reference of its own past the call, so CasPublishesPointee needs no stop.

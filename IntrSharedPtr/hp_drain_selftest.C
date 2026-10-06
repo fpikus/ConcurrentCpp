@@ -255,9 +255,9 @@ TEST(HpDrainDeathTest, DrainAdaptsToRaisedThreshold) {
 namespace {
 
 // Number of objects the LSan positive control leaks. An unusual count, so that
-// the expected report line ("Direct leak of 336 byte(s) in 7 object(s)" with
-// clang-22) identifies this leak and no other: LSan groups leaks by allocation
-// stack, and the seven allocations share one.
+// the "in 7 object(s)" of the expected report line identifies this leak and no
+// other: LSan groups leaks by allocation stack, and the seven allocations share
+// one.
 constexpr int leaked_objects = 7;
 
 // Allocates `leaked_objects` Tracked objects and drops every pointer to them
@@ -273,13 +273,8 @@ constexpr int leaked_objects = 7;
 
 // Overwrites the dead stack region below the caller's frame with zeros. LSan
 // scans stacks conservatively, including uninitialized slots of live frames, and
-// a stale copy of a leaked pointer left by a dead frame can hide the leak.
-// Observed: in a separate standalone program (no gtest; the leak in a noinline
-// function called from main, then a normal exit), built at -O0, LSan reported
-// nothing without the scrub and reported the leak with it. In THIS test's
-// death-test child, LSan reports the leak with or without the scrub (checked
-// with the scrub removed). The scrub stays so that the control does not depend
-// on the stack layout of the child.
+// a stale copy of a leaked pointer left by a dead frame can hide the leak. The
+// scrub makes the control independent of the stack layout of the child.
 [[gnu::noinline]] void scrub_stack() {
     volatile unsigned char buffer[64*1024];
     for (std::size_t i = 0; i < sizeof(buffer); ++i) buffer[i] = 0;

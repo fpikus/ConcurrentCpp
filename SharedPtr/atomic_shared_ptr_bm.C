@@ -29,13 +29,6 @@
  * passes; the destruction-burst counters (scans, max_burst_us) only with -DINTR_HP_BM_BURSTS
  * as well, a separate build that is x86-64 only and whose rates are not used. See
  * "Instrumentation counters" below for what each means and the identities they obey.
- *
- * Performance Hierarchy (16 Threads) -- SUPERSEDED: measured before the _IntrSharedHP and
- * ReadersOneWriter rows and the counters existed; kept only until a new measurement of
- * every row replaces it. Do not quote.
- * 1. IntrShared (Fastest): ~17-32 Million ops/sec. Direct intrusive ref counting bypasses control blocks and hazard records.
- * 2. Parlay Hazard Ptr (Fast): ~14-30 Million ops/sec. Thread-local hazard records avoid control blocks but add slight store/fence overhead.
- * 3. StdAtomic (Slowest): ~2-3 Million ops/sec. Suffers massive cache line bouncing on external control block locks/atomics.
  */
 #include <benchmark/benchmark.h>
 #include <atomic>
@@ -64,14 +57,14 @@ static const int num_cpu = sysconf(_SC_NPROCESSORS_CONF);
 // Two levels, each compiled in only under its macro:
 // - -DINTR_HP_BM_COUNTERS: event counters (thread_local increments and the
 //   CAS result; the same macro compiles intr_shared_ptr_hp's own load-retry
-//   counters). The Makefile builds the benchmark with it: a paired measurement
-//   found its cost within the run-to-run spread.
+//   counters). The Makefile builds the benchmark with it: its cost is within
+//   the run-to-run spread.
 // - -DINTR_HP_BM_BURSTS (requires INTR_HP_BM_COUNTERS): the timing of mm_hp's
 //   destruction bursts, one TSC read per DataHP destruction. Not in the
-//   standard build: the same paired measurement found it costs ~10% of a
-//   one-thread WriteHeavy_IntrSharedHP iteration (~21 ns). Its counters come
-//   from a separate pass of a burst build, whose rates are not used. x86-64
-//   only (rdtsc); the other builds are portable.
+//   standard build: it costs a visible fraction of a short iteration (a
+//   one-thread WriteHeavy_IntrSharedHP one). Its counters come from a separate
+//   pass of a burst build, whose rates are not used. x86-64 only (rdtsc); the
+//   other builds are portable.
 // Without a macro its hooks below are empty functions or discarded
 // `if constexpr` branches, and every row compiles to its uninstrumented body.
 //
@@ -157,19 +150,15 @@ thread_local BurstState burst_state;
 alignas(64) std::atomic<uint64_t> max_burst_ticks{0};
 
 // Destructions closer together than this belong to one burst. Consecutive
-// deleter calls inside one scan are tens of ns apart: the longest scan of a
-// run, 900-1000 DataHP destroyed, took 8-77 us at 1 thread and 26-56 us at 4
-// and 16 threads (max_burst_us of the intr_shared_ptr_hp rows, three short
-// runs, 0.05 s min_time, on a Ryzen 7940HS under WSL2). Two scans on the same
+// deleter calls inside one scan are tens of ns apart. Two scans on the same
 // thread are separated by at least ~1000 retirements of the whole process,
 // each of which is a full iteration of some thread.
 inline constexpr double burst_gap_us = 5.0;
 
 // TSC ticks per microsecond, measured once at startup against steady_clock
 // (20 ms). The TSC is the burst clock because it is read on every DataHP
-// destruction and is the cheaper clock (on the machine above, reading it back
-// to back in a loop: rdtsc 7.3 ns, steady_clock::now() 18.1 ns). It assumes an
-// invariant TSC (constant_tsc).
+// destruction and is the cheaper clock (rdtsc costs less than
+// steady_clock::now()). It assumes an invariant TSC (constant_tsc).
 static const double tsc_ticks_per_us = [] {
     const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
     const uint64_t c0 = __rdtsc();
@@ -312,25 +301,27 @@ private:
 // Pointee types
 // ---------------------------------------------------------------------------
 
-// The pointee of the std, intr and parlay rows. Its layout is the one these
-// rows have always measured: intr_shared_ptr_hp's base class must not change
-// it, hence the separate DataHP below.
+// The pointee of the std, intr and parlay rows. intr_shared_ptr_hp's base
+// class would change its layout, hence the separate DataHP below.
 struct Data {
     int value;
     std::atomic<int> ref_count{0};
     Data(int v) : value(v) {}
     ~Data() { count_destruction(); }   // `destroyed` (instrumented builds only)
-    void AddRef() { ref_count.fetch_add(1, std::memory_order_relaxed); }
-    bool DelRef() { return ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1; }
-    long use_count() const { return ref_count.load(std::memory_order_relaxed); }
+    // The three hooks intr_shared_ptr requires (IntrusivePointee,
+    // IntrSharedPtr/intr_pointee.h), noexcept as the concept demands.
+    void AddRef() noexcept { ref_count.fetch_add(1, std::memory_order_relaxed); }
+    bool DelRef() noexcept { return ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1; }
+    long use_count() const noexcept { return ref_count.load(std::memory_order_relaxed); }
 };
 
 // The pointee of the _IntrSharedHP rows: Data's payload and count plus the
 // hazard pointer base intr_shared_ptr_hp requires (24 bytes at offset 0), so
 // sizeof is 32 (Data: 8) and a `new DataHP` takes a 48-byte malloc chunk
 // (Data: 32). The hooks are noexcept, as the pointer requires; AddRef relaxed,
-// DelRef acq_rel, as Data's. TryAddRef is the reference form shared by every
-// intr_shared_ptr_hp pointee in this repository.
+// DelRef acq_rel, as Data's. TryAddRef is the reference form of
+// IntrSharedPtr/intr_pointee.h, hand-written here as in every pointee of this
+// benchmark (the pointee bases would change Data's layout).
 struct DataHP : std::hazard_pointer_obj_base<DataHP> {
     int value;                       // payload
     std::atomic<int> ref_count{0};   // the intrusive strong count (0 until adopted)
@@ -349,32 +340,9 @@ struct DataHP : std::hazard_pointer_obj_base<DataHP> {
 
     void AddRef() noexcept { ref_count.fetch_add(1, std::memory_order_relaxed); }
 
-    // TryAddRef(): increment the strong count if and only if it is nonzero.
-    // Returns true iff it incremented; returns false iff it observed a count of
-    // 0, in which case the count is left at 0 (an object at 0 is retired, or
-    // about to be retired, and must never be revived). Required only by
-    // intr_shared_ptr_hp; the other pointer policies never call it. Memory
-    // orders, all load-bearing: the load that observes 0 is ACQUIRE; the CAS is
-    // ACQUIRE on success and relaxed on failure; a failed CAS whose refreshed
-    // value is 0 re-reads the count with an acquire load before returning false,
-    // so EVERY observed 0 was read with acquire. Why: intr_shared_ptr_hp::load()
-    // calls this on an object pinned only by a hazard pointer. An observed 0
-    // must synchronize with the release sequence headed by the DelRef that
-    // produced it, so that the loader's next acquire reload of the word is
-    // guaranteed to see the store that unpublished the object; with a relaxed
-    // zero-observation the loader can re-read the stale word forever (model
-    // checked: livelock). The ACQUIRE on CAS success makes the loader's
-    // post-increment re-validation of the word see a swing that released the
-    // word's own reference. The value a successful CAS consumes need not have
-    // been read with acquire: a failed CAS refreshes it with a relaxed read (only
-    // a refreshed 0 is re-read with acquire), and other threads' RMWs may have
-    // rewritten it. A CAS that succeeds with relaxed order on a value it read
-    // from the release sequence headed by the swing's DelRef does not
-    // synchronize with that DelRef, so the re-validation reload may return the
-    // stale word and LockFreeList::~Node's walk can judge a node exclusive
-    // (count 1) that this loader then owns with a stale next (model checked:
-    // assertion failure). Every operation on the count is an RMW. Cost: nil on
-    // x86-64; LDAR/LDAXR on aarch64.
+    // TryAddRef(): the reference form of the hook contract in
+    // IntrSharedPtr/intr_pointee.h (increment iff nonzero; every observed 0 read
+    // with acquire; the CAS acquire on success).
     bool TryAddRef() noexcept {
         int count = ref_count.load(std::memory_order_acquire);
         while (count != 0) {
@@ -576,9 +544,7 @@ DEFINE_BM_HIGHCONTENTION(HighContention_IntrSharedHP, intr_shared_ptr_hp<DataHP>
 // than a load, so in the naive form the readers finish their quota in
 // milliseconds and the writer then runs alone for the rest of the run; the
 // readers' rate is then measured without a writer and the writer's without
-// readers (a role-split probe with a 1 us writer and 10 ns readers: readers
-// done in 3.9 ms, the writer alone for 2.79 s, a kIsRate loads/s 180x below
-// the actual rate). Here each thread counts its own completed operations; the
+// readers. Here each thread counts its own completed operations; the
 // first thread to complete its quota sets `stop`, and every thread that sees
 // `stop` turns its remaining iterations into no-ops. Each thread times its own
 // window, from its first iteration to the moment it stopped. The windows END

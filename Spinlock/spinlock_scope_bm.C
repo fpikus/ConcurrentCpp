@@ -1,11 +1,11 @@
 // Google Benchmark harness of the lock scope benchmark: on which side of
 // unlock() a thread should write the slot it has just claimed under the shipped
 // SpinLock (spinlock.h). The measured operation, the variants, the shared
-// layout, the handoff counter, what has been found and the reasons for all of
-// it are described in spinlock_scope_common.h, which both this harness and its
-// hand-rolled twin, spinlock_scope_mbm.C, use. This file holds only what is
-// specific to Google Benchmark: the measurement window, the throughput
-// accounting and the registration.
+// layout, the handoff counter and the reasons for all of it are described in
+// spinlock_scope_common.h, which both this harness and its hand-rolled twin,
+// spinlock_scope_mbm.C, use. This file holds only what is specific to Google
+// Benchmark: the measurement window, the throughput accounting and the
+// registration.
 //
 // LAYOUT
 //
@@ -16,7 +16,7 @@
 //
 // MEASUREMENT WINDOW
 //
-// Google Benchmark (checked in 1.9.5, src/benchmark_runner.cc) decides that a
+// Google Benchmark (as of 1.9.5, src/benchmark_runner.cc) decides that a
 // threaded run is long enough by comparing min_time against the time SUMMED
 // over all threads. With UseRealTime(), each thread contributes the wall-clock
 // time of its own benchmark loop. At t threads the default 0.5 s is therefore
@@ -89,7 +89,7 @@
 // 'scope_<layout>' matches only the in/out pair:
 //
 //   ./spinlock_scope_bm --benchmark_filter='scope_packed/'     # 8-byte slots, in/out pair
-//   ./spinlock_scope_bm --benchmark_filter='_ptrshared/'       # the prototype-layout controls
+//   ./spinlock_scope_bm --benchmark_filter='_ptrshared/'       # the pointer-placement controls
 //   ./spinlock_scope_bm --benchmark_filter='scope_a(64|128)/'  # line-sized slots, in/out pairs
 //   ./spinlock_scope_bm --benchmark_filter='_lockstore_'       # the lock-line store variants
 //   ./spinlock_scope_bm --benchmark_filter='_poststore_'       # the post-unlock store variants
@@ -157,10 +157,10 @@ static constinit BmShared<Slot, ptr_line> bm_shared {};
 // every value the loop carries must sit in one of the six callee-saved
 // registers (on x86-64) or be spilled, and a spilled counter is a stack store
 // between the unlock and the next lock (see E2 in spinlock_scope_common.h).
-// Inlined into BM_scope(), the loop shared those registers with the setup and
-// results code (and, with GCC, lost %rbp to a frame pointer for the stack
-// realignment of that code's 512-bit vector spills), and the handoff counter
-// was spilled.
+// Inlined into BM_scope(), the loop shares those registers with the setup and
+// results code (and, with GCC, loses %rbp to a frame pointer for the stack
+// realignment of that code's 512-bit vector spills), and the handoff counter is
+// spilled.
 template <typename Slot, Store store, PtrLine ptr_line>
 [[gnu::noinline]] static void timed_loop(benchmark::State& state, int tid) {
   using Clock = std::chrono::steady_clock;

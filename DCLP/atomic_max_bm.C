@@ -26,13 +26,7 @@
 // no-update path is nearly every offer, and two jumps saved on it are most of
 // its cost. If it is contended, everybody loses -- a failed exchange or a
 // contended lock costs far more than two jumps -- and the hint is still the
-// best available layout. Measured (fleet, 2026-09-06, hinted = the then-shipped
-// atomic_max()): with no updates the hint doubles CAS on Grace and M3, gives
-// 1.3-1.7x on Zen 5 and nothing on Intel (whose compiler output already has
-// that layout), which makes CAS equal to DCLP; with updates it has no
-// consistent effect, and DCLP beats CAS by 1.5-80x at every thread count above
-// one except the 256-thread Intel server at its full SMT count of 256, a cell
-// where CAS swings 4x between runs.
+// best available layout.
 //
 // Two workloads bracket the interesting range of how often the maximum actually
 // changes -- which is what decides whether DCLP's fast path pays off:
@@ -45,9 +39,8 @@
 //            and every offer is a new maximum FOR ITS THREAD. Most are
 //            nevertheless stale by the time they reach the shared word -- other
 //            threads have already passed them -- so DCLP's unlocked read still
-//            skips the lock for most offers (93.7% with 16 threads on a
-//            Ryzen 7940HS laptop, per atomic_max_count). The test of whether the
-//            double check pays when the maximum really moves.
+//            skips the lock for most offers (atomic_max_count counts them). The
+//            test of whether the double check pays when the maximum really moves.
 #include <unistd.h>
 #include <cstddef>
 #include <cmath>
@@ -105,12 +98,10 @@ static SameLineMax sameline;
 
 // The CAS loops of the experiment, independent of atomic_max.h (which may
 // change): the same while loop as the shipped function, one per layout. The
-// experiment that chose the loop shape (loop shape x branch bias, and the
-// attribute vs the builtin) lived here earlier; only its conclusion remains:
-// the builtin on the condition, because it states the edge's weight
-// unambiguously where the attribute's strength is up to the compiler (with
-// g++-16 and clang++-22, [[unlikely]] on the loop body gives the same code for
-// this loop; see atomic_max.h).
+// hint is the builtin on the condition, because it states the edge's weight
+// unambiguously where the attribute's strength is up to the compiler (with GCC
+// 16 and Clang 22, [[unlikely]] on the loop body gives the same code for this loop;
+// see atomic_max.h).
 #define CAS_LOOP(NAME, LAYOUT)                                                  \
   template <typename T>                                                        \
   static bool NAME(std::atomic<T>& target, T val,                              \
@@ -199,15 +190,6 @@ void BM_spinlock_grow(benchmark::State& state) {
 // branch order.) The hint makes the layout independent of both, and
 // BM_dclp_uphint forces the wrong layout, which is how to see what the plain
 // `if` would cost if the compiler did not get lucky.
-// Measured with no updates (2026-09-24, 3 runs x 10 reps): on the 128-thread
-// Zen 5 server (GCC 16.2) the unhinted DCLP equals the cold-hinted one (1.00x) at every
-// thread count -- GCC chose the fast layout for this `if` -- and forcing the
-// other layout (BM_dclp_uphint) costs 12-15%. GCC's unhinted CAS loop, by
-// contrast, matches the HOT layout (~0.63x of cold), which is why the shipped
-// hint is worth 1.5-1.6x there. On a 16-thread laptop (Zen 4, clang++-22, one short run)
-// the unhinted DCLP also equals the cold hint, and the forced hot layout halves
-// its throughput. Whether the 12-15% vs 2x difference is the compiler or the
-// core has not been separated.
 // One never/grow pair per variant: LAYOUT wraps only the unlocked probe; MAXV
 // and LOCK name the shared maximum and its lock (separate lines, or one).
 #define DCLP_BM(NAME, LAYOUT, MAXV, LOCK)                                       \
@@ -257,17 +239,11 @@ DCLP_BM(BM_dclp_uphint,   LAYOUT_HOT,  nmax_atomic,    lock)            // updat
 // kept local rather than including that harness), swept over work and threads.
 // The work result feeds the next unit and is pinned, so it cannot be dropped.
 //
-// Measured (128-thread Zen 5 server, GCC 16.2, 2026-09-24, 3 runs x 10 reps): the shared
-// line never wins. It ties at one thread and at work 100-300 up to 32
-// threads, and loses elsewhere: 7-48% at work 0-30 from 8 threads (noisier
-// cells show more), and already about a third at 2 threads when the work
-// between offers is short (work 3-10; at 4 threads 12-32%). So separate lines is the choice when the
-// contention is not known in advance: it costs nothing measurable anywhere and
-// avoids losing up to half. Unlike a lock guarding a payload (Spinlock's layout
-// benchmark, where the shared line wins at low contention), DCLP's operations
-// mostly only READ the maximum, and a writer's lock acquire/release on the same
-// line invalidates the readers' copy even when no update follows (reasoned,
-// not measured with counters).
+// Spinlock's layout benchmark does not answer this: there the lock guards a
+// payload its holder writes, while DCLP's operations mostly only READ the
+// maximum, and a writer's lock acquire/release on the same line invalidates the
+// readers' copy even when no update follows (reasoned, not measured with
+// counters).
 static inline double do_work(double x, long work) {
   for (long i = 0; i < work; ++i) x = std::sin(std::cos(x));
   return x;

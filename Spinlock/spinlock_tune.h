@@ -53,16 +53,16 @@
 //   BackOffParams    every knob of the back-off ladder as one constexpr
 //                    aggregate; the defaults spell the shipped ladder, so a
 //                    named policy reads as its delta from SpinLock. This is
-//                    what will eventually carry names like HighContention or
-//                    LowContentionRead, once the campaign settles the values.
+//                    what a named policy (say, HighContention or
+//                    LowContentionRead) would be spelled with.
 //   BackOffLadder<P> the waiting policy those parameters describe: how to
 //                    acquire a lock word that is currently taken. This is the
 //                    thing being tuned.
 //   TunableSpinLock  the lock word alone. lock<P>() takes the policy as a
 //                    template argument, so the CALLER chooses how to wait,
 //                    per call site -- one flag, any number of waiting
-//                    strategies (this is what replaced the old two-role
-//                    RWTunableSpinLock; see spinlock_rw_tune_bm.C).
+//                    strategies, with no two-role lock class (see
+//                    spinlock_rw_tune_bm.C).
 //   LockAdapter<P>   a policy-bound Lockable view of somebody else's word:
 //                    RAII (std::lock_guard) for the multi-policy case, where
 //                    LadderedLock cannot serve because each one owns its own

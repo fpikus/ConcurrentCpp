@@ -1,4 +1,4 @@
-// Step-6 aside: does the payload belong on the lock's cache line?
+// An aside: does the payload belong on the lock's cache line?
 //
 // The folklore says yes: whoever acquired the lock has just fetched its line,
 // so payload sharing the line is free. The hypothesis under test says that at

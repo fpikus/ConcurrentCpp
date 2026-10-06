@@ -30,7 +30,7 @@
 //     multi-word write, passes through an intermediate payload value while the
 //     counter is odd. A reader that returns the intermediate value has a
 //     broken odd check or a broken validation.
-// Mutation check, on x86 under TSan. Caught: load() without the validation,
+// What the tests catch, on x86 under TSan: load() without the validation,
 // or without the odd check; update(), or store(), without the lock; write()
 // without the odd store, or with the odd store after the payload store; all
 // four release/acquire orderings of seqlock.h relaxed together; SpinLock's

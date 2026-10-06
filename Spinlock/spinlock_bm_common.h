@@ -10,9 +10,9 @@
 // Every benchmark iteration does `work` evaluations of x = sin(cos(x)) on a
 // thread-local value -- work done OUTSIDE the lock -- and then briefly takes
 // the lock to add the local result to a shared accumulator. The `work`
-// argument is the contention dial, calibrated from measured single-thread
-// times (uncontended lock + guarded add ~4 ns, one sin(cos) evaluation
-// ~15 ns), as the fraction of a thread's time spent holding the lock:
+// argument is the contention dial, calibrated from single-thread costs (one
+// sin(cos) evaluation takes about as long as four uncontended lock + guarded
+// add updates), as the fraction of a thread's time spent holding the lock:
 //   work=0   : nothing but the guarded update -- ~100% of time under the lock;
 //   work=3   : ~10% of time under the lock;
 //   work=30  : ~1%;
@@ -46,9 +46,9 @@
 //
 // Note that sin(cos(x)) is a contraction: the chain converges to ~0.694 within
 // a few steps, so the value folded in is numerically constant even though the
-// dependency is real. Cost per evaluation is ~15 ns and stays there, which is
-// the property the dial needs; an unbounded chain would drift into libm's slow
-// argument-reduction path partway through a run.
+// dependency is real. Cost per evaluation is constant, which is the property
+// the dial needs; an unbounded chain would drift into libm's slow argument-
+// reduction path partway through a run.
 static inline double do_work(double x, long work) {
   for (long i = 0; i < work; ++i) x = std::sin(std::cos(x));
   return x;
@@ -59,12 +59,12 @@ static inline double do_work(double x, long work) {
 // the slice advancing (and wrapping) so successive units stream fresh lines
 // instead of re-hitting a hot one. It computes nothing meaningful; it exists
 // to keep the SIMD units fed from memory -- two loaded streams, an FMA, a
-// stored stream, ~1.5 KB of traffic per unit (~6 ns from L3 on the
-// development machine, the same order as one sin/cos evaluation, so the two
-// work dials are roughly commensurate). The arena is 8 MiB per thread: one
-// thread's working set lives in L3, a few threads' combined exceeds it, and
-// from there every work unit is a memory-bandwidth transaction -- so unlike
-// do_work(), the unit cost RISES with the number of running threads.
+// stored stream, ~1.5 KB of traffic per unit (from L3, the same order of time
+// as one sin/cos evaluation, so the two work dials are roughly commensurate).
+// The arena is 8 MiB per thread: one thread's working set lives in L3, a few
+// threads' combined exceeds it, and from there every work unit is a
+// memory-bandwidth transaction -- so unlike do_work(), the unit cost RISES
+// with the number of running threads.
 //
 // Coupling, as everywhere: the seed scales what is stored, and the return
 // value is loaded back from the chunk written last. The seed is folded into
@@ -79,7 +79,7 @@ static inline double do_work(double x, long work) {
 // before the benchmark loop: the framework spawns fresh threads (and thus
 // fresh thread_local arenas) for every calibration round, and the 8 MiB
 // construction storm otherwise lands inside the handful of timed iterations a
-// slow round runs and dominates them (measured 300x at 32 threads).
+// slow round runs and dominates them.
 inline constexpr long mem_chunk = 64;       // doubles per unit (512 B/stream)
 inline constexpr long mem_size = 1l << 19;  // doubles per stream: a + c = 8 MiB
 
@@ -192,9 +192,9 @@ void BM_lock(benchmark::State& state) {
 // endpoints the two placements coincide.
 //
 // Sweeping `work` matters here rather than being inherited out of habit: the
-// single-ladder sweep (spinlock_tune_bm.C) showed that the optimal back-off at
-// ~1% lock occupancy is the opposite of the optimal back-off at saturation, so
-// a read-versus-write comparison run only at work:0 answers the question in one
+// optimal back-off of the single-ladder sweep (spinlock_tune_bm.C) at ~1% lock
+// occupancy is the opposite of the optimal back-off at saturation, so a
+// read-versus-write comparison run only at work:0 answers the question in one
 // regime out of two.
 //
 // Coupling the work to the shared value at both ends is the point of sharing
@@ -300,20 +300,20 @@ static const long numcpu = sysconf(_SC_NPROCESSORS_CONF);
 // experiment runs the same grid and its numbers line up with the others'. The
 // name reads as the ratio -- reads:100 with writes:1 is the 100:1 read-mostly
 // case -- and `work` sets the contention level: saturation, then the two
-// low-occupancy points where the single-ladder sweep showed the optimum moving
+// low-occupancy points where the optimum of the single-ladder sweep moves
 // (work:0 is ~100% of a thread's time inside the shared-data access, work:30
 // ~1%, work:100 ~0.3%).
 //
 // The pure endpoints are what each experiment is actually about; a mix can only
-// interpolate between them, so the default test sets (of the measurement scripts) run the
-// endpoints and leave the mixes for when the endpoints show a spread. For the
-// ladder sweep the endpoints are also self-calibrating: at reads:0/writes:1 the
-// read ladder is never used, so every `r:*` line must collapse onto the
-// baseline and the whole benchmark must reproduce the write-only sweep in
-// spinlock_tune_bm.C, and reads:1/writes:0 is the mirror, where only the read
-// ladder can move the number. For the sequence lock reads:1/writes:0 is where
-// its readers should scale and the spinlock's should not, and reads:0/writes:1
-// is where it pays for the protocol with nothing to show for it.
+// interpolate between them, so run the endpoints first and leave the mixes
+// for when the endpoints show a spread. For the ladder sweep the endpoints are
+// also self-calibrating: at reads:0/writes:1 the read ladder is never used, so
+// every `r:*` line must collapse onto the baseline and the whole benchmark
+// must reproduce the write-only sweep in spinlock_tune_bm.C, and
+// reads:1/writes:0 is the mirror, where only the read ladder can move the
+// number. For the sequence lock reads:1/writes:0 is where its readers should
+// scale and the spinlock's should not, and reads:0/writes:1 is where it pays
+// for the protocol with nothing to show for it.
 #define RW_ENDPOINTS(work) \
   ->Args({0, 1, work})                  /* 100% writers */ \
   ->Args({1, 0, work})                  /* 100% readers */

@@ -45,8 +45,6 @@
 // that come out negative (TSC skew from a thread migrating across cores
 // despite affinity) are counted in lat_neg and discarded; the first
 // warmup_skip valid samples per thread are also dropped.
-//
-// See DN_queue/queue_lmbm.C for the original self-balancing harness design.
 
 #include "concurrent_queue.h"
 #include "latbench_common.h"

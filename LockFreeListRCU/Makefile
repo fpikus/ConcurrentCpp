@@ -57,9 +57,9 @@ TARGET_TEST_TSAN = $(BUILD_DIR)/lock_free_list_rcu_test_tsan
 BENCHMARKS = $(TARGET_BM)
 TESTS = $(TARGET_TEST_ASAN) $(TARGET_TEST_TSAN)
 
-# The test sources: the ported basic and stress tests, the white-box scheme
-# tests and the black-box contract tests. All three are compiled and linked into
-# EACH test binary (one gtest binary per sanitizer), so every one of them is a
+# The test sources: the basic and stress tests, the white-box scheme tests and
+# the black-box contract tests. All three are compiled and linked into EACH test
+# binary (one gtest binary per sanitizer), so every one of them is a
 # prerequisite of both test targets and appears in both recipes.
 TEST_SRCS = lock_free_list_rcu_test.C lock_free_list_rcu_scheme_test.C lock_free_list_rcu_contract_test.C
 

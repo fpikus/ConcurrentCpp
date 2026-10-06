@@ -167,7 +167,7 @@ itself is machine-independent. The reference `config.mk` uses `clang++-22`,
 - `spinlock_scope_bm.C` — whether a thread should store the ring slot it has just claimed inside the critical section or right after `unlock()` (the Google Benchmark harness)
 - `spinlock_scope_mbm.C` — the same with a hand-rolled harness that keeps every thread contending for the whole measurement window, counts lock handoffs, and can sample how long the lock is visibly free
 - `spinlock_scope_demo.C` — the talk-sized version of the scope benchmark: two benchmarks, the slot store before `unlock()` and after it, self-contained apart from `spinlock.h`, with the thread counts at which a laptop shows the loss and a comment on why it needs them
-- `spinlock_scope_common.h` — what the two scope harnesses share: the measured operation, its variants and the shared layout; also contains detailed description of the observed results and underlying mechanisms
+- `spinlock_scope_common.h` — what the two scope harnesses share: the measured operation, its variants and the shared layout; also describes the mechanisms the variants are built to separate
 - `seqlock.h` — a sequence lock: readers copy the payload out without writing to shared memory
 - `seqlock_test.C` — unit tests for the sequence lock (built with ASan and TSan)
 - `seqlock_bm.C` — the sequence lock against the spinlock and a bare atomic, across the same read:write mix

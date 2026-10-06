@@ -3,9 +3,9 @@
 // Three ways to add a thread-local result into a shared total, measured against
 // each other as the amount of local work per update is swept from none to a lot:
 //
-//   BM_spinlock -- a plain unsigned long guarded by the tunable spinlock
-//   BM_atomic   -- std::atomic<unsigned long>::fetch_add, wait-free
-//   BM_cas      -- a compare_exchange loop, lock-free but with no back-off
+//   BM_spinlock_* -- a plain unsigned long guarded by the tunable spinlock
+//   BM_atomic     -- std::atomic<unsigned long>::fetch_add, wait-free
+//   BM_cas        -- a compare_exchange loop, lock-free but with no back-off
 //
 // This is the experiment behind the claim in README.md that at low contention
 // the balance inverts: the spinlock wins the throughput of the lock operations
@@ -54,8 +54,7 @@
 // compute-heavy sin/cos chain, and the memory-streaming AXPY of
 // spinlock_mem_bm.C. A thread doing register-resident work costs the others
 // nothing; a thread streaming memory competes with every other thread for L3
-// and DRAM bandwidth, and the first measurements say the crossover moves
-// accordingly -- see the note at the registrations.
+// and DRAM bandwidth, which can change the balance between the mechanisms.
 //
 // RUNNING IT
 //
@@ -68,22 +67,21 @@
 // Run the _mem benchmarks with --benchmark_repetitions=10 (and
 // --benchmark_report_aggregates_only=true) and read the mean: the memory work
 // re-rolls its cache/CCD placement with every repetition's fresh threads, and
-// a single repetition carries ~10-14% CV from that lottery alone (measured on
-// the development machine via the shared:0 control, whose three identical
-// programs converge to within ~4% at 10 repetitions). The sin/cos benchmarks
-// sit at ~2-4% CV and can afford fewer.
+// a single repetition is noisy from that lottery alone (the shared:0 control,
+// three identical programs, shows how noisy). The sin/cos benchmarks are much
+// quieter and can afford fewer.
 //
 // Repetitions only average the noise that re-rolls per repetition. A process
 // is itself one draw of everything fixed at exec -- ASLR code/stack layout,
 // the physical pages the allocator keeps handing back, initial placement --
 // and repetitions inside it can cluster tightly around a value another
-// invocation will tightly miss (observed on the development machine: two
-// mechanisms 34% apart at many sigma in one process, equal in another). For
-// numbers that decide anything, invoke the binary 2-3 times and compare the
-// per-run means: their spread is the real error bar, and the within-run
-// stddev only its floor. Add --benchmark_enable_random_interleaving on long
-// runs so that slow drift (thermal, background load) decorrelates from
-// benchmark order instead of biasing whichever families run last.
+// invocation will tightly miss (two mechanisms can be tens of percent apart at
+// many sigma in one process and equal in another). For numbers that decide
+// anything, invoke the binary 2-3 times and compare the per-run means: their
+// spread is the real error bar, and the within-run stddev only its floor. Add
+// --benchmark_enable_random_interleaving on long runs so that slow drift
+// (thermal, background load) decorrelates from benchmark order instead of
+// biasing whichever families run last.
 //
 // Read it as three curves per thread count and work kind. The number to find
 // is the smallest `work` at which the atomic overtakes the spinlock -- that is
@@ -100,18 +98,16 @@
 #include "spinlock_bm_common.h"
 
 // The spinlocks under test: TWO configurations, because the machines disagree
-// about which one is the saturation champion and the disagreement is itself a
-// finding.
+// about which one is the saturation champion, so neither can stand for the
+// lock everywhere.
 //
-//   s1 -- the shipped ladder with the short-sleep tier cut to one round.
-//         Best at maximum contention on the development machine (16-core
-//         Ryzen 9 9950X): 244 M updates/s at 8 threads and 256 at 32, against
-//         the shipped ladder's 216 and 192, at identical single-thread cost.
+//   s1 -- the shipped ladder with the short-sleep tier cut to one round: the
+//         saturation choice of the development machine (16-core Ryzen 9
+//         9950X).
 //   s8 -- the shipped SpinLock ladder itself. On a 2-socket 128-core Granite
-//         Rapids server, s1 turned out bistable at saturation -- two
-//         identical-by-construction instantiations measured 70 and 37 M/s,
-//         both far below this ladder's 132 -- so the dev-machine choice did
-//         not transfer, and both configurations are measured everywhere.
+//         Rapids server s1 is bistable at saturation and loses to this
+//         ladder, so the dev-machine choice does not transfer, and both
+//         configurations are measured everywhere.
 using OverheadSpinLockS1 = LadderedLock<BackOffParams{.nshort = 1}>;
 using OverheadSpinLockS8 = LadderedLock<BackOffParams{}>;
 
@@ -198,9 +194,9 @@ void BM_update(benchmark::State& state) {
 
 // The dial, as (shared, work) pairs. Spaced roughly logarithmically because the
 // crossing is expected somewhere in the middle and its location is what is
-// being measured, not its exact value. Calibrated from ~15 ns per sin(cos)
-// evaluation and ~4 ns for an uncontended update, the fraction of a thread's
-// time spent on shared state runs from all of it to almost none:
+// being measured, not its exact value. With one sin(cos) evaluation costing
+// about as much as four uncontended updates, the fraction of a thread's time
+// spent on shared state runs from all of it to almost none:
 //   300:1   -- synchronization is essentially the whole program
 //   100:1   --
 //    10:1   --
@@ -228,7 +224,7 @@ void BM_update(benchmark::State& state) {
 // grid -- including the shared-heavy 100:1 and 10:1 ratios, which are where
 // the lock's domain lives. Both lock configurations run under both kinds of
 // work: comparing BM_spinlock_s1 against BM_spinlock_s8 in the same run also
-// measures the instantiation-level sensitivity that unmasked s1 on the 2-socket
+// measures the instantiation-level sensitivity s1 shows on the 2-socket
 // Granite Rapids server.
 BENCHMARK_TEMPLATE(BM_update, GuardedUpdate<OverheadSpinLockS1>, SinCosWork)
     ->Name("BM_spinlock_s1") OVERHEAD_ARGS;
@@ -239,11 +235,7 @@ BENCHMARK_TEMPLATE(BM_update, FetchAddUpdate, SinCosWork)
 BENCHMARK_TEMPLATE(BM_update, CasUpdate, SinCosWork)
     ->Name("BM_cas") OVERHEAD_ARGS;
 
-// The memory-work variants. Dev-machine and Granite Rapids agree: the
-// crossover sits at the same ratio as with sin/cos work, but the atomic's
-// mid-range lead is wider (the lock runs at DRAM speed while the atomic runs
-// from cache). Past work:~100 differences at a 0.1% sync fraction are
-// cache-placement lottery, not mechanism.
+// The memory-work variants.
 BENCHMARK_TEMPLATE(BM_update, GuardedUpdate<OverheadSpinLockS1>, MemWork)
     ->Name("BM_spinlock_s1_mem") OVERHEAD_ARGS;
 BENCHMARK_TEMPLATE(BM_update, GuardedUpdate<OverheadSpinLockS8>, MemWork)
@@ -254,10 +246,9 @@ BENCHMARK_TEMPLATE(BM_update, CasUpdate, MemWork)
     ->Name("BM_cas_mem") OVERHEAD_ARGS;
 
 // The shipped SpinLock under the same body: the chosen configuration measured
-// against what it would replace, not only against the atomics. Registered but
-// outside the default test sets (the measurement scripts select
-// lock-versus-lock-free);
-// select it with --benchmark_filter='BM_shipped'.
+// against what it would replace, not only against the atomics. Registered,
+// but not part of the lock-versus-lock-free comparison above; select it with
+// --benchmark_filter='BM_shipped'.
 BENCHMARK_TEMPLATE(BM_update, GuardedUpdate<SpinLock>, SinCosWork)
     ->Name("BM_shipped") OVERHEAD_ARGS;
 BENCHMARK_TEMPLATE(BM_update, GuardedUpdate<SpinLock>, MemWork)

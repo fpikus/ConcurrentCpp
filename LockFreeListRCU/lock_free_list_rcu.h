@@ -63,8 +63,8 @@
 // -- logical deletion by a mark bit in the deleted node's OWN next pointer,
 // physical unlinking by swinging the predecessor past it, cooperative helping
 // -- with the reference-counted pointers replaced by plain CAS on raw marked
-// pointers. What used to be done by the pointer policy (keeping a node alive
-// while anyone can still reach it) is done here by GENERATIONS and HANDLES:
+// pointers. What the pointer policy does there (keeping a node alive while
+// anyone can still reach it) is done here by GENERATIONS and HANDLES:
 //
 // HANDLES. Every list operation takes a `handle` as its first argument
 // (`list.insert_after(h, anchor, v)`, `list.begin(h)`, ...). A handle is a
@@ -230,13 +230,12 @@
 // ---------------------------------------------------------------------------
 // PROTOCOL OVERVIEW (the implementation; the public contract is above). The
 // memory order of every atomic operation below is justified in the comment
-// at that operation, with one of three labels. DESIGNATED: a relacy model
-// checker run of the protocol core kills the weaker order (the comment says
-// what the weakening let happen). EXPECTED-EQUIVALENT: a weaker (or a
-// different, equally strong) order would also be correct under the standard
-// and the model checker cannot tell them apart; the chosen order is kept so
-// that nobody "fixes" it either way. REQUIRED: the standard's happens-before
-// argument needs the order; the comment gives it.
+// at that operation, with one of three labels. DESIGNATED: the weaker order
+// fails in a concrete execution (the comment says what the weakening lets
+// happen). EXPECTED-EQUIVALENT: a weaker (or a different, equally strong)
+// order would also be correct under the standard; the chosen order is kept
+// so that nobody "fixes" it either way. REQUIRED: the standard's
+// happens-before argument needs the order; the comment gives it.
 //
 // THE RING. Generations are status blocks in a fixed ring of kGenerations
 // `GenerationBlock`s that are never deallocated or moved. Each block has a
@@ -257,8 +256,8 @@
 // `fetch_sub` and retry. The join and the reclaimer's "publish, then read
 // refs" form a store-buffering pair, which is why the increment, the
 // re-verify load, the publish store and the reclaimer's `refs` loads are all
-// seq_cst (model-checked: with any of the four weakened, or without the
-// re-verify, a joiner ends up reading a node in a bag the reclaimer is
+// seq_cst (with any of the four weakened, or without the re-verify, there is
+// an execution in which a joiner reads a node in a bag the reclaimer is
 // freeing). Two invariants make the stale increment harmless: (J1) between
 // its `fetch_add` and a successful re-verify a joiner touches NO node, head
 // or bag, so a count it leaves on a just-closed or recycled block can delay
@@ -267,9 +266,9 @@
 // leave and by the join's undo -- and is never stored: the reclaimer only
 // reads it, and does NOT reset it when it recycles a slot. A reset would
 // wipe a stale +1 and the matching -1 would then drive the count negative
-// or to zero under a live handle (model-checked: a reclaimer that stores 0
-// on recycle lets a later handle hold a block whose count is 0 while its bag
-// is freed). Hence every -1 follows its own +1 and the count never goes
+// or to zero under a live handle (a reclaimer that stores 0 on recycle lets
+// a later handle hold a block whose count is 0 while that block's bag is
+// freed). Hence every -1 follows its own +1 and the count never goes
 // negative (debug-asserted at every `fetch_sub`). Pointer equality suffices
 // across a ring wrap: a joiner whose re-verify reads block B again after B
 // was freed, recycled and republished has synchronized with that LATER
@@ -297,26 +296,24 @@
 // a slot is reusable only when EMPTY. The A3-before-A5 order: an exchange
 // moved to after the `in_advance_after_publish` hook is caught by the scheme
 // tests; one moved to between the publish and that hook has no deterministic
-// test (model checker and order review only; stress tests under
-// ThreadSanitizer catch it sometimes). The flag's acquire/release pair has
-// two duties: it is the ONLY synchronization on the plain fields `state`,
-// `bag`, `gen` and `oldest_` between successive reclaimers, and it orders a
-// holder's publish before a later holder's `refs` loads (so the
-// store-buffering argument holds across flag holders, not only inside one
-// call); model-checked: with relaxed flag orders, or without the flag, two
+// test (stress tests under ThreadSanitizer catch it sometimes). The flag's
+// acquire/release pair has two duties: it is the ONLY synchronization on the
+// plain fields `state`, `bag`, `gen` and `oldest_` between successive
+// reclaimers, and it orders a holder's publish before a later holder's `refs`
+// loads (so the store-buffering argument holds across flag holders, not only
+// inside one call); with relaxed flag orders, or without the flag, two
 // callers race on the plain fields at once.
-// Concurrent reclaimers were rejected after model checking demonstrated the
-// hazards of every variant tried -- two advancers writing one closing bag,
-// an advance order that wedges the ring after one wrap, a stale snapshot of
-// the current block orphaning a retired chain, a free walk passing a block
-// still current, and a skipped in-progress block with no happens-before to
-// its generation's leave -- and their repairs bought concurrency nobody
-// needs at the price of a state machine. Refusal and retry: `contended`,
-// `ring_full` and `nothing_retired` consume no slot and burn nothing; the
-// caller simply calls again (`ring_full` after the pinning handles leave or
-// refresh -- and it is stale on return exactly when the pin was released
-// between the in-advance free pass and the final one: the final pass then
-// frees it and the next call advances).
+// Reclaimers do not run concurrently: the concurrent variants have hazards --
+// two advancers writing one closing bag, an advance order that wedges the
+// ring after one wrap, a stale snapshot of the current block orphaning a
+// retired chain, a free walk passing a block still current, and a skipped
+// in-progress block with no happens-before to its generation's leave -- and
+// their repairs buy concurrency nobody needs at the price of a state machine.
+// Refusal and retry: `contended`, `ring_full` and `nothing_retired` consume
+// no slot and burn nothing; the caller simply calls again (`ring_full` after
+// the pinning handles leave or refresh -- and it is stale on return exactly
+// when the pin was released between the in-advance free pass and the final
+// one: the final pass then frees it and the next call advances).
 //
 // INVARIANT. Two directions. (I) A handle of generation g never observes a
 // node in a bag of generation < g. Chain: unlink CAS, sequenced before the
@@ -345,8 +342,8 @@
 // destroyed (the bag free does that later), a marked value is stored into
 // its `next`, and it is pushed onto the retired list, from which it re-enters
 // the free list only through a bag. It is never pushed back onto the free
-// list -- model-checked: a stale pop CAS then succeeds by ABA and the node
-// is handed out twice -- and never deleted, because a losing popper may
+// list -- a stale pop CAS would then succeed by ABA and the node would be
+// handed out twice -- and never deleted, because a losing popper may
 // still read its `retire_link`. A freshly `new`ed node that does not get
 // linked is deleted after `~T`.
 //
@@ -964,15 +961,14 @@ public:
             // inserted after target just before target died), and a reader
             // acquiring anchor->next must see its construction, which we saw
             // through our acquire load of target->next; the release carries
-            // it transitively (model-checked and seen under ThreadSanitizer:
-            // with a relaxed unlink a reader's ++ races with the inserter's
-            // construction). INVARIANT (I)'s chain does NOT need this
-            // release (the retire push below is sequenced after the unlink
-            // and carries it); the graveyard rule needs it too (reasoned,
-            // not yet model-checked): with two or more erasers, a dead
-            // node's successor can be unlinked through a word other than
-            // the one a parked reader read, and only this release orders
-            // that unlink before the reader. On failure anchor->next
+            // it transitively (observed: with a relaxed unlink a reader's ++
+            // races with the inserter's construction). INVARIANT (I)'s chain
+            // does NOT need this release (the retire push below is sequenced
+            // after the unlink and carries it); the graveyard rule needs it
+            // too (by argument, not demonstrated): with two or more erasers,
+            // a dead node's successor can be unlinked through a word other
+            // than the one a parked reader read, and only this release
+            // orders that unlink before the reader. On failure anchor->next
             // changed under us -- an insert landed after anchor, or anchor
             // itself was erased -- and the dead node stays linked
             // ("stranded") until the next erase_after() over this edge helps
@@ -1263,8 +1259,7 @@ private:
     // new generation read a node of the closing bag as it is freed. An
     // exchange moved to after the hook below is caught by the scheme tests;
     // one moved to between the publish and the hook has no deterministic
-    // test (model checker and order review only; stress tests under
-    // ThreadSanitizer catch it sometimes).
+    // test (stress tests under ThreadSanitizer catch it sometimes).
     ReclaimResult::Advance advance(ReclaimResult& result) noexcept {
         // relaxed: only the emptiness is tested; a push racing this load is
         // seen by the next call (EXPECTED-EQUIVALENT).
@@ -1380,7 +1375,7 @@ private:
             // publishes nothing a later popper needs -- later poppers reach
             // the splicer through the release sequence this RMW continues --
             // both halves EXPECTED-EQUIVALENT to relaxed given the acquire
-            // load and failure order, kept per the order table). Failure
+            // load and failure order, kept as the label prescribes). Failure
             // ACQUIRE is REQUIRED: a refreshed `head` may come from a LATER
             // splice, and we dereference `head->retire_link` on the next
             // pass -- with a relaxed failure order its write (and the poison,

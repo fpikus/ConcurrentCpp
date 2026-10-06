@@ -614,30 +614,25 @@ private:
     // identical, and the crossover is governed by how often anyone else touches
     // the line during one write.
     //
-    // Measured (BM_WriterVsPollingReaders in concurrent_deque_bm.C, built both
-    // ways; 1 writer vs N size()-polling readers):
+    // What the layout changes (BM_WriterVsPollingReaders in
+    // concurrent_deque_bm.C, built both ways; 1 writer vs N size()-polling
+    // readers):
     //   - The effect requires a writer running CONCURRENTLY with polling readers
     //     (this container's single-producer / many-consumer design point).
     //     Read-only or bursty-write workloads see no difference -- do not let a
     //     benchmark that never overlaps a writer with polling readers report the
     //     padding as free.
-    //   - Robust signature everywhere: the packed build issues ~3-4x more
-    //     L1-dcache load misses (perf stat). Wall-time impact scales with the
-    //     machine's coherence-domain fragmentation:
-    //       . single shared L3 (72-core ARM server): no measurable difference;
-    //       . desktop, 2 CCDs (under a VM): counters only, wall time in noise;
-    //       . 2-socket x86 server: ~15% writer-throughput gain, few readers;
-    //       . 128-core x86 server, 16 CCX-level L3 domains: 1.4-1.7x writer
-    //         throughput at 8-64 readers, and 3-5x LOWER run-to-run variance
-    //         (packed, the push cost depends on which reader last stole the
-    //         line; padded, the spinlock never leaves the writer's L1).
-    //     On that machine, pinned inside one NUMA node (16 cores, 2 CCXs --
-    //     cheap probes), the crossover of the rule above is directly visible
-    //     in one sweep: PACKED wins 1.4-1.6x at 1-2 readers (the lock-acquire
-    //     RFO carries `size_` along free), parity near 4, PADDED wins ~1.4x
-    //     from 8 readers up (writer CPU ~480 vs ~680 ns/push). Unpinned
-    //     (expensive cross-node probes) only the 1-reader point stays packed-
-    //     favored -- the pricier the probe, the earlier separation pays.
+    //   - Robust signature everywhere: the packed build issues several times
+    //     more L1-dcache load misses. Wall-time impact scales with the machine's
+    //     coherence-domain fragmentation: none with a single shared L3; with
+    //     many L3 domains, padding raises writer throughput substantially and
+    //     cuts the run-to-run variance (packed, the push cost depends on which
+    //     reader last stole the line; padded, the spinlock never leaves the
+    //     writer's L1). Where probes are cheap the crossover of the rule above
+    //     is directly visible: PACKED wins with one or two readers (the
+    //     lock-acquire RFO carries `size_` along free), PADDED wins once more
+    //     than a few readers poll. The pricier the probe, the earlier separation
+    //     pays.
     //   - Padding cannot help the first-order cost, which is TRUE sharing:
     //     `size_` itself is what readers poll, so every push must invalidate
     //     every reader's copy regardless of layout. On a fast interconnect this

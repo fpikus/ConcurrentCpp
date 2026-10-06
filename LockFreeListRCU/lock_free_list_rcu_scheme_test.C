@@ -510,7 +510,11 @@ TYPED_TEST(LockFreeListRCUScheme, RefreshInvalidates) {
 
     const long j0 = TestHooks::join.calls.load();
     EXPECT_FALSE(h.refresh());                               // fast path
-    if constexpr (TestFixture::kHooked) EXPECT_EQ(calls_since(TestHooks::join, j0), 0);
+    // Braces: EXPECT_EQ expands to an if/else, which g++ flags as a dangling else
+    // under -Werror.
+    if constexpr (TestFixture::kHooked) {
+        EXPECT_EQ(calls_since(TestHooks::join, j0), 0);
+    }
     ACCOUNTING(list, "step 2: the fast-path refresh changed nothing", 1, 0, 0, 0, 0, 1, 1);
 #ifndef NDEBUG
     EXPECT_DEATH((void)list.erase_after(h, it), "iterator used with a different handle session");
@@ -528,7 +532,9 @@ TYPED_TEST(LockFreeListRCUScheme, RefreshInvalidates) {
 
     const long j1 = TestHooks::join.calls.load();
     EXPECT_TRUE(h.refresh());                                // slow path: [S0/1 C1 ...E]
-    if constexpr (TestFixture::kHooked) EXPECT_EQ(calls_since(TestHooks::join, j1), 1);
+    if constexpr (TestFixture::kHooked) {
+        EXPECT_EQ(calls_since(TestHooks::join, j1), 1);
+    }
 #ifndef NDEBUG
     EXPECT_DEATH((void)list.erase_after(h, it2), "iterator used with a different handle session");
 #endif

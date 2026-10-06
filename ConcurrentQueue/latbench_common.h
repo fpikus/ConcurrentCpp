@@ -21,9 +21,10 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 //
-// Shared helpers for queue latency benchmarks (queue_lmbm.C in each queue dir).
-// Provides: rdtsc timestamps, cycle calibration, per-thread stats with a
-// log-linear latency histogram, and percentile extraction.
+// Shared helpers for the queue latency benchmarks (concurrent_queue_lmbm.C and
+// concurrent_queue_ppmbm.C). Provides: rdtsc timestamps, cycle calibration,
+// per-thread stats with a log-linear latency histogram, and percentile
+// extraction.
 //
 // Compile-time configuration: change kLatPercentiles below and rebuild.
 
@@ -287,7 +288,9 @@ inline double percentile_cycles(const std::array<uint64_t, kHistBuckets>& h,
 // The log-linear histogram (see above) gives ~12.5% relative bin width, fine
 // enough to see bimodality, heavy tails, and cluster structure that p50/p99
 // alone hide. Off by default because one run produces ~100 non-empty buckets
-// per sweep point and a lmbm sweep has five thread counts * four alignments.
+// per sweep point, and a lmbm sweep has a point for every thread count (the
+// powers of 2 from 2 up to the hardware thread count, plus that count itself
+// when it is not a power of 2) at each of four alignments.
 //
 // Each harness's CLI sets this from --dump-hist; print_row consults it.
 inline bool g_dump_hist = false;

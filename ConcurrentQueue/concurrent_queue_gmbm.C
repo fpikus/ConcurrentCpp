@@ -51,16 +51,15 @@
 // commented-out entries of kVariants (a8/a32/a256) are kept ready for ad-hoc
 // runs.
 //
-// Why the balanced rows were added (2026-10): with static roles and a fixed
-// iteration count, producers and consumers here do the same amount of work.
+// Why the balanced rows were added: with static roles and a fixed iteration
+// count, producers and consumers here do the same amount of work.
 // concurrent_queue_mbm.C runs every thread for the same TIME instead, and
 // there the role that attempts faster pins the queue at a boundary -- full,
-// in the rows measured, with the producers' failing retries slowing the
-// consumers -- a different regime, up to 1.5x slower on a Ryzen 9 7940HS at
-// 2^16 slots (up to 1.6x from a half-full start). With BALANCE, a thread that
-// finds the queue full pops and one that finds it empty pushes, so neither
-// boundary can hold it, under equal work or equal time. mbm runs only
-// balanced rows; these are their twins.
+// say, with the producers' failing retries slowing the consumers -- a
+// different and slower regime. With BALANCE, a thread that finds the queue
+// full pops and one that finds it empty pushes, so neither boundary can hold
+// it, under equal work or equal time. mbm runs only balanced rows; these are
+// their twins.
 //
 // Why the key/value (kv) variants were added: the two modes share nothing
 // below the locks. Key-only push/pop store and clear the key inside the
@@ -74,7 +73,7 @@
 //
 // MEASUREMENT WINDOW
 //
-// Google Benchmark (checked in 1.9.5, src/benchmark_runner.cc) decides that a
+// Google Benchmark (as of 1.9.5, src/benchmark_runner.cc) decides that a
 // threaded run is long enough by comparing min_time against the real time
 // SUMMED over all threads, and every thread then runs that many iterations.
 // So a min_time of 1 s at 128 threads is a measurement window of about 8 ms
@@ -154,11 +153,11 @@
 // makes thread 0 push that many elements before the start barrier, so that
 // every run, the measured one included, starts that full. Why: at 2^16 slots
 // an unbalanced row can settle with the queue full or near empty, and the knob
-// lets a run choose where it starts. Where it starts turned out not to decide
-// where it settles: starting half-full changed neither harness (see WHY
-// BALANCED in concurrent_queue_mbm.C); what decides it is which role attempts
-// faster. The prefilled elements are not counted as items. The run names do not show CQ_CAP or CQ_FILL; both are in the context
-// at the top of the output (cq_cap, cq_fill).
+// lets a run choose where it starts. Where it starts does not decide where it
+// settles; which role attempts faster does (see WHY BALANCED in
+// concurrent_queue_mbm.C). The prefilled elements are not counted as items.
+// The run names do not show CQ_CAP or CQ_FILL; both are in the context at the
+// top of the output (cq_cap, cq_fill).
 
 #include "concurrent_queue.h"
 
@@ -218,8 +217,9 @@ constexpr double kWarmupSeconds = 0.5;
 // The number of ints in each key-only thread's array of pointees, a power of
 // 2: a thread pushes their addresses in turn. The queue needs its keys
 // non-null, not distinct (it only stores them; nobody dereferences them), so
-// a small array will do; one of N ints per thread was 32 GB at 2^26 slots and
-// 128 threads. concurrent_queue_mbm.C uses the same value; keep the two files in step.
+// a small array will do; one of N ints per thread would be 32 GB at 2^26
+// slots and 128 threads. concurrent_queue_mbm.C uses the same value; keep the
+// two files in step.
 constexpr size_t kPointees = 1024;
 static_assert(std::has_single_bit(kPointees));
 
@@ -325,10 +325,10 @@ struct OpCounts {
 // into the loop rather than left to the inliner -- with GCC, whose flatten
 // applies to the calls that inlining exposes. Clang's does not reach lock(),
 // which its inliner inlines here because it estimates the call site to be hot
-// (see run_phase() in the twin for how the twin gets the same estimate). Once
-// clang 22 inlined lock() here and called it out of line in the twin, and the
-// twin's 2-thread key-only rate was half of this one's (Ryzen 9 7940HS, both
-// pinned to the same two cores). The SpinLock directory found the same trap
+// (see run_phase() in the twin for how the twin gets the same estimate). With
+// lock() inlined in one loop and called out of line in the other, the two
+// harnesses stop being twins: the out-of-line call can halve the 2-thread
+// key-only rate. The SpinLock directory documents the same trap
 // (spinlock_scope_common.h, E2): a call between the unlock and the next lock
 // is a store there. Whether lock() is inlined into both loops is therefore to
 // be checked in the disassembly of every build that is measured. A
@@ -530,17 +530,16 @@ struct Variant {
     void (*fn)(benchmark::State&);      // the BM_MP_MC() instantiation
 };
 
-// The variants, in registration order at each thread count; the comments
-// say where each one did best in the old fleet campaign (key-only, before
-// the key/value protocol rewrite). The balanced rows follow the unbalanced
-// ones (see "Why the balanced rows were added" above).
+// The variants, in registration order at each thread count. The balanced
+// rows follow the unbalanced ones (see "Why the balanced rows were added"
+// above).
 static constexpr Variant kVariants[] = {
-    {"BM_MP_MC_void_8", BM_MP_MC<int*, void, 8, 0>},            // Best on M3 Ultra, competitive on Grace/AMD
+    {"BM_MP_MC_void_8", BM_MP_MC<int*, void, 8, 0>},            // Packed: the slot's natural alignment
     //{"BM_MP_MC_void_8_a8", BM_MP_MC<int*, void, 8, 8>},
-    {"BM_MP_MC_void_8_a16", BM_MP_MC<int*, void, 8, 16>},       // Best on M3 Ultra (tied), good all-rounder
+    {"BM_MP_MC_void_8_a16", BM_MP_MC<int*, void, 8, 16>},       // One slot per 16 bytes
     //{"BM_MP_MC_void_8_a32", BM_MP_MC<int*, void, 8, 32>},
-    {"BM_MP_MC_void_8_a64", BM_MP_MC<int*, void, 8, 64>},       // Best on Grace 2t, Zen3 mid-high, Cascade Lake 32t
-    {"BM_MP_MC_void_8_a128", BM_MP_MC<int*, void, 8, 128>},     // Best on Granite Rapids, Zen5 high threads
+    {"BM_MP_MC_void_8_a64", BM_MP_MC<int*, void, 8, 64>},       // One slot per 64-byte cache line
+    {"BM_MP_MC_void_8_a128", BM_MP_MC<int*, void, 8, 128>},     // One slot per adjacent-line prefetch pair
     //{"BM_MP_MC_void_8_a256", BM_MP_MC<int*, void, 8, 256>},
     // Key/value queue at the same alignments as the key-only rows above.
     {"BM_MP_MC_kv_8", BM_MP_MC<uint64_t, uint64_t, 8, 0>},
@@ -583,12 +582,12 @@ static size_t get_thread_count() {
 // that is not a whole number, or is outside [8, 2^56], ends the program with
 // a message: 8 is the queue's minimum, and 2^56 slots of the largest slot (128
 // bytes) is the most whose size in bytes fits a size_t; outside them the queue
-// would abort in the constructor with no explanation. A value that is not a power of 2 is reported with the power of
-// 2 it will be rounded down to. main() calls this after
-// MaybeReenterWithoutASLR(): Google Benchmark (1.9.x) re-executes the program
-// at startup with address-space randomization turned off, and anything that
-// ran before the re-execution (a static initializer, as this once was) runs,
-// and prints, twice.
+// would abort in the constructor with no explanation. A value that is not a
+// power of 2 is reported with the power of 2 it will be rounded down to.
+// main() calls this after MaybeReenterWithoutASLR(): Google Benchmark (1.9.x)
+// re-executes the program at startup with address-space randomization turned
+// off, and anything that ran before the re-execution (a static initializer,
+// say) runs, and prints, twice.
 static size_t get_queue_capacity() {
     const char* env = std::getenv("CQ_CAP");
     if (!env) return 1UL << 16;
@@ -642,8 +641,8 @@ int main(int argc, char** argv) {
     benchmark::AddCustomContext("cq_cap", std::to_string(std::bit_floor(queue_capacity)));
     benchmark::AddCustomContext("cq_fill", std::to_string(g_queue_fill));
     // The thread counts: the powers of two from 2 up to the CPU count, then
-    // the CPU count itself if it is not a power of two (what
-    // ThreadRange(2, thread_count) gave before).
+    // the CPU count itself if it is not a power of two (the counts of
+    // ThreadRange(2, thread_count)).
     std::vector<size_t> thread_counts;
     for (size_t t = 2; t <= thread_count; t *= 2) thread_counts.push_back(t);
     if (thread_counts.empty() || thread_counts.back() != thread_count) thread_counts.push_back(thread_count);

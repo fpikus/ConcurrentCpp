@@ -26,9 +26,8 @@ CXX_RPATH := $(call RPATH_OF,$(shell $(CXX) -print-file-name=libstdc++.so))
 SAN_CXX_RPATH := $(if $(SAN_RPATH),$(SAN_RPATH),$(call RPATH_OF,$(shell $(SAN_CXX) -print-file-name=libstdc++.so)))
 
 # Per-host build directory: several hosts build concurrently in the same
-# NFS-shared tree, so binaries must not overwrite each other. Same convention
-# as results/<hostname>/ in the measurement scripts: per-host subdirectories
-# under build/.
+# NFS-shared tree, so binaries must not overwrite each other: per-host
+# subdirectories under build/.
 # clean removes only this host's subdirectory, never the other hosts'.
 BUILD_DIR = build/$(shell hostname)
 
@@ -179,9 +178,9 @@ run_tests: tests
 # Run benchmarks. spinlock_scope_bm and spinlock_scope_mbm are left out: one
 # pass over all their cells takes minutes on the large servers, and
 # runs with repetitions take proportionally longer. spinlock_scope_demo is
-# left out too: its one pass is six 1-second runs, but one pass of a 2-5%
-# noisy WSL2 cell is not a result, and the demo is meant to be run by hand
-# with --benchmark_repetitions.
+# left out too: its one pass is six 1-second runs, but one pass of a cell
+# that varies by a few percent under WSL2 is not a result, and the demo is
+# meant to be run by hand with --benchmark_repetitions.
 run_benchmarks: benchmarks
 	./$(TARGET_BM)
 	./$(TARGET_TUNE_BM)

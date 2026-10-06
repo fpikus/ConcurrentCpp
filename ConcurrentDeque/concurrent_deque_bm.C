@@ -171,7 +171,7 @@ static void BM_AccessNoGrowth(benchmark::State& state) {
 }
 
 // Registration axes (consumed as state.range(0) and state.range(1) inside the
-// benchmark): arg 0 is elements-per-thread, swept geometrically 1e3..1e5 (x10);
+// benchmark): arg 0 is elements-per-thread, swept geometrically 1e3..1e6 (x10);
 // arg 1 is the thread count, swept 1..num_cpu (x2). ArgsProduct runs the full
 // cross product.
 //
@@ -377,26 +377,24 @@ BENCHMARK_TEMPLATE(BM_ResizeAndWrite, ConcurrentAppendDeque<int, 1024>)
 // --benchmark_repetitions and compare MEDIANS -- unpinned placement makes single
 // runs bimodal on multi-domain machines.
 //
-// What to look at (from runs on four machines; details in concurrent_deque.h):
+// What to look at (the layout's effect is described in concurrent_deque.h):
 //   - WriterPush/s carries the wall-time signal, not ReaderLoad/s: reader misses
 //     are rate-limited by how often the writer invalidates the line, and polling
 //     outruns pushing by orders of magnitude, so reader wall time barely moves.
 //     Aggregate ReaderLoad/s instead exposes TRUE sharing: it plateaus once the
 //     hot line's coherence traffic saturates (adding readers just splits it).
-//   - The packed build's penalty grows with coherence-domain fragmentation:
-//     zero on a single shared L3, up to 1.4-1.7x writer throughput (and far
-//     noisier run-to-run) on a 16-CCX x86 server at 8-64 readers. At few
-//     readers packed WINS (1.4-1.6x at 1-2 readers pinned within one NUMA
-//     node, crossover near 4): probes are rare, so the lock-acquire RFO
-//     carries `size_` along free (same-line-vs-separate-line rule, see
-//     concurrent_deque.h). Sweeping reader count pinned vs unpinned moves the
-//     crossover -- the pricier the probe, the earlier separation pays.
+//   - Compare machines with different numbers of coherence domains: what the
+//     packed layout costs depends on what a probe of the line costs. Look for
+//     the crossover in reader count: with few readers probes are rare, so the
+//     lock-acquire RFO carries `size_` along free (same-line-vs-separate-line
+//     rule, see concurrent_deque.h). Sweeping reader count pinned vs unpinned
+//     moves the crossover -- the pricier the probe, the earlier separation
+//     pays.
 //   - When readers oversubscribe the pinned cores, compare writer CPU time
 //     (not real time) per iteration: it is immune to the writer being
-//     descheduled and to background load (measured ~480 vs ~680 ns of writer
-//     CPU per push, padded vs packed, on the 16-CCX machine).
-//   - The L1-miss gap (~3-4x, perf stat -e L1-dcache-load-misses) shows up on
-//     every machine even when wall time does not.
+//     descheduled and to background load.
+//   - Where wall time does not separate the two builds, compare their L1-dcache
+//     load misses (perf stat -e L1-dcache-load-misses).
 //   - Rows where readers >= cores are an oversubscription artifact: the writer
 //     starves, the line goes quiet, and ReaderLoad/s explodes to cache speed --
 //     higher numbers there mean LESS concurrency, not faster reads.

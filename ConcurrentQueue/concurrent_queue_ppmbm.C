@@ -21,12 +21,11 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 //
-// Ping-pong LATENCY benchmark for RingAtomicMapQueueMPMC. Canonical ppmbm
-// harness -- other queues' queue_ppmbm.C reference this file.
+// Ping-pong LATENCY benchmark for RingAtomicMapQueueMPMC.
 //
 // Goal: measure 1-producer / 1-consumer round-trip latency, a setting where
 // every queue implementation has its best shot. Isolates per-op queue cost
-// from the contention behaviour exercised by queue_lmbm.C.
+// from the contention behaviour exercised by concurrent_queue_lmbm.C.
 //
 // Two queues, two threads:
 //   q1: sender -> receiver
@@ -50,9 +49,9 @@
 // share L3, cross-CCD traverses Infinity Fabric. On WSL the topology is
 // virtualised to one flat L3; run on bare Linux for cross-CCD results.
 //
-// Ring-specific sweep: NTRY stays at 8 (RFO round-trip budget, see the
-// queue header) while ALIGN varies 0/16/64/128 to study cache-line
-// alignment of the per-slot key/busy atomics.
+// Ring-specific sweep: NTRY stays at 8 (the queue's default) while ALIGN
+// varies 0/16/64/128 to study cache-line alignment of the per-slot key
+// atomics.
 //
 // Warm-up: `warmup_skip` samples discarded to skip initial page faults,
 // branch-predictor training, and rdtsc first-read skew. Items/s counts

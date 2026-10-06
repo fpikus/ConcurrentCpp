@@ -60,16 +60,14 @@
 //
 // Equal time is not equal work. With static roles and a fixed iteration count
 // (gmbm), producers and consumers attempt the same number of operations. Run
-// for the same time (this harness, until 2026-10 with static roles only), the
-// role that attempts faster pins the queue at a boundary: at 2^16 slots on a
-// Ryzen 9 7940HS the key/value and a64 rows settled full, the consumers
-// almost never failing and the producers' failing retries slowing them, and
-// ran up to 1.5x slower than gmbm, whose consumers kept finding the queue
-// empty; starting half-full changed neither harness. With every miss
-// followed by an operation of the other role, neither boundary can hold the
-// queue, and equal time and equal work measure the same regime. So this
-// harness runs only the balanced rows, and gmbm runs them next to its
-// unbalanced ones.
+// for the same time with static roles, the role that attempts faster pins the
+// queue at a boundary -- full, for instance, with the consumers almost never
+// failing and the producers' failing retries slowing them -- a slower regime
+// than gmbm's, whose consumers keep finding the queue empty; starting
+// half-full does not change where the queue settles. With every miss followed
+// by an operation of the other role, neither boundary can hold the queue, and
+// equal time and equal work measure the same regime. So this harness runs
+// only the balanced rows, and gmbm runs them next to its unbalanced ones.
 //
 // HOW THE NUMBERS RELATE
 //
@@ -247,8 +245,9 @@ constexpr double kWarmupSeconds = 0.5;
 // The number of ints in each key-only thread's array of pointees, a power of
 // 2: a thread pushes their addresses in turn. The queue needs its keys
 // non-null, not distinct (it only stores them; nobody dereferences them), so
-// a small array will do; one of N ints per thread was 32 GB at 2^26 slots and
-// 128 threads. concurrent_queue_gmbm.C uses the same value; keep the two files in step.
+// a small array will do; one of N ints per thread would be 32 GB at 2^26
+// slots and 128 threads. concurrent_queue_gmbm.C uses the same value; keep the
+// two files in step.
 constexpr size_t kPointees = 1024;
 static_assert(std::has_single_bit(kPointees));
 
@@ -327,13 +326,13 @@ OpCounts operator-(const OpCounts& a, const OpCounts& b) {
 // own, as in timed_loop() of concurrent_queue_gmbm.C, whose loop body is the
 // same. flatten: as in timed_loop() -- with GCC. Clang's flatten inlines
 // push() and pop() but not the SpinLock::lock() inside them, which its inliner
-// decides on its own: lock() costs 300 against a threshold of 250, or of 525
-// at a call site it estimates to be hot (much more frequent than the entry to
-// the function). The [[unlikely]] on the flag test below makes that estimate
-// what it is in timed_loop(), whose exit is just as unlikely; with a plain
-// do-while on the flag, clang 22 called lock() out of line here and inlined it
-// there. The phase is a run-time argument, so that there is one instantiation
-// per variant and role, as of timed_loop().
+// decides on its own: lock() costs more than the default threshold but less
+// than the higher one for a call site it estimates to be hot (much more
+// frequent than the entry to the function). The [[unlikely]] on the flag test
+// below makes that estimate what it is in timed_loop(), whose exit is just as
+// unlikely; with a plain do-while on the flag, Clang calls lock() out of line
+// here and inlines it there. The phase is a run-time argument, so that there
+// is one instantiation per variant and role, as of timed_loop().
 template <typename Q, typename K, typename V, bool PRODUCER>
 [[gnu::noinline, gnu::flatten]] void run_phase(const std::atomic<bool>& flag, Q& q, int* v, size_t mask,
                                                size_t key_stride, size_t key_offset, OpCounts& counts) {

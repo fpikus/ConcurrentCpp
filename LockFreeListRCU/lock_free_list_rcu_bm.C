@@ -64,8 +64,7 @@
 // item per iteration), exactly as in the reference-counted list's benchmark,
 // so the two binaries' rates are comparable as they stand. That rate divides
 // the summed iterations by the MEAN per-thread time, which flatters an
-// implementation whose threads finish at different times; replacing it with
-// wall-clock accounting is a separate, later step for both benchmarks.
+// implementation whose threads finish at different times.
 //
 // Counters (user counters; Google Benchmark SUMS each over the run's threads
 // and reports the total for the run, not a rate):
@@ -114,12 +113,8 @@
 //                      ring_full therefore means a holder stalled mid-run: a
 //                      thread preempted while holding its handle (in the
 //                      OpHandle rows, while holding a per-operation handle).
-//                      [Estimate] at ~4 M successful erases/s (16-thread
-//                      WriteHeavy and Graveyard _RCU rows, smoke run and
-//                      2026-10-04 campaign alike: 10-14 M iterations/s x
-//                      0.3-0.45 successful erases per iteration) 16k
-//                      erases take ~4 ms: a stall of a few milliseconds
-//                      suffices
+//                      At the erase rate of the busiest _RCU rows, 16k erases
+//                      take a few milliseconds, so a stall that long suffices
 //   minor_faults       minor page faults taken by the benchmark threads during
 //                      the run (getrusage before and after the state loop):
 //                      first touches of fresh heap, mostly. It depends on the
@@ -673,14 +668,12 @@ void RcuDispersedFixture::ReadDispersedBody(benchmark::State& state) {
 //   cross-core free-list pop (a LIFO stack hands an inserter a node last
 //   touched by whichever thread freed its bag), its contention on the one
 //   free-list head word, and the reclaim() calls themselves. First-touch page
-//   faults, measured 2026-10-04 (WSL2): the median repetition takes none or
-//   a negligible number (none in 63 of 70 RCU cells, at most 0.14 per 1000
-//   iterations), because earlier runs of the same process pre-touch the
-//   heap; a repetition that runs on fresh heap is 19-42% slower. Read
+//   faults depend on how much heap earlier runs of the same process have
+//   already touched, and a repetition that runs on fresh heap pays them: read
 //   minor_faults alongside the rate (see minor_faults above). On
 //   MassiveHeadInsert, which never erases, _RCU and _RCU_NoReclaim execute
-//   identical code: that pair is a labelled control, and its difference is
-//   the noise floor of the comparison.
+//   identical code: that pair is a labelled control, and its difference is the
+//   noise floor of the comparison.
 // - _RCU_OpHandle: a handle per operation, the worst case of the handle
 //   discipline: every operation joins (a seq_cst increment of the current
 //   generation's count, all threads on that one cache line, plus a seq_cst

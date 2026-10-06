@@ -3,10 +3,11 @@
 // changed -- so the tests check that contract single-threaded (update, no-op,
 // equal, return value, boundary values) and then hammer it from many threads:
 // the final maximum must be the global maximum of every value offered, and the
-// count of "true" returns must equal the number of times the running maximum
-// actually advanced. Run under TSan to validate the acquire/acq_rel ordering:
-// a companion plain (non-atomic) payload published alongside the maximum turns
-// any missing release/acquire into both a wrong value and a reported race.
+// count of "true" returns must be bounded by the number of times the running
+// maximum could advance. Run under TSan to validate the acquire/acq_rel
+// ordering: a companion plain (non-atomic) payload published alongside the
+// maximum turns any missing release/acquire into both a wrong value and a
+// reported race.
 #include <gtest/gtest.h>
 #include <atomic>
 #include <algorithm>
@@ -91,9 +92,9 @@ TEST(AtomicMaxTest, ConcurrentMaxIsCorrect) {
 // SAME value set, the running maximum advances exactly once per distinct value
 // that ever becomes a new record, and a value is a record the first time any
 // thread pushes something larger than everything seen so far. That count is
-// data-dependent, so instead of predicting it we check the invariant that ties
-// the returns to the value: the maximum's final value must have been returned
-// true exactly once, and total-trues must be <= the number of distinct values.
+// data-dependent, so instead of predicting it we check the bounds that tie the
+// returns to the values: the final maximum is the largest value offered, and
+// total-trues is at least one and at most the number of distinct values.
 TEST(AtomicMaxTest, AdvanceCountBounded) {
   constexpr int num_threads = 8;
   constexpr unsigned long n_values = 50000;

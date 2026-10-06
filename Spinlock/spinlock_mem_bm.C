@@ -9,7 +9,7 @@
 // own core: registers in, registers out. The only machine-wide resources the
 // benchmark contends for are the lock word and the guarded line, so the cost of
 // a waiter that spins instead of sleeping is one core's worth of coherence
-// probes -- and that is the regime in which the shipped ladder was tuned.
+// probes -- and that is the regime the shipped ladder is tuned for.
 //
 // Memory-streaming work contends for everything: L3 capacity, memory
 // controller queues, DRAM bandwidth. That changes the terms of the back-off
@@ -46,8 +46,8 @@
 //
 // Run with --benchmark_repetitions=10 and read the mean: memory work re-rolls
 // its cache/CCD placement with every repetition's fresh threads, and a single
-// repetition carries ~10-14% CV from that lottery alone (see the repetition
-// guidance in overhead_bm.C, where it was measured).
+// repetition is noisy from that lottery alone (see the repetition guidance in
+// overhead_bm.C).
 //
 // Note that work:0 does not touch the arena at all, so the saturated column
 // must reproduce spinlock_tune_bm.C's work:0 within noise -- the two files are
@@ -75,9 +75,8 @@ void BM_memlock(benchmark::State& state) {
   // more than it looks: the framework spawns fresh threads -- and therefore
   // fresh thread_local arenas -- for every calibration round, and a
   // high-thread-count round runs so few iterations that the construction
-  // storm otherwise dominates every one of them (it measured 7 ms/iteration
-  // at 32 threads, ~300x the steady state). Skipped at work:0, which never
-  // touches the arena and must stay identical to spinlock_tune_bm.C's
+  // storm otherwise dominates every one of them. Skipped at work:0, which
+  // never touches the arena and must stay identical to spinlock_tune_bm.C's
   // saturated column.
   if (work != 0) do_mem_work(1.0, mem_size/mem_chunk);
   double local_x = 1.0 + state.thread_index();
@@ -96,9 +95,9 @@ void BM_memlock(benchmark::State& state) {
 // One caveat has no analogue in the sin/cos file: here the cost of a work
 // unit -- and with it the lock occupancy fraction -- depends on the thread
 // count, because the work slows down as more threads share the memory system
-// (measured on the development machine: ~6 ns/unit alone, ~150 ns/unit with
-// eight threads streaming). The dial still orders the contention levels; it
-// no longer pins them to fixed percentages.
+// (by more than an order of magnitude with eight threads streaming). The dial
+// still orders the contention levels; it no longer pins them to fixed
+// percentages.
 #define MEM_ARGS \
   ->ArgName("work")->Arg(0)->Arg(30)->Arg(100) \
   ->ThreadRange(1, numcpu) \

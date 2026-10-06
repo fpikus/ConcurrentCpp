@@ -30,12 +30,12 @@
 //
 // Every configuration in spinlock_tune_configs.h (shared with
 // spinlock_mem_bm.C) is registered; which subset runs is decided at run time.
-// The named test sets live in the measurement scripts -- the saturation proof runs
+// Two slices answer the main questions: the saturation proof runs
 // `sweep:(base|shape)` at work:0, where the spinning shapes must lose and the
 // margin is the finding; the low-contention probe runs the candidate groups at
-// work:30 and work:100, where the development machine reversed the saturation
-// ranking. For ad-hoc slices, names carry the sweep tag and every parameter
-// (the filter is a regex):
+// work:30 and work:100, where the saturation ranking can reverse. For ad-hoc
+// slices, names carry the sweep tag and every parameter (the filter is a
+// regex):
 //
 //   ./spinlock_tune_bm --benchmark_filter='work:0/'             # saturation
 //   ./spinlock_tune_bm --benchmark_filter='sweep:(base|shape)'  # the confirmation
@@ -47,14 +47,6 @@
 // in any run: the ladder is never climbed there, so it measures each
 // configuration's uncontended cost and exposes fast-path codegen differences
 // that would otherwise be mistaken for back-off effects.
-//
-// EMPIRICAL RESULTS SO FAR (256-CPU, 2 L3-domain machine)
-//
-// From the long-sleep sweep, which is what this benchmark originally existed
-// for: 1 ms is best or tied everywhere; 100 us ties it up to 64 threads but
-// loses at 128; 10 ms wins at work=0 with 8-32 threads (parked waiters disturb
-// the holder least) but collapses at >=128 threads, and at 256 threads for
-// every work level -- hence the 1 ms second tier in spinlock.h.
 #include <atomic>
 
 #include "spinlock.h"
@@ -64,12 +56,14 @@
 
 // Contention levels for this sweep, overriding the four-point dial of
 // spinlock_bm_common.h: saturation, plus the two low-occupancy points where the
-// optimum was seen to move. work:3 is dropped because it sits between two
-// levels that already disagree, and work:300 because work:100 reaches the same
-// regime for a third of the machine time.
-//   work:0   -- ~100% of a thread's time under the lock
-//   work:30  -- ~1%
-//   work:100 -- ~0.3%
+// optimum moves, plus a knee sweep into genuine low contention. work:3 is
+// dropped because it sits between two levels that already disagree.
+//   work:0    -- ~100% of a thread's time under the lock
+//   work:30   -- ~1%
+//   work:100  -- ~0.3%
+//   work:300  -- ~0.1%
+//   work:1000 -- ~0.03%
+//   work:3000 -- ~0.01%
 #define TUNE_ARGS \
   ->ArgName("work")->Arg(0)->Arg(30)->Arg(100) \
   ->Arg(300)->Arg(1000)->Arg(3000)   /* knee sweep: genuine low contention */ \

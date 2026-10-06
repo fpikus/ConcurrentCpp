@@ -68,8 +68,11 @@ threads are added. In the dynamic pattern — every thread repeatedly reserves a
 new range with `resize()` and then works on it — the locked baseline is
 serialized from the start and sinks the same way, from 132 M elements/s on one
 thread to 104 M/s at 32 threads and 43 M/s at 128, while the concurrent deque
-reaches 30 G elements/s at 128 threads. The same shape repeats on ARM (NVIDIA
-Grace); only the absolute numbers change.
+reaches 30 G elements/s at 128 threads. On ARM (NVIDIA Grace) the shape is
+similar but not the same, in both patterns: the locked baseline sinks less
+steeply, from 133 M/s on one thread to 95 M/s at 144 in the static pattern and
+from 136 to 97 M/s in the dynamic one, and the concurrent deque peaks earlier,
+at 64 threads (70 and 35 G/s), then falls back by 144 (56 and 21 G/s).
 
 ## Building and testing
 

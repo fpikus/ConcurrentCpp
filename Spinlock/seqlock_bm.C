@@ -75,25 +75,15 @@
 // visible here; it would need a payload the atomic control cannot hold, at
 // which point the control disappears and the comparison changes character.
 //
-// RESULTS IN BRIEF
+// THE CONCLUSION
 //
-// Indicative numbers from one machine (WSL2 on a Ryzen 7940HS, 16 hardware
-// threads); the shapes are the point, not the digits. The reader-scalability
-// claim holds, and holds big: on the pure-read endpoint at 16 threads the
-// seqlock runs at ~23x the spinlock's throughput and ~0.75x the bare atomic's,
-// so it closes most of the distance to the lower bound. Read-mostly mixes keep
-// a good deal of that -- 100:1 is ~3x the spinlock at saturation and ~2.2x at
-// work:30 -- and by 1:1 the advantage is down to ~15%. Write-heavy is where the
-// protocol gets paid for: within a few percent of the spinlock at saturation up
-// to 8 threads, but ~20-25% slower at work:30 with 8 to 16 threads.
-//
-// The author's conclusion is less flattering to the mechanism than those
-// multiples make it sound. For a payload of one word the atomic wins outright,
-// and a read-heavy workload over a value that rarely changes is usually
-// double-checked-locking territory, which runs at atomic speed even behind a
-// spinlock when it is coded right. What is genuinely left for the sequence lock
-// is payloads an atomic cannot hold -- and that is precisely what this
-// benchmark does not measure; see THE KNOWN LIMITATION above.
+// The author's conclusion is less flattering to the mechanism than its reader
+// scalability makes it sound. For a payload of one word the atomic wins
+// outright, and a read-heavy workload over a value that rarely changes is
+// usually double-checked-locking territory, which runs at atomic speed even
+// behind a spinlock when it is coded right. What is genuinely left for the
+// sequence lock is payloads an atomic cannot hold -- and that is precisely what
+// this benchmark does not measure; see THE KNOWN LIMITATION above.
 //
 // THE HARNESS
 //
@@ -102,8 +92,8 @@
 // spinlock_bm_common.h, shared with the reader/writer ladder sweep in
 // spinlock_rw_tune_bm.C: same per-iteration shape, same work placement, same
 // coupling of the work to the shared value, same masking of the read seed, same
-// items/s accounting, so the numbers here are directly comparable with the
-// existing read/write results by construction rather than by inspection. What
+// items/s accounting, so the numbers here are directly comparable with
+// spinlock_rw_tune_bm.C's by construction rather than by inspection. What
 // this file adds is the three mechanisms plugged into that harness's
 // write()/read() interface; the ladder-tuning machinery (BackOffParams,
 // LockAdapter, the named ladders) stays in spinlock_rw_tune_bm.C.

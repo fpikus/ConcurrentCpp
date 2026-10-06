@@ -1,11 +1,11 @@
 // The lock scope demo: two Google Benchmark benchmarks that show, on a laptop,
 // that writing the slot you have just claimed AFTER unlock() is slower than
 // writing it before, under the shipped SpinLock (spinlock.h). It is the
-// smallest piece of the lock scope benchmark (spinlock_scope_bm.C and its
-// twin spinlock_scope_mbm.C, both built on spinlock_scope_common.h) that still
-// shows the effect on a client CPU; those two, and the MECHANISM section of
-// spinlock_scope_common.h, hold the full investigation. This file depends on
-// nothing but spinlock.h and Google Benchmark, so that it can be read on its
+// smallest piece of the lock scope benchmark (spinlock_scope_bm.C and its twin
+// spinlock_scope_mbm.C, both built on spinlock_scope_common.h) that still shows
+// the effect on a client CPU; those two, and the MECHANISM section of
+// spinlock_scope_common.h, separate the mechanisms behind it. This file depends
+// on nothing but spinlock.h and Google Benchmark, so that it can be read on its
 // own.
 //
 // WHAT IS MEASURED
@@ -33,89 +33,56 @@
 // microseconds, then a 1 ms sleep, and again), so most of the time one thread
 // holds the lock, finds its line already in its own cache, and runs a long
 // streak of operations. The lock only changes hands when a waiter's attempt
-// lands while the lock is visibly free. What this file measures on the laptop
-// is that storing after the unlock makes that happen far more often: the
-// handoffs_per_op counter shows seven to thirteen times the handoffs at every
-// thread count from 16 to 1024 (THE INGREDIENTS below). Why, demonstrated on
-// two servers (a Xeon 6767P and an EPYC 9555; the observer sweeps under W in
-// spinlock_scope_common.h) and carried over to the laptop as the working
-// hypothesis, not re-measured there: a slot store before the unlock keeps the
-// visibly-free window short, because the unlock store cannot become visible
-// before the older slot store has committed (x86 commits stores in order), so
-// while the holder waits for the slot's cache line the lock still looks held;
-// the same store after the unlock leaves the lock visibly free until the
-// holder's next lock() takes it again, and on those servers that wait is the
-// length of the slot store's miss. Whether a Zen 4 core holds its next locked
-// exchange back for the full miss the same way is not known: one holder of
-// this lock storing to slots that miss to memory ran at about 20 ns per
-// operation on the laptop, less than a memory latency, so some overlap is
-// there (an observation from the prototype sweep, not pursued). The cost of a
-// handoff is reasoned, not measured here: cache-line transfers of the lock,
-// the index and the slot lines the new holder then walks cold, and the
-// previous holder, still in its burst of attempts, taking the lock straight
-// back.
+// lands while the lock is visibly free. Storing after the unlock makes that
+// happen more often, and the handoffs_per_op counter shows how much more. Why,
+// in the terms of spinlock_scope_common.h (W under MECHANISM there), carried
+// over to the laptop as the working hypothesis, not measured there: a slot
+// store before the unlock keeps the visibly-free window short, because the
+// unlock store cannot become visible before the older slot store has committed
+// (x86 commits stores in order), so while the holder waits for the slot's cache
+// line the lock still looks held; the same store after the unlock leaves the
+// lock visibly free until the holder's next lock() takes it again, and on x86
+// servers that wait is the length of the slot store's miss. Whether a Zen 4
+// core holds its next locked exchange back for the full miss the same way is
+// not known. The cost of a handoff is reasoned, not measured here: cache-line
+// transfers of the lock, the index and the slot lines the new holder then walks
+// cold, and the previous holder, still in its burst of attempts, taking the
+// lock straight back.
 //
 // THE INGREDIENTS, AND WHY A LAPTOP NEEDS THE THREAD COUNTS IT GETS HERE
 //
-// The scope benchmark shows the loss on the servers it was built for (a
-// two-socket Xeon 6767P at every thread count, a two-socket EPYC 9555 from 32
-// threads up; up to 2.5x at 128 threads). On an AMD Ryzen 9 7940HS laptop
-// (Zen 4, 8 cores / 16 threads, one L3, under WSL2) the same loop at 1 to 16
-// threads shows nothing: with its twin, in / out M operations/s were 350 / 351
-// at 1 thread, 249 / 254 at 8 and 213 / 223 at 16 with these slots (3
-// repetitions, medians). Two things are different on the laptop, and the
-// thread counts registered here are the answer to the first:
+// The scope benchmark shows the loss on the two-socket x86 servers it was built
+// for. On a Zen 4 laptop (8 cores / 16 threads, one L3) the same loop at 1 to
+// 16 threads shows nothing: storing after the unlock is no slower. Two things
+// are different on the laptop, and the thread counts registered here are the
+// answer to the first:
 //   - Too few waiters. A handoff needs a waiter awake in its burst while the
 //     window is open, and a parked waiter is awake for a fraction of a percent
 //     of the time (reasoned from the lock's sleeps: a burst of eight attempts
 //     is well under a microsecond, each park tens of microseconds to a
 //     millisecond); with 15 waiters the window, open or not, is almost never
 //     probed. The handoff counter shows the window is there (at 16 threads,
-//     out-of-scope hands over about 7 times as often as in-scope: 0.0036
-//     against 0.0005 per operation) but at a rate too low to cost anything.
-//     The servers have 127-255 waiters; the laptop gets them by running more
-//     threads than it has CPUs. Waiters spend their time asleep, not on a CPU,
-//     so oversubscription changes the waiter count, not the holder's streaks.
-//     Measured with this file on that laptop (clang 22, -O3 -march=native;
-//     5 repetitions at the registered counts, 3 at the others; medians of
-//     items_per_second in M operations/s, before / after the unlock; the raw
-//     outputs are not part of this repository):
-//        threads      16     32     64    128    256    512   1024
-//        before      228    160    141    123     79     38     26
-//        after       239    164    141    105     54     28     22
-//        ratio      0.96   0.97   1.00   1.16   1.45   1.35   1.20
-//        handoffs per operation, before / after:
-//          .0005/.0036  .0011/.0076  .0016/.0118  .0020/.0199
-//          .0038/.0480  .0074/.0971  .0132/.1517
-//     The loss appears at 128 threads, peaks at 256 and fades past 512, where
-//     the kernel's work of parking and waking hundreds of threads slows both
-//     variants alike. Hence the registered counts, 128, 256 and 512. The
-//     repetitions spread within 2-4% in every cell (min to max), so the 3-4%
-//     advantages of storing after the unlock at 16 and 32 threads are at the
-//     noise level of this WSL2 machine. GCC 16 gives the same numbers within
-//     2% (1.17, 1.46 and 1.37 at the registered counts).
+//     out-of-scope hands the lock over several times as often as in-scope) but
+//     at a rate too low to cost anything. The servers have over a hundred
+//     waiters; the laptop gets them by running more threads than it has CPUs.
+//     Waiters spend their time asleep, not on a CPU, so oversubscription
+//     changes the waiter count, not the holder's streaks. The loss appears at
+//     128 threads, peaks around 256 and fades past 512, where the kernel's work
+//     of parking and waking hundreds of threads slows both variants alike.
+//     Hence the registered counts, 128, 256 and 512.
 //   - Cheap handoffs. With one L3, a cache-line transfer between two of the
-//     laptop's cores should cost tens of nanoseconds, against a hundred or
-//     more across the sockets and dies of the servers (reasoned from the
-//     topology; neither latency was measured in this work). That would be what
-//     caps the ratio here at about 1.4x; nothing tried in this file raised it. On a desktop part with two
-//     core dies (a Ryzen 9 9950X, say) the same handoff rate should cost more,
-//     so the loss there is expected to be at least this large, at the same
-//     thread counts; that is a prediction, not a measurement.
-// Variants tried on the laptop, in a prototype harness with the same loop and
-// measurement (kept with the raw outputs), and not needed. Ratios at 256
-// threads, medians of 3 repetitions, each against the plain loop measured in
-// the same sweep (1.37 and 1.38 in the two sweeps; the file's own 1.45 above
-// is a later run of the same loop, 5 repetitions): eight 8-byte slots per line
-// instead of one per line, 1.16 (the holder's consecutive stores then hit the
-// same line); 128-byte slots, 1.42; rings of 2^10 and 2^20 slots instead of
-// 2^16, 1.43 and 1.48; a second group of threads writing the same ring under a
-// lock of its own, as the consumers of ConcurrentQueue do, 1.24; the slot
-// chosen by hashing the index over a 64 MiB ring so that every store misses to
-// memory, 1.31. The packed slots and the second group lose part of the effect;
-// the others are within the run-to-run spread of the plain loop (the plain
-// loop itself moved from 1.37 to 1.45 between sweeps). None adds anything the
-// plain loop does not show, and the plain loop is the point of the demo.
+//     laptop's cores should cost tens of nanoseconds, against a hundred or more
+//     across the sockets and dies of the servers (reasoned from the topology,
+//     not measured). On a desktop part with two core dies (a Ryzen 9 9950X,
+//     say) the same handoff rate should cost more, so the loss there is
+//     expected to be at least as large, at the same thread counts; that is a
+//     prediction, not a measurement.
+// Variations of the loop add nothing the plain loop does not show -- rings of
+// 2^10 or 2^20 slots instead of 2^16, 128-byte slots, slots chosen by hashing
+// the index over a 64 MiB ring so that every store misses to memory, eight
+// 8-byte slots per line instead of one, a second group of threads writing the
+// same ring under a lock of its own as the consumers of ConcurrentQueue do --
+// so the demo keeps the plain loop.
 //
 // HANDOFFS
 //
@@ -151,8 +118,8 @@
 //                            i.e. over the window; the honest column here;
 //   wall_items_per_second -- the same count over the span from the earliest
 //                            thread's loop start to the latest thread's loop
-//                            end, the cross-check: it can only be lower, and on
-//                            the laptop it agrees within 0.3%;
+//                            end, the cross-check: it can only be lower, and
+//                            close agreement means the drain is negligible;
 //   handoffs_per_op       -- see HANDOFFS.
 // A representative run:
 //   build/$(hostname)/spinlock_scope_demo --benchmark_repetitions=3 --benchmark_report_aggregates_only=true
@@ -246,11 +213,11 @@ inline void store_relaxed(unsigned long& word, unsigned long value) {
 //   handoffs -- the calling thread's handoff counter (HANDOFFS above).
 // always_inline and flatten: what is measured is the order of the stores, the
 // unlock and the next lock, so the whole operation, SpinLock::lock() included,
-// must be inlined into the loop on every compiler (left to itself, GCC 16 keeps
-// lock() out of line in some harnesses and clang 22 in all; a call's pushes are
-// stores between the unlock and the next lock, which on recent Intel cores
-// cost extra; see E2 in spinlock_scope_common.h). flatten reaches lock()'s
-// back-off path too, down to the nanosleep() calls, which stay calls.
+// must be inlined into the loop on every compiler (left to itself, GCC keeps
+// lock() out of line in some harnesses and Clang in all; a call's pushes are
+// stores between the unlock and the next lock, which on recent Intel cores cost
+// extra; see E2 in spinlock_scope_common.h). flatten reaches lock()'s back-off
+// path too, down to the nanosleep() calls, which stay calls.
 // The empty asm statement takes the claimed index as an in/out operand and
 // clobbers memory, so the comparison after it cannot be scheduled above the
 // stores before it; it emits no instruction.
@@ -276,11 +243,10 @@ template <bool before_unlock>
 // loop are the loop's own. lock()'s inlined back-off calls nanosleep(), so
 // every value the loop carries must sit in a callee-saved register or be
 // spilled, and a spilled counter is a stack store between the unlock and the
-// next lock (see step()). What matters, and what the disassembly of the clang
-// 22 and GCC 16 builds shows, is that the steady-state loop stores nothing but
-// the index, the slot and the unlock: the count and the handoff fields stay in
-// registers. The stop flag's load each iteration reads a line that is Shared
-// in every core until the timekeeper writes it.
+// next lock (see step()). What matters is that the steady-state loop stores
+// nothing but the index, the slot and the unlock: the count and the handoff
+// fields stay in registers. The stop flag's load each iteration reads a line
+// that is Shared in every core until the timekeeper writes it.
 template <bool before_unlock>
 [[gnu::noinline]] static unsigned long run_until_stop(Shared& s, unsigned long& handoffs_out) {
   unsigned long count = 0;

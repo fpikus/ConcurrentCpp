@@ -1,10 +1,7 @@
 # Machine-specific configuration -- compiler, -march target, standard, and the
 # Google Benchmark / GoogleTest install paths -- comes from ../config.mk, shared
-# by every benchmark directory and written once per machine. On Arm servers that
-# config.mk resolves GBENCH_DIR/GTEST_DIR to the per-arch builds (gbench_arm,
-# gtest_arm) via its own uname check; on x86 to gbench_x86; on a dev box to a
-# flat path. Everything below this include is machine-independent and ships
-# unchanged.
+# by every benchmark directory and written once per machine. Everything below
+# this include is machine-independent and ships unchanged.
 include ../config.mk
 
 # Compilers and run-time library paths. The per-machine config may select a
@@ -39,8 +36,8 @@ COMMON_INCLUDES = -I.
 # `?=` so a machine's config.mk can override: macOS has no librt.
 COMMON_LIBS ?= -lpthread -lrt -lm
 
-# Benchmark flags (optimized). NDEBUG keeps the deque's debug-only asserts out
-# of the measured hot path; the tests (-O0, no NDEBUG) still run them.
+# Benchmark flags (optimized). NDEBUG keeps any debug-only assert() out of the
+# measured hot path; the tests (-O0, no NDEBUG) keep them.
 CXXFLAGS_BM = $(COMMON_FLAGS) -O3 -DNDEBUG $(COMMON_INCLUDES) -I$(GBENCH_DIR)/include
 LIBS_BM = $(GBENCH_DIR)/lib/libbenchmark.a $(COMMON_LIBS)
 

@@ -22,8 +22,8 @@
 // SOFTWARE.
 //
 // Basic and stress tests of LockFreeListRCU: the test shapes of the
-// reference-counted list's suite (LockFreeList/lock_free_list_test.C) ported
-// to handles and generation reclamation, plus the tests of the node-reuse
+// reference-counted list's suite (LockFreeList/lock_free_list_test.C) recast
+// for handles and generation reclamation, plus the tests of the node-reuse
 // paths that list does not have (EmplaceAfter, the dead-anchor insert with an
 // empty free list). The white-box scheme tests and the black-box contract
 // tests are in the two other test sources linked into the same binary.
@@ -55,7 +55,7 @@
 // included) == nodes freed by all reclaim() calls.
 //
 // No test here relies on `++` past end(), which is a precondition violation
-// for this list (the reference-counted list made it a silent no-op): every
+// for this list (the reference-counted list makes it a silent no-op): every
 // loop tests `!= end()` before incrementing.
 
 #include <gtest/gtest.h>
@@ -479,7 +479,7 @@ TYPED_TEST(LockFreeListRcuTest, EmplaceAfter) {
 // erase_after(): without helping, a marked node whose unlink CAS lost to a
 // concurrent insert stays linked forever and the drain stops at it
 // (`../LockFreeList/lock_free_list_bugs.md`, bug 1). It is unconditional --
-// the reference-counted list's test guarded it with `#ifndef NDEBUG`, which
+// the reference-counted list's test guards it with `#ifndef NDEBUG`, which
 // the test flags never define.
 TYPED_TEST(LockFreeListRcuTest, StressTest) {
     using List = typename TestFixture::template ListOf<Tracked>;
@@ -563,9 +563,9 @@ TYPED_TEST(LockFreeListRcuTest, StressTest) {
 // an insert lands inside the eraser's window between its mark CAS and its
 // unlink CAS. The unlink CAS then fails, and without helping the marked node
 // stays linked for good, wedging the drain at the end. The mixed-op
-// StressTest is too diffuse to hit that interleaving reliably; this shape
-// stranded marked nodes within a few thousand operations in the
-// reference-counted list before helping (`../LockFreeList/lock_free_list_bugs.md`,
+// StressTest is too diffuse to hit that interleaving reliably; without
+// helping, this shape strands marked nodes in the reference-counted list
+// quickly under contention (`../LockFreeList/lock_free_list_bugs.md`,
 // bug 1). Here the eraser's handle REFRESHES on a cadence -- otherwise its
 // generation pins everything it retires and the reclaimers free nothing --
 // two reclaimer threads run throughout, so the inserter mostly reuses nodes

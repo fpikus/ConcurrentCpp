@@ -14,16 +14,16 @@
 // variants, and the handoff comparison), on the same variants, under the same
 // names, with the same rings, the same compile-time index mask and the same
 // layout of the shared blocks. That header also describes the variants and why
-// they exist, what has been found, and why lock() is forced inline. The harness
-// around the loop body differs, and so does the generated loop in one known
-// detail: the loop ends with a load and compare of the stop flag, where the
-// Google Benchmark loop compares its iteration count against the next time
-// stamp's and against the last (both read from stack slots in the builds
-// checked). Both are reads: in neither harness does the loop store anything
-// between the unlock and the next lock beyond the variant's own store there
-// (out_scope, poststore, postmiss, postmiss_late). They sit in the same place
-// in every variant, so they do not affect comparisons between variants, but
-// they can show when 1-thread rates are compared across the two harnesses.
+// they exist, and why lock() is forced inline. The harness around the loop body
+// differs, and so does the generated loop in one known detail: the loop ends
+// with a load and compare of the stop flag, where the Google Benchmark loop
+// compares its iteration count against the next time stamp's and against the
+// last (both read from stack slots in the builds checked). Both are reads: in
+// neither harness does the loop store anything between the unlock and the next
+// lock beyond the variant's own store there (out_scope, poststore, postmiss,
+// postmiss_late). They sit in the same place in every variant, so they do not
+// affect comparisons between variants, but they can show when 1-thread rates
+// are compared across the two harnesses.
 //
 // WHY A SECOND HARNESS
 //
@@ -32,22 +32,10 @@
 // tail of a run has fewer threads contending than its start, and the reported
 // rate is a mix of contention levels -- even the wall-clock rate that
 // spinlock_scope_bm.C adds for this reason (THROUGHPUT ACCOUNTING there). Its
-// finish_spread counter shows how much. The ranges below are of its per-cell
-// medians (a cell is one variant at one thread count, the median is of 5
-// repetitions) in that harness, with lock() inline, over the in_scope and
-// out_scope variants of the packed, a64 and a128 layouts, in_scope / out_scope:
-//   NVIDIA Grace (Arm Neoverse V2),        0.87-0.99 / 0.85-1.00: those runs
-//   32 threads and up                      were close to serial by the end;
-//   Apple M3 Ultra, 24 P-cores in a        0.53-0.88 / 0.11-0.18;
-//   Linux VM guest, 16 to 24 threads
-//   Intel Xeon 6767P (Granite Rapids),     0.07-0.42 / 0.08-0.56;
-//   4 threads and up
-//   AMD EPYC 9555 (Zen 5),                 0.07-0.36 / 0.07-0.26.
-//   4 threads and up
-// (On the M3 the VM matters: the guest's scheduling, and so the lock's
-// fairness, is not the host's.) The M3 figures show the worst of it: the
-// distortion differs between in_scope and out_scope, so it biases the very
-// in/out comparison the benchmark is for.
+// finish_spread counter shows how much: at higher thread counts it can be
+// large, and at the worst a run is close to serial by the end. The distortion
+// can differ between in_scope and out_scope, so it biases the very in/out
+// comparison the benchmark is for.
 // Here every thread instead runs the same loop until a common stop flag, and
 // each counts its own iterations, so all threads contend for the whole window,
 // and the throughput is the true total count divided by the window.
@@ -58,15 +46,9 @@
 // not to its items_per_second (which divides by the mean per-thread loop time).
 // At 1 thread there is no contention and no finish spread, so the two are
 // expected to agree within run-to-run noise, apart from the codegen details
-// under WHAT IS MEASURED. A sweep confirmed it on an Intel Xeon 6767P (in/out
-// throughput 1.29 here, 1.30 in the Google Benchmark harness); on an AMD EPYC
-// 9555, however, the Google Benchmark harness showed 1.09 against 1.00 here, at
-// 1 to 16 threads. The Google Benchmark loop has since been restructured
-// (timed_loop() is noinline, and its index mask a constant), so the agreement
-// is to be re-checked on this build. Where finish_spread is large they differ,
-// and this harness gives the rate at a constant thread count. Fairness shows up
-// here as unequal per-thread counts rather than as a finish spread; it is
-// reported as
+// under WHAT IS MEASURED. Where finish_spread is large they differ, and this
+// harness gives the rate at a constant thread count. Fairness shows up here as
+// unequal per-thread counts rather than as a finish spread; it is reported as
 //   cv       -- the coefficient of variation of the per-thread counts
 //               (population standard deviation divided by the mean): 0 when
 //               every thread did the same number of operations;
@@ -179,14 +161,12 @@
 // queue behind the waiters' reads and RFOs, which crowd the line precisely in
 // the free window. So obs_free_frac can be biased, and the direction of the
 // bias has not been established. --validate-observer (below) calibrates it for
-// programmed phases: on the Xeon 6767P, the EPYC 9555 and Grace, at a 10 us
-// period, it found no bias beyond the worker's own timing (a roughly constant
-// 20-35 ns of extra held time per cycle, 1.2-1.9 clock readings, over
-// programmed cycles of 97 ns to 1.1 us), while at the default 1 us the observer
-// perturbed the measurement (50-66 ns of extra held time at long phases, and a
-// lone worker slowed from 175 to 152 M items/s on the Xeon 6767P). The
-// contended windows under MECHANISM in spinlock_scope_common.h (W) were
-// measured at 10 us.
+// programmed phases: at a 10 us period it finds no bias beyond the worker's own
+// timing (a roughly constant extra held time of one to two clock readings per
+// cycle, over programmed cycles from about 100 ns to 1 us), while at the
+// default 1 us the observer perturbs the measurement (it adds held time at long
+// phases and slows a lone worker measurably). The contended windows under
+// MECHANISM in spinlock_scope_common.h (W) are therefore sampled at 10 us.
 //
 // The observer perturbs what it measures. Each sample pulls the lock's line
 // into the observer's cache, and the next write to it (an xchg or an unlock)
@@ -279,7 +259,7 @@
 // variants, 'scope_<layout>' only the in/out pair:
 //
 //   ./spinlock_scope_mbm --filter='scope_packed$'     # 8-byte slots, in/out pair
-//   ./spinlock_scope_mbm --filter='_ptrshared$'       # the prototype-layout controls
+//   ./spinlock_scope_mbm --filter='_ptrshared$'       # the pointer-placement controls
 //   ./spinlock_scope_mbm --filter='scope_a(64|128)$'  # line-sized slots, in/out pairs
 //   ./spinlock_scope_mbm --filter='_lockstore_'       # the lock-line store variants
 //   ./spinlock_scope_mbm --filter='_poststore_'       # the post-unlock store variants
@@ -394,7 +374,7 @@ struct WorkerCounts {
 // carries must sit in one of the six callee-saved registers (on x86-64) or be
 // spilled, and a spilled counter is a stack store between the unlock and the
 // next lock (see E2 in spinlock_scope_common.h). Inlined into the worker, GCC
-// spilled the running count in one phase and the handoff counter in the other.
+// spills the running count in one phase and the handoff counter in the other.
 template <typename Slot, Store store, PtrLine ptr_line, bool measured>
 [[gnu::noinline]] static void run_phase(WorkerCounts& c) {
   MbmShared<Slot, ptr_line>& s = mbm_shared<Slot, ptr_line>;
@@ -642,7 +622,7 @@ struct alignas(128) ValidationCounts {
 // unlock's commit after its last, a fraction of a clock reading each, and any
 // delay of the unlock's commit by the observer's reads of the line.
 // always_inline and flatten, as for scope_step(): lock() and unlock() are
-// inlined here as in the variants (clang 22 left lock() out of line from a
+// inlined here as in the variants (Clang leaves lock() out of line from a
 // lambda otherwise), and the binary keeps no out-of-line SpinLock::lock(),
 // which is how a build is checked for the inlining that the variants need.
 [[gnu::always_inline, gnu::flatten]] inline std::chrono::steady_clock::duration validation_cycle(

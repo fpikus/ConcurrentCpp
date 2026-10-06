@@ -62,8 +62,8 @@
 // At a pure endpoint only one of the two ladders is ever climbed, so half the
 // registered configurations are inert -- and that is deliberate: eight
 // configurations that MUST produce the same number are an eight-way control on
-// run-to-run and thread-placement noise, which is how a 13% placement bias was
-// caught on the development machine. If run time is tight, drop the inert half:
+// run-to-run and thread-placement noise, which placement alone can push past
+// ten percent. If run time is tight, drop the inert half:
 //
 //   ...--benchmark_filter='w:.*/r:base/reads:0/'   # writers, sweep only
 //   ...--benchmark_filter='w:base/r:.*/writes:0/'  # readers, sweep only
@@ -171,7 +171,7 @@ RW_BM(quick, base);
 
 // Deliberately opposed ladders: these only say something on the mixes, where
 // both roles are active at once -- at a pure endpoint one of the two ladders
-// is never climbed, which the test sets exploit as a control.
+// is never climbed, which makes the endpoints a control (see RUNNING IT above).
 RW_BM(park, spin);
 RW_BM(spin, park);
 

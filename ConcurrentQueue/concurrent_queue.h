@@ -61,7 +61,8 @@
 // says go; that turns one specific interleaving of several threads -- the
 // kind that a stress test reaches once in a billion runs, if ever -- into a
 // deterministic test. concurrent_queue_test.C does exactly this for the
-// interleavings that broke the previous version of the protocol.
+// interleavings that break a busy-flag protocol (see "Why a sequence number
+// and not a flag" below).
 //
 // With the macro undefined (every build but that test) each call site
 // expands to a null statement -- a bare `;` -- which has no effect on the
@@ -195,14 +196,15 @@
 // Why a sequence number and not a flag: the values of seq that a thread at
 // index i compares against -- i, i + 1, i + capacity -- occur exactly once in
 // the slot's life, so the transient states of one lap can never be mistaken
-// for the states of another. The previous protocol used the key as the state
-// word plus a busy flag written by both sides, and validated by re-reading
-// the key around the flag; but the key's values recur (Key{} every lap, and
-// any user key may repeat), so three loads that straddled a commit and a pop
-// could pass the validation on a slot that was never stable, two threads
-// would own one slot, and the loser's flag store would clobber the winner's
-// claim. Here the state word is monotone per slot and its comparison is
-// exact, and the key is plain data published by the seq store like the value.
+// for the states of another. A busy-flag protocol -- the key as the state
+// word plus a busy flag written by both sides, validated by re-reading the
+// key around the flag -- does not work: the key's values recur (Key{} every
+// lap, and any user key may repeat), so three loads that straddle a commit
+// and a pop can pass the validation on a slot that was never stable, two
+// threads then own one slot, and the loser's flag store clobbers the
+// winner's claim. Here the state word is monotone per slot and its
+// comparison is exact, and the key is plain data published by the seq store
+// like the value.
 //
 // Wrap-around of the indices: indices and seq are size_t, so all of this is
 // arithmetic modulo 2^64. Because capacity is a power of 2 it divides 2^64,
@@ -228,33 +230,30 @@
 // correct with every slot write after the unlock -- the key is published and
 // ordered by seq either way, and the cleared key is read by nobody. The store
 // is there for the lock, not for the slot. Moving it after the unlock is the
-// obvious "optimization"; it has been made, measured and reverted twice --
-// first in the key-only queue, then again when the key-value protocol was
-// rewritten around seq and the store was lost with the busy flag -- and this
-// section exists so that nobody steps on that rake a third time.
+// obvious "optimization", and a rake: this section exists so that nobody
+// steps on it.
 //
-// The mechanism, established with instrumented locks and hybrid variants on
-// large Arm and x86 servers: under contention this SpinLock's throughput comes
-// from batching. The thread that just released the lock takes it again while
-// the waiters sit in the back-off, and nearly every acquisition is such a
-// re-acquisition. A store to the slot inside the critical section usually
-// misses (the slot's line was last touched on the other side of the ring), and
-// the release store of unlock() cannot become visible before it -- stores are
-// ordered under x86-TSO, and an Arm release store orders the stores before it
-// -- so a waiter sees the lock free only once the holder's slot write is done,
-// and by then the holder is ready to take the lock again. Without the store
-// the lock shows free while the holder's slot writes are still pending; its
-// next acquisition waits for them, and the waiters that notice the free lock
-// take it, or at least pull its cache line away. The lock ping-pongs, every
-// operation pays cross-core transfers of the lock line and of a cold slot
-// line, and the walk along the ring stops being prefetchable. What makes the
-// batching regime so productive, and its loss so expensive, is the back-off: a
-// waiter that misses the eight-attempt burst is parked for ~50 us (the "short"
-// nanosleep is rounded up by the kernel's default 50 us timer slack on
-// Linux). The discriminating experiments: a pure delay inside the critical
-// section restores the regime but stalls the holder and is slower still; a
-// prefetch-for-write of the slot inside the critical section does not help;
-// only a store works.
+// The mechanism, on large Arm and x86 servers: under contention this
+// SpinLock's throughput comes from batching. The thread that just released the
+// lock takes it again while the waiters sit in the back-off, and nearly every
+// acquisition is such a re-acquisition. A store to the slot inside the
+// critical section usually misses (the slot's line was last touched on the
+// other side of the ring), and the release store of unlock() cannot become
+// visible before it -- stores are ordered under x86-TSO, and an Arm release
+// store orders the stores before it -- so a waiter sees the lock free only
+// once the holder's slot write is done, and by then the holder is ready to
+// take the lock again. Without the store the lock shows free while the
+// holder's slot writes are still pending; its next acquisition waits for them,
+// and the waiters that notice the free lock take it, or at least pull its
+// cache line away. The lock ping-pongs, every operation pays cross-core
+// transfers of the lock line and of a cold slot line, and the walk along the
+// ring stops being prefetchable. What makes the batching regime so productive,
+// and its loss so expensive, is the back-off: a waiter that misses the
+// eight-attempt burst is parked for ~50 us (the "short" nanosleep is rounded
+// up by the kernel's default 50 us timer slack on Linux). Nothing else does
+// the store's job: a pure delay inside the critical section restores the
+// regime but stalls the holder and is slower still; a prefetch-for-write of
+// the slot inside the critical section does not help.
 //
 // The rule that follows: the store is for the lock. Moving it after the unlock
 // is correct and slower. The effect belongs to this lock's back-off -- with a
@@ -268,8 +267,8 @@
 // producer's push() at index i + 1 has already committed and returned true,
 // so "pop() returned Key{}" does not mean "every push() that returned before
 // it has been consumed". This is inherent in claiming under the lock and
-// committing outside it (it was true of the previous protocol too); callers
-// that need a stronger guarantee must synchronize outside the queue.
+// committing outside it; callers that need a stronger guarantee must
+// synchronize outside the queue.
 template <typename Key, typename Value = void,
           size_t NTRY = 8,              // Number of attempts to acquire a slot before giving up
           size_t ALIGN = 0>             // Additional alignment; 64 to align each queue slot on a cache line
@@ -443,8 +442,8 @@ class RingAtomicMapQueueMPMC {
   // That means the store-release of the key -- the cross-lock handoff to
   // the consumer -- would be correct outside the critical section too. It
   // stays inside for the lock's sake: see "Why every critical section ends
-  // with a store to the slot" in the class comment (this queue is where the
-  // effect was measured first; the numbers are in README.md).
+  // with a store to the slot" in the class comment (the numbers are in
+  // README.md).
   bool push(Key key) noexcept requires std::is_same_v<Value, void> {
     assert(!(key == Key{}));    // Key{} is the reserved empty-slot marker; see class comment
     std::unique_lock<SpinLock> l(tail_.l);
@@ -476,15 +475,12 @@ class RingAtomicMapQueueMPMC {
   // value out and destroy it, and release the slot to the next lap's producer
   // by storing seq = i + capacity.
   //
-  // pop() never waits. The previous protocol had two slot states it had to
-  // wait out under the head lock: a producer between its key store and its
-  // busy-flag clear (the element visible but not yet committed), and a
-  // previous-lap consumer still clearing the slot. Neither exists here: the
-  // commit is the single seq store, so a visible element is a committed one,
-  // and a previous-lap consumer still draining the slot means tail_.i ==
-  // head_.i -- the queue is genuinely empty (see the class comment). The head
-  // lock is held for one load, one compare, the key read and clear, and one
-  // increment.
+  // pop() never waits: no slot state has to be waited out under the head
+  // lock. The commit is the single seq store, so a visible element is a
+  // committed one, and a previous-lap consumer still draining the slot means
+  // tail_.i == head_.i -- the queue is genuinely empty (see the class
+  // comment). The head lock is held for one load, one compare, the key read
+  // and clear, and one increment.
   template <typename V = Value>
     requires (!std::is_same_v<void, V>) && std::is_nothrow_assignable_v<V&, Value&&>
   Key pop(V& value) noexcept {

@@ -82,7 +82,7 @@ static void ring_queue_hook(RingQueueHook point);
 //      per-slot sequence number protocol in the key-value queue -- see the
 //      header) is most likely to race. Run under the sanitizers, these turn
 //      rare interleavings into reproducible failures.
-//   5. Forced interleavings -- the two schedules that broke the previous
+//   5. Forced interleavings -- the two schedules that break a busy-flag
 //      key-value protocol, replayed deterministically through the header's
 //      test-only hook points, plus a repeated-key stress test with a per-slot
 //      live-count oracle. A stress test reaches a specific interleaving by
@@ -1019,8 +1019,8 @@ namespace nothrow_requirements {
     static_assert(poppable<atomic_queue_t, int>);
     // A queue of a Value whose destructor may throw is refused by the class's
     // static_assert. That is a hard error at instantiation, which no
-    // requires-expression can observe, so it is not tested here; it was
-    // checked by compiling it once (the build fails at the static_assert).
+    // requires-expression can observe, so it is not tested here; compiling
+    // one fails the build at the static_assert.
     // push()/pop() are noexcept in both modes.
     static_assert(noexcept(std::declval<string_queue_t&>().push(1, std::declval<std::string&&>())));
     static_assert(noexcept(std::declval<string_queue_t&>().pop(std::declval<std::string&>())));
@@ -1492,16 +1492,17 @@ TEST(TSANStress, KV_LargeQueue_MPMC_16x16) {
 // The key-value push()/pop() claim a slot under a lock and construct (resp.
 // move out and destroy) the value after releasing it, so a producer and a
 // consumer, or two producers one lap of the ring apart, can be inside the
-// same slot's protocol at the same time. The previous protocol (key as the
+// same slot's protocol at the same time. A busy-flag protocol (key as the
 // state word, a busy flag written by both sides, a key->busy->key
-// validation) had a logic race in exactly that situation, reachable by two
-// schedules that a stress test practically never produces: each needs a
-// thread preempted between two adjacent loads for the duration of another
-// thread's whole operation. The two tests below replay those schedules
-// deterministically. Both fail on the previous protocol (one element lost
-// and a value constructed over a live one; one element popped twice, the
-// second time from a destroyed value) and pass on the sequence-number
-// protocol, whose per-index state values cannot be confused across laps.
+// validation; see "Why a sequence number and not a flag" in the header) has
+// a logic race in exactly that situation, reachable by two schedules that a
+// stress test practically never produces: each needs a thread preempted
+// between two adjacent loads for the duration of another thread's whole
+// operation. The two tests below replay those schedules deterministically.
+// Both fail on a busy-flag protocol (one element lost and a value
+// constructed over a live one; one element popped twice, the second time
+// from a destroyed value) and pass on the sequence-number protocol, whose
+// per-index state values cannot be confused across laps.
 //
 // Mechanism. The header's key-value push()/pop() call RING_QUEUE_HOOK(point)
 // at the boundaries between protocol steps (the enum at the top of this
@@ -1733,7 +1734,7 @@ struct TrackedValue {
 // The queue is owned through a unique_ptr so that a test can deliberately
 // LEAK it when the oracle reports a violation: a protocol that double-claimed
 // a slot has also broken the head <= tail invariant the destructor's drain
-// loop relies on (on the previous protocol that loop then runs ~2^64 times).
+// loop relies on (on a busy-flag protocol that loop then runs ~2^64 times).
 //   pushed / popped - number of push() calls that returned true / pop() calls
 //                     that returned a key
 //   pushed_sum / popped_sum - sums of the payloads of those elements
@@ -1795,12 +1796,12 @@ struct ForcedQueue {
 // index 8 is slot 0 again. Keys equal payloads here; the keys are distinct,
 // this schedule needs no repeated key.
 //
-// On the previous protocol P1's three loads (key, busy, key) straddled P0's
-// commit (key 0 -> 1) and C's pop (key 1 -> 0): the validation passed on a
-// slot that was never stably empty, P1 claimed it, C's trailing busy=0 store
-// clobbered P1's claim, and a third producer wrapping around claimed the same
-// slot again -- two producers owned one slot, one element was lost and a
-// value was constructed over a live one. On the sequence-number protocol P1
+// On a busy-flag protocol P1's three loads (key, busy, key) straddle P0's
+// commit (key 0 -> 1) and C's pop (key 1 -> 0): the validation passes on a
+// slot that was never stably empty, P1 claims it, C's trailing busy=0 store
+// clobbers P1's claim, and a third producer wrapping around claims the same
+// slot again -- two producers own one slot, one element is lost and a value
+// is constructed over a live one. On the sequence-number protocol P1
 // compares against seq == 8, a value the slot reaches only as C's LAST act;
 // P1 sees "full" until then, and claims index 8 only once C is entirely
 // out of the slot -- after which the ring is full again and the extra push
@@ -1822,38 +1823,38 @@ TEST(ForcedInterleaving, PushSideLapAhead) {
     wait_arrived(gP1);
     // 4. P0 commits: slot 0 holds element 1.
     release(gP0); tP0.join();
-    // 5. P1 reads the slot's state again and stalls (previous protocol: this is
-    //    its busy load, which sees 0 now that P0 is done; here: a retry of the
+    // 5. P1 reads the slot's state again and stalls (busy-flag protocol: its
+    //    busy load, which sees 0 now that P0 is done; here: a retry of the
     //    seq load, which sees 1 == "committed for index 0", not "free for 8").
     run_to(gP1, RingQueueHook::PUSH_LOADED);
     // 6. C pops index 0: claims, moves the value out, destroys it, and runs
-    //    to the last step of its release (previous protocol: the key is
+    //    to the last step of its release (busy-flag protocol: the key is
     //    cleared, the busy flag not yet; here: the release is one store and C
     //    has made it, so C simply finishes).
     std::thread tC = hooked_thread(gC, RingQueueHook::POP_RELEASING, [&] { f.pop(1); });
     wait_arrived(gC);
     run_to(gC, RingQueueHook::POP_RELEASING);
-    // 7. P1 decides. Previous protocol: its second key load sees Key{} (C has
+    // 7. P1 decides. Busy-flag protocol: its second key load sees Key{} (C has
     //    cleared it), the validation passes although the slot was never
     //    stable, P1 claims slot 0 for index 8 and stalls before constructing.
     //    Here: P1's retry sees seq == 8, which C stored as its LAST act, and
     //    claims index 8 legitimately -- at no earlier point did the slot look
     //    free for index 8.
     run_to(gP1, RingQueueHook::PUSH_CLAIMED);
-    // 8. C finishes (previous protocol: its busy=0 clobbers P1's busy=1 and
+    // 8. C finishes (busy-flag protocol: its busy=0 clobbers P1's busy=1 and
     //    slot 0 looks free although P1 owns it).
     release(gC); tC.join();
     // 9. The ring wraps once more while P1 is still parked mid-commit: pop the
     //    seven elements of indices 1..7, push seven (indices 9..15).
     for (int k = 2; k <= 8; ++k) { EXPECT_EQ(k, f.pop(k)); }
     for (int k = 10; k <= 16; ++k) { EXPECT_TRUE(f.push(k, k)); }
-    // 10. One more push, at index 16 = slot 0. Previous protocol: the slot
+    // 10. One more push, at index 16 = slot 0. Busy-flag protocol: the slot
     //     looks free, the push constructs a value in a slot P1 owns and
     //     returns true. Here: the slot holds P1's uncommitted element of
     //     index 8 (seq == 8, not 16), the ring is full, the push returns
     //     false. The result is recorded, not asserted: it is the divergence.
     f.push(17, 17);
-    // 11. P1 completes (previous protocol: constructs over the live value of
+    // 11. P1 completes (busy-flag protocol: constructs over the live value of
     //     step 10 -- the oracle sees 1 -> 2 -- and commits key 9 over key 17).
     release(gP1); tP1.join();
     if (p0_ok) { f.pushed.fetch_add(1); f.pushed_sum.fetch_add(1); }
@@ -1871,12 +1872,12 @@ TEST(ForcedInterleaving, PushSideLapAhead) {
 // key. Every element here has key 5 (keys need not be unique; the payloads
 // are unique). Capacity 8, so index 8 is slot 0 again.
 //
-// On the previous protocol C1 read C0's stale key (5), then busy == 0 after
+// On a busy-flag protocol C1 reads C0's stale key (5), then busy == 0 after
 // C0 finished, then key == 5 again after P refilled the slot with key 5: the
-// key->busy->key validation passed although the slot had gone through empty
-// in between. C1 claimed the slot, P's trailing busy=0 store clobbered C1's
-// claim, and after another lap a consumer found the slot stable with key 5
-// and popped it again -- from a value C1 had already destroyed. On the
+// key->busy->key validation passes although the slot has gone through empty
+// in between. C1 claims the slot, P's trailing busy=0 store clobbers C1's
+// claim, and after another lap a consumer finds the slot stable with key 5
+// and pops it again -- from a value C1 has already destroyed. On the
 // sequence-number protocol C1 compares against seq == 9, which the slot
 // reaches only when P commits; C1 saw 1 (C0's lap) and returns empty.
 TEST(ForcedInterleaving, PopSideRepeatedKey) {
@@ -1889,7 +1890,7 @@ TEST(ForcedInterleaving, PopSideRepeatedKey) {
     EXPECT_TRUE(f.push(key, 1));
     // 2. C0 pops it: reads and clears the key, claims, unlocks, moves the
     //    value out, destroys it, and stalls before releasing the slot
-    //    (previous protocol: key 5 still visible).
+    //    (busy-flag protocol: key 5 still visible).
     std::thread tC0 = hooked_thread(gC0, RingQueueHook::POP_RELEASING, [&] { f.pop(key); });
     wait_arrived(gC0);
     // 3. The ring wraps: push seven (indices 1..7), pop seven; the head is at
@@ -1902,7 +1903,7 @@ TEST(ForcedInterleaving, PopSideRepeatedKey) {
     wait_arrived(gC1);
     // 5. C0 finishes: slot 0 is free for index 8.
     release(gC0); tC0.join();
-    // 6. C1 reads the slot's state again and stalls (previous protocol: its
+    // 6. C1 reads the slot's state again and stalls (busy-flag protocol: its
     //    busy load, 0 now that C0 is done; here: C1 has already decided on the
     //    state it loaded in step 4 -- seq 1, not 9 -- and returns empty, so it
     //    finishes and this call returns at once).
@@ -1911,12 +1912,12 @@ TEST(ForcedInterleaving, PopSideRepeatedKey) {
     //    claims under the lock, constructs, and stalls before its commit store.
     std::thread tP = hooked_thread(gP, RingQueueHook::PUSH_COMMITTING, [&] { p_ok = f.q->push(key, TrackedValue(9)); });
     wait_arrived(gP);
-    // 8. C1 decides. Previous protocol: its second key load sees 5 == the key
+    // 8. C1 decides. Busy-flag protocol: its second key load sees 5 == the key
     //    it read in step 4, the validation passes, C1 claims index 8, moves
     //    P's value out, destroys it and stalls before clearing the key. Here:
     //    C1 is done (step 6), nothing happens.
     run_to(gC1, RingQueueHook::POP_RELEASING);
-    // 9. P completes its commit (previous protocol: busy=0 clobbers C1's
+    // 9. P completes its commit (busy-flag protocol: busy=0 clobbers C1's
     //    busy=1; slot 0 now reads as a stable element with key 5 whose value
     //    C1 has destroyed).
     release(gP); tP.join();
@@ -1925,15 +1926,15 @@ TEST(ForcedInterleaving, PopSideRepeatedKey) {
     // 10. Another lap: push seven, pop seven.
     for (int p = 10; p <= 16; ++p) { EXPECT_TRUE(f.push(key, p)); }
     for (int p = 10; p <= 16; ++p) { EXPECT_EQ(key, f.pop(key)); }
-    // 11. One more pop. Previous protocol: index 16 is slot 0, which looks
+    // 11. One more pop. Busy-flag protocol: index 16 is slot 0, which looks
     //     like a stable element with key 5: popped a second time, from the
     //     destroyed value (the oracle sees 0 -> -1; ASan sees the double
     //     free). Here: index 15, the last element of step 10.
     f.pop(key);
     // 12. C1 completes. It saw seq == 1 at index 8 -- the element of index 0
     //     being drained, nothing committed for index 8 -- so its answer is
-    //     "empty". (On the previous protocol it returned key 5: P's element,
-    //     legitimately, but by a path that also let it be popped twice.)
+    //     "empty". (On a busy-flag protocol it returns key 5: P's element,
+    //     legitimately, but by a path that also lets it be popped twice.)
     release(gC1); tC1.join();
     EXPECT_EQ(0, c1_key);
     // 13. Drain and account.
@@ -1947,8 +1948,8 @@ TEST(ForcedInterleaving, PopSideRepeatedKey) {
 //================================================================================
 // KV stress in the conditions the forced schedules above need: a tiny ring
 // that wraps constantly, keys that repeat (three keys for the whole run, so
-// every slot sees the same key again and again -- the previous protocol's
-// validation compared keys), and consumers that back off when they see empty
+// every slot sees the same key again and again -- a busy-flag protocol's
+// validation compares keys), and consumers that back off when they see empty
 // (which holds the head back while producers wrap, widening the window in
 // which a lap-ahead producer meets the previous lap's commit and pop). The
 // oracle is the same as above: every slot must alternate one construction

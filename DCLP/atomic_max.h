@@ -34,12 +34,12 @@
 // operator bool would not convert to the builtin's `long` parameter).
 //
 // Why the builtin and not the standard attribute: `while (c) [[unlikely]] {...}`
-// also reaches the loop's layout -- with g++-16 and clang++-22 it produces the
-// same code as the builtin for this loop (checked 2026-09-24) -- but the
-// standard leaves the attribute's strength to the compiler, while
-// __builtin_expect states the edge's weight unambiguously. The right layout is
-// a real win and the wrong one largely harmless, so the unambiguous form is
-// used rather than depending on how a given compiler weighs the attribute.
+// also reaches the loop's layout -- with GCC 16 and Clang 22 it produces the
+// same code as the builtin for this loop -- but the standard leaves the
+// attribute's strength to the compiler, while __builtin_expect states the
+// edge's weight unambiguously. The right layout is a real win and the wrong
+// one largely harmless, so the unambiguous form is used rather than depending
+// on how a given compiler weighs the attribute.
 #if defined(__GNUC__) || defined(__clang__)
 #define ATOMIC_MAX_UNLIKELY(c) __builtin_expect(!!(c), 0)
 #else
@@ -70,8 +70,8 @@
 //     the maximum even on the no-update path; pass relaxed when only the value
 //     is wanted and no happens-before is needed -- the common case for a plain
 //     maximum reduction, which is why the initial load is often relaxed.
-// The defaults keep the original "same as CAS" contract -- a read-write barrier
-// on update, a read-only acquire when not updated -- so an unqualified call is
+// The defaults keep the "same as CAS" contract -- a read-write barrier on
+// update, a read-only acquire when not updated -- so an unqualified call is
 // fully synchronized; performance-sensitive callers pass relaxed for both.
 template <typename T>
 bool atomic_max(std::atomic<T>& target, T val,
@@ -85,13 +85,13 @@ bool atomic_max(std::atomic<T>& target, T val,
   // that makes the compiler sink the compare_exchange out of line, so the common
   // no-update fast path is a single taken branch instead of a forward "skip the
   // CAS" branch plus the loop back-edge. On a core that retires one taken branch
-  // per cycle (e.g. Neoverse-V2) that roughly DOUBLES the read-only fast path
-  // (measured: Grace 1.64 -> 3.28 G/s at t1). On x86 it depends on the core the
-  // compiler tunes for: Intel (Granite Rapids) builds already have this layout,
-  // so the hint is a no-op there, while Zen 5 gains 1.3-1.7x. When the maximum
-  // advances on nearly every call (a monotone-increasing feed, which a warmed-up
-  // maximum is not) the cost is within noise on the fleet. (Why the builtin
-  // rather than [[unlikely]]: see ATOMIC_MAX_UNLIKELY above.)
+  // per cycle (e.g. Neoverse-V2) that roughly DOUBLES the read-only fast path.
+  // On x86 it depends on the core the compiler tunes for: Intel (Granite Rapids)
+  // builds already have this layout, so the hint is a no-op there, while Zen 5
+  // sees a smaller but clear gain. When the maximum advances on nearly every
+  // call (a monotone-increasing feed, which a warmed-up maximum is not) the cost
+  // is within noise. (Why the builtin rather than [[unlikely]]: see
+  // ATOMIC_MAX_UNLIKELY above.)
   while (ATOMIC_MAX_UNLIKELY(val > cur)) {
     // compare_exchange_weak (not strong) because we are already in a retry
     // loop: a spurious failure just re-tests the condition and costs one more

@@ -312,8 +312,9 @@ TEST(ConcurrentAppendDequeTest, IteratorRandomAccess) {
     EXPECT_TRUE(it != it2);
 }
 
-// iterator must implicitly convert to const_iterator, e.g. to compare a mutable
-// iterator against cbegin()/cend() or to pass it to a const_iterator parameter.
+// An iterator must implicitly convert to const_iterator, e.g. to compare a
+// mutable iterator against cbegin()/cend() or to pass it to a const_iterator
+// parameter.
 TEST(ConcurrentAppendDequeTest, ConstIteratorConversion) {
     ConcurrentAppendDeque<int, 4> deque;
     deque.push_back(1);

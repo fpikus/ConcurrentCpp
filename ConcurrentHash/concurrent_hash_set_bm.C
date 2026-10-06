@@ -33,18 +33,18 @@
 #include "concurrent_hash_set.h"
 
 /*
- * ConcurrentResizableHashSet Benchmarks, v2
+ * ConcurrentResizableHashSet Benchmarks
  *
- * This suite replaces the pool-collision benchmarks with fixed-composition
- * workloads, so that every row of a ThreadRange measures the *same* workload.
+ * Fixed-composition workloads, so that every row of a ThreadRange measures the
+ * *same* workload.
  *
- * The problem with the old suite: drawing keys from a shared random pool makes
- * the duplicate rate a function of table fill, which is a function of the
- * iteration budget, which Google Benchmark chooses differently for every
- * thread count. The rows of "Insert_MostlyNew" ranged from ~20% duplicates
- * (1 thread) to ~85% duplicates (32 threads) -- the mid-curve was mostly
- * measuring cheap duplicate-rejects (reads) wearing an insert benchmark's
- * name. Here, composition is pinned by construction:
+ * Why fixed: drawing keys from a shared random pool makes the duplicate rate a
+ * function of table fill, which is a function of the iteration budget, which
+ * Google Benchmark chooses differently for every thread count. An insert
+ * benchmark built that way sees mostly new keys at one thread and mostly
+ * duplicates at many -- its mid-curve measures cheap duplicate-rejects (reads)
+ * wearing an insert benchmark's name. Here, composition is pinned by
+ * construction:
  *
  *  - Insert_MostlyNew: every thread inserts sequential keys from its own
  *    disjoint range. Duplicate rate is exactly 0%. Every operation is a real
@@ -53,9 +53,8 @@
  *    std::hash<int> and unmixed keys, thread t's n-th key t*kKeyStride + n
  *    lands in bucket n for every t while the table has fewer than kKeyStride
  *    buckets, so all threads walk and CAS the SAME bucket at the same moment
- *    and every chain is T nodes long -- an O(T) cost per insert that the
- *    campaign of 2026-09-25 measured as the hash table's scaling until the
- *    arena-nodes-per-key counter showed no waste and the chains were found.
+ *    and every chain is T nodes long -- an O(T) cost per insert that would be
+ *    measured as the hash table's scaling.
  *    Because every key is globally unique and attempted exactly once, every
  *    insert() MUST return true -- this is verified per thread, which makes the
  *    benchmark a standing regression test for the insert return-value
@@ -132,9 +131,9 @@ static constexpr int    kNewBase   = 1 << 21;       // new keys start above the 
 static constexpr int    kInsertEvery = 100;         // MostlyOld: 1 insert per 100 ops
 
 // ---------------------------------------------------------------------------
-// A fast, cheap PRNG. std::mt19937 costs a nontrivial fraction of a 6 ns
-// lookup; xorshift32 is a few cycles and identical for all contestants, so
-// the comparison is fair and the floor is barely inflated.
+// A fast, cheap PRNG. std::mt19937 costs a nontrivial fraction of a lookup of
+// a few nanoseconds; xorshift32 is a few cycles and identical for all
+// contestants, so the comparison is fair and the floor is barely inflated.
 // ---------------------------------------------------------------------------
 struct XorShift32 {
     uint32_t s;
@@ -172,13 +171,12 @@ using LockedSet     = LockedHashSet<int, std::hash<int>>;
 // ---------------------------------------------------------------------------
 // Fixtures.
 //
-// CAUTION (inherited from the v1 suite, still true): Google Benchmark runs
-// SetUp() per thread with NO implicit barrier between SetUp() and the start
-// of the benchmark body. The only implicit barrier is the `for (auto _ :
-// state)` loop itself. Therefore: thread 0 creates (and, for MostlyOld,
-// prefills) the container in its SetUp(), and no thread dereferences `set`
-// anywhere except INSIDE the loop (or after it, once the loop's end barrier
-// has been crossed).
+// CAUTION: Google Benchmark runs SetUp() per thread with NO implicit barrier
+// between SetUp() and the start of the benchmark body. The only implicit
+// barrier is the `for (auto _ : state)` loop itself. Therefore: thread 0
+// creates (and, for MostlyOld, prefills) the container in its SetUp(), and no
+// thread dereferences `set` anywhere except INSIDE the loop (or after it, once
+// the loop's end barrier has been crossed).
 // ---------------------------------------------------------------------------
 template <typename SetType>
 class MostlyNewFixture : public benchmark::Fixture {
@@ -195,11 +193,11 @@ template <typename SetType> SetType* MostlyNewFixture<SetType>::set = nullptr;
 
 // The same insert workload into a table constructed with kPresizedBuckets
 // buckets, so that no doubling and no lazy split happens until the arena holds
-// 2*kPresizedBuckets nodes (16.7M: beyond 64 threads' worth of kNewIters). Added
-// 2026-09-25 to separate the allocator's own cost from the doubling and split
-// path: with the table geometry fixed, the arena (its lock or its shards) is the
-// only shared state on the insert path, and this is the fixture the README's
-// allocator numbers come from. Every insert is still a random bucket-head miss.
+// 2*kPresizedBuckets nodes (16.7M: equal to 64 threads' worth of kNewIters). It
+// separates the allocator's own cost from the doubling and split path: with the
+// table geometry fixed, the arena (its lock or its shards) is the only shared
+// state on the insert path, and this is the fixture the README's allocator
+// numbers come from. Every insert is still a random bucket-head miss.
 static constexpr size_t kPresizedBuckets = size_t(1) << 23;
 template <typename SetType>
 class MostlyNewPresizedFixture : public benchmark::Fixture {
@@ -326,7 +324,7 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
         ->ThreadRange(1, num_cpu)->Iterations(kOldIters);
 
 // ---------------------------------------------------------------------------
-// Reclamation benchmarks (added 2026-09-27, with reclaim()).
+// Reclamation benchmarks.
 //
 // The three workloads above are re-run on the AllowDelete == true instantiation
 // in three states of the set, and every cell has a purpose:
@@ -339,7 +337,7 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
 //   *_Del_Control    the same workload on a set PREFILLED (untimed, by thread 0)
 //                    with a population of live keys and nothing else: no erase,
 //                    no reclaim(), every free list empty, so every allocation
-//                    in the timed region APPENDS to a deque as it always did.
+//                    in the timed region APPENDS to a deque.
 //   *_Del_Reclaimed  the same workload on a set that reached the same live
 //                    population by CHURN: twice as many keys were inserted,
 //                    interleaved (survivor, victim, survivor, victim, ... in
@@ -363,8 +361,8 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
 // (every key goes through mix()), so consecutive pops land on scattered slots --
 // about one new cache line per popped node, where an append fills a line with
 // four consecutive nodes. Why measure: the free lists are the point of
-// reclaim(), and nothing before this measured an insert that reuses a slot, nor
-// a lookup over chains that reclaim() relinked.
+// reclaim(), and these are the only cells that measure an insert that reuses a
+// slot, or a lookup over chains that reclaim() relinked.
 //
 // The pre-sized and lookup cells share their bucket count between Control and
 // Reclaimed (no doubling in either prefill), so there the free lists are the

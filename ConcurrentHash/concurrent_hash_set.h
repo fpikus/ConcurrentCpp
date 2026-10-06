@@ -81,10 +81,9 @@ using DefaultConcurrentDeque = ConcurrentAppendDeque<T, 1024>;
 //              once per node, to obtain that address at allocation, and by
 //              the test-only sweeps at a quiescent point; no read path ever
 //              goes through a deque. Sharding exists because one shared
-//              per-node atomic of any kind (a lock, a counter) was measured to
-//              be the insert ceiling; a shard's lock and free-list head are
-//              contended only by the threads whose numbers collide modulo the
-//              shard count.
+//              per-node atomic of any kind (a lock, a counter) is the insert
+//              ceiling; a shard's lock and free-list head are contended only
+//              by the threads whose numbers collide modulo the shard count.
 //   node_count_ : arena occupancy, OVER-counted by up to 255 per touched shard
 //              per allocation path (each shard adds 256 when it appends a node
 //              whose index is a multiple of 256, index 0 included, and 256 on
@@ -361,7 +360,7 @@ using DefaultConcurrentDeque = ConcurrentAppendDeque<T, 1024>;
 //   are totally ordered with every other write of that word on every
 //   architecture. No correctness argument in this class has the store-buffering
 //   (Dekker) shape "A: write x, read y  ||  B: write y, read x", which is the
-//   shape the removed post-CAS rechecks had (x = head or link, y = table_size_)
+//   shape a post-CAS recheck would have (x = head or link, y = table_size_)
 //   and which acquire/release on two DIFFERENT atomics does not order.
 //   What remains cross-variable is only the read-side chain of channel 4
 //   (acquire word -> acquire table_size_). It is used for PROGRESS: a thread
@@ -474,11 +473,11 @@ private:
     // reclaim() adds 256 to node_count_: the pop is the 256th exactly when
     // the counter it replaces has its low eight bits clear (FREE_BATCH_MASK),
     // and reclaim() clears the counter, so the first pop after it counts.
-    // Cheaper layouts were considered and are not cheaper: with the counter in
-    // the low bits (address << 5 | counter) the carry of the increment has to
-    // be masked off the address, which costs the AND that this layout spends
-    // on the decode shift. Encode: (address >> 3) | counter bits; decode:
-    // (word << 9) >> 6, two shifts, no mask.
+    // The obvious alternative is not cheaper: with the counter in the low bits
+    // (address << 5 | counter) the carry of the increment has to be masked off
+    // the address, which costs the AND that this layout spends on the decode
+    // shift. Encode: (address >> 3) | counter bits; decode: (word << 9) >> 6,
+    // two shifts, no mask.
     static constexpr unsigned FREE_COUNT_SHIFT = 55;
     static constexpr word_t FREE_POP_ONE = word_t{1} << FREE_COUNT_SHIFT;
     static constexpr word_t FREE_COUNT_MASK = ~(FREE_POP_ONE - 1);       // bits 63..55

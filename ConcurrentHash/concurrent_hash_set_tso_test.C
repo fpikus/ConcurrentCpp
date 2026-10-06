@@ -41,26 +41,39 @@
 // the racing threads' path (the trial loop calls nothing but the container), so it
 // is a normal gtest and `make run_tests` reports it like any other.
 //
-// WHAT IT DEMONSTRATES. The pre-seal header decided insert() across two
-// independent atomics -- it CASed a bucket head, then re-read `table_size_` to
-// find out whether the geometry had moved under it. That is the store-buffering
-// (Dekker) shape: thread A writes head and reads table_size_, the resizer writes
-// table_size_ and reads head. Acquire/release on two DIFFERENT atomics does not
-// order it on ANY architecture, x86 included: `table_size_.store(release)` is a
-// plain MOV there, and the resizer reaches split_bucket()'s parent-head load with
-// nothing to drain its buffer. Measured on this x86 box: ~1000-3500 lost keys and
-// ~3400 lost erases per million trials against the stock header, and 0 per six
-// million against a control that differs only in making that one store seq_cst
-// (i.e. an XCHG) -- which pins the cause on the store buffer and nothing else.
+// WHAT IT DEMONSTRATES. A header that decides insert() across two independent
+// atomics -- CAS a bucket head, then re-read `table_size_` to find out whether
+// the geometry moved under it -- has the store-buffering (Dekker) shape: thread
+// A writes head and reads table_size_, the resizer writes table_size_ and reads
+// head. Acquire/release on two DIFFERENT atomics does not order it on ANY
+// architecture, x86 included: `table_size_.store(release)` is a plain MOV there,
+// and the resizer reaches split_bucket()'s parent-head load with nothing to drain
+// its buffer. Against such a header this test loses keys and erases on x86, and
+// loses none when only that one store is made seq_cst (i.e. an XCHG) -- which
+// pins the cause on the store buffer and nothing else.
 // The seal+freeze design removes the shape entirely: the decision and the split's
 // interlock are read-modify-writes of the SAME word (the bucket head for insert,
 // the node link for erase), and single-word RMWs are totally ordered everywhere.
 //
-// THE TARGETED EXECUTION, per trial, on a fresh 4-bucket set holding 8 nodes (all
-// in bucket 0), so that the next insert doubles the table to 8:
-//   R: insert(64)   -> publishes, then doubles: `table_size_ = 8` is a plain store
-//                      that may sit in R's store buffer; R itself sees 8 by
-//                      forwarding.
+// WHEN THE TABLE DOUBLES, which decides how a trial's set is built: insert()
+// doubles the table after a successful publishing CAS when the resize hint
+// node_count_ exceeds 2*table_size, and the hint counts each arena shard's
+// appends in batches of 256, the first batch at the shard's first node. From the
+// first allocation on it is therefore at least 256, and while the table has fewer
+// than 128 buckets EVERY successful insert doubles it: a fresh 4-bucket set has 8
+// buckets after its first successful insert, 16 after its second. So the doubling
+// R must perform is the set's first successful insert on the insert side, and
+// its second on the erase side, where the set-up inserts the victim.
+//
+// The two executions below are described as they run on a header with the
+// two-atomic recheck, which is what the test guards against; on this header R's
+// split begins with the seal CAS (and the freeze CAS), locked instructions on the
+// very words A decides on.
+//
+// THE TARGETED EXECUTION, insert side, per trial, on a fresh EMPTY 4-bucket set:
+//   R: insert(64)   -> bucket 0; publishes, then doubles 4 -> 8 (the set's first
+//                      insert): `table_size_ = 8` is a plain store that may sit in
+//                      R's store buffer; R itself sees 8 by forwarding.
 //      contains(13) -> bucket 5 is UNINITIALIZED, so R splits it, which loads
 //                      bucket 1's head (the snapshot) with no locked instruction
 //                      since the table_size_ store.
@@ -69,9 +82,22 @@
 //                      4 (R's store not yet drained), a header with the two-atomic
 //                      recheck does not re-insert: key 5 sits in bucket 1 only,
 //                      bucket 5 was published without it, and contains(5) is false
-//                      forever. The erase-side dual pre-inserts key 5 and has A
-//                      call erase(5): the split copies the node live before A's
-//                      mark lands, so erase(5) returns true and the key stays.
+//                      forever. (If A publishes first, A doubles the table itself
+//                      and the trial is race-free.)
+// THE TARGETED EXECUTION, erase side: the set-up inserts the victim, key 13 (bucket
+// 1 at size 4), which doubles the table to 8, and looks it up, which splits bucket
+// 5 (13 & 7 == 5) from bucket 1: the trial starts at size 8 with key 13's live node
+// in the published bucket 5. The same race then runs one doubling later:
+//   R: insert(64)   -> bucket 0; publishes, then doubles 8 -> 16 (the set's second
+//                      insert), the store again possibly still buffered.
+//      contains(29) -> bucket 13 (29 & 15) is UNINITIALIZED, so R splits it from
+//                      bucket 5, reading key 13's link with no locked instruction
+//                      since the table_size_ store.
+//   A: erase(13)    -> loaded table_size_ == 8, so bucket 5. If its mark lands after
+//                      R's split read the link live, and A's post-mark table_size_
+//                      load still returns 8, a header with the two-atomic recheck
+//                      does not re-erase: erase(13) returns true and the copy in
+//                      bucket 13 keeps the key.
 // The hammer threads keep the `table_size_` cache line shared by several cores so
 // R's request for ownership takes longer, widening the window.
 // ===========================================================================
@@ -113,7 +139,7 @@ static bool pin_to_cpu(int cpu) {
 // Outcome of one harness run.
 struct TsoResult {
     long trials = 0;      // trials actually executed
-    long a_true = 0;      // times A's insert(5)/erase(5) returned true
+    long a_true = 0;      // times A's insert(5)/erase(13) returned true
     long lost = 0;        // trials whose final state contradicts A's `true`
     bool pinned = false;  // whether the racing threads were pinned to distinct CPUs
 };
@@ -134,6 +160,9 @@ template <bool EraseSide>
 static TsoResult run_tso_trials(long trials, int hammers) {
     using Set = ConcurrentResizableHashSet<int, EraseSide>;
     const int BATCH = 1000;
+    // A's key: inserted by A on the insert side, inserted by the set-up and erased
+    // by A on the erase side (see THE TARGETED EXECUTION above).
+    constexpr int VICTIM = EraseSide ? 13 : 5;
 
     const int ncpu = static_cast<int>(std::thread::hardware_concurrency());
     if (ncpu > 0 && hammers > ncpu - 3) hammers = ncpu - 3;
@@ -164,8 +193,12 @@ static TsoResult run_tso_trials(long trials, int hammers) {
             }
             seen = g;
             Set& set = *sets[g%BATCH];
-            set.insert(64);        // the 9th node: doubles 4 -> 8
-            set.contains(13);      // touches bucket 5, so R itself splits it from bucket 1
+            set.insert(64);        // doubles 4 -> 8 (insert side) or 8 -> 16 (erase side)
+            if constexpr (EraseSide) {
+                set.contains(29);  // touches bucket 13, so R itself splits it from bucket 5
+            } else {
+                set.contains(13);  // touches bucket 5, so R itself splits it from bucket 1
+            }
             done.fetch_add(1);
         } // trial loop
     });
@@ -187,9 +220,9 @@ static TsoResult run_tso_trials(long trials, int hammers) {
             for (volatile unsigned d = rng()%192u; d != 0; d = d - 1) {}
             bool won;
             if constexpr (EraseSide) {
-                won = set.erase(5);
+                won = set.erase(VICTIM);
             } else {
-                won = set.insert(5);
+                won = set.insert(VICTIM);
             }
             if (won) a_true.fetch_add(1, std::memory_order_relaxed);
             done.fetch_add(1);
@@ -211,10 +244,11 @@ static TsoResult run_tso_trials(long trials, int hammers) {
             while (!stop.load(std::memory_order_relaxed)) {
                 idle[h].store(false);
                 long g = cur.load();
-                // Key 8 lives in bucket 0 at every table size that occurs here, so
-                // a hammer never splits bucket 5 and never touches bucket 1: it
-                // only keeps the table_size_ line shared.
-                if (g >= 0) sink += sets[g%BATCH]->contains(8) ? 1u : 0u;
+                // Key 0 is never inserted and lives in bucket 0 at every table size
+                // that occurs here (4, 8, 16), which is never UNINITIALIZED, so a
+                // hammer splits nothing and touches no head the race involves: it
+                // only keeps the table_size_ line shared (a miss reads it twice).
+                if (g >= 0) sink += sets[g%BATCH]->contains(0) ? 1u : 0u;
                 idle[h].store(true);
             } // hammer loop
             if (sink == ~size_t{0}) std::printf(" ");   // keep `sink` alive
@@ -227,12 +261,10 @@ static TsoResult run_tso_trials(long trials, int hammers) {
         cur.store(-1);
         for (int h = 0; h < hammers; ++h) { while (!idle[h].load()) {} }
         for (int i = 0; i < BATCH; ++i) {
-            sets[i] = std::make_unique<Set>(4);
+            sets[i] = std::make_unique<Set>(4);   // insert side: left empty, R's insert doubles it
             if constexpr (EraseSide) {
-                sets[i]->insert(5);                                    // the victim, bucket 1
-                for (int k = 0; k < 56; k += 8) sets[i]->insert(k);    // 7 more nodes, all in bucket 0
-            } else {
-                for (int k = 0; k < 64; k += 8) sets[i]->insert(k);    // 8 nodes, all in bucket 0
+                sets[i]->insert(VICTIM);     // bucket 1; the set's first insert: doubles 4 -> 8
+                sets[i]->contains(VICTIM);   // publishes bucket 5, a copy of the victim in it
             }
         } // build the batch
         for (int i = 0; i < BATCH; ++i) {
@@ -246,8 +278,8 @@ static TsoResult run_tso_trials(long trials, int hammers) {
         for (int h = 0; h < hammers; ++h) { while (!idle[h].load()) {} }
         for (int i = 0; i < BATCH; ++i) {
             // Insert side: A's insert(5) returned true, so 5 must be a member.
-            // Erase side: A's erase(5) returned true, so 5 must NOT be a member.
-            const bool present = sets[i]->contains(5);
+            // Erase side: A's erase(13) returned true, so 13 must NOT be a member.
+            const bool present = sets[i]->contains(VICTIM);
             if (EraseSide ? present : !present) ++out.lost;
         } // score the batch
     } // batches
@@ -261,15 +293,12 @@ static TsoResult run_tso_trials(long trials, int hammers) {
     return out;
 } // run_tso_trials()
 
-// Trials per side, sized so that the whole binary runs in roughly fifteen seconds
-// on a 16-thread laptop. The two sides have very different costs per trial: on the
-// insert side BOTH racing threads allocate a node, so they contend for the arena's
-// SpinLock (whose back-off sleeps), at ~27 us per trial; the erase side allocates
-// on one side only and costs ~1.5 us. The counts are chosen to spend the time where
-// it buys detection: measured against the stock header, roughly one trial in 560
-// loses a key on the insert side and one in 310 loses an erase, so these counts
-// expect ~700 and ~6400 detections respectively -- a run that reports zero is
-// evidence, not luck.
+// Trials per side, sized so that the whole binary runs in seconds, not minutes.
+// The two sides have very different costs per trial: an insert-side trial costs
+// several times an erase-side one. The counts are chosen to spend the time where
+// it buys detection: against a header with the two-atomic recheck, they expect
+// thousands of detections on each side -- a run that reports zero is evidence,
+// not luck.
 static constexpr long TSO_TRIALS_INSERT = 400000;
 static constexpr long TSO_TRIALS_ERASE = 2000000;
 static constexpr int TSO_HAMMERS = 4;
@@ -289,7 +318,9 @@ static void report(const TsoResult& r, const char* what) {
 TEST(ConcurrentHashSetTsoTest, InsertedKeyIsNotLostByAConcurrentResize) {
     const TsoResult r = run_tso_trials<false>(TSO_TRIALS_INSERT, TSO_HAMMERS);
     report(r, "insert side");
-    ASSERT_GT(r.a_true, 0) << "harness broken: insert(5) never reported a new key, so nothing was tested";
+    // Key 5 is absent and A is its only inserter, so every insert(5) must return
+    // true; `lost` below counts trials whose final state contradicts that true.
+    EXPECT_EQ(r.a_true, r.trials) << "insert(5) of an absent key with no other inserter returned false";
     EXPECT_EQ(r.lost, 0) << r.lost << " of " << r.trials
                          << " trials: insert(5) returned true and contains(5) was false afterwards";
 } // InsertedKeyIsNotLostByAConcurrentResize
@@ -300,7 +331,9 @@ TEST(ConcurrentHashSetTsoTest, InsertedKeyIsNotLostByAConcurrentResize) {
 TEST(ConcurrentHashSetTsoTest, ErasedKeyIsNotResurrectedByAConcurrentResize) {
     const TsoResult r = run_tso_trials<true>(TSO_TRIALS_ERASE, TSO_HAMMERS);
     report(r, "erase side");
-    ASSERT_GT(r.a_true, 0) << "harness broken: erase(5) never reported a deletion, so nothing was tested";
+    // Key 13 is present and A is its only eraser, so every erase(13) must return
+    // true; `lost` below counts trials whose final state contradicts that true.
+    EXPECT_EQ(r.a_true, r.trials) << "erase(13) of a present key with no other eraser returned false";
     EXPECT_EQ(r.lost, 0) << r.lost << " of " << r.trials
-                         << " trials: erase(5) returned true and contains(5) was still true afterwards";
+                         << " trials: erase(13) returned true and contains(13) was still true afterwards";
 } // ErasedKeyIsNotResurrectedByAConcurrentResize

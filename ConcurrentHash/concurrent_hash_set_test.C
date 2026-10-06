@@ -69,8 +69,7 @@
 // bucket = hash(k) & (ts-1) == k for every larger ts. After that point a
 // doubling MOVES NOTHING, no parent chain is ever split for those keys, and a
 // test built on them is blind to every stale-geometry bug at every doubling
-// beyond its key range. (That is not hypothetical: two earlier versions of the
-// erase stress test could not fail even against a header with the fix removed.)
+// beyond its key range.
 //
 // scramble() is a bijection on 32-bit ints (multiplication by an odd constant is
 // invertible mod 2^32), so distinct indices still give distinct keys and every
@@ -81,10 +80,42 @@ static int scramble(int i) {
     return static_cast<int>(static_cast<unsigned>(i)*2654435761u);
 }
 
+// ---------------------------------------------------------------------------
+// WHEN THE TABLE DOUBLES -- every test that places a resize relies on this.
+//
+// insert() doubles the table right after its publishing CAS succeeds if the
+// resize hint node_count_ exceeds 2*table_size, and only if no other thread has
+// doubled it since this insert loaded the size. The hint is not the arena size:
+// a shard adds 256 when it appends its node 0, 256, 512, ... (header, on
+// node_count_), so before any reclaim() the hint is the sum over the shards of
+// their sizes rounded UP to a multiple of 256 (reclaim() resets it, and pops from
+// the free lists then add 256 per 256 pops, the first pop included). That has two
+// consequences for a test:
+//   1. From the first allocation on, the hint is at least 256, so while the
+//      table has fewer than 128 buckets EVERY successful insert doubles it (one
+//      doubling per insert; under contention, an insert whose loaded size is
+//      already stale does not). A fresh 4-bucket set has 8 buckets after its
+//      first successful insert, 16 after its second, 128 after its fifth if they
+//      run one at a time. Once a successful insert has returned, the set no
+//      longer has 4 buckets: a test whose race must straddle the doubling 4 -> 8
+//      has to make the set's FIRST successful insert part of the race, and a
+//      set-up that inserts keys first has already doubled the table once per key.
+//   2. From 128 buckets on, in a set with ONE arena shard (and no reclaim() yet)
+//      the hint passes 2*table_size exactly when an allocation brings the arena
+//      past 2*table_size slots: 2*table_size is then a multiple of 256, so "hint
+//      > 2*table_size" is "arena size > 2*table_size". The doubling itself is done
+//      by the next successful insert() whose loaded size is still current (a
+//      split copy made inside contains() can cross the threshold without
+//      doubling anything). With more shards, every shard that a new thread
+//      touches adds 256 at once, and the table jumps by several doublings as the
+//      threads start.
+// Allocations include split copies, orphaned nodes and lost split subchains, so
+// rule 2 counts arena slots, not keys.
+// ---------------------------------------------------------------------------
+
 // Run fn(t) on T threads released together by a barrier, then join them all.
 // The barrier (rather than a spin on a start flag) is what makes the racing
-// window open at the same instant on every thread; it also replaces the six
-// hand-rolled `std::atomic<bool> start` loops this suite used to carry.
+// window open at the same instant on every thread.
 template <typename F>
 static void run_threads(int T, F fn) {
     std::barrier start(T);
@@ -233,11 +264,10 @@ TEST(ConcurrentHashSetTest, ManyResizesSingleThread) {
 //   - insert() returned true exactly T*per times. The keys are disjoint, so each
 //     one has exactly one absent->present transition and exactly one call may
 //     report it.
-// Note on the previous oracle: this test used to assert EXPECT_LE(inserted, T*per)
-// "to catch over-count". That assertion was VACUOUS -- T*per is also the number
-// of insert() calls made, so the count cannot exceed it no matter what the
-// implementation does. Only equality has any content here, and equality is what
-// the contract says.
+// An upper bound alone, EXPECT_LE(inserted, T*per), would be VACUOUS -- T*per is
+// also the number of insert() calls made, so the count cannot exceed it no matter
+// what the implementation does. Only equality has any content here, and equality
+// is what the contract says.
 TEST(ConcurrentHashSetTest, ConcurrentDisjointRanges) {
     ConcurrentResizableHashSet<int> set(4);
     const int T = 8, per = 20000;
@@ -263,10 +293,9 @@ TEST(ConcurrentHashSetTest, ConcurrentDisjointRanges) {
 //   (1) every key is present afterwards, and
 //   (2) insert() returned true exactly N times -- one absent->present transition
 //       per key, one winner per transition.
-// This is the test whose total count first exposed the double-winner defect
-// (4001 trues for 4000 keys). It used to assert only EXPECT_LE(true_count, N) on
-// the theory that the boolean was "best-effort and may occasionally under-count"
-// under concurrent resizes; there is no such licence in the contract, and an
+// The total count catches a double winner (one true too many). It is asserted
+// exactly, not as an upper bound: the contract gives no licence for a
+// "best-effort" boolean that may under-count under concurrent resizes, and an
 // under-count is unreachable anyway (a thread that scans and misses either wins
 // its publishing CAS, or loses it and retries until it wins or finds the winner's
 // node, so a winner always exists).
@@ -364,40 +393,48 @@ TEST(ConcurrentHashSetTest, ConcurrentReadersWriters) {
 // std::hash<int> being the identity. The keys' HIGH bits are spread over 80000, so
 // they keep moving at the later doublings too.
 TEST(ConcurrentHashSetTest, SplitContention) {
-    // Initial size 4
-    ConcurrentResizableHashSet<int, false, CollisionHash> set(4);
+    // Many fresh sets, not one: the splits of buckets 4..7 race only while the
+    // table is small, and it grows out of that within the threads' first few
+    // inserts (rule 1 of "WHEN THE TABLE DOUBLES"), so each repetition buys one
+    // more such window.
+    const int REPS = 8;
+    for (int rep = 0; rep < REPS; ++rep) {
+        // Initial size 4, and ONE insert before the threads start: by rule 1 that
+        // insert doubles the table to 8, so buckets 4..7 are published
+        // UNINITIALIZED (their encoded value UNINITIALIZED, distinct from a real
+        // address) and will be split lazily by whichever thread below touches them
+        // first. Any further insert here would double the table again (to 16, 32,
+        // ...) before the threads start. Key 100 is in bucket 0 at size 4 and in
+        // bucket 4 at size 8, so the split of bucket 4 has a node to copy.
+        ConcurrentResizableHashSet<int, false, CollisionHash> set(4);
+        set.insert(100);
 
-    // Insert 8 elements to approach resize threshold (4 * 2 = 8).
-    for (int i = 0; i < 8; ++i) {
-        set.insert(100 + i);
-    }
+        // 8 threads aggressively inserting elements that hash to 4, 5, 6, 7. Every
+        // thread's first key (k = 0) maps to bucket 4 (i*10000 is a multiple of
+        // 16), so all eight start in the split of the same bucket; their own
+        // inserts keep doubling the table from there (rule 1, then the shards they
+        // touch).
+        run_threads(8, [&set](int i) {
+            for (int k = 0; k < 500; ++k) {
+                // Keys that map to bucket 4, 5, 6, 7 when the table size is 8.
+                set.insert(4 + 8*k + i*10000);
+                set.insert(5 + 8*k + i*10000);
+                set.insert(6 + 8*k + i*10000);
+                set.insert(7 + 8*k + i*10000);
+            } // key loop
+        });
 
-    // Insert 1 more element: arena occupancy now exceeds ts*2, so this insert
-    // doubles the table to 8. Buckets 4..7 are published UNINITIALIZED (their
-    // encoded value UNINITIALIZED, distinct from a real address) and will be split
-    // lazily by whichever thread below touches them first.
-    set.insert(200);
-
-    // 8 threads aggressively inserting elements that hash to 4, 5, 6, 7
-    run_threads(8, [&set](int i) {
-        for (int k = 0; k < 500; ++k) {
-            // Keys that map to bucket 4, 5, 6, 7 when the table size is 8.
-            set.insert(4 + 8*k + i*10000);
-            set.insert(5 + 8*k + i*10000);
-            set.insert(6 + 8*k + i*10000);
-            set.insert(7 + 8*k + i*10000);
-        } // key loop
-    });
-
-    // Verify
-    for (int i = 0; i < 8; ++i) {
-        for (int k = 0; k < 500; ++k) {
-            EXPECT_TRUE(set.contains(4 + 8*k + i*10000));
-            EXPECT_TRUE(set.contains(5 + 8*k + i*10000));
-            EXPECT_TRUE(set.contains(6 + 8*k + i*10000));
-            EXPECT_TRUE(set.contains(7 + 8*k + i*10000));
-        } // key loop
-    } // membership sweep
+        // Verify
+        for (int i = 0; i < 8; ++i) {
+            for (int k = 0; k < 500; ++k) {
+                EXPECT_TRUE(set.contains(4 + 8*k + i*10000)) << "rep " << rep;
+                EXPECT_TRUE(set.contains(5 + 8*k + i*10000)) << "rep " << rep;
+                EXPECT_TRUE(set.contains(6 + 8*k + i*10000)) << "rep " << rep;
+                EXPECT_TRUE(set.contains(7 + 8*k + i*10000)) << "rep " << rep;
+            } // key loop
+        } // membership sweep
+        EXPECT_TRUE(set.contains(100)) << "the key the first split copied was lost, rep " << rep;
+    } // repetitions
 } // SplitContention
 
 // Exercises tombstone erase end-to-end: single-threaded correctness (erase makes
@@ -407,8 +444,7 @@ TEST(ConcurrentHashSetTest, SplitContention) {
 // MARK_BIT CAS and the erase/contains interleavings are stressed without two
 // threads ever contending for the same key. AllowDelete=true compiles erase().
 // The concurrent phase erases keys that are present and that no other thread
-// touches, so EVERY erase() there must return true -- the old version discarded
-// those return values, which threw away an exact oracle for free.
+// touches, so EVERY erase() there must return true -- an exact oracle for free.
 // NOTE ON SCOPE: the concurrent phase performs no inserts, so the table does not
 // double while it runs. It is a MARK_BIT contention test, not a stale-geometry
 // test; ExactlyOneEraseWinnerPerKeyDuringGrowth below covers erase under resize.
@@ -460,29 +496,40 @@ TEST(ConcurrentHashSetTest, TombstoneErase) {
 // subchains abandoned). No deletes here (AllowDelete=false), so it exercises the
 // split/publish paths only. The final EXPECT_EQ also checks that every attempted
 // key is present -- membership must be exact across every resize.
+// Racing in the same split takes threads that work in the same bucket WHEN it
+// splits, and with CollisionHash the bucket of a key is its low bits. By rule 1 of
+// "WHEN THE TABLE DOUBLES" the table passes 16, 32 and 64 buckets within the
+// threads' first few inserts, while the chains are still short, and it spends
+// most of the run far larger; so the keys of different threads differ only at
+// bit 16 and above: the i-th key of every thread is in the same bucket at every
+// table size this test reaches, the threads (released together) fill the same
+// chains, and each doubling has them split the same buckets with real chains to
+// copy. Bits 3..12 (the index i) make the keys move at the doublings; bits 0..2
+// are 5, so at size 8 every key is in bucket 5.
 TEST(ConcurrentHashSetTest, CooperativeSplitTSAN) {
     ConcurrentResizableHashSet<int, false, CollisionHash> set(4);
 
-    // Pre-populate to trigger exactly one resize (N=4 -> N=8)
-    for (int i = 0; i < 9; ++i) {
-        set.insert(i*16);
-    }
+    // Exactly one resize (N=4 -> N=8) before the threads start: by rule 1 of "WHEN
+    // THE TABLE DOUBLES" the set's first insert doubles it, and a second one would
+    // double it again. Key 0 stays in bucket 0, so buckets 4..7 are UNINITIALIZED
+    // when the threads are released.
+    set.insert(0);
 
     constexpr int NUM_THREADS = 8;
     constexpr int INSERTS_PER_THREAD = 1000;
+    // The i-th key of thread t (see above); distinct for every (t, i).
+    auto key_of = [](int t, int i) { return 5 + 8*i + (t << 16); };
 
-    run_threads(NUM_THREADS, [&set](int t) {
+    run_threads(NUM_THREADS, [&set, &key_of](int t) {
         for (int i = 0; i < INSERTS_PER_THREAD; ++i) {
-            int key = 5 + ((i*NUM_THREADS + t)*8);
-            set.insert(key);
+            set.insert(key_of(t, i));
         } // insert loop
     });
 
     int success_count = 0;
     for (int t = 0; t < NUM_THREADS; ++t) {
         for (int i = 0; i < INSERTS_PER_THREAD; ++i) {
-            int key = 5 + ((i*NUM_THREADS + t)*8);
-            if (set.contains(key)) {
+            if (set.contains(key_of(t, i))) {
                 success_count++;
             }
         }
@@ -493,8 +540,7 @@ TEST(ConcurrentHashSetTest, CooperativeSplitTSAN) {
 // TSAN stress test specifically for erase(). Unlike TombstoneErase this phase DOES
 // insert, so the arena keeps growing and the table keeps doubling underneath the
 // erasers. Every key is private to one thread, so every return value in the
-// sequence below is fully determined by the contract and is asserted exactly; the
-// old version asserted only the middle contains() and discarded four booleans.
+// sequence below is fully determined by the contract and is asserted exactly.
 // Keys are scrambled because the pre-population alone takes the table past the
 // consecutive key range, after which unscrambled keys would stop moving.
 TEST(ConcurrentHashSetTest, EraseStressTSAN) {
@@ -538,50 +584,57 @@ TEST(ConcurrentHashSetTest, EraseStressTSAN) {
 //
 // The race: key 4 hashes to bucket 0 at size 4 (4 & 3 == 0) but to bucket 4 at
 // size 8 (4 & 7 == 4). t1 inserts 4 (publishing it into bucket 0 under size 4)
-// exactly while t2 doubles the table to 8. If t2's split of the new bucket 4
-// snapshots bucket 0's chain in the instant BEFORE t1's node is linked, the copy
-// pass misses key 4 -- and key 4 would be stranded in a bucket no reader consults
-// at size 8. What closes the window is that the split SEALS bucket 0's head
-// (raising its level by CAS) before snapshotting it: seal and publication are
-// read-modify-writes of the same word, so either t1's node is in the snapshot or
-// t1's publishing CAS fails and it retries in the new geometry. contains(4) must
-// therefore hold afterwards, and insert(4) must have reported true exactly once.
+// exactly while t2 doubles the table to 8 and then splits the new bucket 4. If
+// that split snapshots bucket 0's chain in the instant BEFORE t1's node is
+// linked, the copy pass misses key 4 -- and key 4 would be stranded in a bucket
+// no reader consults at size 8. What closes the window is that the split SEALS
+// bucket 0's head (raising its level by CAS) before snapshotting it: seal and
+// publication are read-modify-writes of the same word, so either t1's node is in
+// the snapshot or t1's publishing CAS fails and it retries in the new geometry.
+// contains(4) must therefore hold afterwards, and t1's insert(4), the only
+// insert of that key, must have reported true.
+// Set-up: the set starts EMPTY, because by rule 1 of "WHEN THE TABLE DOUBLES"
+// its first successful insert is the one that doubles it to 8; a key inserted
+// beforehand would have moved the doubling out of the race. t2 inserts key 1
+// (bucket 1 at every size, so it touches neither head involved), which performs
+// the doubling 4 -> 8 unless t1 publishes first, and then looks up key 12, which
+// maps to bucket 4 at size 8 (at size 16 it maps to bucket 12, whose split splits
+// its parent, bucket 4, first): that lookup is the split of bucket 4 the race
+// needs. No third operation touches bucket 4 during the race (t1's own retry
+// may).
 TEST(ConcurrentHashSetTest, LostUpdateOnResize) {
     for (int rep = 0; rep < 10000; ++rep) {
         ConcurrentResizableHashSet<int, false, CollisionHash> set(4);
-        set.insert(0); // initialize bucket 0
 
         std::atomic<bool> start{false};
+        bool t1_inserted = false;
 
         std::thread t1([&]() {
             while (!start.load(std::memory_order_acquire)) {}
             // Insert 4 which hashes to 0 initially (4 & 3 == 0)
-            set.insert(4);
+            t1_inserted = set.insert(4);
         });
 
         std::thread t2([&]() {
             while (!start.load(std::memory_order_acquire)) {}
-            // Force resize to 8: keys 16,32,... all hash to bucket 0, so nine of
-            // them push arena occupancy past the doubling threshold.
-            for (int i = 1; i <= 9; ++i) {
-                set.insert(i*16);
-            }
+            set.insert(1);      // the set's first insert, as a rule: doubles 4 -> 8
+            set.contains(12);   // splits bucket 4 from bucket 0's chain
         });
 
         start.store(true, std::memory_order_release);
         t1.join();
         t2.join();
 
-        // 4 should be in the set
+        ASSERT_TRUE(t1_inserted) << "insert(4) of an absent, uncontended key returned false in rep " << rep;
         ASSERT_TRUE(set.contains(4)) << "Lost update in rep " << rep;
     } // repetitions
 } // LostUpdateOnResize
 
 // Degenerate hash: every key maps to bucket 0. This funnels all inserts through
 // a single bucket head, maximizing compare_exchange contention -- precisely the
-// condition under which the old "allocate a fresh node on every CAS retry" bug
-// leaked a node per failed attempt. It makes the leak-detection test below
-// sensitive by construction.
+// condition under which allocating a fresh node on every CAS retry would leak a
+// node per failed attempt. It makes the leak-detection test below sensitive by
+// construction.
 struct ConstantHash {
     size_t operator()(int) const { return 0; }
 };
@@ -605,11 +658,10 @@ TEST(ConcurrentHashSetTest, InsertContention_NoMemoryLeak) {
 } // InsertContention_NoMemoryLeak
 
 // ===========================================================================
-// Return-value exactness under concurrent resizes. The tests below are the
-// regression guards for the four defects demonstrated against the pre-seal
-// header (commit ec875ed; described in the message of c5c19e4): double-true
-// insert, erase undone by a stale inserter, double-true erase, and a key lost
-// through a doubling.
+// Return-value exactness under concurrent resizes. The tests below guard
+// against four defects that a geometry check outside the deciding CAS lets
+// through: double-true insert, erase undone by a stale inserter, double-true
+// erase, and a key lost through a doubling.
 // ===========================================================================
 
 // PER-KEY exactly-one-winner for insert(), across many doublings.
@@ -651,7 +703,7 @@ TEST(ConcurrentHashSetTest, InsertContention_NoMemoryLeak) {
 // `shards` is 1 (see ReclaimLimboPushesRaceFreeListPops). Without erase() the
 // prefill keys stay in the set and the free lists hold only those stale copies,
 // which is why the sweep is there, and why the prefill must cross doublings
-// AFTER keys exist (see the sizes measured in ReclaimLimboPushesRaceFreeListPops).
+// AFTER keys exist (see the prefill sizes in ReclaimLimboPushesRaceFreeListPops).
 // `min_free` is the floor the free lists must reach after the prefill reclaim().
 // Returns the number of nodes that were on limbo lists before reclaim().
 template <typename SetT>
@@ -713,15 +765,20 @@ TEST(ConcurrentHashSetTest, ExactlyOneWinnerPerKey) {
 // geometry by hand instead of waiting for it to occur by chance, so it reproduces
 // in milliseconds on any machine and in any build. (The statistical tests above
 // find the same defect, but their hit rate swings by two orders of magnitude with
-// the build -- measured ~50% of repetitions at -O0+TSan and ~0.1% at -O3 without
-// a sanitizer -- so on some machines and some builds they can look green.)
+// the build -- an instrumented -O0 build hits it far more often than an -O3 one
+// -- so on some machines and some builds they can look green.)
 //
 // Geometry, with CollisionHash so the bucket arithmetic is exact: key 4 is in
 // bucket 0 at table size 4 (4 & 3 == 0) and in bucket 4 at size 8 (4 & 7 == 4),
-// so the doubling MOVES it. Eight filler keys, all multiples of 8, sit in bucket 0
-// and bring arena occupancy to exactly ts*2, so the next allocation doubles the
-// table. Key 1 lives in bucket 1, so the resize-triggering insert never disturbs
-// bucket 0's chain.
+// so the doubling 4 -> 8 MOVES it. Every attempt starts from a fresh, EMPTY
+// 4-bucket set, because by rule 1 of "WHEN THE TABLE DOUBLES" the set's first
+// successful insert is the one that doubles it to 8: a key inserted while
+// building the set would have doubled it already. Role 1 inserts key 1, which
+// lives in bucket 1 at every size, so the resize-triggering insert never touches
+// bucket 0's or bucket 4's head. If one of the two inserts of key 4 publishes
+// first, it doubles the table itself and the other finds its node: a correct,
+// race-free attempt. A second doubling (8 -> 16, by the next successful insert
+// that saw size 8) does not move key 4.
 //
 // Threads are persistent and meet at a barrier twice per attempt (once to start
 // the attempt on a freshly built set, once to hand the result back): spawning
@@ -741,7 +798,7 @@ TEST(ConcurrentHashSetTest, NoDoubleWinnerAcrossResize) {
             for (int a = 0; a < ATTEMPTS; ++a) {
                 round.arrive_and_wait();     // the set for this attempt is built
                 if (role == 1) {
-                    set->insert(1);          // the 9th node: crosses the doubling threshold
+                    set->insert(1);          // the set's first insert, as a rule: doubles 4 -> 8
                 } else if (set->insert(KEY)) {
                     winners.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -752,8 +809,7 @@ TEST(ConcurrentHashSetTest, NoDoubleWinnerAcrossResize) {
 
     int bad = 0, first_bad = -1, missing = 0;
     for (int a = 0; a < ATTEMPTS; ++a) {
-        set = std::make_unique<Set>(4);
-        for (int i = 0; i < 8; ++i) set->insert(i*8);
+        set = std::make_unique<Set>(4);   // empty: see "Geometry" above
         winners.store(0, std::memory_order_relaxed);
         round.arrive_and_wait();
         round.arrive_and_wait();
@@ -783,25 +839,41 @@ TEST(ConcurrentHashSetTest, NoDoubleWinnerAcrossResize) {
 // what forces the mark and the copy through one word; this test notices if it
 // stops doing so.
 //
-// Shape, and why it is sized the way it is. Each round is a TINY, fresh set: 4
-// buckets and 16 pre-inserted shared keys, so the table is still at 8 buckets when
-// the threads are released. Every thread erases every shared key, so both
+// Shape, and why it is sized the way it is. Each round is a TINY, fresh set with
+// 16 pre-inserted shared keys. Every thread erases every shared key, so both
 // contention modes occur -- mark versus mark (two erasers on one link) and mark
 // versus freeze (an eraser and a splitter on one link) -- and the threads start at
 // staggered positions in the key order so that a thread which loaded table_size_
 // before a doubling is still walking when another thread has moved on. Between
-// erases each thread inserts private filler keys, and those drive about six
-// doublings while the erases are in flight.
-// The ratio that decides whether this test can see anything is DOUBLINGS PER
-// ERASE, because the defect needs a split to copy a node inside some eraser's
-// load-table_size_-to-mark-CAS window. Doublings are logarithmic in arena size, so
-// a big set is the worst possible shape: an earlier version of this test used 128
-// shared keys in a set already grown to 64 buckets and got 0.03 doublings per
-// erase and ONE violation per run against the no-freeze mutant -- a hair from
-// passing on a broken header. Sixteen keys in a 4-bucket set give ~0.4 doublings
-// per erase, 400 cheap rounds instead of 30 expensive ones, and dozens of
-// violations per run. Prefer many tiny sets to one big one for anything that has
-// to race with a resize.
+// erases each thread inserts private filler keys, which drive the doublings.
+// Where those doublings fall is set by WHEN THE TABLE DOUBLES: inserting the
+// shared keys has already taken the table to 128 buckets (rule 1), and from there
+// the resize hint grows by 256 whenever a thread's first allocation touches its
+// own arena shard, which is what takes the table through 256, 512 and 1024
+// buckets while the erases run, and to 2048 in the rounds in which no worker
+// shares the main thread's shard (a worker that does adds nothing to the hint:
+// thread numbers are assigned at a thread's first allocation, so each round's
+// workers take the next block of numbers and, modulo the shard count, alternate
+// between blocks that include the main thread's shard and blocks that do not).
+// The doubling itself is done by whichever thread next completes an insert. If
+// every thread allocated from its first step on, those doublings would all come
+// together in the first few operations of the round; so thread t inserts its
+// first filler only at step t*K/T (its fillers are spread over the remaining
+// steps). The stagger is partial: a thread's first erase() often splits an
+// UNINITIALIZED bucket, and the split's copy is an allocation made before its
+// fillers start. It spreads the doublings over the first part of the round
+// instead of its first few operations.
+// The set has 2*T arena shards, so that every worker gets a shard no other worker
+// uses, on any machine (the default shard count follows the hardware
+// concurrency).
+// What decides whether this test can see anything is how many doublings land
+// inside erasers' windows, because the defect needs a split to copy a node inside
+// some eraser's load-table_size_-to-mark-CAS window. Doublings are logarithmic in
+// arena size, so a big set is the worst possible shape: its doublings are few and
+// far between the erases. A small fresh set per round, with its doublings spread
+// through the round's erases, in many cheap rounds instead of a few expensive
+// ones, is what makes a header without the freeze fail many times per run. Prefer
+// many tiny sets to one big one for anything that has to race with a resize.
 struct StallingKey {
     int v;
     StallingKey(int x = 0) : v(x) {}
@@ -810,15 +882,15 @@ struct StallingKey {
     // compares the key, THEN CASes MARK onto that same link. The comparison sits
     // inside the window in which a concurrent split can FREEZE the link out from
     // under the eraser -- with plain ints the window is a few nanoseconds wide and
-    // the mark-versus-freeze race is correspondingly rare. Measured against the
-    // no-freeze mutant with everything else held fixed: with plain int keys, 6-12
-    // violations per ASan run; with this key type, 24-36. (Under TSan both are
-    // ~60, because TSan's own instrumentation already stretches the window.) The
-    // extra ASan margin is worth the 0.6 s it costs, because ASan is the build in
-    // which this test is closest to reporting a broken header as green. It changes
-    // nothing about WHAT is tested: operator== still answers correctly, no header
-    // code is touched, the oracle is unchanged, and the mutant fails the test
-    // without the stall too -- just with less room to spare.
+    // the mark-versus-freeze race is correspondingly rare. The stall makes a
+    // header without the freeze fail several times as often under ASan (TSan's
+    // own instrumentation already stretches the window, so it gains little
+    // there). The extra ASan margin is worth the fraction of a second it costs,
+    // because ASan is the build in which this test is closest to reporting a
+    // broken header as green. It changes nothing about WHAT is tested:
+    // operator== still answers correctly, no header code is touched, the oracle
+    // is unchanged, and a broken header fails the test without the stall too --
+    // just with less room to spare.
     // Only matching comparisons stall, and only every 8th, so traversals of other
     // keys run at full speed and the filler inserts still drive the doublings.
     bool operator==(const StallingKey& o) const {
@@ -843,7 +915,7 @@ TEST(ConcurrentHashSetTest, ExactlyOneEraseWinnerPerKeyDuringGrowth) {
     int over = 0, under = 0, still_present = 0, filler_dup = 0, filler_missing = 0;
 
     for (int r = 0; r < ROUNDS; ++r) {
-        Set set(4);
+        Set set(4, 2*T);
         for (int k = 0; k < K; ++k) set.insert(scramble(k));
 
         std::vector<std::vector<unsigned char>> won(T, std::vector<unsigned char>(K, 0));
@@ -852,12 +924,17 @@ TEST(ConcurrentHashSetTest, ExactlyOneEraseWinnerPerKeyDuringGrowth) {
             for (int i = 0; i < K; ++i) {
                 const int k = (i + t*K/T)%K;     // staggered start per thread
                 if (set.erase(scramble(k))) ++won[t][k];
-                // Filler inserts, spread evenly through the erases: these are what
-                // grow the arena and double the table mid-flight. Each key belongs
-                // to one thread, so a false return is a defect in itself.
-                for (int f = i*FILL/K; f < (i + 1)*FILL/K; ++f) {
-                    if (!set.insert(scramble(K + t*FILL + f))) ++dup[t];
-                }
+                // Filler inserts, spread evenly through the erases from step s0 on
+                // (see "Shape" above): these are what grow the arena and double the
+                // table mid-flight. Each key belongs to one thread, so a false
+                // return is a defect in itself.
+                const int s0 = t*K/T;      // this thread's first filler step
+                const int steps = K - s0;  // steps its fillers are spread over
+                if (i >= s0) {
+                    for (int f = (i - s0)*FILL/steps; f < (i - s0 + 1)*FILL/steps; ++f) {
+                        if (!set.insert(scramble(K + t*FILL + f))) ++dup[t];
+                    }
+                } // if this thread's fillers have started
             } // key loop
         });
 
@@ -897,13 +974,25 @@ TEST(ConcurrentHashSetTest, ExactlyOneEraseWinnerPerKeyDuringGrowth) {
 // resurrection (membership disagrees with the difference), with no dependence on
 // which thread did what when. The key range is deliberately tiny (48) so that
 // every key is contended by all eight threads, while the churn still allocates
-// tens of thousands of nodes and drives ~10 doublings.
+// thousands of nodes and drives the table from 4 to 2048 buckets.
+// Where those doublings fall is set by WHEN THE TABLE DOUBLES: the first few
+// successful inserts take the table to 128 buckets (rule 1), and from there the
+// resize hint grows by 256 whenever a thread's first allocation touches its own
+// arena shard, which is what takes the table on to 1024 buckets, and the shards'
+// later 256-node batches take it to 2048. If every thread inserted from its first
+// operation on, those doublings would all come together in the first few dozen
+// operations and the rest of the churn would run at one size; so thread t turns
+// its inserts into lookups for its first t*OPS/(2*T) operations, which staggers
+// the threads' first allocations (a lookup or an erase allocates too when it
+// splits a bucket, so the stagger is partial) and spreads those doublings over
+// the first part of the churn. The set has 2*T arena shards, so that every thread
+// gets a shard of its own on any machine.
 TEST(ConcurrentHashSetTest, InsertEraseChurnPerKeyAccounting) {
     using Set = ConcurrentResizableHashSet<int, true>;
     const int T = 8, R = 48, REPS = 60, OPS = 1600;
 
     for (int rep = 0; rep < REPS; ++rep) {
-        Set set(4);
+        Set set(4, 2*T);
         std::vector<std::vector<int>> ins(T, std::vector<int>(R, 0));
         std::vector<std::vector<int>> ers(T, std::vector<int>(R, 0));
 
@@ -913,7 +1002,11 @@ TEST(ConcurrentHashSetTest, InsertEraseChurnPerKeyAccounting) {
                 const unsigned x = rng();
                 const int i = static_cast<int>((x >> 4)%static_cast<unsigned>(R));
                 const int k = scramble(i + 1);
-                switch (x & 3u) {
+                // Before this thread's start point its inserts are lookups (see the
+                // comment above the test): kind 3 is the lookup.
+                const bool started = op >= t*OPS/(2*T);
+                const unsigned kind = (started || (x & 3u) >= 2) ? (x & 3u) : 3u;
+                switch (kind) {
                     case 0:
                     case 1:  // insert twice as often as erase, so the set stays populated
                         if (set.insert(k)) ++ins[t][i];
@@ -968,21 +1061,21 @@ TEST(ConcurrentHashSetTest, InsertEraseChurnPerKeyAccounting) {
 //     one of them at every instant -- during phase 3 and after it. That is an exact
 //     oracle, not a probabilistic one.
 //
-// HONESTY ABOUT WHAT THIS TEST HAS BEEN SHOWN TO CATCH. The resurrection oracle
-// (phase 3) is exact, but it has never been made to FIRE. Run against the pre-seal
-// stock header and against both mutants (seal removed, freeze removed), the
-// resurrection counters stayed at zero in every run; what fails on those headers is
-// the phase-1 exactly-one-winner check. That is consistent with the split arithmetic:
-// the stale node those headers strand in an old bucket j can
-// only be copied forward when bucket j's CHILD is split, and by the time the strand
-// happens that child has long since been published -- so the stranded node is dead
-// weight and never resurrects. In other words this test currently guards a property
-// that no known defect violates. It is kept because the property is load-bearing
-// (the whole copy-never-unlink design rests on it), the check is exact and costs
-// half a second, and a future change to split_bucket() -- relinking, re-splitting a
+// HONESTY ABOUT WHAT THIS TEST CATCHES. The resurrection oracle (phase 3) is exact,
+// but no known defect makes it FIRE: on a header with the geometry check outside
+// the deciding CAS, or without the seal, the resurrection counters stay at zero and
+// what fails is the phase-1 exactly-one-winner check. The split arithmetic says
+// why: the stale node such a header strands in an old bucket j can only be copied
+// forward when bucket j's CHILD is split, and by the time the strand happens that
+// child has long since been published -- so the stranded node is dead weight and
+// never resurrects. In other words this test guards a property that no known defect
+// violates. It is kept because the property is load-bearing (the whole
+// copy-never-unlink design rests on it), the check is exact and costs half a
+// second, and a future change to split_bucket() -- relinking, re-splitting a
 // published bucket, copying an unfrozen node -- would break it first. Do not count
-// it as a detector for the four known defects; NoDoubleWinnerAcrossResize and
-// ExactlyOneEraseWinnerPerKeyDuringGrowth are the detectors.
+// it as a detector for the four known defects (a header without the freeze passes
+// it); NoDoubleWinnerAcrossResize and ExactlyOneEraseWinnerPerKeyDuringGrowth are
+// the detectors.
 TEST(ConcurrentHashSetTest, EraseNotUndoneByResize) {
     using Set = ConcurrentResizableHashSet<int, true>;
     const int T = 8, K = 64, REPS = 12, FILL = 64, HAMMER = 2000;
@@ -1051,9 +1144,9 @@ TEST(ConcurrentHashSetTest, EraseNotUndoneByResize) {
 // is fully determined by the contract no matter what the other threads do:
 //   insert 1, contains 1, insert 0, erase 1, contains 0, erase 0, insert 1, contains 1.
 // The two contains() calls that follow the thread's own successful insert and its
-// own successful erase are the point: the shipped suite only ever swept contains()
-// after every thread had joined, by which time any self-repair the implementation
-// performs has long since run. This checks what a caller actually relies on -- the
+// own successful erase are the point: a contains() sweep after every thread has
+// joined comes too late, as any self-repair the implementation performs has long
+// since run by then. This checks what a caller actually relies on -- the
 // instant insert(k) returns true, k is visible to that caller; the instant erase(k)
 // returns true, it is not.
 // The other threads' inserts keep the table doubling throughout, so each of these
@@ -1242,8 +1335,7 @@ static void reclaim_with_pending_splits_body() {
         reclaim_and_check(set, in.size(), where + ", reclaim() after the reuse");
         EXPECT_EQ(membership_errors(set, in, out), 0) << where << ": membership after the reuse";
     } // for each burst size
-    // Not an oracle on the header: a guard that the reuse check above is not vacuous
-    // (measured: all 14 sizes with AllowDelete == true, 12 of 14 with false).
+    // Not an oracle on the header: a guard that the reuse check above is not vacuous.
     EXPECT_GT(reuse_exercised, 0) << "no size exercised reuse with free nodes left over";
 } // reclaim_with_pending_splits_body()
 
@@ -1280,9 +1372,8 @@ TEST(ConcurrentHashSetTest, ReclaimStaleSplitCopiesNoDelete) {
         reclaim_and_check(set, T*PER, where + ", phase 1");
         EXPECT_EQ(membership_errors(set, in, out), 0) << where << ": reclaim() with pending splits changed membership";
         const size_t reachable = expect_consistent(set, where + ", after the settling sweep").reachable;
-        // MEASURED precondition, not derived: with scrambled keys over many doublings
+        // EMPIRICAL precondition, not derived: with scrambled keys over many doublings
         // it is overwhelmingly likely that many keys moved, but nothing forces it.
-        // (Measured: 2520-3188 reachable nodes for 2000 keys under ASan and TSan.)
         ASSERT_GT(reachable, size_t(T*PER)) << where << ": test precondition: the sweep left no stale split copy to reclaim";
         reclaim_and_check(set, T*PER, where + ", phase 2");
         EXPECT_EQ(membership_errors(set, in, out), 0) << where << ": reclaim() of stale copies changed membership";
@@ -1364,12 +1455,18 @@ TEST(ConcurrentHashSetTest, ReclaimReuseAcrossShards) {
 // (true, absent, true, present). After the join, the exact key count and the
 // membership of every key ever used are checked, along with the accounting.
 // Shape: four threads on two shards (threads > shards, so pops race), fresh tiny
-// sets, and more fresh keys per round than the set held before it, so each
-// round allocates past the free lists and doubles the table while the erasers
-// and re-inserters work. Keys scrambled (see scramble()).
+// sets, and four times as many fresh keys per round as in the round before, so
+// that each round allocates past the free lists and doubles the table while the
+// erasers and re-inserters work. That growth is what it takes: a doubling needs
+// the resize hint above 2*table_size (see WHEN THE TABLE DOUBLES), reclaim()
+// resets the hint to about the live count while the table keeps its size, and
+// each round's doublings at least double that threshold; a round allocating no
+// more than the one before it does not reach it (with a fixed count, only the
+// first round doubles), and doubling the count leaves some rounds short of it.
+// Keys scrambled (see scramble()).
 TEST(ConcurrentHashSetTest, ReclaimThenConcurrentEraseAndGrowth) {
     using Set = ConcurrentResizableHashSet<int, true>;
-    const int T = 4, REPS = 12, ROUNDS = 3, A = 96, F = 96;
+    const int T = 4, REPS = 12, ROUNDS = 3, A = 96, F0 = 48;
     int next = 0;   // next unused key index; keys are scramble(index), all distinct
     for (int rep = 0; rep < REPS; ++rep) {
         Set set(4, 2);
@@ -1388,6 +1485,7 @@ TEST(ConcurrentHashSetTest, ReclaimThenConcurrentEraseAndGrowth) {
 
         for (int round = 0; round < ROUNDS; ++round) {
             const std::string where = "rep " + std::to_string(rep) + ", round " + std::to_string(round);
+            const int F = F0 << (2*round);   // fresh keys per thread this round (see "Shape" above)
             std::vector<std::vector<int>> old(T), fresh(T);
             for (size_t i = 0; i < present.size(); ++i) old[i%T].push_back(present[i]);
             for (int t = 0; t < T; ++t) {
@@ -1705,8 +1803,7 @@ TEST(ConcurrentHashSetTest, ReclaimKeepsFrozenNodeOfUnfinishedSplit) {
 // nothing but the local head and tail. When an allocation in the middle of the
 // walk throws (a popped slot's copy assignment, as here, or the append's copy
 // construction), the copies made so far must go to limbo before the exception
-// leaves, or they are lost for the life of the set. (Before the header's fix
-// this test was a DISABLED_ defect reproducer: exactly one slot of 512 leaked.)
+// leaves, or they are lost for the life of the set.
 // Same setup as ReclaimKeepsFrozenNodeOfUnfinishedSplit, but the split has two
 // keys to copy (PROBE_X2, then PROBE_X1) and the SECOND copy throws, so the
 // subchain holds one node at the throw. Checked: the exception reaches the
@@ -1812,10 +1909,8 @@ TEST(ConcurrentHashSetTest, ReclaimRecoversPendingInsertNodeWhenRetryThrows) {
 // postconditions (limbo empty afterwards, exact key count, one node per key)
 // while splits are still pending; and membership after it.
 // The limbo total must be positive: the test is only meaningful if the races it
-// exists for happened. (Measured at -O0 over the 40 repetitions: 1070-1350 limbo
-// nodes under ASan, 3120-3320 under TSan, at least 2 in every repetition in
-// those runs; the assertion is on the total anyway, since nothing forces any
-// single race.)
+// exists for happened. The assertion is on the total, since nothing forces any
+// single race.
 TEST(ConcurrentHashSetTest, ReclaimDrainsContendedLimbo) {
     const int T = 8, K = 64, REPS = 40;
     size_t limbo_total = 0;
@@ -1851,19 +1946,16 @@ TEST(ConcurrentHashSetTest, ReclaimDrainsContendedLimbo) {
 // exists for never happened.
 // Prefill size, and the free-list floor asserted before each race. With
 // AllowDelete == true every prefill key is erased, so the free list holds at
-// least PREFILL slots by construction (measured: 941, the rest being stale split
-// copies). With AllowDelete == false the free list holds ONLY stale split copies
-// of the prefill, which exist only for keys that moved at a doubling after they
-// were inserted: a one-shard set jumps to 128 buckets within its first five
-// inserts (the first append counts 256), so a 256-key prefill left just 6 free
-// slots (measured), too few to be popped during the race. 600 keys cross the
-// doublings at 256 and 512 slots with the keys already in place, and the settling
-// sweep turns those splits into stale copies: measured 341 free slots. The floor
-// for that flavor, PREFILL/4, is therefore a MEASURED precondition, not a derived
-// one (the prefill is single-threaded, so the count is the same every run).
-// Measured limbo totals over the 40 repetitions: ASan 38-63, TSan 1500-2900
-// (TSan's instrumentation widens the races); a mutant header whose limbo pushes
-// go to the free list instead failed this test in 10 of 10 runs under both.
+// least PREFILL slots by construction (more, with the stale split copies). With
+// AllowDelete == false the free list holds ONLY stale split copies of the
+// prefill, which exist only for keys that moved at a doubling after they were
+// inserted: a one-shard set jumps to 128 buckets within its first five inserts
+// (the first append counts 256), so a 256-key prefill leaves only a handful of
+// free slots, too few to be popped during the race. 600 keys cross the doublings
+// at 256 and 512 slots with the keys already in place, and the settling sweep
+// turns those splits into a few hundred stale copies. The floor for that flavor,
+// PREFILL/4, is therefore an EMPIRICAL precondition, not a derived one (the
+// prefill is single-threaded, so the count is the same every run).
 TEST(ConcurrentHashSetTest, ReclaimLimboPushesRaceFreeListPops) {
     const int T = 8, K = 64, PREFILL = 600, REPS = 40;
     size_t limbo_total = 0;
@@ -1891,9 +1983,8 @@ TEST(ConcurrentHashSetTest, ReclaimLimboPushesRaceFreeListPops) {
 //     after the first reclaim() the free lists hold at least what the previous
 //     round allocated, dealt evenly; so the arena stabilizes after round 1 at
 //     about (fill + round-1 allocations + split copies), i.e. 2-3 times the live
-//     count (measured: 2.7 times, 5484-5593 slots for 2048 keys, under ASan and
-//     TSan, flat from round 1 or 2 on). A reclaim() that recycled nothing would
-//     add at least one live count per round and cross the bound by round 3;
+//     count. A reclaim() that recycled nothing would add at least one live
+//     count per round and cross the bound by round 3;
 //   - without reclaim(): every successful insert() allocates a node that is never
 //     reused, so the arena holds at least (R + 1)*T*W slots, which is more than
 //     BOUND*T*W: this half proves the bound above is not vacuous.

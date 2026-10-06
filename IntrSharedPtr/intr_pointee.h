@@ -105,10 +105,11 @@
 //       which case the count is left at 0 (an object at 0 is retired, or about
 //       to be retired, and must never be revived). Required only by
 //       intr_shared_ptr_hp; the other pointer policies never call it. Memory
-//       orders, all load-bearing: the load that observes 0 is ACQUIRE; the CAS
-//       is ACQUIRE on success and relaxed on failure; a failed CAS whose
-//       refreshed value is 0 re-reads the count with an acquire load before
-//       returning false, so EVERY observed 0 was read with acquire. Why:
+//       orders (all load-bearing but the re-read of a refreshed 0, which the
+//       reference form below explains): the load that observes 0 is ACQUIRE;
+//       the CAS is ACQUIRE on success and relaxed on failure; a failed CAS
+//       whose refreshed value is 0 re-reads the count with an acquire load
+//       before returning false, so EVERY observed 0 was read with acquire. Why:
 //       intr_shared_ptr_hp::load() calls this on an object pinned only by a
 //       hazard pointer. An observed 0 must synchronize with the release
 //       sequence headed by the DelRef that produced it, so that the loader's

@@ -29,9 +29,11 @@
 // the same summed time, so it needs the same scaling. The per-benchmark values
 // take precedence over the seconds forms of --benchmark_min_time and
 // --benchmark_min_warmup_time, which this binary therefore ignores.
-// --benchmark_min_time=<N>x still works: an explicit iteration count wins over
-// MinTime(), and fixes the number of iterations EACH thread runs. The run names
-// carry min_time: and min_warmup_time: fields that grow with the thread count.
+// --benchmark_min_time=<N>x with N >= 1 still works: an explicit iteration
+// count wins over MinTime(), and fixes the number of iterations EACH thread
+// runs (N = 0 is not supported: timed_loop()'s batch loop never ends at zero
+// iterations). The run names carry min_time: and min_warmup_time: fields that
+// grow with the thread count.
 //
 // THROUGHPUT ACCOUNTING
 //
@@ -43,25 +45,20 @@
 // items_per_second overstates the throughput -- the more, the less fair the
 // lock, and the variants here may differ exactly in fairness. So each run also
 // reports:
-//   wall_items_per_second -- total items (iterations times threads) divided by
-//                            the wall-clock span from the end of the earliest
-//                            first iteration of any thread to the end of the
-//                            last thread's last iteration;
-//   finish_spread         -- (last finish - first finish)/(that span), between
-//                            0 and 1: 0 when all threads finish together, near
-//                            1 when some thread finished right at the start;
+//   wall_items_per_second -- total items (iterations times threads) over the
+//                            run's wall-clock span;
+//   finish_spread         -- how unevenly the threads finished, between 0
+//                            (all together) and 1;
 //   handoffs_per_op       -- the handoffs of all threads (see HANDOFFS in
 //                            spinlock_scope_common.h) divided by the total
 //                            items: 0 at 1 thread. Like wall_items_per_second,
 //                            an average over the whole run, the tail with
 //                            fewer threads included (see below).
-// Every thread stamps the end of its own first iteration, and the span starts
-// at the earliest of those stamps: a thread that misses the lock's first burst
-// can sleep through other threads' whole streaks, so any one thread's stamp,
-// thread 0's included, could be late. Since every finish is at or after its
-// own thread's first stamp, no finish precedes the span start, which is what
-// keeps finish_spread within [0, 1]. The item count includes at most one
-// iteration per thread from before the span starts, which is negligible. All
+// The first two are the counters of gb_wall_clock.h, which defines the span
+// and finish_spread exactly and says why the span starts where it does; this
+// harness keeps its own per-thread record (ThreadStats, derived from the
+// header's WallStamps) and its own timed loop (timed_loop()), and aggregates
+// the records with the header's wall_span() and set_wall_counters(). All
 // three are plain values, set by thread 0 alone, and they stay next to
 // items_per_second, which is kept for comparison with the other benchmarks in
 // this directory. The time stamps cost one compare per iteration and the loop
@@ -96,26 +93,28 @@
 //   ./spinlock_scope_bm --benchmark_filter='_(post|in)miss_'   # the second-ring variants
 //   ./spinlock_scope_bm --benchmark_filter='(_late|fence)_'    # the fenced variants
 //   ./spinlock_scope_bm --benchmark_filter='threads:128$'      # one thread count
-#include <algorithm>
 #include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 
+#include "gb_wall_clock.h"
 #include "spinlock_scope_common.h"
 
 #include "benchmark/benchmark.h"
 
-// One thread's record of one run: its time stamps (see THROUGHPUT ACCOUNTING
-// above) and its handoff count (see HANDOFFS in spinlock_scope_common.h). Each
-// entry gets its own 128-byte block; it is written three times per run, so
-// the padding matters little, but it costs nothing either.
-struct alignas(128) ThreadStats {
-  std::chrono::steady_clock::time_point first;  // end of this thread's first iteration
-  std::chrono::steady_clock::time_point last;   // end of this thread's last iteration
+// One thread's record of one run: its time stamps, `first` and `last`, from
+// WallStamps (see THROUGHPUT ACCOUNTING above), and its handoff count (see
+// HANDOFFS in spinlock_scope_common.h). Each entry gets its own 128-byte
+// block; it is written three times per run, so the padding matters little,
+// but it costs nothing either. A type of its own rather than the header's
+// WallRecords: timed_loop() writes the handoff count next to the stamps, and
+// wall_span() takes an array of any record type derived from WallStamps.
+struct alignas(128) ThreadStats : WallStamps {
   unsigned long handoffs;               // acquisitions after the first that followed another thread's
 };
+static_assert(sizeof(ThreadStats) == 128);
 
 // The state that all threads of one benchmark share: the common blocks, then
 // this harness's own block; see LAYOUT above. The offsets are checked in
@@ -217,7 +216,6 @@ template <typename Slot, Store store, PtrLine ptr_line>
 template <typename Slot, Store store, PtrLine ptr_line>
 void BM_scope(benchmark::State& state) {
   using SharedState = BmShared<Slot, ptr_line>;
-  using Clock = std::chrono::steady_clock;
 
   // The layout claims of LAYOUT above, checked for this instantiation. The
   // common blocks are checked in spinlock_scope_common.h.
@@ -253,29 +251,20 @@ void BM_scope(benchmark::State& state) {
 
   // Past the end-of-loop barrier: no thread touches the arrays any more, and
   // every thread's record is written. Thread 0 turns them into the three
-  // counters (see THROUGHPUT ACCOUNTING above). They are plain
-  // values, not rates, because Google Benchmark would divide a rate by the
-  // mean loop time again; only thread 0 sets them, so summing the counters
-  // over threads leaves them unchanged. The arrays are freed when their
-  // owners go out of scope.
+  // counters (see THROUGHPUT ACCOUNTING above): the span and the spread by
+  // gb_wall_clock.h's wall_span() and set_wall_counters(), the handoffs here.
+  // They are plain values, not rates, because Google Benchmark would divide a
+  // rate by the mean loop time again; only thread 0 sets them, so summing the
+  // counters over threads leaves them unchanged. The span is empty when no
+  // record is stamped, which this harness does not produce (every thread
+  // runs timed_loop() to the end), and otherwise only in a run of one
+  // iteration per thread in which every stamp coincides; such runs are
+  // calibration rounds, which are not reported, and set_wall_counters() gives
+  // them zeros. The arrays are freed when their owners go out of scope.
   if (tid == 0) {
     const int threads = state.threads();
-    Clock::time_point start = s.thread_stats[0].first;          // earliest first-iteration end
-    Clock::time_point first_finish = s.thread_stats[0].last;    // earliest last-iteration end
-    Clock::time_point last_finish = first_finish;               // latest last-iteration end
-    for (int i = 1; i != threads; ++i) {
-      start = std::min(start, s.thread_stats[i].first);
-      first_finish = std::min(first_finish, s.thread_stats[i].last);
-      last_finish = std::max(last_finish, s.thread_stats[i].last);
-    }
-    // The span can be empty only in a run of one iteration per thread, and
-    // then only if every stamp coincides; such runs are calibration rounds,
-    // which are not reported, and they get zeros.
-    const double span = std::chrono::duration<double>(last_finish - start).count();
-    const double spread = std::chrono::duration<double>(last_finish - first_finish).count();
     const double items = static_cast<double>(state.iterations())*threads;
-    state.counters["wall_items_per_second"] = benchmark::Counter(span > 0 ? items/span : 0.0);
-    state.counters["finish_spread"] = benchmark::Counter(span > 0 ? spread/span : 0.0);
+    set_wall_counters(state, wall_span(s.thread_stats, threads), items);
     unsigned long handoffs_total = 0;
     for (int i = 0; i != threads; ++i) handoffs_total += s.thread_stats[i].handoffs;
     state.counters["handoffs_per_op"] = benchmark::Counter(items > 0 ? static_cast<double>(handoffs_total)/items : 0.0);

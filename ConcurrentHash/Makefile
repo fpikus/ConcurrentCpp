@@ -37,8 +37,10 @@ COMMON_INCLUDES = -I.
 # `?=` so a machine's config.mk can override: macOS has no librt.
 COMMON_LIBS ?= -lpthread -lrt -lm
 
-# Benchmark flags (optimized)
-CXXFLAGS_BM = $(COMMON_FLAGS) -O3 -DNDEBUG $(COMMON_INCLUDES) -I$(GBENCH_DIR)/include
+# Benchmark flags (optimized). -I../Spinlock reaches the wall-clock accounting
+# header (gb_wall_clock.h) of the benchmark; on the benchmark flags only, since
+# the tests do not use it.
+CXXFLAGS_BM = $(COMMON_FLAGS) -O3 -DNDEBUG $(COMMON_INCLUDES) -I../Spinlock -I$(GBENCH_DIR)/include
 LIBS_BM = $(GBENCH_DIR)/lib/libbenchmark.a $(COMMON_LIBS)
 
 # Test flags
@@ -75,6 +77,10 @@ TESTS = $(TARGET_TEST_ASAN) $(TARGET_TEST_TSAN) $(TARGET_TEST_TSO)
 # concurrent_deque.h and spinlock.h are symlinks into ../ConcurrentDeque and
 # ../Spinlock; make follows them, so a change to the shipped header rebuilds here.
 HEADERS = concurrent_deque.h concurrent_hash_set.h spinlock.h ../config.mk
+# The wall-clock accounting header of the benchmark. A variable of its own
+# rather than an entry in HEADERS: HEADERS is a prerequisite of the tests, which
+# do not use Google Benchmark and must not depend on this header.
+GB_HEADERS = ../Spinlock/gb_wall_clock.h
 
 .PHONY: all benchmarks tests clean run_tests run_benchmarks
 
@@ -93,7 +99,7 @@ benchmarks: $(BENCHMARKS)
 tests: $(TESTS)
 
 # Build benchmark
-$(TARGET_BM): concurrent_hash_set_bm.C $(HEADERS) | $(BUILD_DIR)
+$(TARGET_BM): concurrent_hash_set_bm.C $(HEADERS) $(GB_HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) $(CXX_RPATH) -o $@
 
 # Build ASan test

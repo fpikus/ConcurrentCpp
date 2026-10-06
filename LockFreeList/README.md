@@ -166,6 +166,10 @@ The pointer policies come from two sibling projects, through
 - `../SharedPtr/atomic_shared_ptr_concept.h` — the concept the pointer
   policies model
 
+The benchmark also includes `../Spinlock/gb_wall_clock.h` (through
+`-I../Spinlock`), the wall-clock accounting behind its `wall_items_per_second`
+and `finish_spread` counters.
+
 The pointers are tested on their own in `../SharedPtr` (see
 [../SharedPtr/README.md](../SharedPtr/README.md)) and `../IntrSharedPtr` (see
 [../IntrSharedPtr/README.md](../IntrSharedPtr/README.md), which also says how

@@ -53,6 +53,14 @@
 // must reproduce spinlock_tune_bm.C's work:0 within noise -- the two files are
 // the same program there. That is the cross-file calibration; BM_spinlock is
 // the in-file one.
+//
+// OUTPUT
+//
+// Every row reports wall_items_per_second and finish_spread next to Google
+// Benchmark's items_per_second (defined at the top of spinlock_bm_common.h):
+// the standard rate divides by the threads' mean loop time, which overstates
+// the throughput of a ladder that lets some threads finish early, and the
+// candidates can differ in how evenly they hand the lock out.
 #include <atomic>
 
 #include "spinlock.h"
@@ -62,11 +70,13 @@
 
 // The benchmark body: BM_lock of spinlock_bm_common.h with do_mem_work in
 // place of do_work -- same guarded unsigned long total, same pre-lock cast,
-// same separate cache lines for the lock and the total.
+// same separate cache lines for the lock and the total, the same wall-clock
+// records.
 template <typename Lock>
 void BM_memlock(benchmark::State& state) {
   alignas(64) static Lock lock;
   alignas(64) static unsigned long shared_n;
+  static constinit WallRecords records;
   const long work = state.range(0);
   if (state.thread_index() == 0) shared_n = 0;
   // Construct and fault in this thread's arena OUTSIDE the timed region, with
@@ -79,14 +89,18 @@ void BM_memlock(benchmark::State& state) {
   // never touches the arena and must stay identical to spinlock_tune_bm.C's
   // saturated column.
   if (work != 0) do_mem_work(1.0, mem_size/mem_chunk);
+  records.allocate(state);
   double local_x = 1.0 + state.thread_index();
-  for (auto _ : state) {
+  for (auto _ : WallTimed(state, records)) {
     local_x = do_mem_work(local_x, work);
     const unsigned long n = static_cast<unsigned long>(1.0 + local_x);
     std::lock_guard guard(lock);
     benchmark::DoNotOptimize(shared_n += n);
   }
   state.SetItemsProcessed(state.iterations());
+  report_wall(state, records,
+              static_cast<double>(state.iterations())*state.threads());
+  records.release(state);
 } // BM_memlock
 
 // The same three contention levels as spinlock_tune_bm.C, by design: the

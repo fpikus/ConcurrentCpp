@@ -7,6 +7,13 @@
 // is a CAS, so lock-versus-CAS is the comparison most designs actually face.
 // See spinlock_bm_common.h for the benchmark body and the contention dial;
 // tuning of the back-off tiers themselves lives in spinlock_tune_bm.C.
+//
+// Every row reports wall_items_per_second and finish_spread next to Google
+// Benchmark's items_per_second (defined at the top of spinlock_bm_common.h):
+// the standard rate divides by the threads' mean loop time, which overstates
+// the throughput of a mechanism that lets some threads finish early, and the
+// mechanisms here can differ in that kind of fairness. BM_atomic and BM_cas
+// keep their wall-clock records the way BM_lock() does.
 #include <atomic>
 
 #include "spinlock.h"
@@ -23,15 +30,20 @@
 // overhead_bm.C.
 void BM_atomic(benchmark::State& state) {
   alignas(64) static std::atomic<unsigned long> shared_n;
+  static constinit WallRecords records;
   const long work = state.range(0);
   if (state.thread_index() == 0) shared_n.store(0, std::memory_order_relaxed);
+  records.allocate(state);
   double local_x = 1.0 + state.thread_index();
-  for (auto _ : state) {
+  for (auto _ : WallTimed(state, records)) {
     local_x = do_work(local_x, work);
     shared_n.fetch_add(static_cast<unsigned long>(1.0 + local_x),
                        std::memory_order_relaxed);
   }
   state.SetItemsProcessed(state.iterations());
+  report_wall(state, records,
+              static_cast<double>(state.iterations())*state.threads());
+  records.release(state);
 } // BM_atomic
 
 // The lock-free retry loop: read the total, try to install the sum, repeat if
@@ -41,10 +53,12 @@ void BM_atomic(benchmark::State& state) {
 // contention is the reason the spinlock's ladder exists.
 void BM_cas(benchmark::State& state) {
   alignas(64) static std::atomic<unsigned long> shared_n;
+  static constinit WallRecords records;
   const long work = state.range(0);
   if (state.thread_index() == 0) shared_n.store(0, std::memory_order_relaxed);
+  records.allocate(state);
   double local_x = 1.0 + state.thread_index();
-  for (auto _ : state) {
+  for (auto _ : WallTimed(state, records)) {
     local_x = do_work(local_x, work);
     const unsigned long n = static_cast<unsigned long>(1.0 + local_x);
     unsigned long expected = shared_n.load(std::memory_order_relaxed);
@@ -55,6 +69,9 @@ void BM_cas(benchmark::State& state) {
     }
   }
   state.SetItemsProcessed(state.iterations());
+  report_wall(state, records,
+              static_cast<double>(state.iterations())*state.threads());
+  records.release(state);
 } // BM_cas
 
 BENCHMARK(BM_atomic) ARGS;

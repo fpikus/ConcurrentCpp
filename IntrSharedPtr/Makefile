@@ -40,8 +40,9 @@ COMMON_INCLUDES = -I.
 # `?=` so a machine's config.mk can override: macOS has no librt.
 COMMON_LIBS ?= -lpthread -lrt -lm
 
-# Benchmark flags (optimized)
-CXXFLAGS_BM = $(COMMON_FLAGS) -O3 -DNDEBUG $(COMMON_INCLUDES) -I$(GBENCH_DIR)/include
+# Benchmark flags (optimized). -I../Spinlock for gb_wall_clock.h (GB_HEADERS
+# below), on the benchmark flags only: the tests do not use Google Benchmark.
+CXXFLAGS_BM = $(COMMON_FLAGS) -O3 -DNDEBUG $(COMMON_INCLUDES) -I$(GBENCH_DIR)/include -I../Spinlock
 LIBS_BM = $(GBENCH_DIR)/lib/libbenchmark.a $(COMMON_LIBS)
 
 # Test flags
@@ -101,6 +102,12 @@ HEADERS = intr_shared_ptr.h intr_pointee.h intr_shared_ptr_common.h ../config.mk
 include mm_hp.mk
 HEADERS += $(HP_HEADERS)
 
+# The wall-clock accounting header of the threaded Google Benchmark rows
+# (../Spinlock/gb_wall_clock.h), a prerequisite of the microbenchmark only. A
+# variable of its own rather than an entry in HEADERS: HEADERS is a
+# prerequisite of the tests, which must not depend on this header.
+GB_HEADERS = ../Spinlock/gb_wall_clock.h
+
 .PHONY: all benchmarks tests clean run_tests run_benchmarks imports
 
 # The first rule in a Makefile is the default goal; without this line it would
@@ -129,7 +136,7 @@ $(MM_HP_STAMP): mm_hp.patch $(THIRD_PARTY_MK)
 
 # Build the microbenchmark of both pointers (Google Benchmark; links mm_hp for
 # intr_shared_ptr_hp)
-$(TARGET_INTR_MBM): intr_shared_ptr_mbm.C $(HP_SOURCES) $(HEADERS) | $(BUILD_DIR)
+$(TARGET_INTR_MBM): intr_shared_ptr_mbm.C $(HP_SOURCES) $(HEADERS) $(GB_HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_BM) $< $(HP_SOURCES) $(LIBS_BM) $(CXX_RPATH) -o $@
 
 # Build the TSan stress test of both pointers (standalone, no GoogleTest; -O1

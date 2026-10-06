@@ -30,6 +30,8 @@
 
 #include "lock_free_list_rcu.h"
 
+#include "gb_wall_clock.h"              // WallRecords, WallTimed, report_wall()
+
 // Benchmarks of LockFreeListRCU, the generation-reclamation list, against the
 // reference-counted LockFreeList (../LockFreeList/lock_free_list_bm.C).
 //
@@ -60,14 +62,28 @@
 // own successful erases), _RCU_NoReclaim (never reclaims) and _RCU_OpHandle (a
 // fresh handle per operation; head-anchored workloads only).
 //
-// Rates are Google Benchmark's standard items/s (SetItemsProcessed with one
-// item per iteration), exactly as in the reference-counted list's benchmark,
-// so the two binaries' rates are comparable as they stand. That rate divides
-// the summed iterations by the MEAN per-thread time, which flatters an
-// implementation whose threads finish at different times.
+// Rates, exactly as in the reference-counted list's benchmark, so the two
+// binaries' rates are comparable as they stand (gb_wall_clock.h defines the
+// two wall-clock counters and does the stamping):
+//   items_per_second       Google Benchmark's standard rate (SetItemsProcessed
+//                          with one item per iteration): the summed iterations
+//                          over the MEAN per-thread time, which flatters an
+//                          implementation whose threads finish at different
+//                          times -- the early ones wait at the end barrier, so
+//                          the mean is shorter than the run
+//   wall_items_per_second  the same total over the wall-clock span of the run,
+//                          from the end of the earliest thread's first
+//                          iteration to the end of the latest thread's last:
+//                          the throughput the run delivered
+//   finish_spread          (latest finish - earliest finish)/span, from 0 when
+//                          all threads finish together to near 1 when some
+//                          thread finishes right at the start: how much of the
+//                          run had fewer threads left contending
+// The two wall-clock counters are plain values set by thread 0 alone, so
+// Google Benchmark's sum over the threads leaves them as they are.
 //
-// Counters (user counters; Google Benchmark SUMS each over the run's threads
-// and reports the total for the run, not a rate):
+// Counters (user counters set by every thread; Google Benchmark SUMS each
+// over the run's threads and reports the total for the run, not a rate):
 //   erases_ok          successful erase_after() calls
 //   inserts            successful insert_after() calls
 //   advances           reclaim() calls that returned `advanced`
@@ -184,6 +200,18 @@ public:
     // OpHandle rows. Built by thread 0 in SetUp(), so a thread reads its
     // record only inside the state loop, after the start barrier.
     inline static std::vector<ThreadRec> recs;
+    // The run's wall-clock records (gb_wall_clock.h), one per thread; a
+    // different thing from `recs`. Constant-initialized. allocate() in every
+    // SetUp() override (this one, RcuOpHandleFixture's and
+    // RcuDispersedFixture's; the latter two do not call this one) and
+    // release() in this TearDown() alone, which all three fixtures end in;
+    // both are called on every thread and act on thread 0 alone. In between,
+    // the bodies touch the records only through WallTimed inside the loop and
+    // through report_wall() after it. No thread other than 0 may touch them in
+    // SetUp() or TearDown(): nothing orders one thread's SetUp() against
+    // another's, and a non-zero thread's TearDown() can run while thread 0 is
+    // still reporting.
+    inline static constinit WallRecords wall_records;
 
     // A generic 1000 items, as in the reference-counted list's benchmark, for
     // the head-anchored workloads; then one handle per thread.
@@ -192,6 +220,7 @@ public:
             Prepopulate(1000);
             MakeThreadHandles(state.threads());
         }
+        wall_records.allocate(state);   // thread 0 only (a no-op on the others)
     } // SetUp()
 
     // Every handle leaves before the list is deleted (the list's destructor
@@ -205,6 +234,11 @@ public:
             delete list;
             list = nullptr;
         }
+        // The body has reported by now (report_wall() runs before TearDown()).
+        // Thread 0 only (a no-op on the others). RcuOpHandleFixture has no
+        // TearDown() and RcuDispersedFixture's ends here, so this one release
+        // covers all three fixtures.
+        wall_records.release(state);
     } // TearDown()
 
 protected:
@@ -437,7 +471,7 @@ template <Regime kRegime>
 void RcuListFixture::ReadHeavyBody(benchmark::State& state) {
     SETUP_RNG;
     ThreadContext<kRegime> ctx(state);
-    for (auto _ : state) {
+    for (auto _ : WallTimed(state, wall_records)) {
         int op = dist(rng);
         ctx.Run([&](const Handle& h) {
             if (op < 90) { // 90% read
@@ -455,6 +489,7 @@ void RcuListFixture::ReadHeavyBody(benchmark::State& state) {
         ctx.FinishIteration();
     } // state loop
     state.SetItemsProcessed(state.iterations());
+    report_wall(state, wall_records, static_cast<double>(state.iterations())*state.threads());
     ctx.Report(state, true);
 } // RcuListFixture::ReadHeavyBody()
 
@@ -466,7 +501,7 @@ template <Regime kRegime>
 void RcuListFixture::WriteHeavyBody(benchmark::State& state) {
     SETUP_RNG;
     ThreadContext<kRegime> ctx(state);
-    for (auto _ : state) {
+    for (auto _ : WallTimed(state, wall_records)) {
         int op = dist(rng);
         ctx.Run([&](const Handle& h) {
             if (op < 10) { // 10% read
@@ -484,6 +519,7 @@ void RcuListFixture::WriteHeavyBody(benchmark::State& state) {
         ctx.FinishIteration();
     } // state loop
     state.SetItemsProcessed(state.iterations());
+    report_wall(state, wall_records, static_cast<double>(state.iterations())*state.threads());
     ctx.Report(state, true);
 } // RcuListFixture::WriteHeavyBody()
 
@@ -497,7 +533,7 @@ template <Regime kRegime>
 void RcuListFixture::GraveyardBody(benchmark::State& state) {
     SETUP_RNG;
     ThreadContext<kRegime> ctx(state);
-    for (auto _ : state) {
+    for (auto _ : WallTimed(state, wall_records)) {
         int op = dist(rng);
         ctx.Run([&](const Handle& h) {
             if (op < 70) { // 70% erase
@@ -509,6 +545,7 @@ void RcuListFixture::GraveyardBody(benchmark::State& state) {
         ctx.FinishIteration();
     } // state loop
     state.SetItemsProcessed(state.iterations());
+    report_wall(state, wall_records, static_cast<double>(state.iterations())*state.threads());
     ctx.Report(state, true);
 } // RcuListFixture::GraveyardBody()
 
@@ -522,13 +559,14 @@ template <Regime kRegime>
 void RcuListFixture::MassiveHeadInsertBody(benchmark::State& state) {
     SETUP_RNG;
     ThreadContext<kRegime> ctx(state);
-    for (auto _ : state) {
+    for (auto _ : WallTimed(state, wall_records)) {
         ctx.Run([&](const Handle& h) {
             ctx.Inserted(list->insert_after(h, list->before_begin(h), dist(rng)));
         }); // one insert under the iteration's handle
         ctx.FinishIteration();
     } // state loop
     state.SetItemsProcessed(state.iterations());
+    report_wall(state, wall_records, static_cast<double>(state.iterations())*state.threads());
     ctx.Report(state, false);
 } // RcuListFixture::MassiveHeadInsertBody()
 
@@ -543,6 +581,10 @@ public:
         if (state.thread_index() == 0) {
             Prepopulate(1000);
         }
+        // This SetUp() replaces RcuListFixture's rather than calling it, so it
+        // allocates the run's records itself. Thread 0 only (a no-op on the
+        // others).
+        wall_records.allocate(state);
     } // SetUp()
 }; // RcuOpHandleFixture
 
@@ -585,6 +627,10 @@ public:
                 start_positions.push_back(it);
             } // one start position per thread, under its handle
         }
+        // This SetUp() replaces RcuListFixture's rather than calling it, so it
+        // allocates the run's records itself. Thread 0 only (a no-op on the
+        // others).
+        wall_records.allocate(state);
     } // SetUp()
 
     void TearDown(const ::benchmark::State& state) override {
@@ -617,7 +663,7 @@ void RcuDispersedFixture::ReadDispersedBody(benchmark::State& state) {
     constexpr int mid = window/2;   // offset within the window where writes are anchored
     Iterator cursor;                // this thread's staggered start, assigned on the first pass below
     bool first_pass = true;
-    for (auto _ : state) {
+    for (auto _ : WallTimed(state, wall_records)) {
         if (first_pass) {
             // start_positions is built by thread 0's SetUp(), readable only
             // after the loop's start barrier.
@@ -654,6 +700,7 @@ void RcuDispersedFixture::ReadDispersedBody(benchmark::State& state) {
         ctx.FinishIteration(); // last: on the final iteration it releases `h`; `cursor` is not used after it
     } // state loop
     state.SetItemsProcessed(state.iterations());
+    report_wall(state, wall_records, static_cast<double>(state.iterations())*state.threads());
     ctx.Report(state, true);
 } // RcuDispersedFixture::ReadDispersedBody()
 
@@ -700,8 +747,10 @@ BENCHMARK_DEFINE_F(RcuOpHandleFixture, MassiveHeadInsert_RCU_OpHandle)(benchmark
 static const int num_cpu = sysconf(_SC_NPROCESSORS_CONF);
 
 // As in the reference-counted list's benchmark: ThreadRange(1, num_cpu)
-// doubles the thread count up to the CPU count; UseRealTime() measures wall
-// time per iteration rather than CPU time.
+// doubles the thread count up to the CPU count; UseRealTime() times each
+// thread's loop by the real-time clock rather than the thread's CPU clock (the
+// Time column and items_per_second are over the mean of those times; the
+// wall-clock span is wall_items_per_second's, see "Rates" above).
 #define REGISTER_RCU_BM(Fixture, name) \
     BENCHMARK_REGISTER_F(Fixture, name)->ThreadRange(1, num_cpu)->UseRealTime()
 

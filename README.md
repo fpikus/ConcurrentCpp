@@ -72,7 +72,9 @@ Requirements: a recent clang (the Makefiles use `clang++-22`, C++23),
 Some projects (ConcurrentDeque, ConcurrentHash, ConcurrentQueue) share headers
 via relative symlinks, so clone on a filesystem that supports them (on Windows,
 use WSL or enable `core.symlinks`); SharedPtr and LockFreeList include their
-sibling projects' headers through `-I` instead.
+sibling projects' headers through `-I` instead, and so do the benchmarks of
+ConcurrentHash, ConcurrentQueue, IntrSharedPtr and LockFreeListRCU, for the
+wall-clock accounting in `Spinlock/gb_wall_clock.h`.
 IntrSharedPtr, SharedPtr and LockFreeList build on Linux only: the hazard
 pointers they link issue `membarrier(2)`. Before their first build, clone the
 third-party code they use (SharedPtr's README, "Third-party code"); their

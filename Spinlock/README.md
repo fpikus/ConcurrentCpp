@@ -136,8 +136,20 @@ the measurement protocol is the standard `--benchmark_repetitions`,
 `--benchmark_report_aggregates_only`, and
 `--benchmark_enable_random_interleaving`. `make run_benchmarks` runs the full
 grid of every benchmark except the lock-scope harnesses and the demo (run those
-directly, with repetitions) and prints Google Benchmark's console report. For machine-readable
-results, run a binary directly and ask for JSON:
+directly, with repetitions) and prints Google Benchmark's console report.
+Every Google Benchmark binary here but the demo (which runs every thread to a
+common stop, so its `items_per_second` is already the honest rate; it computes
+its own `wall_items_per_second`, over the span from the earliest thread's loop
+start, as a cross-check) reports, next to `items_per_second`, two counters
+from `gb_wall_clock.h`:
+`wall_items_per_second`, the same item count over the run's wall-clock span,
+from the end of the earliest thread's first iteration to the end of the latest
+thread's last, and `finish_spread`, how unevenly the threads finished — 0 when
+they finish together, near 1 when one of them finished right at the start.
+Every thread runs the same number of iterations, and Google Benchmark divides
+by the mean of the threads' loop times, which flatters an unfair lock: the
+threads it favours finish early, and the mean comes out shorter than the run.
+For machine-readable results, run a binary directly and ask for JSON:
 
 ```sh
 build/$(hostname)/spinlock_bm --benchmark_filter='work:0/' \
@@ -173,6 +185,7 @@ itself is machine-independent. The reference `config.mk` uses `clang++-22`,
 - `seqlock_bm.C` — the sequence lock against the spinlock and a bare atomic, across the same read:write mix
 - `spinlock_tune_configs.h` — the ladder configurations, shared by both sweeps
 - `spinlock_bm_common.h` — the shared benchmark harness
+- `gb_wall_clock.h` — the wall-clock accounting (`wall_items_per_second`, `finish_spread`) of every Google Benchmark binary here but the demo; the benchmarks of the other projects that run on Google Benchmark's threads include it through `-I../Spinlock`
 
 ## The book
 

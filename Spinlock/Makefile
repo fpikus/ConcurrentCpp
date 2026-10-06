@@ -91,6 +91,12 @@ SEQLOCK_HEADERS = seqlock.h
 # operation and the variant list, used by its Google Benchmark harness and by
 # the hand-rolled twin.
 SCOPE_HEADERS = spinlock_scope_common.h
+# The wall-clock accounting header of the threaded Google Benchmark
+# benchmarks (every user of spinlock_bm_common.h, and the scope benchmark).
+# A variable of its own rather than an entry in HEADERS: HEADERS is a
+# prerequisite of the tests, which do not use Google Benchmark and must not
+# depend on this header. The hand-rolled twin and the demo do not use it.
+GB_HEADERS = gb_wall_clock.h
 
 .PHONY: all benchmarks tests clean run_tests run_benchmarks
 
@@ -109,35 +115,35 @@ benchmarks: $(BENCHMARKS)
 tests: $(TESTS)
 
 # Build benchmark (SpinLock vs atomic and mutex across the contention range)
-$(TARGET_BM): spinlock_bm.C $(HEADERS) | $(BUILD_DIR)
+$(TARGET_BM): spinlock_bm.C $(HEADERS) $(GB_HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) $(CXX_RPATH) -o $@
 
 # Build tuning benchmark (back-off ladder parameter exploration)
-$(TARGET_TUNE_BM): spinlock_tune_bm.C $(HEADERS) $(TUNE_HEADERS) $(TUNE_CONFIGS) | $(BUILD_DIR)
+$(TARGET_TUNE_BM): spinlock_tune_bm.C $(HEADERS) $(GB_HEADERS) $(TUNE_HEADERS) $(TUNE_CONFIGS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) $(CXX_RPATH) -o $@
 
 # Build read/write tuning benchmark (separate ladders for readers and writers)
-$(TARGET_RW_TUNE_BM): spinlock_rw_tune_bm.C $(HEADERS) $(TUNE_HEADERS) | $(BUILD_DIR)
+$(TARGET_RW_TUNE_BM): spinlock_rw_tune_bm.C $(HEADERS) $(GB_HEADERS) $(TUNE_HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) $(CXX_RPATH) -o $@
 
 # Build overhead benchmark (spinlock vs atomic vs CAS loop across the work dial)
-$(TARGET_OVERHEAD_BM): overhead_bm.C $(HEADERS) $(TUNE_HEADERS) | $(BUILD_DIR)
+$(TARGET_OVERHEAD_BM): overhead_bm.C $(HEADERS) $(GB_HEADERS) $(TUNE_HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) $(CXX_RPATH) -o $@
 
 # Build memory-work tuning benchmark (the ladder sweep against streaming work)
-$(TARGET_MEM_BM): spinlock_mem_bm.C $(HEADERS) $(TUNE_HEADERS) $(TUNE_CONFIGS) | $(BUILD_DIR)
+$(TARGET_MEM_BM): spinlock_mem_bm.C $(HEADERS) $(GB_HEADERS) $(TUNE_HEADERS) $(TUNE_CONFIGS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) $(CXX_RPATH) -o $@
 
 # Build lock/payload cache-line layout benchmark
-$(TARGET_LAYOUT_BM): spinlock_layout_bm.C $(HEADERS) $(TUNE_HEADERS) | $(BUILD_DIR)
+$(TARGET_LAYOUT_BM): spinlock_layout_bm.C $(HEADERS) $(GB_HEADERS) $(TUNE_HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) $(CXX_RPATH) -o $@
 
 # Build sequence-lock benchmark (seqlock vs spinlock vs atomic, read/write mix)
-$(TARGET_SEQLOCK_BM): seqlock_bm.C $(HEADERS) $(TUNE_HEADERS) $(SEQLOCK_HEADERS) | $(BUILD_DIR)
+$(TARGET_SEQLOCK_BM): seqlock_bm.C $(HEADERS) $(GB_HEADERS) $(TUNE_HEADERS) $(SEQLOCK_HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) $(CXX_RPATH) -o $@
 
 # Build lock scope benchmark (slot store before vs after unlock)
-$(TARGET_SPINLOCK_SCOPE_BM): spinlock_scope_bm.C $(HEADERS) $(SCOPE_HEADERS) | $(BUILD_DIR)
+$(TARGET_SPINLOCK_SCOPE_BM): spinlock_scope_bm.C $(HEADERS) $(GB_HEADERS) $(SCOPE_HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) $(CXX_RPATH) -o $@
 
 # Build the hand-rolled twin of the lock scope benchmark (every thread runs

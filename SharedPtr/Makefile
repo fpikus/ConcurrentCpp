@@ -43,8 +43,9 @@ COMMON_INCLUDES = -I. -I../IntrSharedPtr
 # `?=` so a machine's config.mk can override: macOS has no librt.
 COMMON_LIBS ?= -lpthread -lrt -lm
 
-# Benchmark flags (optimized)
-CXXFLAGS_BM = $(COMMON_FLAGS) -O3 -DNDEBUG $(COMMON_INCLUDES) -I$(GBENCH_DIR)/include
+# Benchmark flags (optimized). -I../Spinlock for gb_wall_clock.h (GB_HEADERS
+# below), on the benchmark flags only: the tests do not use Google Benchmark.
+CXXFLAGS_BM = $(COMMON_FLAGS) -O3 -DNDEBUG $(COMMON_INCLUDES) -I$(GBENCH_DIR)/include -I../Spinlock
 LIBS_BM = $(GBENCH_DIR)/lib/libbenchmark.a $(COMMON_LIBS)
 
 # Test flags
@@ -85,6 +86,12 @@ HEADERS = atomic_shared_ptr_concept.h ../IntrSharedPtr/intr_shared_ptr.h ../Intr
 # twice, and makes the generated files come with the stamp).
 include ../IntrSharedPtr/mm_hp.mk
 HEADERS += $(HP_HEADERS)
+
+# The wall-clock accounting header of the threaded Google Benchmark rows
+# (../Spinlock/gb_wall_clock.h), a prerequisite of the two benchmark builds
+# only. A variable of its own rather than an entry in HEADERS: HEADERS is a
+# prerequisite of the tests, which must not depend on this header.
+GB_HEADERS = ../Spinlock/gb_wall_clock.h
 
 .PHONY: all benchmarks tests clean run_tests run_benchmarks imports FORCE
 
@@ -131,11 +138,11 @@ BM_COUNTER_FLAGS = -DINTR_HP_BM_COUNTERS
 BM_BURST_FLAGS = $(BM_COUNTER_FLAGS) -DINTR_HP_BM_BURSTS
 
 # Build benchmark (every pointer policy; links mm_hp for intr_shared_ptr_hp)
-$(TARGET_BM): atomic_shared_ptr_bm.C $(HP_SOURCES) $(HEADERS) | $(BUILD_DIR)
+$(TARGET_BM): atomic_shared_ptr_bm.C $(HP_SOURCES) $(HEADERS) $(GB_HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_BM) $(BM_COUNTER_FLAGS) $< $(HP_SOURCES) $(LIBS_BM) $(CXX_RPATH) -o $@
 
 # Build the benchmark with destruction-burst timing (`make build/$(hostname)/atomic_shared_ptr_bursts_bm`)
-$(TARGET_BM_BURSTS): atomic_shared_ptr_bm.C $(HP_SOURCES) $(HEADERS) | $(BUILD_DIR)
+$(TARGET_BM_BURSTS): atomic_shared_ptr_bm.C $(HP_SOURCES) $(HEADERS) $(GB_HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_BM) $(BM_BURST_FLAGS) $< $(HP_SOURCES) $(LIBS_BM) $(CXX_RPATH) -o $@
 
 # Build ASan test (links mm_hp for intr_shared_ptr_hp)

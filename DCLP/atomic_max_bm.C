@@ -41,6 +41,27 @@
 //            threads have already passed them -- so DCLP's unlocked read still
 //            skips the lock for most offers (atomic_max_count counts them). The
 //            test of whether the double check pays when the maximum really moves.
+//
+// Counters. Every row reports Google Benchmark's items_per_second: the offers
+// of all threads over the MEAN of the threads' loop times. The grow rows
+// (BM_cas*_grow, BM_dclp*_grow, BM_spinlock_grow), BM_spinlock_never and the
+// work rows (BM_dclp_work, BM_dclp_sameline_work) also report
+//   wall_items_per_second -- the same total over the wall-clock span of the
+//                            run, from the end of the earliest thread's first
+//                            iteration to the end of the latest thread's last;
+//   finish_spread         -- (latest finish - earliest finish)/span, 0 when all
+//                            threads finish together;
+// both defined and stamped by ../Spinlock/gb_wall_clock.h. Every thread runs
+// the same number of iterations, so where a contended lock or word lets some
+// threads finish early, the mean loop time is shorter than the run and
+// items_per_second overstates the throughput; the wall rate is the throughput
+// the run delivered. The never rows of the CAS_BM and DCLP_BM families
+// (BM_cas*_never, BM_dclp*_never) keep Google Benchmark's own loop and report
+// items_per_second alone: their loop is the read-only fast path, a loop of a
+// few instructions whose code layout is what those rows measure (the
+// hint/branch-layout comparison is made among them), and a stamping loop
+// changes that layout. BM_spinlock_never takes the lock on every offer, so it
+// is wall-timed like the grow rows.
 #include <unistd.h>
 #include <cstddef>
 #include <cmath>
@@ -52,6 +73,7 @@
 
 #include "spinlock.h"                     // the shipped SpinLock (../Spinlock)
 #include "atomic_max.h"                   // the lock-free atomic_max()
+#include "gb_wall_clock.h"                // wall-clock counters (../Spinlock)
 
 // Shared state, each on its own cache line so the three mechanisms do not
 // perturb one another's coherence traffic across benchmark families. The
@@ -122,7 +144,9 @@ CAS_LOOP(atomic_max_uphint, LAYOUT_HOT)
 // which max function it calls, so a macro keeps the two from being two copies.
 // never: one fixed random offer per thread, so the max never advances after
 // warm-up (update genuinely rare -- the hint's best case). grow: a strictly
-// increasing offer, every iteration a new max (the hint's worst case).
+// increasing offer, every iteration a new max (the hint's worst case). Only the
+// grow function is wall-timed; the never function keeps Google Benchmark's own
+// loop (see the top of this file).
 #define CAS_BM(NAME, MAXFN)                                                     \
   void NAME##_never(benchmark::State& state) {                                 \
     if (state.thread_index() == 0)                                             \
@@ -134,12 +158,19 @@ CAS_LOOP(atomic_max_uphint, LAYOUT_HOT)
     state.SetItemsProcessed(state.iterations());                              \
   } /* NAME##_never */                                                         \
   void NAME##_grow(benchmark::State& state) {                                  \
+    static constinit WallRecords records;                                      \
     if (state.thread_index() == 0)                                             \
       nmax_atomic.store(0, std::memory_order_relaxed);                         \
+    records.allocate(state);                                                   \
     unsigned long n = state.thread_index(), dn = state.threads();              \
-    for (auto _ : state) { n += dn; MAXFN(nmax_atomic, n); }                   \
+    for (auto _ : WallTimed(state, records)) {                                 \
+      n += dn; MAXFN(nmax_atomic, n);                                          \
+    }                                                                          \
     benchmark::DoNotOptimize(nmax_atomic.load());                              \
     state.SetItemsProcessed(state.iterations());                              \
+    report_wall(state, records,                                                \
+                static_cast<double>(state.iterations())*state.threads());      \
+    records.release(state);                                                    \
   } /* NAME##_grow */
 
 CAS_BM(BM_cas,        atomic_max)          // the shipped atomic_max.h, whatever it is
@@ -149,27 +180,37 @@ CAS_BM(BM_cas_uphint, atomic_max_uphint)   // experiment: update hinted LIKELY
 
 // --- locked: take the lock on every offer, plain compare-store -------------
 void BM_spinlock_never(benchmark::State& state) {
+  static constinit WallRecords records;
   if (state.thread_index() == 0) nmax_plain = 0;
+  records.allocate(state);
   std::mt19937_64 rng(state.thread_index());
   volatile unsigned long n = rng();
-  for (auto _ : state) {
+  for (auto _ : WallTimed(state, records)) {
     std::lock_guard guard(lock);
     if (n > nmax_plain) nmax_plain = n;
   }
   benchmark::DoNotOptimize(nmax_plain);
   state.SetItemsProcessed(state.iterations());
+  report_wall(state, records,
+              static_cast<double>(state.iterations())*state.threads());
+  records.release(state);
 } // BM_spinlock_never
 
 void BM_spinlock_grow(benchmark::State& state) {
+  static constinit WallRecords records;
   if (state.thread_index() == 0) nmax_plain = 0;
+  records.allocate(state);
   unsigned long n = state.thread_index(), dn = state.threads();
-  for (auto _ : state) {
+  for (auto _ : WallTimed(state, records)) {
     n += dn;
     std::lock_guard guard(lock);
     if (n > nmax_plain) nmax_plain = n;
   }
   benchmark::DoNotOptimize(nmax_plain);
   state.SetItemsProcessed(state.iterations());
+  report_wall(state, records,
+              static_cast<double>(state.iterations())*state.threads());
+  records.release(state);
 } // BM_spinlock_grow
 
 // --- DCLP: unlocked acquire read, lock only to actually update -------------
@@ -191,7 +232,9 @@ void BM_spinlock_grow(benchmark::State& state) {
 // BM_dclp_uphint forces the wrong layout, which is how to see what the plain
 // `if` would cost if the compiler did not get lucky.
 // One never/grow pair per variant: LAYOUT wraps only the unlocked probe; MAXV
-// and LOCK name the shared maximum and its lock (separate lines, or one).
+// and LOCK name the shared maximum and its lock (separate lines, or one). Only
+// the grow function is wall-timed; the never function keeps Google Benchmark's
+// own loop (see the top of this file).
 #define DCLP_BM(NAME, LAYOUT, MAXV, LOCK)                                       \
   void NAME##_never(benchmark::State& state) {                                  \
     if (state.thread_index() == 0)                                              \
@@ -209,10 +252,12 @@ void BM_spinlock_grow(benchmark::State& state) {
     state.SetItemsProcessed(state.iterations());                                \
   } /* NAME##_never */                                                          \
   void NAME##_grow(benchmark::State& state) {                                   \
+    static constinit WallRecords records;                                       \
     if (state.thread_index() == 0)                                              \
       MAXV.store(0, std::memory_order_relaxed);                                 \
+    records.allocate(state);                                                    \
     unsigned long n = state.thread_index(), dn = state.threads();               \
-    for (auto _ : state) {                                                      \
+    for (auto _ : WallTimed(state, records)) {                                  \
       n += dn;                                                                  \
       if (LAYOUT(n > MAXV.load(std::memory_order_acquire))) {                   \
         std::lock_guard guard(LOCK);                                            \
@@ -222,6 +267,9 @@ void BM_spinlock_grow(benchmark::State& state) {
     }                                                                           \
     benchmark::DoNotOptimize(MAXV.load());                                      \
     state.SetItemsProcessed(state.iterations());                                \
+    report_wall(state, records,                                                 \
+                static_cast<double>(state.iterations())*state.threads());       \
+    records.release(state);                                                     \
   } /* NAME##_grow */
 
 DCLP_BM(BM_dclp,          LAYOUT_COLD, nmax_atomic,    lock)            // update hinted unlikely
@@ -251,12 +299,14 @@ static inline double do_work(double x, long work) {
 
 #define DCLP_WORK_BM(NAME, MAXV, LOCK)                                          \
   void NAME(benchmark::State& state) {                                         \
+    static constinit WallRecords records;                                      \
     const long work = state.range(0);                                          \
     if (state.thread_index() == 0)                                             \
       MAXV.store(0, std::memory_order_relaxed);                                \
+    records.allocate(state);                                                   \
     unsigned long n = state.thread_index(), dn = state.threads();              \
     double x = 1.0 + state.thread_index();                                     \
-    for (auto _ : state) {                                                     \
+    for (auto _ : WallTimed(state, records)) {                                 \
       x = do_work(x, work);                                                    \
       n += dn;                                                                 \
       if (LAYOUT_COLD(n > MAXV.load(std::memory_order_acquire))) {             \
@@ -268,6 +318,9 @@ static inline double do_work(double x, long work) {
     benchmark::DoNotOptimize(x);                                               \
     benchmark::DoNotOptimize(MAXV.load());                                     \
     state.SetItemsProcessed(state.iterations());                              \
+    report_wall(state, records,                                                \
+                static_cast<double>(state.iterations())*state.threads());      \
+    records.release(state);                                                    \
   } /* NAME */
 
 DCLP_WORK_BM(BM_dclp_work,          nmax_atomic,    lock)            // separate lines

@@ -92,10 +92,11 @@
 // state or the workers' placement. The
 // per-benchmark values take precedence over the seconds forms of
 // --benchmark_min_time and --benchmark_min_warmup_time, which this binary
-// therefore ignores. --benchmark_min_time=<N>x still works: an explicit
-// iteration count wins over MinTime(), and fixes the number of iterations
-// EACH thread runs. The run names carry min_time: and min_warmup_time: fields
-// that grow with the thread count.
+// therefore ignores. --benchmark_min_time=<N>x with N >= 1 still works: an
+// explicit iteration count wins over MinTime(), and fixes the number of
+// iterations EACH thread runs (N = 0 is not supported: timed_loop()'s batch
+// loop never ends at zero iterations). The run names carry min_time: and
+// min_warmup_time: fields that grow with the thread count.
 //
 // THROUGHPUT ACCOUNTING
 //
@@ -110,13 +111,10 @@
 // run alone against a queue that nobody drains or fills. The mean loop time
 // is then shorter than the run, and the tail of the run measures a different
 // regime from its start. So each run also reports:
-//   wall_items_per_second -- total successful pushes and pops divided by the
-//                            wall-clock span from the end of the earliest
-//                            first iteration of any thread to the end of the
-//                            last thread's last iteration;
-//   finish_spread         -- (last finish - first finish)/(that span), between
-//                            0 and 1: 0 when all threads finish together, near
-//                            1 when some thread finished right at the start;
+//   wall_items_per_second -- total successful pushes and pops over the run's
+//                            wall-clock span;
+//   finish_spread         -- how unevenly the threads finished, between 0
+//                            (all together) and 1;
 //   push_end, pop_end     -- the end of the last producer's (consumer's) loop,
 //                            measured from the start of the span, as a
 //                            fraction of the span: 1 for the role that
@@ -125,15 +123,18 @@
 //                            (consumers) at all. A producer here is an odd
 //                            thread, also in the balanced rows, where it
 //                            pops too.
-// Every thread stamps the end of its own first iteration, and the span starts
-// at the earliest of those stamps: a thread that misses the lock's first burst
-// can sleep through other threads' whole streaks, so any one thread's stamp
-// could be late. Since every finish is at or after its own thread's first
-// stamp, no finish precedes the span start, which is what keeps the fractions
-// within [0, 1]. The item count includes at most one operation per thread from
-// before the span starts, which is negligible. These counters are plain
-// values, set by thread 0 alone. The time stamps cost one compare per
-// iteration, after the operation. Where finish_spread is large, even
+// The first two are the counters of ../Spinlock/gb_wall_clock.h, which
+// defines the span and finish_spread exactly and says why the span starts
+// where it does; this benchmark keeps its own per-thread record (ThreadStats,
+// derived from the header's WallStamps) and its own timed loop (timed_loop()),
+// and aggregates the records with the header's wall_span() and
+// set_wall_counters(). Every finish is at or after its own thread's first
+// stamp, the earliest of which starts the span, so no finish precedes the
+// span start, which is what keeps push_end and pop_end within [0, 1]. The
+// item count includes at most one operation per thread from before the span
+// starts, which is negligible. These counters are plain values, set by
+// thread 0 alone. The time stamps cost one compare per iteration, after the
+// operation. Where finish_spread is large, even
 // wall_items_per_second mixes contention levels; concurrent_queue_mbm.C runs
 // the same operation with every thread contending until a common stop, and its
 // items_per_s does not have this problem.
@@ -160,6 +161,7 @@
 // top of the output (cq_cap, cq_fill).
 
 #include "concurrent_queue.h"
+#include "gb_wall_clock.h"
 
 #include <algorithm>
 #include <bit>
@@ -268,15 +270,17 @@ bool prefill(Q& q, size_t count, size_t key_stride, std::vector<int>& storage) {
 // thread starts, and only read after that.
 static double g_queue_fill = 0;
 
-// One thread's record of one run: its time stamps and its successful
-// operations (see THROUGHPUT ACCOUNTING above). Each entry gets its own
-// 128-byte block; it is written twice per run, so the padding matters little,
-// but it costs nothing either.
-struct alignas(128) ThreadStats {
-    Clock::time_point first;            // end of this thread's first iteration
-    Clock::time_point last;             // end of this thread's last iteration
+// One thread's record of one run: its time stamps, `first` and `last`, from
+// WallStamps, and its successful operations (see THROUGHPUT ACCOUNTING
+// above). Each entry gets its own 128-byte block; it is written twice per run,
+// so the padding matters little, but it costs nothing either. A type of its
+// own rather than the header's WallRecords: timed_loop() writes the item
+// count next to the stamps, and wall_span() takes an array of any record type
+// derived from WallStamps.
+struct alignas(128) ThreadStats : WallStamps {
     size_t items;                       // successful pushes and pops of this thread
 };
+static_assert(sizeof(ThreadStats) == 128);
 
 // One thread's operation counts over a run.
 struct OpCounts {
@@ -475,34 +479,31 @@ void BM_MP_MC(benchmark::State& state) {
     state.counters["pop_fail"] = benchmark::Counter(static_cast<double>(counts.cmiss), benchmark::Counter::kIsRate);
     // Past the end-of-loop barrier: no thread touches the queue any more, and
     // every thread's record is written. Thread 0 turns the records into the
-    // counters of THROUGHPUT ACCOUNTING above. They are plain values, not
-    // rates, because Google Benchmark would divide a rate by the mean loop
-    // time again; only thread 0 sets them, so summing the counters over
-    // threads leaves them unchanged.
+    // counters of THROUGHPUT ACCOUNTING above: the span and the spread by
+    // gb_wall_clock.h's wall_span() and set_wall_counters(), the item total
+    // and the per-role ends here. They are plain values, not rates, because
+    // Google Benchmark would divide a rate by the mean loop time again; only
+    // thread 0 sets them, so summing the counters over threads leaves them
+    // unchanged.
     if (tid == 0) {
-        Clock::time_point start = stats[0].first;               // earliest first-iteration end
-        Clock::time_point first_finish = stats[0].last;         // earliest last-iteration end
+        const WallSpan ws = wall_span(stats, nthreads);
         Clock::time_point push_finish = stats[1].last;          // latest producer last-iteration end
         Clock::time_point pop_finish = stats[0].last;           // latest consumer last-iteration end
         size_t items = 0;                                       // successful operations of all threads
         for (int i = 0; i != nthreads; ++i) {
-            start = std::min(start, stats[i].first);
-            first_finish = std::min(first_finish, stats[i].last);
             if (i & 1) push_finish = std::max(push_finish, stats[i].last);
             else pop_finish = std::max(pop_finish, stats[i].last);
             items += stats[i].items;
         } // loop over the threads' records
-        const Clock::time_point last_finish = std::max(push_finish, pop_finish);
-        // The span can be empty only in a run of one iteration per thread, and
-        // then only if every stamp coincides; such runs are calibration
-        // rounds, which are not reported, and they get zeros.
-        const double span = std::chrono::duration<double>(last_finish - start).count();
-        const auto fraction = [start, span](Clock::time_point t) {
-            return span > 0 ? std::chrono::duration<double>(t - start).count()/span : 0.0;
+        // The span is empty when no record is stamped, which this benchmark
+        // does not produce (every thread runs timed_loop() to the end), and
+        // otherwise only in a run of one iteration per thread in which every
+        // stamp coincides; such runs are calibration rounds, which are not
+        // reported, and they get zeros, here and in set_wall_counters().
+        const auto fraction = [&ws](Clock::time_point t) {
+            return ws.seconds > 0 ? std::chrono::duration<double>(t - ws.start).count()/ws.seconds : 0.0;
         };
-        state.counters["wall_items_per_second"] = benchmark::Counter(span > 0 ? static_cast<double>(items)/span : 0.0);
-        state.counters["finish_spread"] =
-            benchmark::Counter(span > 0 ? std::chrono::duration<double>(last_finish - first_finish).count()/span : 0.0);
+        set_wall_counters(state, ws, static_cast<double>(items));
         state.counters["push_end"] = benchmark::Counter(fraction(push_finish));
         state.counters["pop_end"] = benchmark::Counter(fraction(pop_finish));
 

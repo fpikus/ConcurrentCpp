@@ -66,6 +66,12 @@ TESTS = $(TARGET_TEST_ASAN) $(TARGET_TEST_TSAN)
 HEADERS = concurrent_queue.h spinlock.h ../config.mk
 # Used only by the two latency benchmarks (lmbm, ppmbm).
 LAT_HEADERS = latbench_common.h
+# The wall-clock accounting header of the Google Benchmark throughput
+# benchmark (gmbm), shared with the Spinlock directory and reached through
+# -I../Spinlock on that one compile. A variable of its own rather than an
+# entry in HEADERS: HEADERS is a prerequisite of the tests, which do not use
+# Google Benchmark and must not depend on this header.
+GB_HEADERS = ../Spinlock/gb_wall_clock.h
 
 .PHONY: all benchmarks tests clean run_tests run_benchmarks
 
@@ -83,9 +89,11 @@ benchmarks: $(BENCHMARKS)
 
 tests: $(TESTS)
 
-# Google Benchmark throughput benchmark
-$(TARGET_GMBM): concurrent_queue_gmbm.C $(HEADERS) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) $(CXX_RPATH) -o $@
+# Google Benchmark throughput benchmark. -I../Spinlock comes after
+# CXXFLAGS_BM's -I., so a header of this directory takes precedence over a
+# same-named one in ../Spinlock.
+$(TARGET_GMBM): concurrent_queue_gmbm.C $(HEADERS) $(GB_HEADERS) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS_BM) -I../Spinlock $< $(LIBS_BM) $(CXX_RPATH) -o $@
 
 # Custom latency benchmark (push->pop handoff under contention)
 $(TARGET_LMBM): concurrent_queue_lmbm.C $(HEADERS) $(LAT_HEADERS) | $(BUILD_DIR)

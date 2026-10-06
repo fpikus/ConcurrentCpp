@@ -48,7 +48,14 @@
 // over a compound critical section would be measuring a different design.
 //
 // Reports items/s == shared updates/s, so the ratios are comparable to each
-// other even though an iteration costs `shared` updates rather than one.
+// other even though an iteration costs `shared` updates rather than one. Every
+// row carries the rate twice: Google Benchmark's items_per_second, which
+// divides by the threads' mean loop time, and wall_items_per_second, which
+// divides by the wall-clock span of the run, with finish_spread next to it
+// (all three defined at the top of spinlock_bm_common.h). The standard rate
+// overstates the throughput of a mechanism that lets some threads finish
+// early, and the three mechanisms can differ in how evenly the threads
+// progress; finish_spread shows how much of the run had fewer threads left.
 //
 // Each mechanism runs under two kinds of work (the `_mem` names): the
 // compute-heavy sin/cos chain, and the memory-streaming AXPY of
@@ -175,21 +182,28 @@ class CasUpdate {
 // is a policy from spinlock_bm_common.h (SinCosWork or MemWork): one work chunk,
 // then `shared` applications of its result to the shared total. The trailing
 // DoNotOptimize keeps the self-feeding work chain alive on the shared:0
-// control, where no update ever consumes it.
+// control, where no update ever consumes it. The wall-clock records follow
+// BM_lock()'s shape (spinlock_bm_common.h); the item count is the shared
+// updates of all threads.
 template <typename Update, typename Work>
 void BM_update(benchmark::State& state) {
   alignas(64) static Update update;
+  static constinit WallRecords records;
   const long shared = state.range(0);
   const long work = state.range(1);
   Work::warmup(work);
+  records.allocate(state);
   double local_x = 1.0 + state.thread_index();
-  for (auto _ : state) {
+  for (auto _ : WallTimed(state, records)) {
     local_x = Work::run(local_x, work);
     const unsigned long n = static_cast<unsigned long>(1.0 + local_x);
     for (long i = 0; i < shared; ++i) update(n);
   }
   benchmark::DoNotOptimize(local_x);
   state.SetItemsProcessed(state.iterations()*shared);
+  report_wall(state, records,
+              static_cast<double>(state.iterations()*shared)*state.threads());
+  records.release(state);
 } // BM_update
 
 // The dial, as (shared, work) pairs. Spaced roughly logarithmically because the
@@ -209,7 +223,8 @@ void BM_update(benchmark::State& state) {
 //     1:300 -- ~0.1%
 //    1:1000 -- ~0.03%, where the choice of mechanism should stop mattering
 //     0:1   -- the control: no sharing, so all three are the same program and
-//              must report the same time (items/s is 0 here by construction)
+//              must report the same time (both items/s rates, the standard
+//              and the wall-clock one, are 0 here by construction)
 #define OVERHEAD_ARGS \
   ->ArgNames({"shared", "work"}) \
   ->Args({300, 1})->Args({100, 1})->Args({10, 1}) \

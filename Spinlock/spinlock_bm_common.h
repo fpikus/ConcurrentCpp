@@ -20,6 +20,25 @@
 // The estimate is order-of-magnitude only (and shrinks further once waiting
 // inflates the denominator), which is all the comparisons need.
 //
+// Every row of every benchmark built on this file reports two rates and a
+// fairness measure (gb_wall_clock.h defines them and does the stamping):
+//   items_per_second      -- Google Benchmark's own rate: the total item count
+//                            over the MEAN of the threads' loop times;
+//   wall_items_per_second -- the same total over the wall-clock span of the
+//                            run, from the end of the earliest thread's first
+//                            iteration to the end of the latest thread's last;
+//   finish_spread         -- (latest finish - earliest finish)/span, from 0
+//                            when all threads finish together to near 1 when
+//                            some thread finishes right at the start.
+// Both rates are needed because every thread runs the same number of
+// iterations: under a lock that lets some threads finish early, those threads
+// wait at the end barrier, the mean loop time is shorter than the run, and the
+// standard rate overstates the throughput by more the less fair the lock is.
+// The wall rate is the throughput the run actually delivered, and
+// finish_spread says how much of the run had fewer threads left contending.
+// items_per_second stays in every row, so results stay comparable with every
+// benchmark that reports only it.
+//
 // Select a slice with, e.g.:
 //   ./spinlock_bm --benchmark_filter='work:0/.*threads:32$'
 #ifndef INCLUDED_SPINLOCK_BM_COMMON_H
@@ -32,6 +51,8 @@
 #include "spinlock.h"                   // the lock inside SpinLockData
 
 #include "benchmark/benchmark.h"
+
+#include "gb_wall_clock.h"              // WallRecords, WallTimed, report_wall()
 
 // One chunk of thread-local work: `work` evaluations of x = sin(cos(x)),
 // starting from `x` and returning the result. Every benchmark in this directory
@@ -145,21 +166,35 @@ struct MemWork {
 // on the lock word is not conflated with the traffic on the data it guards.
 // The DoNotOptimize is load-bearing: nothing ever reads shared_n, so without
 // it the compiler may drop the accumulation and time an empty critical
-// section. Reports items/s == guarded updates/s.
+// section. Reports items/s == guarded updates/s, both as Google Benchmark's
+// mean-time rate and as the wall-clock rate (see the top of this file).
+//
+// The wall-clock records follow gb_wall_clock.h's contract: one records object
+// per instantiation; allocate() before the loop and, after it, report_wall()
+// then release(), each called on every thread and doing its work on thread 0
+// alone; state.iterations() is read only after the loop. The calls are
+// explicit rather than a scope-bound owner because no object with a
+// destructor may be live across the timed loop: its cleanup region can let
+// the compiler move work into the critical section.
 template <typename Lock>
 void BM_lock(benchmark::State& state) {
   alignas(64) static Lock lock;
   alignas(64) static unsigned long shared_n;
+  static constinit WallRecords records;
   const long work = state.range(0);
   if (state.thread_index() == 0) shared_n = 0;
+  records.allocate(state);
   double local_x = 1.0 + state.thread_index();
-  for (auto _ : state) {
+  for (auto _ : WallTimed(state, records)) {
     local_x = do_work(local_x, work);
     const unsigned long n = static_cast<unsigned long>(1.0 + local_x);
     std::lock_guard guard(lock);
     benchmark::DoNotOptimize(shared_n += n);
   }
   state.SetItemsProcessed(state.iterations());
+  report_wall(state, records,
+              static_cast<double>(state.iterations())*state.threads());
+  records.release(state);
 } // BM_lock
 
 // The read/write benchmark body, shared by every mechanism measured across a
@@ -212,18 +247,22 @@ void BM_lock(benchmark::State& state) {
 // work chunk quietly get more expensive as the run proceeds. The dependency is
 // what this needs, not the magnitude.
 //
-// Reports items/s == shared-data operations/s (reads plus writes), so the
-// number is comparable across mixes even though an iteration costs
-// `reads + writes` accesses rather than one.
+// Reports items/s == shared-data operations/s (reads plus writes), both as
+// Google Benchmark's mean-time rate and as the wall-clock rate (see the top of
+// this file), so the numbers are comparable across mixes even though an
+// iteration costs `reads + writes` accesses rather than one. The wall-clock
+// records follow the same contract as in BM_lock().
 template <typename DataT, typename Work>
 void BM_rw(benchmark::State& state) {
   alignas(64) static DataT data;
+  static constinit WallRecords records;
   const long reads = state.range(0);
   const long writes = state.range(1);
   const long work = state.range(2);
   Work::warmup(work);                   // untimed; a no-op for SinCosWork
+  records.allocate(state);
   double local_x = 1.0 + state.thread_index();
-  for (auto _ : state) {
+  for (auto _ : WallTimed(state, records)) {
     for (long i = 0; i < writes; ++i) {
       local_x = Work::run(local_x, work);
       data.write(static_cast<unsigned long>(1.0 + local_x));
@@ -241,6 +280,10 @@ void BM_rw(benchmark::State& state) {
     }
   }
   state.SetItemsProcessed(state.iterations()*(reads + writes));
+  report_wall(state, records,
+              static_cast<double>(state.iterations()*(reads + writes))*
+                  state.threads());
+  records.release(state);
 } // BM_rw()
 
 // The shipped SpinLock guarding a plain unsigned long, behind BM_rw()'s

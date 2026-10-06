@@ -37,8 +37,10 @@ COMMON_INCLUDES = -I.
 # `?=` so a machine's config.mk can override: macOS has no librt.
 COMMON_LIBS ?= -lpthread -lrt -lm
 
-# Benchmark flags (optimized)
-CXXFLAGS_BM = $(COMMON_FLAGS) -O3 -DNDEBUG $(COMMON_INCLUDES) -I$(GBENCH_DIR)/include
+# Benchmark flags (optimized). -I../Spinlock reaches gb_wall_clock.h, the
+# wall-clock accounting of the threaded Google Benchmark rows; on the benchmark
+# flags only, since the tests do not use Google Benchmark.
+CXXFLAGS_BM = $(COMMON_FLAGS) -O3 -DNDEBUG $(COMMON_INCLUDES) -I../Spinlock -I$(GBENCH_DIR)/include
 LIBS_BM = $(GBENCH_DIR)/lib/libbenchmark.a $(COMMON_LIBS)
 
 # Test flags
@@ -71,6 +73,12 @@ TEST_SRCS = lock_free_list_rcu_test.C lock_free_list_rcu_scheme_test.C lock_free
 # binaries get measured.
 HEADERS = lock_free_list_rcu.h rcu_test_common.h ../config.mk
 
+# The wall-clock accounting header, a prerequisite of the benchmark alone. A
+# variable of its own rather than an entry in HEADERS: HEADERS is a
+# prerequisite of the tests, which do not use Google Benchmark and must not
+# depend on this header.
+GB_HEADERS = ../Spinlock/gb_wall_clock.h
+
 .PHONY: all benchmarks tests clean run_tests run_benchmarks
 
 # The first rule in a Makefile is the default goal; without this line it would
@@ -88,7 +96,7 @@ benchmarks: $(BENCHMARKS)
 tests: $(TESTS)
 
 # Build benchmark
-$(TARGET_BM): lock_free_list_rcu_bm.C $(HEADERS) | $(BUILD_DIR)
+$(TARGET_BM): lock_free_list_rcu_bm.C $(HEADERS) $(GB_HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) $(CXX_RPATH) -o $@
 
 # Build ASan test (all test sources in one binary)

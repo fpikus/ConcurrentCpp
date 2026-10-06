@@ -32,7 +32,8 @@ SAN_CXX_RPATH := $(if $(SAN_RPATH),$(SAN_RPATH),$(call RPATH_OF,$(shell $(SAN_CX
 BUILD_DIR = build/$(shell hostname)
 
 # Common configuration. -I../Spinlock so atomic_max_bm.C can include the shipped
-# SpinLock (spinlock.h) instead of a copy.
+# SpinLock (spinlock.h) instead of a copy, and the wall-clock accounting header
+# (gb_wall_clock.h).
 COMMON_FLAGS = -march=$(VEC) --std=$(STD) -g -Werror -Wall -Wextra -pedantic
 COMMON_INCLUDES = -I. -I../Spinlock
 # `?=` so a machine's config.mk can override: macOS has no librt, so an M3's
@@ -66,6 +67,11 @@ TESTS = $(TARGET_TEST_ASAN) $(TARGET_TEST_TSAN)
 # the shipped SpinLock are on the list for the same reason: a change to either
 # must rebuild what uses it.
 HEADERS = atomic_max.h ../Spinlock/spinlock.h ../config.mk
+# The wall-clock accounting header of the Google Benchmark binary, reached
+# through the -I../Spinlock above. A variable of its own rather than an entry
+# in HEADERS: HEADERS is a prerequisite of the tests, which do not use Google
+# Benchmark and must not depend on this header.
+GB_HEADERS = ../Spinlock/gb_wall_clock.h
 
 .PHONY: all benchmarks tests clean run_tests run_benchmarks
 
@@ -84,7 +90,7 @@ benchmarks: $(BENCHMARKS)
 tests: $(TESTS)
 
 # Build benchmark (lock-free vs spinlocked vs DCLP running maximum)
-$(TARGET_BM): atomic_max_bm.C $(HEADERS) | $(BUILD_DIR)
+$(TARGET_BM): atomic_max_bm.C $(HEADERS) $(GB_HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) $(CXX_RPATH) -o $@
 
 # Build the outcome counter (per-offer outcomes of CAS vs DCLP on the grow

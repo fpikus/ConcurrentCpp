@@ -19,10 +19,23 @@
  *                  later, in a batch, by whichever thread's retire crosses mm_hp's
  *                  scan threshold
  *
- * Rows ReadHeavy, WriteHeavy and HighContention report Google Benchmark's standard
- * items/s; with several threads GB divides the summed item count by the MEAN per-thread
- * loop time, which flatters a pointer that lets some threads finish early while others
- * are parked. ReadersOneWriter reports its own per-thread rates (see that row).
+ * Rows ReadHeavy, WriteHeavy and HighContention report two rates and a fairness measure
+ * (../Spinlock/gb_wall_clock.h defines them and does the stamping):
+ *   items_per_second       Google Benchmark's standard rate: the item count summed over
+ *                          the threads, divided by the MEAN per-thread loop time;
+ *   wall_items_per_second  the same total over the wall-clock span of the run, from the
+ *                          end of the earliest thread's first iteration to the end of the
+ *                          latest thread's last;
+ *   finish_spread          (latest finish - earliest finish)/span, from 0 when all threads
+ *                          finish together to near 1 when some thread finishes right at
+ *                          the start.
+ * Both rates because every thread runs the same number of iterations: under a pointer
+ * that lets some threads finish early while others are parked, the early ones wait at the
+ * end barrier, the mean loop time is shorter than the run, and the standard rate flatters
+ * that pointer; the wall rate is what the run delivered, and finish_spread says how much
+ * of the run had fewer threads left. items_per_second stays, for comparison with every
+ * result that has only it. ReadersOneWriter reports its own per-thread rates and none
+ * of these (see that row).
  *
  * Instrumentation counters (cas_ok, cas_fail, destroyed and the intr_shared_ptr_hp
  * load-retry counters) are compiled in only with -DINTR_HP_BM_COUNTERS, which the Makefile
@@ -47,6 +60,7 @@
 #include "intr_shared_ptr_hp.h"
 #include "hp_drain.h"
 #include "lock_free_shared_ptr/atomic_shared_ptr.hpp"
+#include "gb_wall_clock.h"   // WallRecords, WallTimed, report_wall() (../Spinlock)
 
 static const int num_cpu = sysconf(_SC_NPROCESSORS_CONF);
 
@@ -68,8 +82,9 @@ static const int num_cpu = sysconf(_SC_NPROCESSORS_CONF);
 // Without a macro its hooks below are empty functions or discarded
 // `if constexpr` branches, and every row compiles to its uninstrumented body.
 //
-// Counters, per row, as Google Benchmark user counters (GB sums them over the
-// row's threads, so each is a total for the run):
+// Counters, per row, as Google Benchmark user counters (every thread sets them
+// and GB sums them over the row's threads, so each is a total for the run;
+// unlike wall_items_per_second and finish_spread, which thread 0 alone sets):
 // - cas_ok, cas_fail: results of compare_exchange_strong in the CAS rows. The
 //   rate counts iterations, i.e. attempts; the split shows how much of it was
 //   wasted, and the `destroyed` identity needs both.
@@ -444,12 +459,25 @@ PtrType* AtomicPtrFixture<PtrType>::ptr = nullptr;
 // Data at once, so the next `new` reuses a just-freed, cache-hot chunk; HP frees
 // in batches, so the next `new DataHP` gets a chunk freed long ago.
 
+// The wall-clock records of the three mixed workloads (ReadHeavy, WriteHeavy,
+// HighContention) follow gb_wall_clock.h's contract: one function-local static
+// per row, allocate() before the loop and, after it, report_wall() then
+// release(), each called on every thread and doing its work on thread 0 alone.
+// In the body, not in AtomicPtrFixture: ReadersOneWriterFixture::SetUp() calls
+// AtomicPtrFixture::SetUp(), and those rows keep their own timing. The calls
+// are explicit, not a scope-bound owner, because no local with a destructor
+// may be live across the timed loop (rng, dist and counters are trivially
+// destructible): its cleanup region can change the loop's code. The seed's
+// state.iterations() is read before the loop, where it is 0.
+
 #define DEFINE_BM_READHEAVY(Name, PtrType) \
     BENCHMARK_TEMPLATE_DEFINE_F(AtomicPtrFixture, Name, PtrType)(benchmark::State& state) { \
         std::mt19937 rng(state.thread_index() + 42 + state.iterations()); \
         std::uniform_int_distribution<int> dist(0, 99); \
+        static constinit WallRecords records; \
+        records.allocate(state); \
         BodyCounters counters; \
-        for (auto _ : state) { \
+        for (auto _ : WallTimed(state, records)) { \
             if (dist(rng) < 90) { \
                 auto p = ptr->load(); \
                 benchmark::DoNotOptimize(p); \
@@ -462,6 +490,8 @@ PtrType* AtomicPtrFixture<PtrType>::ptr = nullptr;
             } \
         } \
         state.SetItemsProcessed(state.iterations()); \
+        report_wall(state, records, static_cast<double>(state.iterations())*state.threads()); \
+        records.release(state); \
         counters.report<PtrType>(state); \
     } \
     BENCHMARK_REGISTER_F(AtomicPtrFixture, Name)->ThreadRange(1, num_cpu)->UseRealTime();
@@ -471,16 +501,19 @@ DEFINE_BM_READHEAVY(ReadHeavy_IntrShared, intr_shared_ptr<Data>)
 DEFINE_BM_READHEAVY(ReadHeavy_LockFree, parlay::atomic_shared_ptr<Data>)    // _LockFree = parlay
 // ReadHeavy, HP: the fairness axis. 90% loads on one word is where the
 // spinlock's readers convoy on the lock bit (and its occasional CAS waits
-// behind them) while HP's loads never wait on each other; GB's mean-time rate
-// hides who was locked out, which ReadersOneWriter below shows.
+// behind them) while HP's loads never wait on each other. Neither rate of this
+// row shows who was locked out (finish_spread shows only that the threads
+// finished unevenly); ReadersOneWriter below shows it.
 DEFINE_BM_READHEAVY(ReadHeavy_IntrSharedHP, intr_shared_ptr_hp<DataHP>)
 
 #define DEFINE_BM_WRITEHEAVY(Name, PtrType) \
     BENCHMARK_TEMPLATE_DEFINE_F(AtomicPtrFixture, Name, PtrType)(benchmark::State& state) { \
         std::mt19937 rng(state.thread_index() + 42 + state.iterations()); \
         std::uniform_int_distribution<int> dist(0, 99); \
+        static constinit WallRecords records; \
+        records.allocate(state); \
         BodyCounters counters; \
-        for (auto _ : state) { \
+        for (auto _ : WallTimed(state, records)) { \
             if (dist(rng) < 10) { \
                 auto p = ptr->load(); \
                 benchmark::DoNotOptimize(p); \
@@ -493,6 +526,8 @@ DEFINE_BM_READHEAVY(ReadHeavy_IntrSharedHP, intr_shared_ptr_hp<DataHP>)
             } \
         } \
         state.SetItemsProcessed(state.iterations()); \
+        report_wall(state, records, static_cast<double>(state.iterations())*state.threads()); \
+        records.release(state); \
         counters.report<PtrType>(state); \
     } \
     BENCHMARK_REGISTER_F(AtomicPtrFixture, Name)->ThreadRange(1, num_cpu)->UseRealTime();
@@ -507,8 +542,10 @@ DEFINE_BM_WRITEHEAVY(WriteHeavy_IntrSharedHP, intr_shared_ptr_hp<DataHP>)
 
 #define DEFINE_BM_HIGHCONTENTION(Name, PtrType) \
     BENCHMARK_TEMPLATE_DEFINE_F(AtomicPtrFixture, Name, PtrType)(benchmark::State& state) { \
+        static constinit WallRecords records; \
+        records.allocate(state); \
         BodyCounters counters; \
-        for (auto _ : state) { \
+        for (auto _ : WallTimed(state, records)) { \
             auto expected = ptr->load(); \
             if (expected) { \
                 auto new_p = make_shared_data<PtrType>(expected->value + 1); \
@@ -516,11 +553,28 @@ DEFINE_BM_WRITEHEAVY(WriteHeavy_IntrSharedHP, intr_shared_ptr_hp<DataHP>)
             } \
         } \
         state.SetItemsProcessed(state.iterations()); \
+        report_wall(state, records, static_cast<double>(state.iterations())*state.threads()); \
+        records.release(state); \
         counters.report<PtrType>(state); \
     } \
     BENCHMARK_REGISTER_F(AtomicPtrFixture, Name)->Threads(16)->UseRealTime();
 
+// g++ -O3 reports -Warray-bounds and -Wstringop-overflow in this one row, from
+// libstdc++ and parlay code: it speculatively devirtualizes the release of the
+// shared_ptr<Data> control block to the other in-place control block of this
+// translation unit (parlay's ThreadIdPool), and checks that never-taken path
+// against the Data control block that make_shared allocated. A false
+// positive (-fno-devirtualize-speculatively removes it); the pragma silences
+// these two kinds of warning for this row alone and changes no generated code.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Warray-bounds"
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
+#endif
 DEFINE_BM_HIGHCONTENTION(HighContention_StdAtomic, StdAtomicSharedPtrAdapter<Data>)
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 DEFINE_BM_HIGHCONTENTION(HighContention_IntrShared, intr_shared_ptr<Data>)
 DEFINE_BM_HIGHCONTENTION(HighContention_LockFree, parlay::atomic_shared_ptr<Data>)  // _LockFree = parlay
 // HighContention, HP: 16 threads in a load-CAS loop on one word. A failed CAS

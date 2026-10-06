@@ -41,8 +41,10 @@ COMMON_INCLUDES = -I. -I../IntrSharedPtr -I../SharedPtr
 # `?=` so a machine's config.mk can override: macOS has no librt.
 COMMON_LIBS ?= -lpthread -lrt -lm
 
-# Benchmark flags (optimized)
-CXXFLAGS_BM = $(COMMON_FLAGS) -O3 -DNDEBUG $(COMMON_INCLUDES) -I$(GBENCH_DIR)/include
+# Benchmark flags (optimized). -I../Spinlock reaches gb_wall_clock.h, the
+# wall-clock accounting of the threaded Google Benchmark rows; on the benchmark
+# flags only, since the tests do not use Google Benchmark.
+CXXFLAGS_BM = $(COMMON_FLAGS) -O3 -DNDEBUG $(COMMON_INCLUDES) -I../Spinlock -I$(GBENCH_DIR)/include
 LIBS_BM = $(GBENCH_DIR)/lib/libbenchmark.a $(COMMON_LIBS)
 
 # Test flags
@@ -85,6 +87,12 @@ HEADERS = lock_free_list.h ../SharedPtr/atomic_shared_ptr_concept.h ../IntrShare
 include ../IntrSharedPtr/mm_hp.mk
 HEADERS += $(HP_HEADERS)
 
+# The wall-clock accounting header, a prerequisite of the benchmark alone. A
+# variable of its own rather than an entry in HEADERS: HEADERS is a
+# prerequisite of the tests, which do not use Google Benchmark and must not
+# depend on this header.
+GB_HEADERS = ../Spinlock/gb_wall_clock.h
+
 .PHONY: all benchmarks tests clean run_tests run_benchmarks imports FORCE
 
 # The first rule in a Makefile is the default goal; without this line it would
@@ -121,7 +129,7 @@ imports: $(MM_HP_STAMP) $(PARLAY_STAMP)
 FORCE:
 
 # Build benchmark (links mm_hp for the intr_shared_ptr_hp policy)
-$(TARGET_BM): lock_free_list_bm.C $(HP_SOURCES) $(HEADERS) | $(BUILD_DIR)
+$(TARGET_BM): lock_free_list_bm.C $(HP_SOURCES) $(HEADERS) $(GB_HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_BM) $< $(HP_SOURCES) $(LIBS_BM) $(CXX_RPATH) -o $@
 
 # Build ASan test (links mm_hp for the intr_shared_ptr_hp policy)

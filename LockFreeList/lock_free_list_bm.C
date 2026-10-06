@@ -39,6 +39,27 @@
 //   hazard pointer (Maged Michael's mm_hp), and a released node is destroyed
 //   later, in a batch, by whichever thread's retire crosses mm_hp's scan
 //   threshold.
+//
+// Every row of every policy reports two rates and a fairness measure
+// (gb_wall_clock.h defines them and does the stamping):
+//   items_per_second      -- Google Benchmark's own rate: the total iteration
+//                            count over the MEAN of the threads' loop times;
+//   wall_items_per_second -- the same total over the wall-clock span of the
+//                            run, from the end of the earliest thread's first
+//                            iteration to the end of the latest thread's last;
+//   finish_spread         -- (latest finish - earliest finish)/span, from 0
+//                            when all threads finish together to near 1 when
+//                            some thread finishes right at the start.
+// Both rates are needed because every thread runs the same number of
+// iterations: under a policy that lets some threads through while others wait
+// (the IntrPtr spinlock; libstdc++'s std::atomic<std::shared_ptr>, whose load
+// and store take a lock bit in its control-block pointer, spinning on it with
+// a pause), the favoured threads finish early and wait at the end barrier,
+// the mean loop time is shorter than the run, and the standard rate overstates
+// the throughput. The wall rate is the throughput the run delivered, and
+// finish_spread says how much of the run had fewer threads left contending.
+// Only thread 0 sets the two counters, so Google Benchmark's sum over the
+// threads leaves them as they are.
 
 #include "atomic_shared_ptr_concept.h"
 #include "intr_shared_ptr.h"
@@ -46,6 +67,8 @@
 #include "hp_drain.h"
 #include "lock_free_shared_ptr/atomic_shared_ptr.hpp"
 #include "lock_free_list.h"
+
+#include "gb_wall_clock.h"              // WallRecords, WallTimed, report_wall()
 
 // Wrappers for the benchmark fixtures (same trick as in lock_free_list_test.C):
 // BENCHMARK_TEMPLATE_DEFINE_F takes a *type* argument, but LockFreeList is
@@ -98,6 +121,17 @@ public:
     // the one object would be shared just the same).
     static List* list;
     static Factory<Wrapper> factory;
+    // The run's wall-clock records (gb_wall_clock.h), one per thread, shared
+    // by every row of this policy (rows run one at a time). Constant-
+    // initialized (constinit on the definition below). allocate() in SetUp()
+    // -- ListFixture's and DispersedListFixture's, which does not call this
+    // one -- and release() in TearDown(), both on every thread and both acting
+    // on thread 0 alone; in between, the bodies touch the records only through
+    // WallTimed inside the loop and through report_wall() after it. No thread
+    // other than 0 may touch them in SetUp() or TearDown(): nothing orders one
+    // thread's SetUp() against another's, and a non-zero thread's TearDown()
+    // can run while thread 0 is still reporting.
+    static WallRecords records;
 
     // True for a policy that declares `deferred_reclamation = true`
     // (intr_shared_ptr_hp): released nodes are destroyed at a later mm_hp scan,
@@ -109,11 +143,13 @@ public:
     void SetUp(const ::benchmark::State& state) override {
         // A generic 1000 items is good enough for the head-anchored benchmarks
         // (ReadHeavy, WriteHeavy, Graveyard, MassiveHeadInsert); fixtures that
-        // need a different prepopulation override SetUp and call Prepopulate()
-        // with their own count (see DispersedListFixture).
+        // need a different prepopulation override SetUp, call Prepopulate()
+        // with their own count and allocate the records themselves (see
+        // DispersedListFixture).
         if (state.thread_index() == 0) {
             Prepopulate(1000);
         }
+        records.allocate(state);        // thread 0 only (a no-op on the others)
     } // SetUp()
 
     void TearDown(const ::benchmark::State& state) override {
@@ -134,6 +170,12 @@ public:
             // run it goes to mm_hp's scan at process exit.
             DrainIfDeferred();
         }
+        // Last, after the drain: thread 0's body has reported by now
+        // (report_wall() runs before TearDown()) and nothing touches the
+        // records any more. Thread 0 only (a no-op on the others).
+        // DispersedListFixture::TearDown() ends here too, so this one release
+        // covers both fixtures.
+        records.release(state);
     } // TearDown()
 
 protected:
@@ -179,19 +221,23 @@ typename ListFixture<Wrapper>::List* ListFixture<Wrapper>::list = nullptr;
 template <typename Wrapper>
 Factory<Wrapper> ListFixture<Wrapper>::factory;
 
+template <typename Wrapper>
+constinit WallRecords ListFixture<Wrapper>::records;
+
 // The drains must not silently become no-ops (a misspelt member would make the
 // detection false, not an error).
 static_assert(ListFixture<IntrPtrHPWrapper>::deferred_reclamation);
 static_assert(!ListFixture<IntrPtrWrapper>::deferred_reclamation);
 
-// Fixture for the dispersed-read benchmarks. Reuses ListFixture's list and
-// factory (benchmarks run sequentially, so sharing the statics is safe) but
-// prepopulates a list two orders of magnitude larger and precomputes evenly
-// spaced starting positions, one per thread. Both together are what makes the
-// workload genuinely dispersed: threads begin far apart and advance at roughly
-// equal rates over a list ~60x larger than all their read windows combined, so
-// they rarely traverse the same nodes at the same time -- rarely, not never,
-// which is the point of benchmarking a thread-safe list this way.
+// Fixture for the dispersed-read benchmarks. Reuses ListFixture's list,
+// factory and wall-clock records (benchmarks run sequentially, so sharing the
+// statics is safe) but prepopulates a list two orders of magnitude larger and
+// precomputes evenly spaced starting positions, one per thread. Both together
+// are what makes the workload genuinely dispersed: threads begin far apart and
+// advance at roughly equal rates over a list ~60x larger than all their read
+// windows combined, so they rarely traverse the same nodes at the same time --
+// rarely, not never, which is the point of benchmarking a thread-safe list
+// this way.
 template <typename Wrapper>
 class DispersedListFixture : public ListFixture<Wrapper> {
 public:
@@ -224,6 +270,10 @@ public:
                 } // skip the walk after the last position
             } // one start position per thread
         }
+        // This SetUp() replaces ListFixture's rather than calling it, so it
+        // allocates the run's records itself. Thread 0 only (a no-op on the
+        // others).
+        Base::records.allocate(state);
     } // SetUp()
 
     void TearDown(const ::benchmark::State& state) override {
@@ -246,7 +296,7 @@ std::vector<typename DispersedListFixture<Wrapper>::Iterator> DispersedListFixtu
 BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, ReadHeavy_StdAtomic, StdAtomicWrapper)(benchmark::State& state) {
     SETUP_RNG;
     using Node = LockFreeList<int, StdAtomicWrapper::template ptr_type>::Node;
-    for (auto _ : state) {
+    for (auto _ : WallTimed(state, records)) {
         int op = dist(rng);
         if (op < 90) { // 90% read
             int count = 0;
@@ -261,12 +311,13 @@ BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, ReadHeavy_StdAtomic, StdAtomicWrapper)(
         }
     }
     state.SetItemsProcessed(state.iterations());
+    report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
 }
 
 BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, WriteHeavy_StdAtomic, StdAtomicWrapper)(benchmark::State& state) {
     SETUP_RNG;
     using Node = LockFreeList<int, StdAtomicWrapper::template ptr_type>::Node;
-    for (auto _ : state) {
+    for (auto _ : WallTimed(state, records)) {
         int op = dist(rng);
         if (op < 10) { // 10% read
             int count = 0;
@@ -281,12 +332,13 @@ BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, WriteHeavy_StdAtomic, StdAtomicWrapper)
         }
     }
     state.SetItemsProcessed(state.iterations());
+    report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
 }
 
 BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, Graveyard_StdAtomic, StdAtomicWrapper)(benchmark::State& state) {
     SETUP_RNG;
     using Node = LockFreeList<int, StdAtomicWrapper::template ptr_type>::Node;
-    for (auto _ : state) {
+    for (auto _ : WallTimed(state, records)) {
         int op = dist(rng);
         if (op < 70) { // 70% erase
             list->erase_after(list->before_begin());
@@ -295,12 +347,13 @@ BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, Graveyard_StdAtomic, StdAtomicWrapper)(
         }
     }
     state.SetItemsProcessed(state.iterations());
+    report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
 }
 
 BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, ReadHeavy_IntrPtr, IntrPtrWrapper)(benchmark::State& state) {
     SETUP_RNG;
     using Node = LockFreeList<int, IntrPtrWrapper::template ptr_type>::Node;
-    for (auto _ : state) {
+    for (auto _ : WallTimed(state, records)) {
         int op = dist(rng);
         if (op < 90) { // 90% read
             int count = 0;
@@ -315,12 +368,13 @@ BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, ReadHeavy_IntrPtr, IntrPtrWrapper)(benc
         }
     }
     state.SetItemsProcessed(state.iterations());
+    report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
 }
 
 BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, WriteHeavy_IntrPtr, IntrPtrWrapper)(benchmark::State& state) {
     SETUP_RNG;
     using Node = LockFreeList<int, IntrPtrWrapper::template ptr_type>::Node;
-    for (auto _ : state) {
+    for (auto _ : WallTimed(state, records)) {
         int op = dist(rng);
         if (op < 10) { // 10% read
             int count = 0;
@@ -335,12 +389,13 @@ BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, WriteHeavy_IntrPtr, IntrPtrWrapper)(ben
         }
     }
     state.SetItemsProcessed(state.iterations());
+    report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
 }
 
 BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, Graveyard_IntrPtr, IntrPtrWrapper)(benchmark::State& state) {
     SETUP_RNG;
     using Node = LockFreeList<int, IntrPtrWrapper::template ptr_type>::Node;
-    for (auto _ : state) {
+    for (auto _ : WallTimed(state, records)) {
         int op = dist(rng);
         if (op < 70) { // 70% erase
             list->erase_after(list->before_begin());
@@ -349,12 +404,13 @@ BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, Graveyard_IntrPtr, IntrPtrWrapper)(benc
         }
     }
     state.SetItemsProcessed(state.iterations());
+    report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
 }
 
 BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, ReadHeavy_HazardPtr, ParlayWrapper)(benchmark::State& state) {
     SETUP_RNG;
     using Node = LockFreeList<int, ParlayWrapper::template ptr_type>::Node;
-    for (auto _ : state) {
+    for (auto _ : WallTimed(state, records)) {
         int op = dist(rng);
         if (op < 90) { // 90% read
             int count = 0;
@@ -369,12 +425,13 @@ BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, ReadHeavy_HazardPtr, ParlayWrapper)(ben
         }
     }
     state.SetItemsProcessed(state.iterations());
+    report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
 }
 
 BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, WriteHeavy_HazardPtr, ParlayWrapper)(benchmark::State& state) {
     SETUP_RNG;
     using Node = LockFreeList<int, ParlayWrapper::template ptr_type>::Node;
-    for (auto _ : state) {
+    for (auto _ : WallTimed(state, records)) {
         int op = dist(rng);
         if (op < 10) { // 10% read
             int count = 0;
@@ -389,12 +446,13 @@ BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, WriteHeavy_HazardPtr, ParlayWrapper)(be
         }
     }
     state.SetItemsProcessed(state.iterations());
+    report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
 }
 
 BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, Graveyard_HazardPtr, ParlayWrapper)(benchmark::State& state) {
     SETUP_RNG;
     using Node = LockFreeList<int, ParlayWrapper::template ptr_type>::Node;
-    for (auto _ : state) {
+    for (auto _ : WallTimed(state, records)) {
         int op = dist(rng);
         if (op < 70) { // 70% erase
             list->erase_after(list->before_begin());
@@ -403,33 +461,37 @@ BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, Graveyard_HazardPtr, ParlayWrapper)(ben
         }
     }
     state.SetItemsProcessed(state.iterations());
+    report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
 }
 
 BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, MassiveHeadInsert_StdAtomic, StdAtomicWrapper)(benchmark::State& state) {
     SETUP_RNG;
     using Node = LockFreeList<int, StdAtomicWrapper::template ptr_type>::Node;
-    for (auto _ : state) {
+    for (auto _ : WallTimed(state, records)) {
         list->insert_after(list->before_begin(), factory.template operator()<Node>(dist(rng)));
     }
     state.SetItemsProcessed(state.iterations());
+    report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
 }
 
 BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, MassiveHeadInsert_IntrPtr, IntrPtrWrapper)(benchmark::State& state) {
     SETUP_RNG;
     using Node = LockFreeList<int, IntrPtrWrapper::template ptr_type>::Node;
-    for (auto _ : state) {
+    for (auto _ : WallTimed(state, records)) {
         list->insert_after(list->before_begin(), factory.template operator()<Node>(dist(rng)));
     }
     state.SetItemsProcessed(state.iterations());
+    report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
 }
 
 BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, MassiveHeadInsert_HazardPtr, ParlayWrapper)(benchmark::State& state) {
     SETUP_RNG;
     using Node = LockFreeList<int, ParlayWrapper::template ptr_type>::Node;
-    for (auto _ : state) {
+    for (auto _ : WallTimed(state, records)) {
         list->insert_after(list->before_begin(), factory.template operator()<Node>(dist(rng)));
     }
     state.SetItemsProcessed(state.iterations());
+    report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
 }
 
 // The IntrPtrHP rows: intr_shared_ptr_hp, the fourth policy. Their bodies are
@@ -448,9 +510,11 @@ BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, MassiveHeadInsert_HazardPtr, ParlayWrap
 //   record from mm_hp's global pool under a 1-bit spinlock INSIDE the timed
 //   loop (once per thread per run).
 // - ReadHeavy: the fairness axis. 90% traversals of the head's 50 nodes: the
-//   spinlock's readers convoy on the same few words, and the rate (summed
-//   items over the MEAN per-thread time) does not show who was locked out.
-//   Also a confounder in HP's FAVOUR, neighbour false sharing. Where the
+//   spinlock's readers convoy on the same few words. items_per_second (summed
+//   items over the MEAN per-thread time) does not show who was locked out; a
+//   thread held back finishes last, which finish_spread shows, and
+//   wall_items_per_second counts the time it ran after the others had
+//   finished. Also a confounder in HP's FAVOUR, neighbour false sharing. Where the
 //   count a traversal step RMWs lives, and the per-node allocation (glibc
 //   chunks; "per line" assumes consecutive nodes are adjacent in memory, as
 //   they are when prepopulated):
@@ -481,7 +545,7 @@ BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, MassiveHeadInsert_HazardPtr, ParlayWrap
 BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, ReadHeavy_IntrPtrHP, IntrPtrHPWrapper)(benchmark::State& state) {
     SETUP_RNG;
     using Node = LockFreeList<int, IntrPtrHPWrapper::template ptr_type>::Node;
-    for (auto _ : state) {
+    for (auto _ : WallTimed(state, records)) {
         int op = dist(rng);
         if (op < 90) { // 90% read
             int count = 0;
@@ -496,12 +560,13 @@ BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, ReadHeavy_IntrPtrHP, IntrPtrHPWrapper)(
         }
     }
     state.SetItemsProcessed(state.iterations());
+    report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
 }
 
 BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, WriteHeavy_IntrPtrHP, IntrPtrHPWrapper)(benchmark::State& state) {
     SETUP_RNG;
     using Node = LockFreeList<int, IntrPtrHPWrapper::template ptr_type>::Node;
-    for (auto _ : state) {
+    for (auto _ : WallTimed(state, records)) {
         int op = dist(rng);
         if (op < 10) { // 10% read
             int count = 0;
@@ -516,12 +581,13 @@ BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, WriteHeavy_IntrPtrHP, IntrPtrHPWrapper)
         }
     }
     state.SetItemsProcessed(state.iterations());
+    report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
 }
 
 BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, Graveyard_IntrPtrHP, IntrPtrHPWrapper)(benchmark::State& state) {
     SETUP_RNG;
     using Node = LockFreeList<int, IntrPtrHPWrapper::template ptr_type>::Node;
-    for (auto _ : state) {
+    for (auto _ : WallTimed(state, records)) {
         int op = dist(rng);
         if (op < 70) { // 70% erase
             list->erase_after(list->before_begin());
@@ -530,15 +596,17 @@ BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, Graveyard_IntrPtrHP, IntrPtrHPWrapper)(
         }
     }
     state.SetItemsProcessed(state.iterations());
+    report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
 }
 
 BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, MassiveHeadInsert_IntrPtrHP, IntrPtrHPWrapper)(benchmark::State& state) {
     SETUP_RNG;
     using Node = LockFreeList<int, IntrPtrHPWrapper::template ptr_type>::Node;
-    for (auto _ : state) {
+    for (auto _ : WallTimed(state, records)) {
         list->insert_after(list->before_begin(), factory.template operator()<Node>(dist(rng)));
     }
     state.SetItemsProcessed(state.iterations());
+    report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
 }
 
 // ReadDispersed: read-heavy workload with contention dispersed across the list
@@ -546,9 +614,9 @@ BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, MassiveHeadInsert_IntrPtrHP, IntrPtrHPW
 // top of that, 5% of iterations insert and 5% erase (the mutation anchor is a
 // node discovered during the read pass, so a read always precedes a write --
 // unlike ReadHeavy, where each iteration is either a read or a write). Each
-// thread keeps a persistent cursor (declared outside the `for (auto _ : state)`
-// loop, so it survives across iterations) that resumes where the previous read
-// window ended, wrapping back to begin() at the tail. The cursor starts at this
+// thread keeps a persistent cursor (declared outside the state loop, so it
+// survives across iterations) that resumes where the previous read window
+// ended, wrapping back to begin() at the tail. The cursor starts at this
 // thread's slot in start_positions, so threads begin evenly spread around the
 // large list (see DispersedListFixture) instead of convoying from begin().
 // Inserts/erases anchor on a node captured mid-window, so mutations track
@@ -575,12 +643,13 @@ BENCHMARK_TEMPLATE_DEFINE_F(DispersedListFixture, ReadDispersed_StdAtomic, StdAt
     constexpr int mid = window / 2; // offset within the window where writes are anchored
     Iterator cursor; // this thread's staggered start, assigned on the first pass below
     bool first_pass = true;
-    for (auto _ : state) {
+    for (auto _ : WallTimed(state, records)) {
         if (first_pass) {
             // The cursor cannot be initialized before the state loop: fixture
             // threads other than 0 can get there before thread 0's SetUp() has
             // built `list` and start_positions -- the barrier that makes them
-            // safe to read only exists at the `for (auto _ : state)` above.
+            // safe to read only exists at the head of the state loop above
+            // (WallTimed's begin() runs it).
             cursor = start_positions[state.thread_index()];
             first_pass = false;
         }
@@ -604,6 +673,7 @@ BENCHMARK_TEMPLATE_DEFINE_F(DispersedListFixture, ReadDispersed_StdAtomic, StdAt
         cursor = (it == list->end()) ? list->begin() : it; // wrap at the tail, otherwise resume here next pass
     }
     state.SetItemsProcessed(state.iterations());
+    report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
 }
 
 BENCHMARK_TEMPLATE_DEFINE_F(DispersedListFixture, ReadDispersed_IntrPtr, IntrPtrWrapper)(benchmark::State& state) {
@@ -614,7 +684,7 @@ BENCHMARK_TEMPLATE_DEFINE_F(DispersedListFixture, ReadDispersed_IntrPtr, IntrPtr
     constexpr int mid = window / 2; // offset within the window where writes are anchored
     Iterator cursor; // this thread's staggered start, assigned on the first pass (see ReadDispersed_StdAtomic)
     bool first_pass = true;
-    for (auto _ : state) {
+    for (auto _ : WallTimed(state, records)) {
         if (first_pass) {
             cursor = start_positions[state.thread_index()];
             first_pass = false;
@@ -639,6 +709,7 @@ BENCHMARK_TEMPLATE_DEFINE_F(DispersedListFixture, ReadDispersed_IntrPtr, IntrPtr
         cursor = (it == list->end()) ? list->begin() : it; // wrap at the tail, otherwise resume here next pass
     }
     state.SetItemsProcessed(state.iterations());
+    report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
 }
 
 BENCHMARK_TEMPLATE_DEFINE_F(DispersedListFixture, ReadDispersed_HazardPtr, ParlayWrapper)(benchmark::State& state) {
@@ -649,7 +720,7 @@ BENCHMARK_TEMPLATE_DEFINE_F(DispersedListFixture, ReadDispersed_HazardPtr, Parla
     constexpr int mid = window / 2; // offset within the window where writes are anchored
     Iterator cursor; // this thread's staggered start, assigned on the first pass (see ReadDispersed_StdAtomic)
     bool first_pass = true;
-    for (auto _ : state) {
+    for (auto _ : WallTimed(state, records)) {
         if (first_pass) {
             cursor = start_positions[state.thread_index()];
             first_pass = false;
@@ -674,6 +745,7 @@ BENCHMARK_TEMPLATE_DEFINE_F(DispersedListFixture, ReadDispersed_HazardPtr, Parla
         cursor = (it == list->end()) ? list->begin() : it; // wrap at the tail, otherwise resume here next pass
     }
     state.SetItemsProcessed(state.iterations());
+    report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
 }
 
 // ReadDispersed for intr_shared_ptr_hp (see the IntrPtrHP rows above for why).
@@ -691,7 +763,7 @@ BENCHMARK_TEMPLATE_DEFINE_F(DispersedListFixture, ReadDispersed_IntrPtrHP, IntrP
     constexpr int mid = window / 2; // offset within the window where writes are anchored
     Iterator cursor; // this thread's staggered start, assigned on the first pass (see ReadDispersed_StdAtomic)
     bool first_pass = true;
-    for (auto _ : state) {
+    for (auto _ : WallTimed(state, records)) {
         if (first_pass) {
             cursor = start_positions[state.thread_index()];
             first_pass = false;
@@ -716,16 +788,20 @@ BENCHMARK_TEMPLATE_DEFINE_F(DispersedListFixture, ReadDispersed_IntrPtrHP, IntrP
         cursor = (it == list->end()) ? list->begin() : it; // wrap at the tail, otherwise resume here next pass
     }
     state.SetItemsProcessed(state.iterations());
+    report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
 }
 
 static const int num_cpu = sysconf(_SC_NPROCESSORS_CONF);
 
 // ThreadRange(1, num_cpu) doubles the thread count at each step up to the
-// core count. UseRealTime() reports wall-clock time per iteration instead of
-// accumulated per-thread CPU time; CPU time would flatter implementations
-// that block instead of spinning (the intr spinlock naps in nanosleep, the
-// libstdc++ std::atomic<shared_ptr> waits on a mutex), while wall time is the
-// throughput actually observed.
+// core count. UseRealTime() times each thread's loop by the real-time clock
+// instead of the thread's CPU clock; CPU time would flatter an implementation
+// that blocks instead of spinning (the intr spinlock naps in nanosleep); a
+// spinning wait (libstdc++'s std::atomic<shared_ptr> spins with a pause on a
+// lock bit in its control-block pointer) is counted by the CPU clock too. The
+// Time column and items_per_second are then over the MEAN of the threads' real
+// loop times; the throughput of the whole run, over the wall-clock span, is
+// wall_items_per_second (see the counters under "Pointer policies" above).
 #define REGISTER_BMS(name) \
     BENCHMARK_REGISTER_F(ListFixture, ReadHeavy_##name)->ThreadRange(1, num_cpu)->UseRealTime(); \
     BENCHMARK_REGISTER_F(ListFixture, WriteHeavy_##name)->ThreadRange(1, num_cpu)->UseRealTime(); \

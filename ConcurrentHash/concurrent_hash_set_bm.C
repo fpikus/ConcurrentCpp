@@ -31,6 +31,7 @@
 #include <shared_mutex>
 #include <unordered_set>
 #include "concurrent_hash_set.h"
+#include "gb_wall_clock.h"      // WallRecords, WallTimed, report_wall() (../Spinlock)
 
 /*
  * ConcurrentResizableHashSet Benchmarks
@@ -90,6 +91,26 @@
  * trajectory is identical across thread counts and across containers. Scale
  * kNewIters / kOldIters to taste; keep kKeyStride >= kNewIters and
  * (max_threads * kKeyStride + kNewBase) within int range.
+ *
+ * Every registration measures real time (->UseRealTime(); the row names end
+ * in /real_time/threads:N), so the rates are over real time: the default CPU
+ * time leaves out the time a thread spends blocked -- in the baseline's
+ * std::shared_mutex, in the back-off sleeps of the arena's SpinLock -- which
+ * is part of what each container costs. Every row reports two rates and a
+ * fairness measure (../Spinlock/gb_wall_clock.h defines them and does the
+ * stamping):
+ *   items_per_second      -- Google Benchmark's own: the operations of all
+ *                            threads over the MEAN of the threads' loop times;
+ *   wall_items_per_second -- the same total over the wall-clock span of the
+ *                            run, from the end of the earliest thread's first
+ *                            operation to the end of the latest thread's last;
+ *   finish_spread         -- (latest finish - earliest finish)/span, 0 when
+ *                            all threads finish together.
+ * With fixed iteration counts every thread runs the same number of operations,
+ * so a thread that gets through them faster waits for the others at the end
+ * of the loop, the mean loop time is shorter than the run, and
+ * items_per_second overstates the throughput by more the less evenly the
+ * threads progress; the wall rate is the throughput the run delivered.
  */
 
 static const int num_cpu = sysconf(_SC_NPROCESSORS_CONF);
@@ -173,7 +194,7 @@ using LockedSet     = LockedHashSet<int, std::hash<int>>;
 //
 // CAUTION: Google Benchmark runs SetUp() per thread with NO implicit barrier
 // between SetUp() and the start of the benchmark body. The only implicit
-// barrier is the `for (auto _ : state)` loop itself. Therefore: thread 0
+// barrier is the benchmark loop itself. Therefore: thread 0
 // creates (and, for MostlyOld, prefills) the container in its SetUp(), and no
 // thread dereferences `set` anywhere except INSIDE the loop (or after it, once
 // the loop's end barrier has been crossed).
@@ -250,6 +271,17 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
 
 // ---------------------------------------------------------------------------
 // Benchmark bodies (as macros, so each container gets an identical body).
+//
+// Each body keeps its own wall-clock records, a function-local static (one per
+// instantiation), rather than one per fixture: one placement then serves all
+// four fixture types (MostlyNewFixture, MostlyNewPresizedFixture,
+// MostlyOldFixture, ChurnFixture). The calls follow
+// gb_wall_clock.h's contract: allocate() before the loop and, after it,
+// report_wall() then release(), each called on every thread and doing its work
+// on thread 0 alone; state.iterations() is read only after the loop, and the
+// per-thread SkipWithError() is called after the loop, never inside it. No
+// object with a destructor is live across the loop: its cleanup region can
+// change the loop's code.
 // ---------------------------------------------------------------------------
 
 /*
@@ -261,10 +293,12 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
 #define DEFINE_MOSTLY_NEW_ON(FIXTURE, NAME, SET_TYPE)                         \
     BENCHMARK_TEMPLATE_DEFINE_F(FIXTURE, NAME, SET_TYPE)                      \
     (benchmark::State& state) {                                               \
+        static constinit WallRecords records;                                 \
         const int base = state.thread_index() * kKeyStride;                   \
         int next = 0;                                                         \
         int64_t ok = 0;                                                       \
-        for (auto _ : state) {                                                \
+        records.allocate(state);                                              \
+        for (auto _ : WallTimed(state, records)) {                            \
             ok += set->insert(mix(base + next++));                            \
         }                                                                     \
         if (ok != state.iterations()) {                                       \
@@ -272,6 +306,8 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
                                 "(resize return-value regression)");          \
         }                                                                     \
         state.SetItemsProcessed(state.iterations());                          \
+        report_wall(state, records,                                           \
+                    double(state.iterations()) * state.threads());            \
         /* Arena nodes per inserted key, read by thread 0 once every thread */ \
         /* has left the loop (its end is a barrier): 1.0 means no waste;    */ \
         /* above it are split copies and subchains abandoned by splitters   */ \
@@ -282,9 +318,10 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
                 double(set->get_internal_node_count()) /                      \
                 (double(state.iterations()) * state.threads()));              \
         }                                                                     \
+        records.release(state);                                               \
     }                                                                         \
     BENCHMARK_REGISTER_F(FIXTURE, NAME)                                       \
-        ->ThreadRange(1, num_cpu)->Iterations(kNewIters);
+        ->ThreadRange(1, num_cpu)->Iterations(kNewIters)->UseRealTime();
 
 /*
  * Lookup_MostlyOld: 99% contains() at a fixed ~50% hit rate, 1% insertion of
@@ -296,13 +333,15 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
 #define DEFINE_MOSTLY_OLD_ON(FIXTURE, NAME, SET_TYPE)                         \
     BENCHMARK_TEMPLATE_DEFINE_F(FIXTURE, NAME, SET_TYPE)                      \
     (benchmark::State& state) {                                               \
+        static constinit WallRecords records;                                 \
         XorShift32 rng(0x1234567u + 0x9e3779b9u * state.thread_index());      \
         const int base = kNewBase + state.thread_index() * kKeyStride;        \
         int next = 0;                                                         \
         int op = 0;                                                           \
         int64_t ok = 0, tries = 0;                                            \
         bool hit = false;                                                     \
-        for (auto _ : state) {                                                \
+        records.allocate(state);                                              \
+        for (auto _ : WallTimed(state, records)) {                            \
             if (++op == kInsertEvery) {                                       \
                 op = 0;                                                       \
                 ++tries;                                                      \
@@ -317,11 +356,14 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
                                 "(resize return-value regression)");          \
         }                                                                     \
         state.SetItemsProcessed(state.iterations());                          \
+        report_wall(state, records,                                           \
+                    double(state.iterations()) * state.threads());            \
         state.counters["inserts"] =                                           \
             benchmark::Counter((double)tries, benchmark::Counter::kDefaults); \
+        records.release(state);                                               \
     }                                                                         \
     BENCHMARK_REGISTER_F(FIXTURE, NAME)                                       \
-        ->ThreadRange(1, num_cpu)->Iterations(kOldIters);
+        ->ThreadRange(1, num_cpu)->Iterations(kOldIters)->UseRealTime();
 
 // ---------------------------------------------------------------------------
 // Reclamation benchmarks.

@@ -42,6 +42,27 @@
 //               0 first replaces both pointees (outside the timed loop), so
 //               every run starts from fresh objects.
 //
+// Every row reports, next to the Time column, two rates of one item per
+// iteration and a fairness measure (../Spinlock/gb_wall_clock.h defines them
+// and does the stamping):
+//   items_per_second       Google Benchmark's rate: the iterations summed over
+//                          the threads, divided by the MEAN per-thread loop
+//                          time;
+//   wall_items_per_second  the same total over the wall-clock span of the run,
+//                          from the end of the earliest thread's first
+//                          iteration to the end of the latest thread's last;
+//   finish_spread          (latest finish - earliest finish)/span, from 0 when
+//                          all threads finish together to near 1 when some
+//                          thread finishes right at the start.
+// Time is the mean per-thread time per iteration (the threads' summed real
+// loop times over their summed iterations), not the wall-clock time per
+// operation of the run. Every thread runs the same number of iterations, so
+// under a pointer that lets some threads finish early, those threads wait at
+// the end barrier, the mean loop time is shorter than the run, and both Time
+// and items_per_second flatter that pointer; wall_items_per_second is what
+// the run delivered, and finish_spread says how much of the run had fewer
+// threads left.
+//
 // No row measures reclamation: in the steady state of every row no count
 // reaches 0. intr_shared_ptr_hp's deferred destruction (an mm_hp scan of
 // ~1000 objects inside some thread's retire) is measured by the SharedPtr
@@ -73,6 +94,8 @@
 #include <type_traits>
 
 #include "benchmark/benchmark.h"
+
+#include "gb_wall_clock.h"          // WallRecords, WallTimed, report_wall() (../Spinlock)
 
 #define ARGS(N) \
   ->Threads(N) \
@@ -185,42 +208,67 @@ typename P::atomic& shared_q1() {
   return q1;
 }
 
+// The wall-clock records of every body follow gb_wall_clock.h's contract: one
+// function-local static per instantiation (per operation and pointer),
+// allocate() before the loop and, after it, report_wall() then release(), each
+// called on every thread and doing its work on thread 0 alone. The calls are
+// explicit, not a scope-bound owner, because no local with a destructor may be
+// live across the timed loop: its cleanup region can change the loop's code.
+
 // BM_deref: load(), read through the handle, release (see the file comment).
 template <typename P>
 void BM_deref(benchmark::State& state) {
+  static constinit WallRecords records;
   typename P::atomic& p1 = shared_p1<P>();
   volatile A x;
-  while (state.KeepRunning()) {
+  records.allocate(state);
+  for (auto _ : WallTimed(state, records)) {
     benchmark::DoNotOptimize(x = *p1.load());
   }
-}
+  state.SetItemsProcessed(state.iterations());
+  report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
+  records.release(state);
+} // BM_deref()
 
 // BM_copy: an atomic constructed from load() and destroyed (see the file
 // comment). volatile keeps the otherwise unused atomic from being elided.
 template <typename P>
 void BM_copy(benchmark::State& state) {
+  static constinit WallRecords records;
   typename P::atomic& p1 = shared_p1<P>();
-  while (state.KeepRunning()) {
+  records.allocate(state);
+  for (auto _ : WallTimed(state, records)) {
     volatile typename P::atomic q(p1.load());
   }
-}
+  state.SetItemsProcessed(state.iterations());
+  report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
+  records.release(state);
+} // BM_copy()
 
 // BM_assign: q1.store(p1.load()) (see the file comment).
 template <typename P>
 void BM_assign(benchmark::State& state) {
+  static constinit WallRecords records;
   typename P::atomic& p1 = shared_p1<P>();
   typename P::atomic& q1 = shared_q1<P>();
-  while (state.KeepRunning()) {
+  records.allocate(state);
+  for (auto _ : WallTimed(state, records)) {
     q1.store(p1.load());
   }
-}
+  state.SetItemsProcessed(state.iterations());
+  report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
+  records.release(state);
+} // BM_assign()
 
 // BM_xassign: cross-assignment between p1 and q1, by the parity of the thread
 // index (see the file comment). Thread 0 replaces both pointees before its
-// loop: Google Benchmark starts the timed loops of all threads together at
-// the first KeepRunning(), so the replacement is not timed.
+// loop: every thread's timer starts at the loop's start barrier, which thread
+// 0 reaches only after the replacement, so the replacement is not timed. Both
+// loops are wall-timed over the same records: each thread runs exactly one of
+// them, and that one stamps the thread's record.
 template <typename P>
 void BM_xassign(benchmark::State& state) {
+  static constinit WallRecords records;
   typename P::atomic& p1 = shared_p1<P>();
   typename P::atomic& q1 = shared_q1<P>();
   using shared_ptr_type = typename P::atomic::shared_ptr_type;
@@ -228,15 +276,19 @@ void BM_xassign(benchmark::State& state) {
       p1.store(shared_ptr_type(new typename P::pointee(42)));
       q1.store(shared_ptr_type(new typename P::pointee(7)));
   }
+  records.allocate(state);
   if (state.thread_index() & 1) {
-    while (state.KeepRunning()) {
+    for (auto _ : WallTimed(state, records)) {
       q1.store(p1.load());
     }
   } else {
-    while (state.KeepRunning()) {
+    for (auto _ : WallTimed(state, records)) {
       p1.store(q1.load());
     }
   }
+  state.SetItemsProcessed(state.iterations());
+  report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
+  records.release(state);
 } // BM_xassign()
 
 // Registration: for each thread count, each operation for both pointers in

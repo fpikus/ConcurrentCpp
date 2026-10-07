@@ -50,11 +50,12 @@
 //      erase() that made it a tombstone, the split that superseded it, or a later
 //      insert() or erase() whose walk passes it -- and retired. contains()'s own
 //      walk never writes; a contains() that reaches an UNINITIALIZED bucket and
-//      wins its split runs that split's cleanup like any other splitter. Where a dead node ends up is asserted only for operations that
-//      ran UNCONTENDED, as POSTCONDITIONS of those operations: an uncontended
-//      erase() leaves its own node unreachable unless the node's predecessor is
-//      tagged and not dead; an uncontended split leaves no superseded parent copy
-//      and no tombstone reachable in the parent behind an untagged predecessor;
+//      wins its split runs that split's cleanup like any other splitter. Where a
+//      dead node ends up is asserted only for operations that ran UNCONTENDED, as
+//      POSTCONDITIONS of those operations: an uncontended erase() leaves its own
+//      node unreachable unless a tagged, not-dead node lies between it and the
+//      last live word before it; an uncontended split leaves no dead node
+//      reachable in the parent behind an untagged word;
 //      an uncontended insert() or erase() walk leaves no dead run reachable
 //      behind the bucket head or a live predecessor it passed. They are not
 //      guarantees: under contention a dead node may stay in its chain (a

@@ -195,10 +195,11 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 //   head or a live node's link); an insert() or erase() walk leaves no dead
 //   run reachable behind the bucket head or a live node it passed (a run at
 //   the head counts: the head is an untagged word); an erase() leaves its
-//   tombstone unreachable, unless the node before it is tagged and not dead,
-//   which in uncontended use arises only after an earlier split threw
-//   between its freeze and its publish (behind such a node nothing can be
-//   bypassed until its child is published and a later walk passes it).
+//   tombstone unreachable, unless a tagged, not-dead node lies between it
+//   and the last live word before it, which in uncontended use arises only
+//   after an earlier split threw between its freeze and its publish (behind
+//   such a node nothing can be bypassed until its child is published and a
+//   later walk passes it).
 //   Stragglers also arise from a stale view (a walker whose table size does
 //   not yet cover the doubling a node was frozen for cannot decide it), from
 //   an erase() that gave up (two lost attempts, the first of which may have
@@ -207,13 +208,13 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 //   from Hash{} throwing inside an unlinking site. A dead run that no writer
 //   walks past again, in a bucket none of whose new children is accessed,
 //   stays until reclaim(): its lifetime is unbounded only when the table
-//   stops doubling or the bucket's new children are never accessed. Two designs are
-//   deliberately NOT taken here: a contains() that bypasses the dead runs it
-//   passes (it would make every reader a writer), and a standalone
-//   collector call that walks published chains like a writer miss walk
-//   without inserting anything; both would trade read-path cost or an API
-//   call for fewer stragglers, and this class keeps the reader pure and
-//   reclaim() as the only collector of the remainder. A retired node is not
+//   stops doubling or the bucket's new children are never accessed. Two
+//   designs are deliberately NOT taken here: a contains() that bypasses the
+//   dead runs it passes (it would make every reader a writer), and a
+//   standalone collector call that walks published chains like a writer
+//   miss walk without inserting anything; both would trade read-path cost
+//   or an API call for fewer stragglers, and this class keeps the read walk
+//   pure and reclaim() as the only collector of the remainder. A retired node is not
 //   reused before reclaim(): the retired lists only separate "dead and out
 //   of its chain" from "dead and still in it", for reclaim() to drain without
 //   a chain walk (RECLAMATION).
@@ -569,15 +570,17 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 //      argument hold for a bypass of a FROZEN copy (a head bypass also rides
 //      channel 4's release sequence on the head word). It carries two things.
 //      FIRST, the deciding thread's OWN edge: an unlinker decides a FROZEN
-//      node dead only at a table size it ACQUIRED that covers the node's
-//      child (is_dead_now()), so the resizer's release store of that size is
-//      sequenced before the unlinker's release CAS, and a reader that
-//      acquires the CAS's value -- or any later value of that word, since
-//      every later write to a published head or link is a read-modify-write
-//      extending the release sequence -- reloads a size no smaller. The
-//      acquire of the FROZEN link and the acquire of the child head are
-//      redundant for this edge: the unlinker's own table_size_ acquire
-//      carries it. SECOND, EARLIER unlinkers' edges, through release
+//      node dead only at a table size it READ that covers the node's child
+//      (is_dead_now()). That read is sequenced before the unlinker's release
+//      CAS, and a reader that acquires the CAS's value -- or any later value
+//      of that word, since every later write to a published head or link is
+//      a read-modify-write extending the release sequence -- therefore has
+//      the unlinker's read of table_size_ happen-before its own reload, and
+//      by read-read coherence the reload returns that size or a newer one.
+//      No order on the unlinker's table_size_ load is needed for this (its
+//      acquire is channel 2's: it is what lets the unlinker index the new
+//      buckets), and the acquire of the FROZEN link and the acquire of the
+//      child head are redundant for it. SECOND, EARLIER unlinkers' edges, through release
 //      sequences: when an unlinker rewrote a live link (from F to E, say) and
 //      a mark or freeze then tagged that link (a read-modify-write, so the
 //      tagged value is still in the unlinker's release sequence), a walker at
@@ -587,7 +590,15 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 //      tagged link -- the walk's load when the node starts a run, the run
 //      walk's load otherwise. For a MARKED link there is no other route at
 //      all; for a FROZEN link the child head's publisher need not have
-//      acquired the earlier size either. The same acquire of a LIVE pred
+//      acquired the earlier size either. The eraser has a third such route,
+//      the ACQUIRE FAILURE ORDER of its mark CAS: when the mark fails on a
+//      live value that an unlinker wrote (a new successor address), the
+//      retried mark and the self-unlink that follows install that successor
+//      through the pred word, and the failed CAS's read is the eraser's only
+//      acquire of the unlinker's write (the run walk then loads the
+//      successor's own link, which the unlinker did not write); with that
+//      failure order relaxed a reader following the eraser's bypass would
+//      reload the old size. The same acquire of a LIVE pred
 //      word that an earlier unlinker rewrote is what UNREACHABILITY's u_D
 //      clause rests on. Every acquire of the walk and the run walk is
 //      therefore load-bearing, for earlier unlinkers' edges, whatever the
@@ -618,10 +629,10 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 //   is used for SAFETY: the reload must return a larger size, or the miss
 //   would be final and wrong (half (ii)(b) of the miss argument, STALE
 //   GEOMETRY). The chain is a happens-before chain on two different atomics
-//   (the bypassed word, then table_size_), closed by write-read coherence:
-//   the unlinker's acquire of the larger size (or, through a release
-//   sequence, an earlier unlinker's) happens-before the reader's reload, so
-//   the reload cannot return an older value. A miss that is confirmed by an
+//   (the bypassed word, then table_size_), closed by read-read coherence:
+//   the unlinker's READ of the larger size (or, through a release sequence,
+//   an earlier unlinker's) happens-before the reader's reload, so the reload
+//   cannot return an older value, whatever the order of that read. A miss that is confirmed by an
 //   unchanged table_size_ (contains(), erase()) linearizes at the first
 //   table_size_ load; see contains() and the two halves under STALE
 //   GEOMETRY.
@@ -829,9 +840,10 @@ private:
     //     inserting and an erasing thread whose numbers collide modulo the
     //     shard count. The retire counters are bumped right before the push
     //     CAS, by the thread about to own the line; the split counters and
-    //     the cleanup-failure counter are bumped by a thread that may not own
-    //     it, at sites that run far less often than pops. None of them is on
-    //     the free line.
+    //     the four loss counters are bumped by a thread that may not own it
+    //     (a loss is a CAS that failed, with no push to follow), at sites
+    //     that run far less often than pops. None of them is on the free
+    //     line.
     struct Shard {
         // Nodes are appended block-by-block and never destructed until the set
         // is destroyed; a slot's address is stable for the life of the set.
@@ -871,7 +883,10 @@ private:
         // when read at a quiescent point, and a snapshot otherwise); summed
         // over the shards by get_internal_counters(). Always compiled: the
         // benchmark reads them in its NDEBUG build, and their cost is one
-        // relaxed increment on a line the thread already owns.
+        // relaxed increment per counted event, on a line the thread already
+        // owns for the retire counters (bumped just before the push CAS) and
+        // on a line it may not own for the split and loss counters (see the
+        // layout comment above).
         std::atomic<size_t> retire_runs{0};             // push_retired() calls: one per unlinked run
         std::atomic<size_t> retire_nodes{0};            // nodes those runs held in total
         // Lost one-shot unlink CASes, by site and by kind. A loss is a PEER
@@ -1133,7 +1148,10 @@ private:
     // unlink, after this thread's acquire of the table size at which it
     // decided the run dead, and after every earlier unlink whose edge this
     // thread's walk acquired) and acquire on failure (the pinned order; no
-    // site uses the failed value, so it carries nothing today). The WINNER retires EXACTLY
+    // site dereferences or follows the failed value -- the loser only
+    // compares its address for the loss counters, which needs no
+    // happens-before -- so the failure acquire carries nothing today). The
+    // WINNER retires EXACTLY
     // the recorded run first..last and nothing else: deadness is never
     // re-evaluated after the CAS, because a FROZEN node's child can publish
     // between the run walk and the CAS, which would make S dead and a
@@ -1798,8 +1816,11 @@ public:
                 // walk, its freezer had sealed this head above our level first,
                 // and the seal is a write to the very word our CAS expects
                 // unchanged, so the CAS fails and the attempt restarts from the
-                // table_size_ load (the reload returns the larger size by channel
-                // 4, since the retry acquires the sealed head).
+                // table_size_ load. The failed CAS carries no ordering (its
+                // failure order is relaxed), so that first reload may still
+                // return the old size; the retry then acquires the sealed head,
+                // its geometry check sends it round again, and the second reload
+                // returns the larger size (channel 4).
                 // The walk is a WRITER WALK (step_over()): every dead run it
                 // passes gets one unlink attempt through the last live word
                 // before it, never retried (H5': the run walk hashes each FROZEN
@@ -1920,7 +1941,8 @@ public:
     // returns normally (no other operation on the set runs meanwhile; see
     // WHY COPY in the class overview): no dead run stays reachable behind the
     // bucket head or a live node the walk passed, and the tombstone is
-    // unreachable unless the node before it is tagged and not dead.
+    // unreachable unless a tagged, not-dead node lies between it and the
+    // last live word before it.
     //
     // The decision is the marking CAS, and the geometry is validated by that same
     // CAS: its expected value is the LIVE link (no MARK, no FROZEN). A split that
@@ -1983,11 +2005,17 @@ public:
                     // check_curr as loaded BEFORE the comparison, never a reload;
                     // a retry's expected value is the failure value. Success is
                     // release: operations that acquire this link afterwards see
-                    // the key as deleted. Failure is acquire: if the reason is
-                    // FROZEN we go on to reload table_size_, and the acquire orders
-                    // that reload after the freezer's view of the table (see "Retry
-                    // bound" above); if the reason is an unlink, the failure value
-                    // is the new expected value and the loop goes round.
+                    // the key as deleted. Failure is acquire, load-bearing on both
+                    // failure paths: if the reason is FROZEN we go on to reload
+                    // table_size_, and the acquire orders that reload after the
+                    // freezer's view of the table (see "Retry bound" above); if the
+                    // reason is an unlink (a live value with a new successor
+                    // address), the failure value is the new expected value, the
+                    // loop goes round, and the self-unlink after the retried mark
+                    // starts its run at that successor and installs it through the
+                    // pred word -- this failed CAS's read is the eraser's only
+                    // acquire of the unlinker's write, and a reader that follows
+                    // the eraser's bypass needs the unlinker's edge (channel 5).
                     while (!(check_curr & (MARK_BIT | FROZEN_BIT))) {   // mark loop: retried while the failure value is live
                         if (node->link.compare_exchange_strong(check_curr, check_curr | MARK_BIT, std::memory_order_release, std::memory_order_acquire)) {
                             // This CAS is THE deletion of the key. H5: the self-unlink

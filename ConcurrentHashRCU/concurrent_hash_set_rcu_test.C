@@ -2757,8 +2757,10 @@ TEST(ConcurrentHashSetRcuTest, ContainsReloadsAfterMidChainUnlink) {
 // 65 becomes 33 -> 1) and retires it. The split's freeze CAS then fails with the
 // live value 33 -> 1; retried on it, it freezes 33, the split copies 33, publishes
 // bucket 33, and its cleanup unlinks the FROZEN parent copy.
-// Afterwards one node per key is reachable (1 in bucket 1, 33 in bucket 33), none
-// dead, and two nodes are retired.
+// Afterwards one node per key is reachable (1 in bucket 1, 2 in bucket 2, 33 in
+// bucket 33), none dead, and two nodes are retired (65, and 33's parent copy).
+// Under the fallthrough, 33's unfrozen parent node stays in bucket 1 as a fourth,
+// untagged dead node.
 TEST(ConcurrentHashSetRcuTest, SplitRetriesFreezeAfterLiveLinkChange) {
     using Set = ConcurrentResizableHashSetRCU<ProbeKey, true, ProbeKeyHash>;
     const int MOVER = 33, VICTIM = 65, STAYER = 1;
@@ -2780,7 +2782,7 @@ TEST(ConcurrentHashSetRcuTest, SplitRetriesFreezeAfterLiveLinkChange) {
         ASSERT_EQ(retired_in_window, 1u) << "test precondition: erase(65) did not unlink its node through 33's link";
         EXPECT_TRUE(found);
         const Set::InternalAccounting acc = expect_consistent(set, "after the split");
-        EXPECT_EQ(acc.reachable, 2u) << "a key has two reachable nodes: the split copied a node it did not freeze";
+        EXPECT_EQ(acc.reachable, 3u) << "a key has two reachable nodes: the split copied a node it did not freeze";
         EXPECT_EQ(acc.reachable_dead, 0u);
         EXPECT_EQ(acc.retired, 2u);
         EXPECT_TRUE(set.contains(MOVER));

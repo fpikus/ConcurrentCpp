@@ -22,6 +22,7 @@
 // SOFTWARE.
 //
 #include <benchmark/benchmark.h>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <unistd.h>
@@ -470,6 +471,17 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
 // value equals its Control's minus the free-list share is a row that popped.
 // ---------------------------------------------------------------------------
 using ConcurrentSetDel = ConcurrentResizableHashSetRCU<int, true, std::hash<int>>;
+
+// The node layout these measurements were made for, checked at compile time so
+// that it cannot change unnoticed: comparisons of this container with the
+// original ConcurrentResizableHashSet rest on the original's layout (the key,
+// then the link word) plus this container's retire_link, LAST. For int keys:
+// 24 bytes, the link at offset 8, retire_link at offset 16 (the original's node
+// is 16 bytes). Both instantiations share the layout.
+static_assert(sizeof(ConcurrentSetDel::Node) == 24, "the node layout changed: 24 bytes for int keys expected");
+static_assert(offsetof(ConcurrentSetDel::Node, link) == 8, "the node layout changed: the link word at offset 8 expected");
+static_assert(offsetof(ConcurrentSetDel::Node, retire_link) == 16, "the node layout changed: retire_link last, at offset 16, expected");
+static_assert(sizeof(ConcurrentSet::Node) == sizeof(ConcurrentSetDel::Node), "the two instantiations' nodes differ in size");
 
 // What the fixture does to the set after the prefill: nothing (Control), erase
 // every victim and reclaim() (Reclaimed), or erase every victim and nothing more

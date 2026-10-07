@@ -27,6 +27,7 @@
 #include <unistd.h>
 #include <atomic>
 #include <cstdint>
+#include <string>
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_set>
@@ -217,8 +218,9 @@ template <typename SetType> SetType* MostlyNewFixture<SetType>::set = nullptr;
 // 2*kPresizedBuckets nodes (16.7M: equal to 64 threads' worth of kNewIters). It
 // separates the allocator's own cost from the doubling and split path: with the
 // table geometry fixed, the arena (its lock or its shards) is the only shared
-// state on the insert path, and this is the fixture the README's allocator
-// numbers come from. Every insert is still a random bucket-head miss.
+// state on the insert path; the allocator numbers ../ConcurrentHash/README.md
+// quotes for the original container come from this fixture there. Every insert
+// is still a random bucket-head miss.
 static constexpr size_t kPresizedBuckets = size_t(1) << 23;
 template <typename SetType>
 class MostlyNewPresizedFixture : public benchmark::Fixture {
@@ -369,13 +371,16 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
 // Reclamation benchmarks.
 //
 // The three workloads above are re-run on the AllowDelete == true instantiation
-// in three states of the set, and every cell has a purpose:
+// in several states of the set, and every cell has a purpose:
 //
 //   *_Del            the workload above, on an EMPTY AllowDelete == true set (the
-//                    MostlyOld fixture prefills as before). Against the
-//                    AllowDelete == false rows this is the price of compiling
-//                    erase() in: the FROZEN handling in the split, the mark
-//                    tests on the read paths. Nothing is erased.
+//                    MostlyOld fixture prefills as before). Nothing is erased.
+//                    In this container the two instantiations run the same
+//                    insert, lookup and split code (the split freezes the nodes
+//                    it moves for both values, and with AllowDelete == false the
+//                    MARK tests test a bit that is never set), so against the
+//                    AllowDelete == false rows this checks that compiling
+//                    erase() in costs nothing on those paths.
 //   *_Del_Control    the same workload on a set PREFILLED (untimed, by thread 0)
 //                    with a population of live keys and nothing else: no erase,
 //                    no reclaim(), every free list empty, so every allocation
@@ -392,19 +397,38 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
 //                    slot of the deque blocks thread 0 filled. The timed
 //                    allocations POP from the calling thread's shard's list
 //                    until it is empty and then append -- the mixed regime.
+//   *_Del_Erased     (pre-sized insert and lookup only) the same churn without
+//                    the reclaim(): the victims are erased and the timed
+//                    workload starts right after. It is the only state of the
+//                    set that erases built: in this container each erase()
+//                    unlinked its own node at once and retired it, so the
+//                    timed walks find chains of live nodes only, where a
+//                    container that leaves tombstones in place until reclaim()
+//                    walks past every one of them. The free lists are empty, as
+//                    in the Control. Why measure: this is what eager unlinking
+//                    buys a reader and a writer; Erase_Presized_Del below
+//                    measures what it costs the eraser.
 //
 // Control vs Del separates "a resident population" from "AllowDelete"; Reclaimed
 // vs Control is the free lists in use: the pop path in alloc_node() (one CAS on
 // the shard's free head instead of the deque's lock and cursor) and the locality
-// of the popped slots. reclaim() deals the freed nodes round-robin over the
-// shards in the order it finds them (the limbo lists first, then the dead nodes
-// of its walk over the buckets), and each free list is LIFO, so a shard pops
-// them in reverse dealing order. Bucket order bears no relation to slot order
-// (every key goes through mix()), so consecutive pops land on scattered slots --
-// about one new cache line per popped node, where an append fills a line with
-// four consecutive nodes. Why measure: the free lists are the point of
-// reclaim(), and these are the only cells that measure an insert that reuses a
-// slot, or a lookup over chains that reclaim() relinked.
+// of the popped slots; Erased vs Control is the dead nodes the erases left (or,
+// here, did not leave) in the chains. reclaim() deals the freed nodes
+// round-robin over the shards in the order it finds them -- the limbo lists
+// first, then the retired lists, then the dead nodes its walk over the buckets
+// unlinks -- and each free list is LIFO, so a shard pops them in reverse dealing
+// order. In this container the prefill's erases unlink and retire every victim
+// themselves, onto thread 0's retired list, which is LIFO too: reclaim() deals
+// the victims in reverse erase order, so each shard pops its share in erase
+// order, i.e. in arena order, every 2*shards-th slot in the pre-sized and lookup
+// fixtures (survivors and victims alternate in the arena; in the growth fixture
+// the split copies interleave with them, and the superseded copies are retired
+// in split order). Popped slots are therefore at least 2*shards*sizeof(Node)
+// bytes apart, a new cache line per popped node at any shard count above one,
+// where an append fills a line with two or three consecutive 24-byte nodes. Why
+// measure: the free lists are the point of reclaim(), and these are the only
+// cells that measure an insert that reuses a slot, or a lookup over chains that
+// reclaim() relinked.
 //
 // The pre-sized and lookup cells share their bucket count between Control and
 // Reclaimed (no doubling in either prefill), so there the free lists are the
@@ -446,10 +470,11 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
 // ---------------------------------------------------------------------------
 using ConcurrentSetDel = ConcurrentResizableHashSetRCU<int, true, std::hash<int>>;
 
-// What the fixture does to the set after the prefill: nothing (Control), or
-// erase every victim and reclaim() (Reclaimed). Every Reclaimed configuration
-// has a Control with the same live keys and the same buckets.
-enum class Churn { Control, Reclaimed };
+// What the fixture does to the set after the prefill: nothing (Control), erase
+// every victim and reclaim() (Reclaimed), or erase every victim and nothing more
+// (Erased). Every Reclaimed and Erased configuration has a Control with the same
+// live keys and the same buckets.
+enum class Churn { Control, Reclaimed, Erased };
 
 // The insert fixtures' churn population: kChurnPairs survivors, and as many
 // victims for Reclaimed. Both live in the NEGATIVE keys, disjoint from every
@@ -498,8 +523,10 @@ using NewControl        = InsertChurn<1024, Churn::Control>;
 using NewReclaimed      = InsertChurn<1024, Churn::Reclaimed>;
 using PresizedControl   = InsertChurn<kPresizedBuckets, Churn::Control>;
 using PresizedReclaimed = InsertChurn<kPresizedBuckets, Churn::Reclaimed>;
+using PresizedErased    = InsertChurn<kPresizedBuckets, Churn::Erased>;
 using OldControl        = LookupChurn<Churn::Control>;
 using OldReclaimed      = LookupChurn<Churn::Reclaimed>;
+using OldErased         = LookupChurn<Churn::Erased>;
 
 // The churn fixture: builds the set described by Cfg (above) in thread 0's
 // SetUp(), untimed, under the same no-barrier CAUTION as the fixtures above.
@@ -519,12 +546,12 @@ public:
         long failed = 0;
         for (int k = 0; k < Cfg::pairs; ++k) {
             failed += !set->insert(mix(Cfg::survivor(k)));
-            if constexpr (Cfg::churn == Churn::Reclaimed) failed += !set->insert(mix(Cfg::victim(k)));
+            if constexpr (Cfg::churn != Churn::Control) failed += !set->insert(mix(Cfg::victim(k)));
         } // prefill, survivors and victims alternating
-        if constexpr (Cfg::churn == Churn::Reclaimed) {
+        if constexpr (Cfg::churn != Churn::Control) {
             for (int k = 0; k < Cfg::pairs; ++k) failed += !set->erase(mix(Cfg::victim(k)));
-            set->reclaim();
-        } // erase every victim, then reclaim
+        } // erase every victim
+        if constexpr (Cfg::churn == Churn::Reclaimed) set->reclaim();
         if (failed != 0) {
             fprintf(stderr, "ChurnFixture: %ld prep operations failed in %s\n", failed, state.name().c_str());
             abort();
@@ -537,10 +564,13 @@ public:
 private:
     // Prints the arena state the timed region starts from, once per
     // configuration and process (it is the same for every repetition and
-    // thread count: the prep is deterministic): slots ever appended, live
-    // keys, free-list and limbo totals, the sweep's consistency verdict, the
-    // shard count and the free nodes a timed thread can pop before its shard's
-    // list is empty. To stdout, so the line lands in the benchmark output
+    // thread count: the prep is deterministic): slots ever appended, nodes
+    // reachable from the buckets and how many of those are dead (erased or
+    // superseded nodes still in their chains: what an erase or a split left
+    // behind), free-list, limbo and retired-list totals (retired: dead nodes the
+    // prep's operations unlinked, which only a reclaim() recycles), the sweep's
+    // consistency verdict, the shard count and the free nodes a timed thread
+    // can pop before its shard's list is empty. To stdout, so the line lands in the benchmark output
     // before the first row that uses the configuration (Google Benchmark
     // writes its console report to stdout too). The accounting sweep sorts
     // every slot; a few hundred milliseconds, once, untimed.
@@ -550,12 +580,63 @@ private:
         reported = true;
         const typename SetType::InternalAccounting a = set->get_internal_accounting();
         const size_t shards = set->get_internal_arena_shards();
-        printf("# prep %s: slots=%zu reachable=%zu free=%zu limbo=%zu consistent=%d shards=%zu free_per_shard=%zu\n",
-               state.name().c_str(), a.slots, a.reachable, a.free_nodes, a.limbo, int(a.consistent), shards, a.free_nodes/shards);
+        printf("# prep %s: slots=%zu reachable=%zu reachable_dead=%zu free=%zu limbo=%zu retired=%zu consistent=%d shards=%zu free_per_shard=%zu\n",
+               state.name().c_str(), a.slots, a.reachable, a.reachable_dead, a.free_nodes, a.limbo, a.retired, int(a.consistent),
+               shards, a.free_nodes/shards);
         fflush(stdout);
     } // ChurnFixture::report_prep()
 }; // class ChurnFixture
 template <typename Cfg> typename Cfg::Set* ChurnFixture<Cfg>::set = nullptr;
+
+// ---------------------------------------------------------------------------
+// Erase_Presized_Del: timed erase() of present keys.
+//
+// Why measure: in this container an uncontended erase() marks its node (one
+// CAS), unlinks it (one CAS on its predecessor's word) and retires it (one
+// release CAS on the retired head of the erasing thread's shard): three
+// read-modify-writes where an erase that only marks does one, plus a mark
+// retried when a concurrent unlink through the node's link changes it, and a
+// second walk from the bucket head when the first unlink attempt loses. The
+// Erased churn cells measure what that buys the later walks; this row measures
+// what it costs the eraser.
+// Shape: thread 0's SetUp() prefills kErasePrefill mix()ed keys, untimed, into
+// kPresizedBuckets buckets (no doubling, no split: half a node per bucket);
+// thread t erases mix(t*n + i) for i < n, n = kErasePrefill/num_cpu, so the
+// threads' keys are disjoint and all present, and every erase() must return
+// true (checked per thread, after the loop). The prefill is single-threaded, so
+// every node lives in thread 0's shard; the retire push goes to the ERASING
+// thread's shard, not to the node's, so the timed erases do not all push onto one
+// retired head.
+// Counter, read by thread 0 after the loop (every thread has left it, so the
+// container's test-only counters are exact there), untimed:
+//   retired_per_erase -- nodes retired during the timed loop per timed erase: 1
+//                        when every erase took its own node out of its chain,
+//                        less by the share left in place under contention (for
+//                        a later writer or reclaim() to collect).
+// ---------------------------------------------------------------------------
+static constexpr int kErasePrefill = 1 << 22;
+template <typename SetType>
+class EraseFixture : public benchmark::Fixture {
+public:
+    static SetType* set;
+    static size_t retired_before;   // the container's retired-node counter after the prefill
+    void SetUp(const ::benchmark::State& state) override {
+        if (state.thread_index() != 0) return;
+        set = new SetType(kPresizedBuckets, arena_shards_from_env());
+        long failed = 0;
+        for (int k = 0; k < kErasePrefill; ++k) failed += !set->insert(mix(k));
+        if (failed != 0) {
+            fprintf(stderr, "EraseFixture: %ld prefill inserts failed in %s\n", failed, state.name().c_str());
+            abort();
+        } // if the prefill did not build the population it describes
+        retired_before = set->get_internal_counters().retire_nodes;
+    } // EraseFixture::SetUp()
+    void TearDown(const ::benchmark::State& state) override {
+        if (state.thread_index() == 0) { delete set; set = nullptr; }
+    }
+}; // class EraseFixture
+template <typename SetType> SetType* EraseFixture<SetType>::set = nullptr;
+template <typename SetType> size_t EraseFixture<SetType>::retired_before = 0;
 
 // ---------------------------------------------------------------------------
 // Registrations: identical workloads, two containers.
@@ -579,9 +660,52 @@ DEFINE_MOSTLY_NEW_ON(ChurnFixture, Insert_MostlyNew_Del_Reclaimed, NewReclaimed)
 DEFINE_MOSTLY_NEW_ON(MostlyNewPresizedFixture, Insert_MostlyNew_Presized_Del, ConcurrentSetDel)
 DEFINE_MOSTLY_NEW_ON(ChurnFixture, Insert_MostlyNew_Presized_Del_Control,   PresizedControl)
 DEFINE_MOSTLY_NEW_ON(ChurnFixture, Insert_MostlyNew_Presized_Del_Reclaimed, PresizedReclaimed)
+DEFINE_MOSTLY_NEW_ON(ChurnFixture, Insert_MostlyNew_Presized_Del_Erased,    PresizedErased)
 
 DEFINE_MOSTLY_OLD(Lookup_MostlyOld_Del, ConcurrentSetDel)
 DEFINE_MOSTLY_OLD_ON(ChurnFixture, Lookup_MostlyOld_Del_Control,   OldControl)
 DEFINE_MOSTLY_OLD_ON(ChurnFixture, Lookup_MostlyOld_Del_Reclaimed, OldReclaimed)
+DEFINE_MOSTLY_OLD_ON(ChurnFixture, Lookup_MostlyOld_Del_Erased,    OldErased)
 
-BENCHMARK_MAIN();
+// The erase cell (see Erase_Presized_Del above). Same accounting contract as the
+// macro bodies: allocate() before the loop; report_wall() then release() after
+// it; the per-thread SkipWithError() after the loop, never inside it.
+BENCHMARK_TEMPLATE_DEFINE_F(EraseFixture, Erase_Presized_Del, ConcurrentSetDel)(benchmark::State& state) {
+    static constinit WallRecords records;
+    const int base = state.thread_index()*(kErasePrefill/num_cpu);
+    int next = 0;
+    int64_t ok = 0;
+    records.allocate(state);
+    for (auto _ : WallTimed(state, records)) {
+        ok += set->erase(mix(base + next++));
+    }
+    if (ok != state.iterations()) {
+        state.SkipWithError("erase() returned false for a present key no other thread erases");
+    }
+    state.SetItemsProcessed(state.iterations());
+    report_wall(state, records, double(state.iterations())*state.threads());
+    if (state.thread_index() == 0) {   // the container's test-only counter (see the fixture)
+        const double erased = double(state.iterations())*state.threads();
+        state.counters["retired_per_erase"] = benchmark::Counter(
+            double(set->get_internal_counters().retire_nodes - retired_before)/erased);
+    }
+    records.release(state);
+} // Erase_Presized_Del
+BENCHMARK_REGISTER_F(EraseFixture, Erase_Presized_Del)
+    ->ThreadRange(1, num_cpu)->Iterations(kErasePrefill/num_cpu)->UseRealTime();
+
+// Same start-up as BENCHMARK_MAIN(), including its re-exec without ASLR, plus
+// the identification every output carries (the console header and the JSON
+// "context"): the container this binary measures, the size of its Node (the
+// node layout is part of what is measured), and the compiler.
+int main(int argc, char** argv) {
+    benchmark::MaybeReenterWithoutASLR(argc, argv);
+    benchmark::AddCustomContext("container", "ConcurrentResizableHashSetRCU");
+    benchmark::AddCustomContext("sizeof_node", std::to_string(sizeof(ConcurrentSetDel::Node)));
+    benchmark::AddCustomContext("compiler", __VERSION__);
+    benchmark::Initialize(&argc, argv);
+    if (benchmark::ReportUnrecognizedArguments(argc, argv)) return 1;
+    benchmark::RunSpecifiedBenchmarks();
+    benchmark::Shutdown();
+    return 0;
+} // main()

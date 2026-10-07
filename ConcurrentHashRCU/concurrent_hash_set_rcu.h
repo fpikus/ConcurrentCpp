@@ -200,13 +200,22 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 //     node_count_ keeps its previous value, an over-count, so growth stays
 //     early, never late. reclaim() may be called again.
 //
-// RECLAMATION: FREE LISTS, LIMBO LISTS, reclaim()
+// RECLAMATION: FREE LISTS, LIMBO LISTS, RETIRED LISTS, reclaim()
 //   Every shard has two intrusive singly linked lists threaded through the
 //   nodes' `link` words: a FREE LIST of nodes available for reuse and a LIMBO
 //   LIST of unreachable nodes waiting for the next reclaim(). The next pointer
 //   lives in the atomic link word and never in the T bytes: a thread that
 //   loses a pop race may still read the node's link while the winner is
 //   already assigning the node's value (see alloc_node()).
+//   A third list per shard, the RETIRED LIST, is threaded through a word of
+//   its own, Node::retire_link: it is for dead nodes that a concurrent
+//   operation has unlinked from their chain (push_retired() is its one entry
+//   point), and such a node may still be traversed by an operation that
+//   reached it before the unlink, so its `link` must stay what it was. No
+//   operation in this file unlinks, so the retired lists are empty between
+//   reclaim() calls; reclaim() drains them in two phases, sequester_retired()
+//   and reclaim_sequestered() (their preconditions are stated there), onto
+//   the free lists, where a drained node is a free node like any other.
 //   - POP (alloc_node()): a lock-free CAS on the calling thread's own shard's
 //     free head. The head word packs the top node's address with a 9-bit POP
 //     COUNTER (see the free-list constants), so the CAS that pops a node also
@@ -298,10 +307,12 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 //   operation that needs the child publishes it first, see split_bucket()).
 //   Authority passes from a node to its single published copy; a tombstone ends
 //   the lineage, because MARKED nodes are never copied.
-//   With AllowDelete == false the freeze is compiled out: a moved key then has
-//   an unmarked node in the parent AND its copy in the child. Nothing is ever
-//   tombstoned, so both answer "present" and the weaker invariant "every
-//   reachable node for a key agrees" is all that is needed.
+//   With AllowDelete == false the invariant holds in the same form: the freeze
+//   runs for both values (see split_bucket() step 2), so a moved key has a
+//   FROZEN node in the parent and its live copy in the child. Nothing is ever
+//   tombstoned, so the tag decides nothing about membership there (both nodes
+//   answer "present"); it is set so that every dead node is tagged, which the
+//   removal of dead nodes from their chains depends on.
 //
 // SYNCHRONIZATION CHANNELS (all memory-ordering correctness rides on these)
 //   1. buckets_[j] CAS/store is release; every load of buckets_[j] is acquire.
@@ -386,10 +397,12 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 //                 copy-constructible and copy-assignable (a node reused after
 //                 a reclaim() takes its new value by assignment; see
 //                 EXCEPTIONS for what a throwing assignment must satisfy).
-//   AllowDelete : when true, compiles erase() (tombstone deletion) and the
-//                 freeze step of split_bucket(). When false, no node is ever
-//                 marked or frozen, so the state-bit checks are overhead-free
-//                 no-ops and every chain is append-only.
+//   AllowDelete : when true, compiles erase() (tombstone deletion). When
+//                 false, no node is ever marked; the freeze step of
+//                 split_bucket() runs for both values (every superseded
+//                 parent copy is FROZEN), so a chain's links still gain a
+//                 tag, and the MARK checks on the read paths are tests of a
+//                 bit that is never set.
 //   Hash        : hash functor; must return the SAME hash for a key every call
 //                 (the split math re-hashes keys under wider masks).
 //   Container   : the append-only, address-stable arena template: elements
@@ -500,17 +513,36 @@ public:
         // THIS node was superseded by a copy in a child bucket. Atomic because
         // erase() and split_bucket() set those bits via CAS while readers
         // traverse concurrently, and because it is the field that
-        // publishes/observes chain structure. The address bits never change
-        // while the node is published; between quiescent points a published
-        // link changes only by gaining MARK or FROZEN. On a free or limbo list
-        // the same word is the list's next pointer (a bare address).
+        // publishes/observes chain structure. The address bits of a published
+        // link may change in exactly one way, by an unlink CAS on a LIVE link
+        // that bypasses a run of dead successors (this file contains no such
+        // site, so they do not change between quiescent points); a TAGGED link
+        // (MARK or FROZEN) is immutable until reclaim() takes the node out of
+        // its chain, so a dead node can always be EXITED through the successor
+        // it held when it died. On a free or limbo list the same
+        // word is the list's next pointer (a bare address); a retired node
+        // keeps its chain link intact (the retired lists use retire_link).
         std::atomic<word_t> link;
+        // The RETIRED LIST's next pointer: a bare node address or EMPTY, tag
+        // bits zero. A separate word, and not `link`, because a retired node
+        // is still EXITED by concurrent operations that reached it before it
+        // was unlinked: its `link` must keep the chain successor (see above).
+        // Written only by push_retired() (the retiring thread, privately for
+        // the run and then as the list's next pointer) and read only by the
+        // quiescent reclaim_sequestered() and the test-only sweep; no
+        // concurrent operation reads it, so its stores are relaxed and only
+        // the retired head's CAS carries ordering. The nine bits an address
+        // never uses (63..58 and 2..0) are zero here and RESERVED for a
+        // retire-time stamp. LAST member on purpose: `value` and `link` keep
+        // their relative placement, and the hot read path never touches this
+        // word. A free or limbo node's retire_link is stale and never read.
+        std::atomic<word_t> retire_link;
 
         // Default ctor: an unlinked live node whose successor is EMPTY. Rarely
         // used -- the arena is filled via the (val, next) ctor below; this
         // exists only for the container's value-initialization path.
-        Node() : value(), link(EMPTY) {}
-        Node(const T& val, word_t next) : value(val), link(next) {}
+        Node() : value(), link(EMPTY), retire_link(EMPTY) {}
+        Node(const T& val, word_t next) : value(val), link(next), retire_link(EMPTY) {}
     };
     static_assert(alignof(Node) >= 8, "the low three bits of a node address are the link's tag bits");
 
@@ -521,14 +553,24 @@ private:
     Container<std::atomic<word_t>> buckets_;
 
     // One arena shard: the append-only node deque and the heads of the shard's
-    // free and limbo lists (see RECLAMATION in the class overview). The two
-    // heads share a cache line of their own, apart from the deque's members
-    // (which the deque's default build pads onto lines of their own): the
-    // free head is written by every pop of the shard's threads, and with more
-    // threads than shards a pop CAS and the deque's lock exchange would
-    // otherwise fight over one line; the limbo head is written rarely (lost
-    // splits, orphans, throwing assignments) and costs nothing on the free
-    // head's line.
+    // free, limbo and retired lists (see RECLAMATION in the class overview),
+    // on two cache lines of their own, apart from the deque's members (which
+    // the deque's default build pads onto lines of their own):
+    //   - the FREE LINE: free_head and limbo_head. The free head is written by
+    //     every pop of the shard's threads, and with more threads than shards
+    //     a pop CAS and the deque's lock exchange would otherwise fight over
+    //     one line; the limbo head is written rarely (lost splits, orphans,
+    //     throwing assignments) and costs nothing on the free head's line.
+    //   - the RETIRED LINE: retired_head, the drain's private slot and the
+    //     test-only counters. The retired head takes a release CAS from every
+    //     operation that unlinks a dead run, i.e. from the erase path and from
+    //     writer walks, at a rate comparable to the pop rate of an insert-heavy
+    //     workload; on the free line the two CASes would alternate ownership
+    //     of one line between an inserting and an erasing thread whose
+    //     numbers collide modulo the shard count. The counters are bumped at
+    //     the sites that CAS the retired head (and at the split sites, which
+    //     run far less often than pops), by the thread that already owns the
+    //     line, so they cost nothing there and nothing on the free line.
     struct Shard {
         // Nodes are appended block-by-block and never destructed until the set
         // is destroyed; a slot's address is stable for the life of the set.
@@ -541,6 +583,39 @@ private:
         // link through their `link` words. Pushed with a relaxed CAS by the
         // shard's threads, drained by reclaim(), read by the test-only sweeps.
         std::atomic<word_t> limbo_head{EMPTY};
+        // Retired list: the bare address of the top retired node, or EMPTY;
+        // the nodes link through their `retire_link` words, never through
+        // `link` (a retired node keeps its chain link: see Node). LIFO and
+        // push-only between two sequesters: push_retired() pushes a run with
+        // one RELEASE CAS on behalf of the thread that unlinked it (its own
+        // shard, see there), sequester_retired() exchanges the head to EMPTY
+        // at a quiescent point, and nothing pops. Push-only makes the CAS
+        // ABA-free for the same reason the limbo push is. The release on every
+        // push means an ACQUIRE load of this head is a happens-before boundary
+        // for the whole list below the value loaded: every push below it is a
+        // read-modify-write extending the release sequence of the push whose
+        // value was loaded, so a reader that acquires the head sees every
+        // unlink that preceded any of those pushes.
+        alignas(64) std::atomic<word_t> retired_head{EMPTY};
+        // The drain's private slot: the retired list sequester_retired() took
+        // from retired_head, held between the two drain phases for
+        // reclaim_sequestered() to deal out. EMPTY outside a drain. Owned by
+        // the drainer alone (a plain word: both phases run at a quiescent
+        // point), it exists so that the sequester is one exchange per shard
+        // and no allocation, and so that the drained set is fixed before any
+        // node of it is dealt (see sequester_retired()).
+        word_t sequestered{EMPTY};
+        // Test-only counters, each bumped with a relaxed fetch_add by the
+        // thread whose operation took the counted step (so they are exact
+        // when read at a quiescent point, and a snapshot otherwise); summed
+        // over the shards by get_internal_counters(). Always compiled: the
+        // benchmark reads them in its NDEBUG build, and their cost is one
+        // relaxed increment on a line the thread already owns.
+        std::atomic<size_t> retire_runs{0};             // push_retired() calls: one per unlinked run
+        std::atomic<size_t> retire_nodes{0};            // nodes those runs held in total
+        std::atomic<size_t> cleanup_cas_failures{0};    // one-shot unlink CASes of a split winner's cleanup pass that lost (no site in this file increments it: there is no cleanup pass)
+        std::atomic<size_t> split_attempts{0};          // split_bucket() calls that sealed a parent and walked it, recursive parent splits included
+        std::atomic<size_t> splits_published{0};        // of those, the ones whose publishing CAS won
     }; // struct Shard
 
     // The node arena: arena_mask_ + 1 (a power of two) shards. A thread
@@ -616,6 +691,64 @@ private:
             last->link.store(old_head, std::memory_order_relaxed);
         } while (!shard.limbo_head.compare_exchange_weak(old_head, word_of(first), std::memory_order_relaxed, std::memory_order_relaxed));
     } // push_limbo()
+
+    // Retire the run first..last of dead nodes that the calling operation has
+    // just unlinked from its chain: push it, as one unit, onto `shard`'s
+    // retired list, where reclaim() (through sequester_retired() and
+    // reclaim_sequestered()) will find it. The ONE entry point to the retired
+    // lists.
+    // Preconditions: every node of the run is dead and TAGGED (MARKED or
+    // FROZEN; asserted), the run is the exact set of nodes the caller's OWN
+    // successful unlink CAS bypassed (a loser retires nothing: the winner
+    // retires the same nodes, and a node pushed twice makes a cycle in the
+    // list), the run's nodes are consecutive in the chain, first through
+    // last, through their immutable tagged `link` words, and `shard` is the
+    // caller's own shard (my_shard()). It must be the caller's own shard
+    // because that is the only shard a node can be attributed to without a
+    // search: a Node carries no shard identity (its address is stable, but
+    // nothing maps it back to the deque it lives in), and the retired list is
+    // only a holding bag until reclaim() deals its nodes round-robin over
+    // every shard's free list, so the shard a node is retired to has no
+    // effect on where it is reused; what it does affect is contention, and
+    // the caller's own retired line is the one its thread already owns.
+    // Steps: (1) link the run privately through the retire_link words,
+    // walking the run's own chain links from first to last. This happens
+    // AFTER the caller's unlink CAS won, never while recording the run: a
+    // recorder that then loses its CAS would be writing the retire_link of a
+    // node a concurrent winner may already have pushed, with a value from a
+    // run of a different extent (a FROZEN node's child can publish between
+    // two recorders' walks), and corrupt the list. The chain links are
+    // reloaded relaxed: the caller loaded each one with acquire when it
+    // recorded the run, a tagged link is never written by a concurrent
+    // operation, and read-read coherence returns the same value to this
+    // thread. (2) The push_limbo() loop on retired_head, with RELEASE on
+    // success: the push is the one point that orders "this node is
+    // unreachable" before whatever later acquires the head (the quiescent
+    // reclaim() needs no ordering, but a future generation bump that
+    // snapshots the heads with an acquire does: see Shard::retired_head).
+    // Failure is relaxed: the value that failed is only the next expected
+    // value. Weak CAS: a retry loop anyway, and each failure is another
+    // thread's completed push, so the loop is lock-free. The retire_link
+    // stores are relaxed: nothing reads them concurrently. The counters are
+    // bumped before the CAS, on the line the CAS is about to own.
+    static void push_retired(Shard& shard, Node* first, Node* last) {
+        size_t count = 1;
+        for (Node* node = first; node != last; ++count) {   // step 1: link the run privately
+            const word_t link = node->link.load(std::memory_order_relaxed);
+            assert((link & (MARK_BIT | FROZEN_BIT)) != 0 && "retiring a node that is not tagged: it is not dead");
+            assert(addr_of(link) != EMPTY && "the run ends before `last`: first..last is not a chain");
+            Node* next = node_of(link);
+            node->retire_link.store(word_of(next), std::memory_order_relaxed);
+            node = next;
+        } // link the run privately
+        assert((last->link.load(std::memory_order_relaxed) & (MARK_BIT | FROZEN_BIT)) != 0 && "retiring a node that is not tagged: it is not dead");
+        shard.retire_runs.fetch_add(1, std::memory_order_relaxed);
+        shard.retire_nodes.fetch_add(count, std::memory_order_relaxed);
+        word_t old_head = shard.retired_head.load(std::memory_order_relaxed);
+        do {   // step 2: the push
+            last->retire_link.store(old_head, std::memory_order_relaxed);
+        } while (!shard.retired_head.compare_exchange_weak(old_head, word_of(first), std::memory_order_release, std::memory_order_relaxed));
+    } // push_retired()
 
     // Thread-safe node allocator: returns a node holding `val` with link
     // `next`, private to the caller until it publishes the node, at an
@@ -731,8 +864,15 @@ private:
     //      hash to parent + 2^m*N under 2^(m+1)*N - 1 for any m >= 1 (that
     //      would require bit N of the hash to be clear), so no other child of
     //      this parent ever selects it, and it is never copied forward again.
-    //      (With AllowDelete == false there are no tombstones, nothing can race
-    //      with the copy, and the freeze is compiled out.)
+    //      The freeze runs for BOTH AllowDelete values. With AllowDelete ==
+    //      false there are no tombstones and nothing races with the copy, so
+    //      the tag decides nothing for the key; it is set anyway because a
+    //      superseded parent copy must be TAGGED to be dead: the tag is what
+    //      makes its link immutable, and an immutable link is what lets a
+    //      run of dead nodes be bypassed by one CAS on an untagged
+    //      predecessor without a lost unlink or a double retirement (two
+    //      bypasses through a node that one of them treats as live). Every
+    //      dead node in a chain, tombstone or stale copy, is therefore tagged.
     //   3. Publish the subchain with one CAS on bucket j's head. A subchain
     //      that loses the CAS goes to the limbo list, whole.
     // Exceptions: see EXCEPTIONS in the class overview.
@@ -740,6 +880,13 @@ private:
     // what keeps already-observed node addresses valid for the whole of an
     // operation (see the class overview); only reclaim() unlinks, at a
     // quiescent point.
+    // PINNED ORDER H3 (see PINNED ORDERS before contains()): for every node of
+    // the snapshot, the link load, then Hash{}(val), then the freeze CAS whose
+    // expected value is that earlier load, never a reload.
+    // RESERVED ORDER H6: the split winner's cleanup pass, which follows the
+    // publishing CAS, calls Hash{} on each FROZEN node of a dead run before
+    // that run's unlink CAS; this file has no cleanup pass, so the order
+    // names the site after the publish below.
     void split_bucket(size_t j) {
         // Bucket 0 has no parent and is published EMPTY by the constructor, so
         // it can never be UNINITIALIZED and never reaches here. The guard
@@ -783,6 +930,7 @@ private:
         word_t new_subchain_head = EMPTY;
         Node* new_subchain_tail = nullptr;
         word_t curr = parent_head;
+        my_shard().split_attempts.fetch_add(1, std::memory_order_relaxed);   // test-only counter
 
         try {
             while (addr_of(curr) != EMPTY) {   // traverse parent chain
@@ -792,26 +940,25 @@ private:
                 const T& val = node->value;
                 word_t next_raw = node->link.load(std::memory_order_acquire);
                 if (!(next_raw & MARK_BIT)) {          // skip logically deleted nodes
-                    if ((Hash{}(val) & mask) == j) {   // key belongs to bucket j now
-                        if constexpr (AllowDelete) {
-                            // FREEZE before copying. Expected value: the live link
-                            // we just read. Strong CAS, so failure means the link
-                            // really changed, and a published link changes only by
-                            // gaining MARK (an eraser won: skip the node) or FROZEN
-                            // (another splitter of j won: copy it, as that splitter
-                            // does). On failure next_raw is the value that failed
-                            // the comparison, i.e. one of those two final states.
-                            // Success is release: a stale eraser that acquires the
-                            // FROZEN link is thereby ordered after our caller's
-                            // acquire of table_size_ >= 2N (channel 4). Failure is
-                            // relaxed: both outcomes are decided by the returned
-                            // bits alone, we need nothing else its writer did.
-                            if (!(next_raw & FROZEN_BIT)) {
-                                if (node->link.compare_exchange_strong(next_raw, next_raw | FROZEN_BIT, std::memory_order_release, std::memory_order_relaxed)) {
-                                    next_raw |= FROZEN_BIT;
-                                }
-                            } // if not frozen yet
-                        } // if erase() exists
+                    if ((Hash{}(val) & mask) == j) {   // key belongs to bucket j now (H3: hashed after the link load)
+                        // FREEZE before copying, for both AllowDelete values (see
+                        // step 2 above). Expected value: the live link loaded
+                        // BEFORE the hash (H3), never a reload. Strong CAS, so
+                        // failure means the link really changed, and a published
+                        // link changes only by gaining MARK (an eraser won: skip
+                        // the node) or FROZEN (another splitter of j won: copy it,
+                        // as that splitter does). On failure next_raw is the value
+                        // that failed the comparison, i.e. one of those two final
+                        // states. Success is release: a stale eraser that acquires
+                        // the FROZEN link is thereby ordered after our caller's
+                        // acquire of table_size_ >= 2N (channel 4). Failure is
+                        // relaxed: both outcomes are decided by the returned bits
+                        // alone, we need nothing else its writer did.
+                        if (!(next_raw & FROZEN_BIT)) {
+                            if (node->link.compare_exchange_strong(next_raw, next_raw | FROZEN_BIT, std::memory_order_release, std::memory_order_relaxed)) {
+                                next_raw |= FROZEN_BIT;
+                            }
+                        } // if not frozen yet
                         if (!(next_raw & MARK_BIT)) {
                             // Prepend a fresh live copy to the child subchain.
                             Node* copy = alloc_node(val, new_subchain_head);
@@ -841,6 +988,10 @@ private:
         word_t expected = UNINITIALIZED;
         if (buckets_[j].compare_exchange_strong(expected, new_subchain_head, std::memory_order_release, std::memory_order_relaxed)) {
             // CAS succeeded: our subchain is now bucket j's authoritative head.
+            my_shard().splits_published.fetch_add(1, std::memory_order_relaxed);   // test-only counter
+            // RESERVED ORDER H6: the winner's cleanup pass over the parent chain
+            // belongs here, after the publication (P9: a node FROZEN for j may
+            // be unlinked only once j is published).
         } else {
             // CAS failed: subchain abandoned (unpublished, memory waste until reclaim() collects it).
             if (new_subchain_head != EMPTY) push_limbo(my_shard(), node_of(new_subchain_head), new_subchain_tail);
@@ -880,6 +1031,46 @@ public:
         table_size_.store(initial_capacity, std::memory_order_release);
     }
 
+    // ------------------------------------------------------------------------
+    // PINNED ORDERS. The order in which an operation loads a word, hashes or
+    // compares a key, and performs its deciding CAS is part of this class's
+    // correctness argument AND of its test contract: a test can suspend a
+    // thread inside Hash{} or operator== (a hook in the key type) and run a
+    // concurrent operation in that window, so every hook test rests on the
+    // exact call site it hooks, counted from the start of the operation. The
+    // orders are named H1-H6 and marked at their sites; a site this file does
+    // not contain is marked RESERVED where it belongs. Changing an order
+    // changes which window a test opens: name the affected tests.
+    //   H1  contains(), insert(), erase(): Hash{}(key) is called between the
+    //       table_size_ load and the bucket-head load, once per pass or
+    //       attempt (every retry re-hashes, since it reloads table_size_).
+    //   H2  erase(): for the matching node, the link load, then operator==,
+    //       then the mark CAS, whose expected value is the link loaded BEFORE
+    //       the comparison, never a reload.
+    //   H3  split_bucket(): for every node of the snapshot, the link load,
+    //       then Hash{}(val), then the freeze CAS whose expected value is
+    //       that earlier load, never a reload.
+    //   H4  contains(): a node's link is loaded before its key is compared,
+    //       and the comparison precedes the next node's link load; nothing
+    //       is hashed on the walk.
+    //   H5  (RESERVED: erase()'s own unlink, after a successful mark) the run
+    //       walk calls Hash{} on each FROZEN node it passes, before the
+    //       unlink CAS; the restart re-reads the head of the SAME bucket j
+    //       and does NOT re-hash the key.
+    //   H5' (RESERVED: the run unlinks of insert()'s and erase()'s walks) the
+    //       run walk calls Hash{} on each FROZEN node of the run before the
+    //       run's one CAS.
+    //   H6  (RESERVED: the split winner's cleanup pass, after its publishing
+    //       CAS) the cleanup calls Hash{} on each FROZEN node of a run before
+    //       that run's one CAS.
+    // CAS VALUE RULES. Every deciding CAS is one strong CAS on one word with
+    // the FULL expected value as loaded (a head with its level, a link with
+    // its tags), loaded before the compare or hash that precedes the CAS;
+    // after an operation's OWN successful CAS on a word, its next expected
+    // value for that word is the value it installed (a head unlink keeps the
+    // level; a publish after an own head unlink expects the unlinked head).
+    // ------------------------------------------------------------------------
+
     // Membership test. Lock-free on the fast path (a plain chain walk with no
     // atomic writes); it can, however, fall into split_bucket() -- which
     // allocates, possibly under its arena shard's lock -- if it lands on an
@@ -911,7 +1102,7 @@ public:
     bool contains(const T& key) {
         size_t ts = table_size_.load(std::memory_order_acquire);
         while (true) {
-            size_t j = Hash{}(key) & (ts - 1);
+            size_t j = Hash{}(key) & (ts - 1);   // H1: hashed between the table_size_ load and the head load
             word_t head = addr_of(buckets_[j].load(std::memory_order_acquire));
             if (head == UNINITIALIZED) {
                 split_bucket(j);
@@ -924,7 +1115,9 @@ public:
                 Node* node = node_of(curr);
                 // Load the successor link once: it is both the tombstone flag for
                 // THIS node and the pointer to the next one, so a single acquire
-                // load serves the mark check and the advance.
+                // load serves the mark check and the advance. H4: the link load
+                // precedes the comparison, and the comparison precedes the next
+                // node's link load; nothing is hashed on the walk.
                 word_t check_curr = node->link.load(std::memory_order_acquire);
                 if (node->value == key && !(check_curr & MARK_BIT)) {
                     found = true;
@@ -969,7 +1162,7 @@ public:
         try {
             while (true) {
                 size_t ts = table_size_.load(std::memory_order_acquire);
-                size_t j = Hash{}(key) & (ts - 1);
+                size_t j = Hash{}(key) & (ts - 1);   // H1: hashed between the table_size_ load and the head load, once per attempt
                 word_t head = buckets_[j].load(std::memory_order_acquire);
                 if (addr_of(head) == UNINITIALIZED) {
                     split_bucket(j);
@@ -999,6 +1192,11 @@ public:
                 // publishing CAS below.
                 bool exists = false;
                 word_t curr = addr_of(head);
+                // RESERVED ORDER H5': this walk's run unlinks (one CAS per dead
+                // run it passes, never retried) hash each FROZEN node of a run
+                // before the run's CAS; after an own head unlink the publishing
+                // CAS below expects the value that unlink installed. This file
+                // has no such site; the walk only reads.
                 while (addr_of(curr) != EMPTY) {   // walk bucket j's chain
                     Node* node = node_of(curr);
                     word_t check_curr = node->link.load(std::memory_order_acquire);
@@ -1123,7 +1321,7 @@ public:
     bool erase(const T& key) requires AllowDelete {
         size_t ts = table_size_.load(std::memory_order_acquire);
         while (true) {
-            size_t j = Hash{}(key) & (ts - 1);
+            size_t j = Hash{}(key) & (ts - 1);   // H1: hashed between the table_size_ load and the head load, once per pass
             word_t head = addr_of(buckets_[j].load(std::memory_order_acquire));
             if (head == UNINITIALIZED) {
                 split_bucket(j);
@@ -1135,18 +1333,29 @@ public:
             // unchanged.
             bool stale = false;
             word_t curr = head;
+            // RESERVED ORDER H5': this walk's run unlinks (one CAS per dead run
+            // it passes, never retried) hash each FROZEN node of a run before
+            // the run's CAS. This file has no such site; the walk only reads.
             while (addr_of(curr) != EMPTY) {   // walk bucket j's chain
                 Node* node = node_of(curr);
                 word_t check_curr = node->link.load(std::memory_order_acquire);
-                if (node->value == key && !(check_curr & MARK_BIT)) {
+                if (node->value == key && !(check_curr & MARK_BIT)) {   // H2: the comparison follows the link load
                     // Live (or frozen) node of our key. If live, set MARK_BIT while
-                    // keeping the same successor. Success is release: operations
+                    // keeping the same successor. H2: the expected value is
+                    // check_curr as loaded BEFORE the comparison, never a reload.
+                    // Success is release: operations
                     // that acquire this link afterwards see the key as deleted.
                     // Failure is acquire: if the reason is FROZEN we go on to
                     // reload table_size_, and the acquire orders that reload after
                     // the freezer's view of the table (see "Retry bound" above).
                     if (!(check_curr & FROZEN_BIT) &&
                         node->link.compare_exchange_strong(check_curr, check_curr | MARK_BIT, std::memory_order_release, std::memory_order_acquire)) {
+                        // RESERVED ORDER H5: the eraser's own unlink of its node
+                        // (one attempt on the predecessor tracked during the walk,
+                        // one restart from the head of this same bucket j without
+                        // re-hashing the key, then give up) belongs here, after
+                        // the mark; its run walk calls Hash{} on each FROZEN node
+                        // it passes. This file has no such site.
                         return true;   // this CAS is THE deletion of the key
                     }
                     // Not marked by us; check_curr holds the link's current value.
@@ -1189,6 +1398,89 @@ private:
         shard.free_head.store(free_word(word_of(node), head), std::memory_order_relaxed);
     } // push_free()
 
+    // The DRAIN of the retired lists, in two phases, both private and both
+    // called by reclaim() alone, under its quiescence. The phases are
+    // separate because a drain has a weaker true precondition than
+    // quiescence, and the split is what a caller that wants to exploit it
+    // needs. The precondition, exact, in happens-before terms (a retired node
+    // is one that an operation's unlink CAS u bypassed and push_retired()
+    // then pushed):
+    //   (1) every operation that could have loaded a retired node's address
+    //       has completed, and its completion happens-before the drain's
+    //       START;
+    //   (2) every operation that starts during or after the drain has each
+    //       retired node's unlink CAS u happen-before its first bucket-head
+    //       load (a thread that never synchronized after u could otherwise,
+    //       in the C++ model, still load a pre-u head value and walk into the
+    //       node); "arrange happens-before" means delivering this, e.g. by
+    //       having new operations start after acquiring something the
+    //       drain's starter released after the retirers' completions;
+    //   (3) the drained set is FIXED at the START, which is the point after
+    //       the drainer has exchanged EVERY shard's retired head into its
+    //       private slot: operations resumed under (2) start after that
+    //       point, so every later retire push follows every exchange in
+    //       modification order, and no node retired after the start is in
+    //       the drained set. Without (3) a per-shard drain could take a node
+    //       retired onto shard 1 after shard 0 was exchanged while a resumed
+    //       operation still holds that node.
+    // reclaim()'s quiescence implies all three. What a caller that resumes
+    // operations after the START would ALSO need, and this file does not
+    // provide, is thread-safe free lists: reclaim_sequestered() pushes onto
+    // the free lists, and a push concurrent with alloc_node()'s pops breaks
+    // the pop's ABA argument (RECLAMATION in the class overview: a head value
+    // a popper read can be restored only by a push, and pushes happen only
+    // inside reclaim()); so in this file the two phases run only inside
+    // reclaim(), and a drain concurrent with operations is not supported.
+
+    // Phase 1, SEQUESTER: take every shard's retired list out of its head and
+    // into the shard's private slot (one exchange per shard, no walk, no
+    // allocation). Relaxed, as every access in reclaim() is: under
+    // quiescence every push already happens-before this call. The last
+    // exchange is the drain's START point of condition (3).
+    void sequester_retired() {
+        for (size_t s = 0; s <= arena_mask_; ++s) {
+            Shard& shard = shards_[s];
+            assert(shard.sequestered == EMPTY && "a sequestered list was never dealt out: reclaim_sequestered() did not run");
+            shard.sequestered = shard.retired_head.exchange(EMPTY, std::memory_order_relaxed);
+        } // loop over the shards
+    } // sequester_retired()
+
+    // Phase 2, RECLAIM: deal every sequestered node onto the free lists,
+    // round-robin over the shards with the caller's cursor `deal` (reclaim()
+    // shares one cursor across its limbo, retired and chain-walk sources so
+    // that the free lists come out equally long whatever the source: a
+    // single-threaded prefill retires every victim onto one shard, and
+    // without the dealing that shard's threads alone would pop while the
+    // others append). This is the ONLY place a retired node's `link` is
+    // rewritten (push_free() makes it the free list's next pointer); until
+    // here the link keeps the chain successor the node had when it died, so
+    // an operation that reached the node before its unlink can exit through
+    // it (condition (1) says no such operation remains). The node's
+    // retire_link is left as it is: stale, never read again. Checks (live in
+    // the sanitizer builds): every retired node is tagged, since only dead
+    // nodes are retired and every dead node in a chain is tagged (a live node
+    // here means a run walk overshot its run, or a node was retired on a
+    // lost CAS); and the dealt count never exceeds the arena's slot count (a
+    // longer list is a cycle from a double retirement, which would otherwise
+    // hang this loop).
+    void reclaim_sequestered(size_t& deal) {
+        [[maybe_unused]] const size_t slots = get_internal_node_count();
+        [[maybe_unused]] size_t count = 0;   // nodes dealt so far, for the cycle check
+        for (size_t s = 0; s <= arena_mask_; ++s) {
+            Shard& shard = shards_[s];
+            word_t curr = shard.sequestered;
+            shard.sequestered = EMPTY;
+            while (addr_of(curr) != EMPTY) {   // walk the sequestered list
+                Node* node = node_of(curr);
+                assert((node->link.load(std::memory_order_relaxed) & (MARK_BIT | FROZEN_BIT)) != 0 && "a retired node is not tagged: a live node was retired");
+                ++count;
+                assert(count <= slots && "more retired nodes than arena slots: a retired list has a cycle (a node retired twice)");
+                curr = node->retire_link.load(std::memory_order_relaxed);   // before push_free() rewrites the link; retire_link stays stale
+                push_free(shards_[deal++ & arena_mask_], node);
+            } // walk the sequestered list
+        } // loop over the shards
+    } // reclaim_sequestered()
+
     // The dead-node rule of reclaim(), for `node` with link value `link` in
     // the chain of published bucket `j`, at table size `ts`. Dead means: no
     // operation, present or future, can need this node, so it may leave the
@@ -1213,10 +1505,10 @@ private:
     // split that published child SEALED j first and snapshotted the sealed
     // head, and an insert of this key into j can only have run at a table
     // size <= 2^b, whose level is below the seal, so it is in the snapshot or
-    // it failed. Every splitter of child therefore saw this node: with
-    // AllowDelete it froze it and the winner copied it (or found it marked and
-    // skipped it), without AllowDelete it copied it unconditionally. Either
-    // way the copy in child (or, transitively, in a deeper published bucket)
+    // it failed. Every splitter of child therefore saw this node and froze it
+    // (for both AllowDelete values), and the winner copied it, or found it
+    // marked and skipped it. Either way the copy in child (or, transitively,
+    // in a deeper published bucket)
     // is what every operation at the current table size consults, and this
     // node decides nothing any more. Conversely, if child is still
     // UNINITIALIZED this node is the key's only reachable node and is kept,
@@ -1277,19 +1569,24 @@ public:
     //   2. Drain every shard's limbo list (lost or abandoned subchains,
     //      orphans, nodes whose assignment threw: unreachable since birth)
     //      into the free lists.
+    //   2'. Drain every shard's retired list (dead nodes a concurrent
+    //      operation unlinked from their chain; see RECLAMATION in the class
+    //      overview) into the free lists, in the two phases
+    //      sequester_retired() and reclaim_sequestered() (their comments
+    //      state the drain's own precondition, which quiescence implies).
     //   3. Walk every PUBLISHED bucket j < table_size_, skipping UNINITIALIZED
     //      ones, and unlink every node is_dead() says is dead, relinking
     //      through the predecessor's word: a head keeps its seal level, a
     //      link keeps its tag bits (a kept predecessor is never MARKED but may
     //      be FROZEN with an unpublished child). Every kept node is counted.
     //   4. node_count_ := kept + the append credit (see its comment).
-    //   Nodes from steps 2 and 3 are DEALT ROUND-ROBIN over the shards' free
-    //   lists, on top of whatever those lists still hold, in one policy for
-    //   both sources: a shard whose threads lost many splits or erased many
-    //   keys does not hoard its own garbage, and splicing a limbo list whole
-    //   would save nothing (finding its tail is the same walk). Each node is
-    //   pushed as it is freed, not collected first (see EXCEPTIONS in the
-    //   class overview).
+    //   Nodes from steps 2, 2' and 3 are DEALT ROUND-ROBIN over the shards'
+    //   free lists with ONE cursor, on top of whatever those lists still
+    //   hold, in one policy for all sources: a shard whose threads lost many
+    //   splits or erased many keys does not hoard its own garbage, and
+    //   splicing a limbo or retired list whole would save nothing (finding
+    //   its tail is the same walk). Each node is pushed as it is freed, not
+    //   collected first (see EXCEPTIONS in the class overview).
     //
     // WHY ONE REACHABLE NODE PER KEY AFTERWARDS. A key's nodes lie along its
     // bucket path j0 -> j1 -> ... (each the next child of the previous, see
@@ -1317,6 +1614,8 @@ public:
                 push_free(shards_[deal++ & arena_mask_], node);
             } // walk the limbo chain
         } // for each shard's limbo list
+        sequester_retired();          // step 2': the retired lists, same cursor
+        reclaim_sequestered(deal);
         size_t live = 0;
         for (size_t j = 0; j < ts; ++j) {   // step 3: published chains
             // `slot` is the word that points at the current node (the bucket
@@ -1368,22 +1667,70 @@ public:
     // `consistent`, which tests assert alongside these counts.
     size_t get_internal_free_count() const { return get_internal_accounting().free_nodes; }
     size_t get_internal_limbo_count() const { return get_internal_accounting().limbo; }
+    // Test-only accessor: the number of nodes on all retired lists, as the
+    // accounting sweep counts them (the same caveats as the two above).
+    size_t get_internal_retired_count() const { return get_internal_accounting().retired; }
+    // Test-only accessor: the current table size (number of buckets), for
+    // tests that construct an exact geometry and must know whether a doubling
+    // happened. Quiescent, as the others.
+    size_t get_internal_table_size() const { return table_size_.load(std::memory_order_relaxed); }
+
+    // Test-only counters: the sums over the shards of Shard's counters (see
+    // there for what each counts). Exact at a quiescent point; a snapshot of
+    // monotone counters otherwise. Never reset.
+    struct InternalCounters {
+        size_t retire_runs;            // push_retired() calls (one per unlinked run)
+        size_t retire_nodes;           // nodes those runs held in total
+        size_t cleanup_cas_failures;   // lost one-shot CASes of a split winner's cleanup pass
+        size_t split_attempts;         // split_bucket() calls that walked a parent chain
+        size_t splits_published;       // of those, the ones whose publishing CAS won
+    }; // struct InternalCounters
+    InternalCounters get_internal_counters() const {
+        InternalCounters c{0, 0, 0, 0, 0};
+        for (size_t s = 0; s <= arena_mask_; ++s) {
+            const Shard& shard = shards_[s];
+            c.retire_runs += shard.retire_runs.load(std::memory_order_relaxed);
+            c.retire_nodes += shard.retire_nodes.load(std::memory_order_relaxed);
+            c.cleanup_cas_failures += shard.cleanup_cas_failures.load(std::memory_order_relaxed);
+            c.split_attempts += shard.split_attempts.load(std::memory_order_relaxed);
+            c.splits_published += shard.splits_published.load(std::memory_order_relaxed);
+        } // loop over the shards
+        return c;
+    } // get_internal_counters()
 
     // Test-only accounting sweep: where every arena slot is. `consistent` is
-    // true iff every slot of every shard is reachable from a published bucket
-    // head, on a free list, or on a limbo list, exactly one of the three and
-    // exactly once, and no list or chain contains an address that is not a
-    // slot. The counts are what was found (a walk stops at the first address
-    // that is unknown or already seen, so a cyclic list cannot hang it, and
-    // then `consistent` is false). Expected true at every quiescent point,
-    // including after an exception on any operation (see EXCEPTIONS in the
-    // class overview).
+    // true iff
+    //   C1  every slot of every shard is reachable from a published bucket
+    //       head, on a free list, on a limbo list, or on a retired list,
+    //       exactly one of the four and exactly once, and no list or chain
+    //       contains an address that is not a slot;
+    //   C2  every reachable node that is dead by is_dead()'s quiescent rule
+    //       is TAGGED (MARKED or FROZEN): a dead node with a live link would
+    //       be a node a concurrent bypass can run through while another
+    //       bypasses it (a lost unlink or a double retirement); the freeze
+    //       runs for both AllowDelete values to keep this true;
+    //   C3  every retired node is TAGGED (only dead nodes may be retired: a
+    //       live one here means a run walk overshot its run, or a retirement
+    //       on a lost CAS of a run that then changed), and its `link`'s
+    //       address field is EMPTY or an arena slot (the chain link a retired
+    //       node is exited through was not overwritten by the retirement).
+    // The counts are what was found (a walk stops at the first address that
+    // is unknown or already seen, so a cyclic list cannot hang it, and then
+    // `consistent` is false; a node retired twice makes exactly such a cycle
+    // in a retired list). `reachable_dead` is the number of reachable nodes
+    // that is_dead() calls dead at this quiescent point: the dead nodes still
+    // in their chains, which reclaim()'s chain walk would unlink; it calls
+    // Hash{} on every reachable node that is not MARKED, as reclaim() does.
+    // Expected consistent at every quiescent point, including after an
+    // exception on any operation (see EXCEPTIONS in the class overview).
     struct InternalAccounting {
-        size_t slots;       // sum of the shards' sizes (get_internal_node_count())
-        size_t reachable;   // nodes reachable from published heads, live and dead alike
-        size_t free_nodes;  // nodes on the free lists
-        size_t limbo;       // nodes on the limbo lists
-        bool consistent;    // reachable + free_nodes + limbo == slots, with no slot twice
+        size_t slots;           // sum of the shards' sizes (get_internal_node_count())
+        size_t reachable;       // nodes reachable from published heads, live and dead alike
+        size_t reachable_dead;  // of those, the ones is_dead() calls dead (quiescent rule)
+        size_t free_nodes;      // nodes on the free lists
+        size_t limbo;           // nodes on the limbo lists
+        size_t retired;         // nodes on the retired lists
+        bool consistent;        // C1 (reachable + free_nodes + limbo + retired == slots, no slot twice), C2 and C3
     }; // struct InternalAccounting
     InternalAccounting get_internal_accounting() const {
         // Every slot's address, sorted, with a seen flag per slot. A shard is
@@ -1398,7 +1745,7 @@ public:
         }
         std::sort(slots.begin(), slots.end());
         std::vector<unsigned char> seen(slots.size(), 0);
-        InternalAccounting acc{slots.size(), 0, 0, 0, true};
+        InternalAccounting acc{slots.size(), 0, 0, 0, 0, 0, true};
         // Marks `addr` as seen; false (and the sweep inconsistent) if it is not
         // a slot or was seen before.
         auto visit = [&](word_t addr) -> bool {
@@ -1410,19 +1757,38 @@ public:
             seen[it - slots.begin()] = 1;
             return true;
         };
+        // True iff `addr` is EMPTY or a slot (seen or not): the C3 link check.
+        auto is_empty_or_slot = [&](word_t addr) -> bool {
+            return addr == EMPTY || std::binary_search(slots.begin(), slots.end(), addr);
+        };
         const size_t ts = table_size_.load(std::memory_order_relaxed);
         for (size_t j = 0; j < ts; ++j) {   // published chains
             word_t curr = buckets_[j].load(std::memory_order_relaxed);
             if (addr_of(curr) == UNINITIALIZED) continue;
-            for (; addr_of(curr) != EMPTY && visit(addr_of(curr)); ++acc.reachable) curr = node_of(curr)->link.load(std::memory_order_relaxed);
-        }
-        for (size_t s = 0; s <= arena_mask_; ++s) {   // free and limbo lists
+            for (; addr_of(curr) != EMPTY && visit(addr_of(curr)); ++acc.reachable) {
+                const Node* node = node_of(curr);
+                const word_t link = node->link.load(std::memory_order_relaxed);
+                if (is_dead(node, link, j, ts)) {
+                    ++acc.reachable_dead;
+                    if ((link & (MARK_BIT | FROZEN_BIT)) == 0) acc.consistent = false;   // C2: a dead node with a live link
+                }
+                curr = link;
+            } // walk bucket j's chain
+        } // loop over the published buckets
+        for (size_t s = 0; s <= arena_mask_; ++s) {   // free, limbo and retired lists
             word_t curr = free_addr_of(shards_[s].free_head.load(std::memory_order_relaxed));
             for (; curr != FREE_EMPTY && visit(curr); ++acc.free_nodes) curr = node_of(curr)->link.load(std::memory_order_relaxed);
             curr = shards_[s].limbo_head.load(std::memory_order_relaxed);
             for (; addr_of(curr) != EMPTY && visit(addr_of(curr)); ++acc.limbo) curr = node_of(curr)->link.load(std::memory_order_relaxed);
-        }
-        if (acc.reachable + acc.free_nodes + acc.limbo != acc.slots) acc.consistent = false;
+            curr = shards_[s].retired_head.load(std::memory_order_relaxed);
+            for (; addr_of(curr) != EMPTY && visit(addr_of(curr)); ++acc.retired) {
+                const Node* node = node_of(curr);
+                const word_t link = node->link.load(std::memory_order_relaxed);
+                if ((link & (MARK_BIT | FROZEN_BIT)) == 0 || !is_empty_or_slot(addr_of(link))) acc.consistent = false;   // C3
+                curr = node->retire_link.load(std::memory_order_relaxed);
+            } // walk the retired list
+        } // loop over the shards
+        if (acc.reachable + acc.free_nodes + acc.limbo + acc.retired != acc.slots) acc.consistent = false;   // C1's sum
         return acc;
     } // get_internal_accounting()
 }; // class ConcurrentResizableHashSetRCU

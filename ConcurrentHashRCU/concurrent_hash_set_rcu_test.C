@@ -1720,8 +1720,9 @@ TEST(ConcurrentHashSetRcuTest, ReclaimThenConcurrentEraseAndGrowth) {
 // one of its pinned call sites and run a nested operation, or throw, there: an
 // interleaving another thread could produce, made deterministic on one thread.
 // The header pins the order in which every operation loads a word, hashes or
-// compares a key, and performs its deciding CAS (PINNED ORDERS before contains(),
-// H1-H6), so a hook that fires on a counted call opens a known window. Rules:
+// compares a key, and performs its deciding CAS (its PINNED ORDERS block before
+// contains() names them H1-H6; every H-number in this file's comments is one of
+// those), so a hook that fires on a counted call opens a known window. Rules:
 //   - Hooks live only in Hash{} (ProbeKeyHash) and operator==. Not in the copy
 //     constructor or the copy assignment: those run inside alloc_node(), and on
 //     its append path under the arena shard's SpinLock, where a nested
@@ -2515,7 +2516,7 @@ static void insert_in_order(SetT& set, const std::vector<int>& keys, size_t expe
     ASSERT_EQ(set.get_internal_table_size(), expected_ts) << "test precondition: the set-up did not reach the derived table size";
 } // insert_in_order()
 
-// T1: an uncontended erase() unlinks and retires its own node, every time.
+// An uncontended erase() unlinks and retires its own node, every time.
 //
 // Kills: erase() sending its unlinked node to a LIMBO list (or anywhere but a
 // retired list): retired and limbo counts then disagree with the erases.
@@ -2556,7 +2557,7 @@ TEST(ConcurrentHashSetRcuTest, EraseAllUnlinksEveryNode) {
     EXPECT_EQ(after.retire_nodes - before.retire_nodes, size_t(B*PER));
 } // EraseAllUnlinksEveryNode
 
-// T2: uncontended growth leaves no dead node reachable.
+// Uncontended growth leaves no dead node reachable.
 //
 // Kills: a split that does not FREEZE the nodes it moves in one AllowDelete
 // instantiation (the superseded copies are then untagged dead nodes, which no
@@ -2600,7 +2601,7 @@ TEST(ConcurrentHashSetRcuTest, GrowthLeavesNoDeadNodeReachable) {
     growth_leaves_no_dead_node_body<true>();
 } // GrowthLeavesNoDeadNodeReachable
 
-// T3d: erase()'s mark CAS fails on a LIVE value, and erase() must retry it.
+// erase()'s mark CAS fails on a LIVE value, and erase() must retry it.
 //
 // Kills: erase() falling through after a failed mark CAS whose failure value is
 // live (the key is still present, and the erase reports it absent).
@@ -2652,7 +2653,7 @@ TEST(ConcurrentHashSetRcuTest, EraseRetriesMarkAfterLiveLinkChange) {
     EXPECT_EQ(ProbeKey::corrupt.load(), 0);
 } // EraseRetriesMarkAfterLiveLinkChange
 
-// T5d: a miss in a chain from which the key's FROZEN copy was unlinked must reload
+// A miss in a chain from which the key's FROZEN copy was unlinked must reload
 // the table size and retry in the new geometry (the reload is what finds the
 // key's live copy in the child).
 //
@@ -3328,7 +3329,7 @@ TEST(ConcurrentHashSetRcuTest, HotGrowthResidue) {
     EXPECT_EQ(missing, 0) << "keys lost";
 } // HotGrowthResidue
 
-// T4: churn stress with the full accounting after every join.
+// Churn stress with the full accounting after every join.
 //
 // Not a mutant test: a stress of the unlinking protocol under contention --
 // erases unlinking their own nodes, walks unlinking what they pass, splits'

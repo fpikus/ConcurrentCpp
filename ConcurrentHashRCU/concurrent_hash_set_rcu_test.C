@@ -48,8 +48,9 @@
 //   5. Between reclaim() calls a dead node (a tombstone, or a parent copy that a
 //      split superseded) may be unlinked from its chain by a WRITER -- the
 //      erase() that made it a tombstone, the split that superseded it, or a later
-//      insert() or erase() whose walk passes it -- and retired; contains() never
-//      writes. Where a dead node ends up is asserted only for operations that
+//      insert() or erase() whose walk passes it -- and retired. contains()'s own
+//      walk never writes; a contains() that reaches an UNINITIALIZED bucket and
+//      wins its split runs that split's cleanup like any other splitter. Where a dead node ends up is asserted only for operations that
 //      ran UNCONTENDED, as POSTCONDITIONS of those operations: an uncontended
 //      erase() leaves its own node unreachable unless the node's predecessor is
 //      tagged and not dead; an uncontended split leaves no superseded parent copy
@@ -257,22 +258,6 @@ static void reclaim_and_check(SetT& set, size_t expected_live, const std::string
         << where << ": the free lists did not grow by exactly the limbo, retired and dead nodes";
 } // reclaim_and_check()
 
-// Whether bucket j of `set` is published (neither a pending split nor out of
-// range), for settle_writers(). The header answers through its test-only
-// get_internal_bucket_published() where it has one; a header without it is
-// treated as if every bucket were published, and settle_writers() then also
-// splits the pending buckets it erases in: each such split is uncontended and
-// its own cleanup leaves nothing dead behind, so the oracles after settling
-// hold either way, but the set's geometry changes.
-template <typename SetT>
-static bool bucket_published(const SetT& set, size_t j) {
-    if constexpr (requires { set.get_internal_bucket_published(j); }) {
-        return set.get_internal_bucket_published(j);
-    } else {
-        return true;
-    }
-} // bucket_published()
-
 // settle_writers(set): a writer MISS walk over every published bucket, so that
 // every dead node a CONCURRENT history left in a chain (a straggler: a one-shot
 // unlink CAS that lost, an erase() that gave up, a run a walker with a stale
@@ -285,6 +270,12 @@ static bool bucket_published(const SetT& set, size_t j) {
 // contains() reports absent --, so that the erase() walks the whole chain (a
 // miss) and unlinks every dead run it passes behind the head or a live
 // predecessor. Every such erase() must return false.
+// It skips the pending (UNINITIALIZED) buckets, asking the header's test-only
+// get_internal_bucket_published(): a contains() or erase() there would split the
+// bucket, and that split's cleanup walks the parent chain and unlinks its dead
+// runs itself, so the settling would succeed even if the writer walks it exists
+// to exercise unlinked nothing. Skipping them also leaves the geometry as the
+// history left it: settling splits nothing.
 // Requirements: quiescent and single-threaded; ProbeKey hooks disarmed; an
 // AllowDelete == true set of int keys whose hash is the identity (std::hash<int>
 // here, so j + m*ts maps to j; not StringKeys); and no dead run behind a FROZEN
@@ -296,7 +287,7 @@ template <typename SetT>
 static void settle_writers(SetT& set) {
     const size_t ts = set.get_internal_table_size();
     for (size_t j = 0; j < ts; ++j) {
-        if (!bucket_published(set, j)) continue;
+        if (!set.get_internal_bucket_published(j)) continue;
         bool erased_in_j = false;
         for (size_t m = 0; m < 64 && !erased_in_j; ++m) {
             const size_t k = j + m*ts;
@@ -2428,7 +2419,7 @@ TEST(ConcurrentHashSetRcuTest, ReclaimLimboPushesRaceFreeListPops) {
 //     not fitted: a round allocates W nodes per thread plus split copies, and
 //     after the first reclaim() the free lists hold at least what the previous
 //     round allocated, dealt evenly; so the arena stabilizes after round 1 at
-//     about (fill + round-1 allocations + split copies), i.e. 2-3 times the live
+//     about (fill + round-1 allocations + split copies), i.e. about 3 times the live
 //     count. A reclaim() that recycled nothing would add at least one live
 //     count per round and cross the bound by round 3;
 //   - without reclaim(): every successful insert() allocates a node that is never
@@ -2912,17 +2903,22 @@ TEST(ConcurrentHashSetRcuTest, RetiredNodeStaysExitable) {
 // it, (3), and runs `action` in (3)'s window, i.e. after the publication and
 // before the cleanup's CAS. The hooks check the window: the published-split
 // counter has not moved yet at (2) and has moved by one at (3).
+// `key` is the hooked key (33 here): a key whose split is made by contains(key),
+// whose node is the FIRST node of the parent chain the split moves (so its H3
+// call is the second Hash{}(key) of contains(key)), and which the cleanup reaches
+// with a usable predecessor as the first tagged node it meets (so its H6 call is
+// the third).
 struct CleanupWindow {
     bool before_publish = false;   // hook (2) fired, before the split published
     bool after_publish = false;    // hook (3) fired, right after the split published
 }; // struct CleanupWindow
 
 template <typename SetT>
-static void arm_cleanup_window(SetT& set, CleanupWindow& w, std::function<void()> action) {
-    ProbeKey::arm(ProbeKey::hash_hook, 33, 2, [&set, &w, action]() {   // (2)
+static void arm_cleanup_window(SetT& set, CleanupWindow& w, int key, std::function<void()> action) {
+    ProbeKey::arm(ProbeKey::hash_hook, key, 2, [&set, &w, key, action]() {   // (2)
         const size_t published = set.get_internal_counters().splits_published;
         w.before_publish = true;
-        ProbeKey::arm(ProbeKey::hash_hook, 33, 1, [&set, &w, action, published]() {   // (3)
+        ProbeKey::arm(ProbeKey::hash_hook, key, 1, [&set, &w, action, published]() {   // (3)
             w.after_publish = set.get_internal_counters().splits_published == published + 1;
             action();
         });
@@ -2950,7 +2946,7 @@ TEST(ConcurrentHashSetRcuTest, CleanupLosingItsCasRetiresNothing) {
         CleanupWindow w;
         bool nested_inserted = false;
         size_t retired_in_window = 0;
-        arm_cleanup_window(set, w, [&set, &nested_inserted, &retired_in_window]() {
+        arm_cleanup_window(set, w, 33, [&set, &nested_inserted, &retired_in_window]() {
             nested_inserted = set.insert(129);
             retired_in_window = set.get_internal_accounting().retired;
         });
@@ -2989,7 +2985,7 @@ TEST(ConcurrentHashSetRcuTest, WriterWalkCollectsCleanupStraggler) {
         Set set(4, 1);
         ASSERT_NO_FATAL_FAILURE(insert_in_order(set, {1, 33, 65, 2}, 64));
         CleanupWindow w;
-        arm_cleanup_window(set, w, []() { throw std::runtime_error("Hash{} armed to throw in the cleanup"); });
+        arm_cleanup_window(set, w, 33, []() { throw std::runtime_error("Hash{} armed to throw in the cleanup"); });
         EXPECT_THROW(set.contains(33), std::runtime_error);
         ProbeKey::disarm_hooks();
         ASSERT_TRUE(w.before_publish) << "test precondition: the hook on the split's Hash{}(33) did not fire";
@@ -3004,6 +3000,165 @@ TEST(ConcurrentHashSetRcuTest, WriterWalkCollectsCleanupStraggler) {
     } // the set's lifetime
     EXPECT_EQ(ProbeKey::corrupt.load(), 0);
 } // WriterWalkCollectsCleanupStraggler
+
+// erase()'s writer walk unlinks a dead run it passes behind a live predecessor.
+//
+// Kills: erase()'s walk making no opportunistic unlink while insert()'s walk
+// still makes them (WriterWalkCollectsCleanupStraggler collects with an insert(),
+// and settle_writers() collects with erase() walks). Only the MISS variant kills
+// it: a HIT walk that passes the dead run and then marks its key unlinks the run
+// anyway, through its own self-unlink, whose first attempt starts at the node its
+// predecessor leads to and so takes the dead run along with the erased node.
+// Geometry and hooks: WriterWalkCollectsCleanupStraggler's (the cleanup throws,
+// so 33's FROZEN parent copy stays in bucket 1 behind the live 65, dead). Then:
+//   - miss: erase(129), absent, of bucket 1: its walk passes the whole chain and
+//     unlinks the dead node: one node retired;
+//   - hit: erase(1), the chain's last node, behind the dead node: the walk's
+//     unlink, or else the self-unlink, takes the dead node; with 1 itself, two
+//     nodes retired.
+TEST(ConcurrentHashSetRcuTest, EraseWalkCollectsCleanupStraggler) {
+    using Set = ConcurrentResizableHashSetRCU<ProbeKey, true, ProbeKeyHash>;
+    for (const bool hit : {false, true}) {
+        const std::string where = hit ? "hit walk" : "miss walk";
+        ProbeKey::reset_counters();
+        {
+            Set set(4, 1);
+            ASSERT_NO_FATAL_FAILURE(insert_in_order(set, {1, 33, 65, 2}, 64));
+            CleanupWindow w;
+            arm_cleanup_window(set, w, 33, []() { throw std::runtime_error("Hash{} armed to throw in the cleanup"); });
+            EXPECT_THROW(set.contains(33), std::runtime_error);
+            ProbeKey::disarm_hooks();
+            ASSERT_TRUE(w.before_publish && w.after_publish) << where << ": test precondition: the cleanup window did not open";
+            const Set::InternalAccounting left = expect_consistent(set, where + ", after the cleanup threw");
+            ASSERT_EQ(left.reachable_dead, 1u) << where << ": test precondition: no straggler behind 65";
+            if (hit) {
+                EXPECT_TRUE(set.erase(1));
+            } else {
+                EXPECT_FALSE(set.erase(129));
+            }
+            const Set::InternalAccounting acc = expect_consistent(set, where + ", after the erase");
+            EXPECT_EQ(acc.reachable_dead, 0u) << where << ": erase()'s walk passed a dead node behind a live predecessor and left it";
+            EXPECT_EQ(acc.retired, left.retired + (hit ? 2u : 1u)) << where;
+            EXPECT_TRUE(set.contains(33)) << where;
+            EXPECT_TRUE(set.contains(65)) << where;
+            EXPECT_EQ(set.contains(1), !hit) << where;
+        } // the set's lifetime
+        EXPECT_EQ(ProbeKey::corrupt.load(), 0) << where;
+    } // miss, then hit
+} // EraseWalkCollectsCleanupStraggler
+
+// insert()'s publish after its OWN unlink of the bucket head expects the head
+// value that unlink installed (the own-CAS rule): one attempt, one Hash{}(key).
+//
+// Kills: a publish CAS that expects the head word as insert() first loaded it.
+// That value is gone -- the insert's own unlink replaced it --, so the CAS fails
+// on the thread's own write and the insert starts over: a second table-size load,
+// a second Hash{}(key), a second walk. The result stays correct, so the oracle is
+// the count of Hash{}(129) calls the insert makes (outside every hook: see CALL
+// HOOKS), which must be 1.
+// Geometry: insert(1), insert(65), insert(33), insert(2) take a Set(4, 1) to 64
+// buckets with bucket 1's chain 33 -> 65 -> 1; contains(33)'s cleanup throws at
+// its Hash{}(33) (arm_cleanup_window()), leaving 33's FROZEN parent copy at the
+// HEAD of bucket 1, dead. insert(129), a new key of bucket 1, then unlinks it
+// through the head word and publishes 129 there.
+TEST(ConcurrentHashSetRcuTest, InsertPublishAfterOwnHeadUnlink) {
+    using Set = ConcurrentResizableHashSetRCU<ProbeKey, true, ProbeKeyHash>;
+    ProbeKey::reset_counters();
+    {
+        Set set(4, 1);
+        ASSERT_NO_FATAL_FAILURE(insert_in_order(set, {1, 65, 33, 2}, 64));
+        CleanupWindow w;
+        arm_cleanup_window(set, w, 33, []() { throw std::runtime_error("Hash{} armed to throw in the cleanup"); });
+        EXPECT_THROW(set.contains(33), std::runtime_error);
+        ProbeKey::disarm_hooks();
+        ASSERT_TRUE(w.before_publish && w.after_publish) << "test precondition: the cleanup window did not open";
+        const Set::InternalAccounting left = expect_consistent(set, "after the cleanup threw");
+        ASSERT_EQ(left.reachable_dead, 1u) << "test precondition: no dead node at the head of bucket 1";
+        ProbeKey::tally_value = 129;
+        ProbeKey::tally = 0;
+        EXPECT_TRUE(set.insert(129));
+        const int outer_hashes = ProbeKey::tally;
+        ProbeKey::disarm_hooks();
+        EXPECT_EQ(outer_hashes, 1) << "the publish after the insert's own head unlink did not expect the head it installed";
+        const Set::InternalAccounting acc = expect_consistent(set, "after insert(129)");
+        EXPECT_EQ(acc.reachable_dead, 0u);
+        EXPECT_EQ(acc.retired, left.retired + 1);
+        for (int k : {1, 2, 33, 65, 129}) EXPECT_TRUE(set.contains(k)) << k;
+    } // the set's lifetime
+    EXPECT_EQ(ProbeKey::corrupt.load(), 0);
+} // InsertPublishAfterOwnHeadUnlink
+
+// settle_writers() collects every straggler a history left, through writer walks
+// alone, and splits nothing.
+//
+// Kills: insert()'s and erase()'s walks making no opportunistic unlink, and
+// erase()'s walk alone making none (settle_writers() collects through erase()
+// miss walks). It is the deterministic test behind the oracles that the
+// concurrent tests check after settle_writers(), which under contention seldom
+// find a straggler to settle.
+// Stragglers, single-threaded: three splits whose cleanup throws at its first
+// Hash{} (arm_cleanup_window()), each leaving every parent copy it superseded in
+// the parent chain, dead. Geometry, identity hash, one shard:
+//   - insert 0, 256, 512, 768, 1024: bucket 0 at every size up to 256; the set
+//     doubles on each (rule 1 of WHEN THE TABLE DOUBLES), from 4 to 128 buckets.
+//     The buckets those doublings create stay pending, among them 5, 6 and 7,
+//     the first children of buckets 1, 2 and 3;
+//   - at 128 buckets (no doubling until the arena passes 256 slots), the chains
+//     of buckets 1, 2 and 3, newest first, keys congruent to the bucket modulo
+//     128, those with bit 7 set moving at 256:
+//         bucket 1: 385 -> 129 -> 257     (two movers at the head)
+//         bucket 2: 514 -> 130 -> 258     (a mover behind a live node)
+//         bucket 3: 515 -> 387 -> 259 -> 131   (two movers, each behind a live node);
+//   - fillers 256*64, 256*65, ... (bucket 0, outside the absent keys settling
+//     looks for there) until the table doubles to 256;
+//   - contains(385), contains(130), contains(387): each splits the child 128
+//     above its bucket and throws in that split's cleanup at the first tagged
+//     node it meets, which is the hooked key.
+// Five dead nodes are then reachable: a two-node run at the head of bucket 1, a
+// one-node run behind a live node in bucket 2, two one-node runs in bucket 3; and
+// buckets 5, 6 and 7, pending children of the same three parents, are
+// UNINITIALIZED. settle_writers() must leave no dead node reachable, retire
+// exactly those five in four runs, and leave buckets 5, 6 and 7 pending: had it
+// split them, their cleanups would have walked the parents and collected the
+// stragglers whatever the writer walks did.
+TEST(ConcurrentHashSetRcuTest, SettleWritersCollectsStragglers) {
+    using Set = ConcurrentResizableHashSetRCU<ProbeKey, true, ProbeKeyHash>;
+    struct Split { int bucket; int key; };   // a parent bucket, and the hooked mover whose contains() splits its child
+    ProbeKey::reset_counters();
+    {
+        Set set(4, 1);
+        ASSERT_NO_FATAL_FAILURE(insert_in_order(set, {0, 256, 512, 768, 1024,   // to 128 buckets
+                                                      257, 129, 385, 258, 130, 514, 131, 259, 387, 515}, 128));
+        for (int i = 0; set.get_internal_table_size() == 128; ++i) {   // fillers, until the doubling to 256
+            ASSERT_LT(i, 300) << "test precondition: the fillers did not double the table";
+            ASSERT_TRUE(set.insert(256*(64 + i)));
+        }
+        ASSERT_EQ(set.get_internal_table_size(), 256u);
+        for (const Split split : {Split{1, 385}, Split{2, 130}, Split{3, 387}}) {
+            CleanupWindow w;
+            arm_cleanup_window(set, w, split.key, []() { throw std::runtime_error("Hash{} armed to throw in the cleanup"); });
+            EXPECT_THROW(set.contains(split.key), std::runtime_error) << "bucket " << split.bucket;
+            ProbeKey::disarm_hooks();
+            ASSERT_TRUE(w.before_publish && w.after_publish) << "test precondition: the cleanup window of bucket " << split.bucket << "'s split did not open";
+        } // leave the stragglers
+        const Set::InternalAccounting left = expect_consistent(set, "after the cleanups threw");
+        ASSERT_EQ(left.reachable_dead, 5u) << "test precondition: the throwing cleanups did not leave five stragglers";
+        for (size_t j : {5, 6, 7}) ASSERT_FALSE(set.get_internal_bucket_published(j)) << "test precondition: bucket " << j << " is published";
+        const Set::InternalCounters before = set.get_internal_counters();
+
+        ASSERT_NO_FATAL_FAILURE(settle_writers(set));
+        const Set::InternalAccounting settled = expect_consistent(set, "after settle_writers()");
+        EXPECT_EQ(settled.reachable_dead, 0u) << "a straggler survived a writer miss walk over its chain";
+        EXPECT_EQ(settled.reachable, left.reachable - 5);
+        EXPECT_EQ(settled.retired, left.retired + 5);
+        const Set::InternalCounters after = set.get_internal_counters();
+        EXPECT_EQ(after.retire_runs - before.retire_runs, 4u) << "one run at the head of bucket 1, one in bucket 2, two in bucket 3";
+        EXPECT_EQ(after.split_attempts, before.split_attempts) << "settle_writers() split a bucket";
+        for (size_t j : {5, 6, 7}) EXPECT_FALSE(set.get_internal_bucket_published(j)) << "settle_writers() published bucket " << j;
+        for (int k : {257, 129, 385, 258, 130, 514, 131, 259, 387, 515}) EXPECT_TRUE(set.contains(k)) << k;
+    } // the set's lifetime
+    EXPECT_EQ(ProbeKey::corrupt.load(), 0);
+} // SettleWritersCollectsStragglers
 
 // The hot-growth construction, shared with the benchmark's insert probe: the key
 // of index i (0 <= i < kHotKeys) keeps a "hot" pattern of 64 values in bits 0..5,
@@ -3026,18 +3181,22 @@ static int hot_growth_key(int index) {
     return static_cast<int>((m & 63) | (((m >> 6) & 7) << 12) | (static_cast<uint32_t>(index) << 16));
 } // hot_growth_key()
 
-// The residue concurrent growth on hot chains leaves: the cleanups' lost CASes.
+// What concurrent growth on hot chains leaves behind.
 //
-// Not a mutant test: it measures (prints) what a contended growth leaves behind
-// and checks that a writer pass over every bucket collects all of it.
+// Not a mutant test: a GUARD on the accounting under the contention that makes
+// the splits' one-shot cleanup CASes lose, and a print of what it left.
 // T threads insert the kHotKeys keys of the hot-growth construction (interleaved
 // indices), AllowDelete == true, one arena shard per thread. After the join: the
 // accounting is consistent and has exactly one non-dead reachable node per key.
-// It prints the dead nodes still reachable (stragglers, mostly runs whose cleanup
-// CAS lost to a prepend or a seal), the lost cleanup CASes and the splits.
-// Then settle_writers(), after which the eager oracles hold: one reachable node per
-// key, none dead, nothing free, every other slot retired or on a limbo list (the
-// lost split subchains).
+// It prints the lost cleanup CASes, the splits and the dead nodes still
+// reachable (stragglers). A lost cleanup CAS is not a straggler by itself: the
+// CAS loses because another writer changed the predecessor word first, and on
+// these chains that writer is another walker bypassing the same run, which then
+// leaves the chain anyway. So the stragglers after the join are usually none,
+// and the oracles after settle_writers() (one reachable node per key, none dead,
+// nothing free, every other slot retired or on a limbo list: the lost split
+// subchains) are then guards rather than tests of the settling;
+// SettleWritersCollectsStragglers is the test that makes them bite.
 TEST(ConcurrentHashSetRcuTest, HotGrowthResidue) {
     using Set = ConcurrentResizableHashSetRCU<int, true>;
     const int T = 8;
@@ -3080,7 +3239,10 @@ TEST(ConcurrentHashSetRcuTest, HotGrowthResidue) {
 //     which no dead node is reachable, one node per key is, nothing is free, and
 //     every other slot is retired or on a limbo list. The dead nodes reachable
 //     BEFORE settling (the stragglers the churn left) are printed per round,
-//     summed and maximized over the repetitions;
+//     summed and maximized over the repetitions. Under this churn the writers'
+//     own walks collect nearly every straggler before the join, so the oracles
+//     after settling are GUARDS here; SettleWritersCollectsStragglers is the
+//     deterministic test of the settling;
 //   - kLongChains: ConstantHash (every key in bucket 0, so splits copy nothing and
 //     the one chain holds every key and every dead node), with reclaim(): erases
 //     unlinking through mid-chain predecessors that other erases are marking and

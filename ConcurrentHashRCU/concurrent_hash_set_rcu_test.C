@@ -3089,6 +3089,92 @@ TEST(ConcurrentHashSetRcuTest, InsertPublishAfterOwnHeadUnlink) {
     EXPECT_EQ(ProbeKey::corrupt.load(), 0);
 } // InsertPublishAfterOwnHeadUnlink
 
+// A lost unlink CAS is classified by the word's value when it lost: a PEER LOSS
+// when the predecessor word already holds the successor the loser computed (a
+// peer bypassed the same run, so nothing is left behind), any other loss
+// otherwise (a prepend, a seal, a tag of the predecessor, or a bypass of a run of
+// another extent: possibly a straggler). The test-only counters keep both, for
+// the split winner's cleanup and for insert()'s and erase()'s walks.
+//
+// Kills: the classification inverted (a peer loss counted as a possible
+// straggler and the other way round), at either site.
+// Four deterministic cases, each on the 64-bucket geometry of the split-cleanup
+// tests (insert(1), insert(33), insert(65), insert(2) or the same with 33 and 65
+// swapped; 33 moves to bucket 33, 129 and 193 are new keys of bucket 1), and
+// each with a nested insert() whose walk unlinks 33's dead parent copy in the
+// window between the outer unlink's load of its predecessor word and its CAS:
+//   - cleanup, peer: chain 65 -> 33 -> 1; contains(33)'s cleanup, hooked at its
+//     Hash{}(33) (arm_cleanup_window()), is about to CAS 65's link from 33 to 1;
+//     the nested insert(129) unlinks 33 through that link, installing 1, then
+//     prepends at the head: the cleanup's CAS loses to a word holding 1;
+//   - cleanup, prepend: chain 33 -> 65 -> 1; the cleanup is about to CAS the
+//     head from 33 to 65; the nested insert(129) unlinks 33 through the head and
+//     then prepends 129 there: the cleanup's CAS loses to a word holding 129;
+//   - walk, peer: chain 65 -> 33 -> 1, with 33's parent copy left behind 65 by a
+//     cleanup that threw; insert(129)'s walk, hooked at its first Hash{}(33) (the
+//     deadness test of the tagged node it reaches with a usable predecessor:
+//     insert(129) hashes 129 before its walk, and 65 is live), is about to CAS
+//     65's link; the nested insert(193) unlinks 33 through it, installing 1;
+//   - walk, prepend: chain 33 -> 65 -> 1, the dead copy at the head; the nested
+//     insert(193) unlinks it and prepends 193.
+// Each case: the hook ran (the nested insert returned true), exactly one loss at
+// the hooked site and none at the other, a peer loss exactly in the peer cases,
+// one node retired (by the nested insert, never by the loser), and nothing dead
+// left reachable.
+TEST(ConcurrentHashSetRcuTest, UnlinkLossClassification) {
+    using Set = ConcurrentResizableHashSetRCU<ProbeKey, true, ProbeKeyHash>;
+    struct Case {
+        const char* name;
+        bool cleanup;   // the hooked unlink: the split's cleanup (else insert()'s walk)
+        bool peer;      // 33's predecessor is 65's link (a peer loss; else the head: a prepend)
+    }; // struct Case
+    for (const Case c : {Case{"cleanup, peer", true, true}, Case{"cleanup, prepend", true, false},
+                         Case{"walk, peer", false, true}, Case{"walk, prepend", false, false}}) {
+        const std::string where = c.name;
+        ProbeKey::reset_counters();
+        {
+            Set set(4, 1);
+            ASSERT_NO_FATAL_FAILURE(insert_in_order(set, c.peer ? std::vector<int>{1, 33, 65, 2} : std::vector<int>{1, 65, 33, 2}, 64));
+            bool nested_inserted = false;
+            Set::InternalCounters before{};
+            size_t retired_before = 0;
+            CleanupWindow w;
+            if (c.cleanup) {
+                before = set.get_internal_counters();
+                retired_before = set.get_internal_accounting().retired;
+                arm_cleanup_window(set, w, 33, [&set, &nested_inserted]() { nested_inserted = set.insert(129); });
+                EXPECT_TRUE(set.contains(33)) << where;
+                ProbeKey::disarm_hooks();
+                ASSERT_TRUE(w.before_publish && w.after_publish) << where << ": test precondition: the cleanup window did not open";
+            } else {
+                // Leave 33's parent copy in bucket 1, dead, then hook insert(129)'s walk.
+                arm_cleanup_window(set, w, 33, []() { throw std::runtime_error("Hash{} armed to throw in the cleanup"); });
+                EXPECT_THROW(set.contains(33), std::runtime_error) << where;
+                ProbeKey::disarm_hooks();
+                ASSERT_TRUE(w.before_publish && w.after_publish) << where << ": test precondition: the cleanup window did not open";
+                ASSERT_EQ(set.get_internal_accounting().reachable_dead, 1u) << where << ": test precondition: no straggler in bucket 1";
+                before = set.get_internal_counters();
+                retired_before = set.get_internal_accounting().retired;
+                ProbeKey::arm(ProbeKey::hash_hook, 33, 1, [&set, &nested_inserted]() { nested_inserted = set.insert(193); });
+                EXPECT_TRUE(set.insert(129)) << where;
+                ProbeKey::disarm_hooks();
+            } // cleanup or walk
+            ASSERT_TRUE(nested_inserted) << where << ": test precondition: the nested insert did not run in the unlink's window";
+            const Set::InternalCounters after = set.get_internal_counters();
+            EXPECT_EQ(after.cleanup_cas_failures - before.cleanup_cas_failures, c.cleanup ? 1u : 0u) << where;
+            EXPECT_EQ(after.cleanup_cas_peer_losses - before.cleanup_cas_peer_losses, c.cleanup && c.peer ? 1u : 0u) << where;
+            EXPECT_EQ(after.walk_cas_failures - before.walk_cas_failures, c.cleanup ? 0u : 1u) << where;
+            EXPECT_EQ(after.walk_cas_peer_losses - before.walk_cas_peer_losses, !c.cleanup && c.peer ? 1u : 0u) << where;
+            const Set::InternalAccounting acc = expect_consistent(set, where + ", after the lost CAS");
+            EXPECT_EQ(acc.retired, retired_before + 1) << where << ": 33's parent copy must be retired once, by the nested insert";
+            EXPECT_EQ(acc.reachable_dead, 0u) << where;
+            for (int k : {1, 2, 33, 65, 129}) EXPECT_TRUE(set.contains(k)) << where << ", key " << k;
+            if (!c.cleanup) EXPECT_TRUE(set.contains(193)) << where;
+        } // the set's lifetime
+        EXPECT_EQ(ProbeKey::corrupt.load(), 0) << where;
+    } // loop over the cases
+} // UnlinkLossClassification
+
 // settle_writers() collects every straggler a history left, through writer walks
 // alone, and splits nothing.
 //

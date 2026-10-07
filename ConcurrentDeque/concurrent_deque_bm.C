@@ -175,10 +175,12 @@ static void BM_AccessNoGrowth(benchmark::State& state) {
 // arg 1 is the thread count, swept 1..num_cpu (x2). ArgsProduct runs the full
 // cross product.
 //
-// UseRealTime() is essential for these multi-threaded cases: by default Google
-// Benchmark reports CPU time, which SUMS across all worker threads, so an 8-way
-// run would look ~8x "slower" purely from counting eight cores' time. Wall-clock
-// (real) time is what actually measures concurrent scaling here.
+// UseRealTime() is essential for these multi-threaded cases: the workers are
+// the benchmark's own jthread pool, and Google Benchmark runs this function on
+// one thread, whose CPU time is all that its default clock measures. That
+// thread spends each iteration blocked in the barriers, so CPU time would leave
+// out the workers' work and inflate Elements/s, which divides by that time.
+// Wall-clock (real) time covers the whole parallel phase.
 BENCHMARK_TEMPLATE(BM_AccessNoGrowth, SpinlockDeque<int>)
     ->ArgsProduct({
         benchmark::CreateRange(1000, 1000000, /*multi=*/10),

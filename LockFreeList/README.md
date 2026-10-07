@@ -101,8 +101,11 @@ trends are remarkably consistent.
 
 - **Dispersed workloads** — threads working on mostly separate sections of
   the list, the design's true fast path — perform excellently: full
-  concurrent insertion, deletion, and never-dangling traversal at a baseline
-  cost that stays flat as threads are added.
+  concurrent insertion, deletion, and never-dangling traversal, with
+  throughput that keeps scaling as threads are added, for the standard and
+  intrusive pointers. The parlay pointer is the exception: measured on a Zen 4
+  laptop, its throughput falls by more than two thirds as soon as a second
+  thread joins, for reasons not yet understood.
 - **Read-heavy workloads**: the intrusive pointer (`intr_shared_ptr`) scales
   best at moderate thread counts — not by a better algorithm (it and the
   standard pointer both hide a one-bit spinlock) but by a leaner

@@ -145,8 +145,10 @@ record cache and loads go to the pool again (the header's overview,
   hazard, increments the count only if it is not zero (`TryAddRef`: an
   object at zero is dead and must never be revived), and re-validates the
   word after the increment, giving the reference back if the word moved.
-  Each memory order in that protocol is load-bearing, and the header's
-  overview says which failure each one prevents.
+  Each memory order in that protocol but one is load-bearing, and the
+  header's overview says which failure each one prevents; the exception, the
+  acquire re-read of a zero count reported by a failed CAS inside the
+  increment, is a choice that `intr_pointee.h` explains.
 - Mark-aware protection, by hand. `mm_hp`'s own `protect()`/`try_protect()`
   compare the whole word and so never accept a legitimately marked one; the
   pointer builds its validation from the public pieces instead. That

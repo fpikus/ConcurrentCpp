@@ -381,10 +381,12 @@
 //     needs: unpublish happens-before retire); use_count a relaxed snapshot;
 //     TryAddRef increment-iff-nonzero with every observed 0 read with acquire
 //     and an acquire CAS success (protocol steps 5 and 6 above say why each
-//     order is load-bearing for THIS pointer). Every operation on the count is
-//     an RMW: a plain store would break the release sequence that TryAddRef's
-//     acquire zero-load synchronizes with (step 5). The count starts at 0 for
-//     a freshly constructed object and is taken to 1 by its first owner
+//     order is load-bearing for THIS pointer; the one exception, the acquire
+//     re-read of a refreshed 0, is a choice that intr_pointee.h's reference
+//     form explains). Every operation on the count is an RMW: a plain store
+//     would break the release sequence that TryAddRef's acquire zero-load
+//     synchronizes with (step 5). The count starts at 0 for a freshly
+//     constructed object and is taken to 1 by its first owner
 //     (shared_ptr_type(U*)); 0 is reached again exactly once, by the DelRef()
 //     that returns true, whose caller must retire() the object
 //     (retire_disposal::release() does).

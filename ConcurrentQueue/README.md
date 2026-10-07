@@ -38,8 +38,6 @@ before the push, and moved in.
 
 ## Design principles
 
-Stated here, argued in the book:
-
 - A fixed-size array used as a ring buffer; indexing is a bitmask, no bounds
   checks anywhere.
 - Two separate contention domains: producers contend on the tail under one

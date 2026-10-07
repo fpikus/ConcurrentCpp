@@ -76,17 +76,17 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 //              (see reclaim()) a published node's value is never written, its
 //              link changes only by the one CAS that tags it and by unlink
 //              CASes that bypass dead successors (see WORD ENCODING), and its
-//              retire_link is written only when the node is retired.
-//              Nodes are addressed by POINTER: a deque is segmented
-//              and its blocks never move, so a node's address is stable for the
-//              life of the set, and nothing that reads the structure knows or
-//              cares which shard a node lives in. The deque's index is used
-//              once per node, to obtain that address at allocation, and by
-//              the test-only sweeps at a quiescent point; no read path ever
-//              goes through a deque. Sharding exists because one shared
-//              per-node atomic of any kind (a lock, a counter) is the insert
-//              ceiling; a shard's lock and free-list head are contended only
-//              by the threads whose numbers collide modulo the shard count.
+//              retire_link is written only when the node is retired. Nodes are
+//              addressed by POINTER: a deque is segmented and its blocks never
+//              move, so a node's address is stable for the life of the set,
+//              and nothing that reads the structure knows or cares which shard
+//              a node lives in. The deque's index is used once per node, to
+//              obtain that address at allocation, and by the test-only sweeps
+//              at a quiescent point; no read path ever goes through a deque.
+//              Sharding exists because one shared per-node atomic of any kind
+//              (a lock, a counter) is the insert ceiling; a shard's lock and
+//              free-list head are contended only by the threads whose numbers
+//              collide modulo the shard count.
 //   node_count_ : arena occupancy, OVER-counted by up to 255 per touched shard
 //              per allocation path (each shard adds 256 when it appends a node
 //              whose index is a multiple of 256, index 0 included, and 256 on
@@ -134,9 +134,8 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 //   parent chain, FROZEN, until a writer bypasses them (the split's own winner
 //   first, right after it publishes j: see WHY COPY below), so for a while a
 //   key that moved to j exists in BOTH the parent chain (a superseded, FROZEN
-//   copy) and bucket j. Splitting is recursive: a parent that is
-//   itself still UNINITIALIZED is split first, so the bucket tree is filled in
-//   on demand.
+//   copy) and bucket j. Splitting is recursive: a parent that is itself still
+//   UNINITIALIZED is split first, so the bucket tree is filled in on demand.
 //
 // WHY COPY, AND WHEN A DEAD NODE LEAVES ITS CHAIN
 //   Nodes are copied, never moved: a node that a split supersedes stays where
@@ -156,68 +155,72 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 //   and (e) were never published and are recorded on a LIMBO list before the
 //   operation that made them returns or throws, because nothing else could
 //   ever find them again.
-//   (a) and (b) are DEAD IN THEIR CHAIN: reachable, tagged, and deciding
-//   nothing. A DEAD NODE is a tombstone, or a FROZEN node whose child bucket
-//   is published; a FROZEN node whose child is not yet published is live for
-//   its key (INVARIANT below). A concurrent WRITER takes dead nodes out: it
-//   bypasses a maximal run of consecutive dead nodes with one CAS on the live
-//   word before the run (a bucket head, or the untagged link of a live node),
-//   and the winner of that CAS RETIRES exactly the run onto its shard's
-//   retired list (unlink_run(), push_retired()). Where this happens: the
-//   split winner's cleanup pass over the parent chain, right after it
-//   publishes the child (the copies it superseded leave with the split that
-//   superseded them, and the pass is lazy with respect to the doubling, as
-//   splitting is; whichever operation started the split runs it, a
-//   contains() included); erase(), right after its mark (an eager
-//   self-unlink: one attempt through the predecessor it tracked, one restart
-//   from the head, then give up); and the walks of insert() and erase(),
-//   which attempt to bypass every dead run they pass behind a live word, on
-//   the way to their key (a hit stops a walk at its key, so a hit walk
-//   attempts the runs before the key and only a MISS walks the whole chain).
+//   DEAD NODES. (a) and (b) are DEAD IN THEIR CHAIN: reachable, tagged, and
+//   deciding nothing. A DEAD NODE is a tombstone, or a FROZEN node whose
+//   child bucket is published; a FROZEN node whose child is not yet published
+//   is not dead: it is still authoritative for its key (INVARIANT below). A
+//   concurrent WRITER takes dead nodes out: it bypasses a maximal RUN of
+//   consecutive dead nodes with one CAS on the live word before the run, its
+//   PRED WORD (a bucket head, or the untagged link of a live node), and the
+//   winner of that CAS RETIRES exactly the run onto its shard's retired list
+//   (unlink_run(), push_retired()). Where this happens:
+//   - the split winner's cleanup pass over the parent chain, right after it
+//     publishes the child (the copies it superseded leave with the split that
+//     superseded them, and the pass is lazy with respect to the doubling, as
+//     splitting is; whichever operation started the split runs it, a
+//     contains() included);
+//   - erase(), right after its mark (an eager self-unlink: one attempt
+//     through the predecessor it tracked, one restart from the head, then
+//     give up);
+//   - the walks of insert() and erase(), which attempt to bypass every dead
+//     run they pass behind a live word, on the way to their key (a hit stops
+//     a walk at its key, so a hit walk attempts the runs before the key and
+//     only a MISS walks the whole chain).
 //   contains()'s own walk writes nothing: a reader pays for no unlinking
-//   except by starting a split. Every one of these is ONE CAS per run, never
-//   retried (erase()'s restart is the one exception, bounded at two): a lost
-//   CAS is another thread's completed step on the same word. When that step
-//   was a peer's bypass of the same run (the word already holds the successor
-//   this thread computed), nothing is left behind. Otherwise -- the word
-//   gained a prepended node, a seal level, a tag of the predecessor, or a
-//   peer's bypass of a run of a different extent -- the dead nodes still
-//   reachable are a STRAGGLER, collected by the next writer walk that passes
-//   them (hit or miss), the next cleanup pass over the chain (every doubling
-//   gives the bucket a new child, and the split of ANY child of the bucket
-//   walks the whole parent chain with no hit to stop it), or reclaim()'s
-//   chain walk, which collects everything. Unlinking is therefore best effort
-//   under contention: no operation guarantees that a dead node has left its
-//   chain when it returns. What an UNCONTENDED call does guarantee -- one
-//   during which no other operation on the set runs, and that returns
-//   normally -- are these POSTCONDITIONS: a split's cleanup leaves no dead
-//   node reachable in the parent chain behind an untagged word (the bucket
-//   head or a live node's link); an insert() or erase() walk leaves no dead
-//   run reachable behind the bucket head or a live node it passed (a run at
-//   the head counts: the head is an untagged word); an erase() leaves its
-//   tombstone unreachable, unless a tagged, not-dead node lies between it
-//   and the last live word before it, which in uncontended use arises only
-//   after an earlier split threw between its freeze and its publish (behind
-//   such a node nothing can be bypassed until its child is published and a
-//   later walk passes it).
-//   Stragglers also arise from a stale view (a walker whose table size does
-//   not yet cover the doubling a node was frozen for cannot decide it), from
-//   an erase() that gave up (two lost attempts, the first of which may have
-//   been skipped because the walk's own CAS on the predecessor was lost),
-//   from a split stalled or thrown between its freeze and its publish, and
-//   from Hash{} throwing inside an unlinking site. A dead run that no writer
-//   walks past again, in a bucket none of whose new children is accessed,
-//   stays until reclaim(): its lifetime is unbounded only when the table
-//   stops doubling or the bucket's new children are never accessed. Two
-//   designs are deliberately NOT taken here: a contains() that bypasses the
-//   dead runs it passes (it would make every reader a writer), and a
-//   standalone collector call that walks published chains like a writer
-//   miss walk without inserting anything; both would trade read-path cost
-//   or an API call for fewer stragglers, and this class keeps the read walk
-//   pure and reclaim() as the only collector of the remainder. A retired
-//   node is not reused before reclaim(): the retired lists only separate
-//   "dead and out of its chain" from "dead and still in it", for reclaim()
-//   to drain without a chain walk (RECLAMATION).
+//   except by starting a split.
+//   STRAGGLERS. Every one of these is ONE CAS per run, never retried
+//   (erase()'s restart is the one exception, bounded at two): a lost CAS is
+//   another thread's completed step on the same word. When that step was a
+//   peer's bypass of the same run (the word already holds the successor this
+//   thread computed), nothing is left behind. Otherwise -- the word gained a
+//   prepended node, a seal level, a tag of the predecessor, or a peer's
+//   bypass of a run of a different extent -- the dead nodes still reachable
+//   are a STRAGGLER, collected by the next writer walk that passes them (hit
+//   or miss), the next cleanup pass over the chain (every doubling gives the
+//   bucket a new child, and the split of ANY child of the bucket walks the
+//   whole parent chain with no hit to stop it), or reclaim()'s chain walk,
+//   which collects everything. Stragglers also arise from a stale view (a
+//   walker whose table size does not yet cover the doubling a node was frozen
+//   for cannot decide it), from an erase() that gave up (two lost attempts,
+//   the first of which may have been skipped because the walk's own CAS on
+//   the pred word was lost), from a split stalled or thrown between its
+//   freeze and its publish, and from Hash{} throwing inside an unlinking site
+//   (EXCEPTIONS). A dead run that no writer walks past again, in a bucket
+//   none of whose new children is accessed, stays until reclaim(): its
+//   lifetime is unbounded only when the table stops doubling or the bucket's
+//   new children are never accessed.
+//   POSTCONDITIONS. Unlinking is therefore best effort under contention: no
+//   operation guarantees that a dead node has left its chain when it returns.
+//   What an UNCONTENDED call does guarantee -- one during which no other
+//   operation on the set runs, and that returns normally -- is this: a
+//   split's cleanup leaves no dead node reachable in the parent chain behind
+//   an untagged word (the bucket head or a live node's link); an insert() or
+//   erase() walk leaves no dead run reachable behind the bucket head or a
+//   live node it passed (a run at the head counts: the head is an untagged
+//   word); an erase() leaves its tombstone unreachable, unless a tagged,
+//   not-dead node lies between it and the last live word before it, which in
+//   uncontended use arises only after an earlier split threw between its
+//   freeze and its publish (behind such a node nothing can be bypassed until
+//   its child is published and a later walk passes it).
+//   NOT TAKEN. Two designs are deliberately NOT taken here: a contains() that
+//   bypasses the dead runs it passes (it would make every reader a writer),
+//   and a standalone collector call that walks published chains like a
+//   writer miss walk without inserting anything; both would trade read-path
+//   cost or an API call for fewer stragglers, and this class keeps the read
+//   walk pure and reclaim() as the only collector of the remainder.
+//   RETIREMENT. A retired node is not reused before reclaim(): the retired
+//   lists only separate "dead and out of its chain" from "dead and still in
+//   it", for reclaim() to drain without a chain walk (RECLAMATION).
 //
 // EXCEPTIONS: WHAT IS AND IS NOT HANDLED (the one place that says it all)
 //   Exception behavior is mostly out of scope for this class, as it is for
@@ -253,11 +256,11 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 //     nodes already FROZEN remain authoritative for their keys, which the
 //     INVARIANT allows: the next operation that needs j splits it again from
 //     them, so the work is redone, not lost. If Hash{} throws inside the
-//     winner's cleanup pass (step 4), AFTER the publishing CAS (the case
-//     called W4 below), bucket j is published and complete; the exception
-//     leaves the dead nodes of the parent chain reachable, as a lost CAS
-//     would, for a later walk, split or reclaim() to collect. The caller of
-//     split_bucket() sees the exception, not the published bucket.
+//     winner's cleanup pass (step 4), AFTER the publishing CAS (the case the
+//     comments below call W4), bucket j is published and complete; the
+//     exception leaves the dead nodes of the parent chain reachable, as a
+//     lost CAS would, for a later walk, split or reclaim() to collect. The
+//     caller of split_bucket() sees the exception, not the published bucket.
 //   - insert(): a throw before the publishing CAS -- from alloc_node(),
 //     Hash{}, or a split_bucket() met on any attempt -- leaves the key as it
 //     was; the catch around the retry loop pushes the pending node, if one
@@ -273,13 +276,13 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 //   - erase(): holds no private node; it throws what Hash{} or a
 //     split_bucket() throws. A throw BEFORE the mark (from the hash of the
 //     key, from a split, or from the hash of a FROZEN node the walk passes,
-//     H5') leaves the key as it was. Hash{} is also called inside the
-//     self-unlink that follows a successful mark (H5; the case called P5
-//     below): a throw there leaves the key DELETED (the mark is the deletion)
-//     but the caller sees an exception and no `true`, as insert() does on a
-//     throw from the doubling after its publishing CAS. Any unlink a throwing
-//     erase() or insert() walk had already won stands; it changed no
-//     membership.
+//     the call site H5' of PINNED ORDERS, before contains()) leaves the key
+//     as it was. Hash{} is also called inside the self-unlink that follows a
+//     successful mark (H5; the case the comments below call P5): a throw
+//     there leaves the key DELETED (the mark is the deletion) but the caller
+//     sees an exception and no `true`, as insert() does on a throw from the
+//     doubling after its publishing CAS. Any unlink a throwing erase() or
+//     insert() walk had already won stands; it changed no membership.
 //   - reclaim(): throws only if Hash{}(key) throws. The set is then
 //     consistent: every node unlinked so far is already on a free list, since
 //     each node is pushed as it is freed, not collected first, and
@@ -309,27 +312,29 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 //   precondition. A retired node is reused no earlier than a node reclaim()'s
 //   chain walk unlinks: retirement changes WHEN a dead node stops being
 //   walked, not when its memory comes back.
-//   What a reclamation that frees retired nodes WITHOUT quiescence needs,
-//   and this class does not provide: a way to know that no operation still
-//   holds a retired node's address (handles with a generation counter, where
-//   a node is stamped at retirement -- retire_link's nine spare bits can hold
-//   a stamp, compared modulo 512, which bounds the number of generations
-//   that may be live at once -- or where a generation bump takes an acquire
-//   snapshot of every retired head, so that every node below the snapshot
-//   was pushed, and unlinked, before the bump); thread-safe free lists,
-//   since a drain that runs while alloc_node() pops pushes concurrently with
+//   BEYOND QUIESCENCE. A reclamation that frees retired nodes WITHOUT
+//   quiescence needs three things this class does not provide. First, a way
+//   to know that no operation still holds a retired node's address: handles
+//   with a generation counter, where a node is stamped at retirement (the
+//   STAMP form: retire_link's nine spare bits can hold a stamp, compared
+//   modulo 512, which bounds the number of generations that may be live at
+//   once), or where a generation bump takes an acquire snapshot of every
+//   retired head, so that every node below the snapshot was pushed, and
+//   unlinked, before the bump (the SNAPSHOT form). Second, thread-safe free
+//   lists: a drain that runs while alloc_node() pops pushes concurrently with
 //   the pops, which the pop's ABA argument below excludes (the free head's
 //   9-bit pop count is a version tag that wraps at 512, or one drain at a
 //   time started under the drain precondition keeps a popper from ever
-//   having seen an address the drain resurrects); and an answer to the unlink
-//   CAS's own ABA premise, that every expected value of an unlink CAS (the
-//   pred word and the recorded run) is loaded and used within one such
+//   having seen an address the drain resurrects). Third, an answer to the
+//   unlink CAS's own ABA premise, that every expected value of an unlink CAS
+//   (the pred word and the recorded run) is loaded and used within one such
 //   handle. That premise needs a BRIDGE from a node's retirement to the head
 //   loads of later operations: the snapshot form supplies it by construction
 //   (every unlink below the snapshot happens-before the bump, and a later
-//   handle acquires the bump), the drain precondition's condition (2)
-//   supplies it for a drain, and surrendering a handle alone does not; for
-//   the stamp form it is an open question.
+//   handle acquires the bump), condition (2) of the drain precondition
+//   (stated before sequester_retired()) supplies it for a drain, and
+//   surrendering a handle alone does not; for the stamp form it is an open
+//   question.
 //   - POP (alloc_node()): a lock-free CAS on the calling thread's own shard's
 //     free head. The head word packs the top node's address with a 9-bit POP
 //     COUNTER (see the free-list constants), so the CAS that pops a node also
@@ -352,13 +357,13 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 //   - reclaim() (contract at its definition) walks every published bucket,
 //     unlinks every dead node, deals the dead, the retired and the limbo
 //     nodes round-robin over the shards' free lists, and resets the pop
-//     counters and
-//     node_count_. It takes no lock: its precondition is that the caller has
-//     made every earlier operation happen-before it and it happens-before every
-//     later one, which is what "quiescent" means here. Under that precondition
-//     it needs no atomic ordering at all (all of its atomic accesses are
-//     relaxed): every write it makes is visible to every later operation by
-//     happens-before, exactly as the constructor's writes are.
+//     counters and node_count_. It takes no lock: its precondition is that
+//     the caller has made every earlier operation happen-before it and it
+//     happens-before every later one, which is what "quiescent" means here.
+//     Under that precondition it needs no atomic ordering at all (all of its
+//     atomic accesses are relaxed): every write it makes is visible to every
+//     later operation by happens-before, exactly as the constructor's writes
+//     are.
 //   - PERIODS. reclaim() calls divide the set's life into PERIODS (the first
 //     starts at construction, the last ends at destruction). The CLIENT's
 //     view: the only thing the client can observe across a reclaim() is
@@ -381,12 +386,11 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 //     re-enters one only through a pop that follows a reclaim(). An address a
 //     thread observed in a head or link therefore names the same node, in
 //     that chain or retired from it, for the whole of that thread's
-//     operation, and an unlink CAS
-//     whose expected value still holds really is bypassing the run it
-//     recorded. No CAS of any operation, and no pop of a free list, can span
-//     a reclaim(): nothing else runs on the table while it does. There is
-//     therefore no ABA problem the client can get into, and none in the free
-//     lists.
+//     operation, and an unlink CAS whose expected value still holds really is
+//     bypassing the run it recorded. No CAS of any operation, and no pop of a
+//     free list, can span a reclaim(): nothing else runs on the table while
+//     it does. There is therefore no ABA problem the client can get into,
+//     and none in the free lists.
 //   - LIFETIME OF VALUES. A free node keeps its old, constructed T; reclaim()
 //     destroys nothing. Reuse COPY-ASSIGNS the new value over the old one, so
 //     the old value's resources are released at reuse (the assignment's
@@ -441,26 +445,29 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 //   walk never loads X's address from any word. The words that ever held X's
 //   address are of four kinds, and the walk reads none of them with X in it:
 //   (1) u's own word: its post-u value is in u's modification order, and a
-//   load that happens-after u returns that value or a later one. (2) The
-//   links of the run-predecessors of X that u itself bypasses (P -> D1 -> X:
-//   D1's link holds X): the walk never loads D1's address, by this same
-//   argument applied to D1, whose address was in u's word. (3) The link of a
-//   node D bypassed EARLIER, by an unlink u_D (D's immutable link still holds
-//   X): the walk never loads D's address because u_D happens-before u -- u's
-//   unlinker reached its pred word by acquire loads along the chain from the
-//   head, and the word u_D rewrote lies on that path, or was itself bypassed
-//   later by an unlink whose word does, recursively; every later write to a
-//   published head or link is a read-modify-write, which extends u_D's
-//   release sequence, so the unlinker's acquire of that word synchronizes
-//   with u_D. The walk's and the pred-word's acquires are load-bearing here,
-//   not u's release. (4) Words that held X's address and were overwritten
-//   before u by a read-modify-write on that same path (a prepend at the
-//   head, an earlier bypass): u's unlinker read them at or after the
-//   overwrite, so a load that happens-after u returns the overwritten value
-//   or a later one (coherence). There is no fifth kind: an address enters a
-//   published word only by a prepend's publishing CAS, a split's publishing
-//   CAS (whose subchain was linked privately), or an unlink CAS, all on the
-//   chain u's unlinker walked.
+//       load that happens-after u returns that value or a later one.
+//   (2) The links of the run-predecessors of X that u itself bypasses
+//       (P -> D1 -> X: D1's link holds X): the walk never loads D1's address,
+//       by this same argument applied to D1, whose address was in u's word.
+//   (3) The link of a node D bypassed EARLIER, by an unlink u_D (D's
+//       immutable link still holds X): the walk never loads D's address
+//       because u_D happens-before u -- u's unlinker reached its pred word by
+//       acquire loads along the chain from the head, and the word u_D
+//       rewrote lies on that path, or was itself bypassed later by an unlink
+//       whose word does, recursively; every later write to a published head
+//       or link is a read-modify-write, which extends u_D's release sequence,
+//       so the unlinker's acquire of that word synchronizes with u_D. The
+//       walk's and the pred word's acquires are load-bearing here, not u's
+//       release.
+//   (4) Words that held X's address and were overwritten before u by a
+//       read-modify-write on that same path (a prepend at the head, an
+//       earlier bypass): u's unlinker read them at or after the overwrite, so
+//       a load that happens-after u returns the overwritten value or a later
+//       one (coherence).
+//   There is no fifth kind: an address enters a published word only by a
+//   prepend's publishing CAS, a split's publishing CAS (whose subchain was
+//   linked privately), or an unlink CAS, all on the chain u's unlinker
+//   walked.
 //   EXIT. An operation whose head load does not happen-after u may hold X and
 //   may read X's `link` and `value`, which no concurrent operation writes
 //   after X is tagged. Following links from X reaches the current chain,
@@ -480,41 +487,48 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 //   that value is no longer UNINITIALIZED once any publish of j succeeded --
 //   and one did, since a copy can be bypassed only after it.
 //   LINEARIZABILITY of a miss, with dead nodes leaving concurrently, in two
-//   halves. (i) A miss is linearized before every insert that does NOT
-//   happen-before the call: no mechanism is needed, and no test may assert a
-//   hit for a key whose insert does not happen-before the call. (ii) For an
-//   insert that DOES happen-before the call, a miss is final only if the key
-//   was deleted: (a) if the key's node was MARKED and then bypassed, the
-//   deletion linearizes at the mark CAS as before, and contains() and
-//   erase() skip a MARKED node anyway. In every other case the miss is never
-//   final: (b) if the key's FROZEN parent copy was bypassed after a later
-//   split published the copy's bucket, the reader's reload of table_size_
-//   returns a strictly larger size (channel 5), so the walk retries in the
-//   child, at most once per doubling. (c) The copy's child is then
-//   PUBLISHED to the reader, never UNINITIALIZED: the unlinker read the child
-//   head published before its CAS, and the reader's acquire of the CAS's
-//   value orders the reader's own child-head load after that read, so by
-//   read-read coherence it returns the published value or a later one. If
-//   the reload sent the reader to a deeper bucket on the key's path that is
-//   still UNINITIALIZED, that is a first access, and the reader splits it
-//   from the published child as any operation would; a losing splitter is
-//   the P9 case. The list is complete because no unlink
-//   bypasses a live node or a FROZEN node whose child is unpublished
-//   (is_dead_now()): the only nodes a walk can miss through a bypass are
-//   tombstones, (a), and superseded copies, (b). (d) The edge of (b) is the
-//   unlinker's OWN: it decided the copy dead at a table size it had READ,
-//   which covers the child; that read is sequenced before its release CAS,
-//   and the reader, which acquires the CAS's value (or a later value of the
-//   word, through the release sequence that read-modify-writes extend), has
-//   the read happen-before its own reload, so by read-read coherence the
-//   reload returns that size or a newer one, whatever the order of the
-//   unlinker's load. The acquires of the FROZEN link and of the child head
-//   inside is_dead_now() are not what carries this edge. The acquires of the walk
-//   and the run walk carry something else: an EARLIER unlinker's edge, which
-//   a walker at a stale size inherits when it bypasses a node whose link
-//   that earlier unlinker rewrote and a tag CAS then extended; for a MARKED
-//   link there is no other route, and for a FROZEN link the child head's
-//   publisher need not have acquired the earlier size either (channel 5).
+//   halves.
+//   (i) A miss is linearized before every insert that does NOT happen-before
+//       the call: no mechanism is needed, and no test may assert a hit for a
+//       key whose insert does not happen-before the call.
+//   (ii) For an insert that DOES happen-before the call, a miss is final only
+//       if the key was deleted:
+//       (a) if the key's node was MARKED and then bypassed, the deletion
+//           linearizes at the mark CAS (the marking CAS is THE deletion, see
+//           above), and contains() and erase() skip a MARKED node anyway.
+//       In every other case the miss is never final:
+//       (b) if the key's FROZEN parent copy was bypassed after a later split
+//           published the copy's bucket, the reader's reload of table_size_
+//           returns a strictly larger size (channel 5), so the walk retries
+//           in the child, at most once per doubling.
+//       (c) The copy's child is then PUBLISHED to the reader, never
+//           UNINITIALIZED: the unlinker read the child head published before
+//           its CAS, and the reader's acquire of the CAS's value orders the
+//           reader's own child-head load after that read, so by read-read
+//           coherence it returns the published value or a later one. If the
+//           reload sent the reader to a deeper bucket on the key's path that
+//           is still UNINITIALIZED, that is a first access, and the reader
+//           splits it from the published child as any operation would; a
+//           losing splitter is the P9 case.
+//       The list is complete because no unlink bypasses a live node or a
+//       FROZEN node whose child is unpublished (is_dead_now()): the only
+//       nodes a walk can miss through a bypass are tombstones, (a), and
+//       superseded copies, (b).
+//       (d) The edge of (b) is the unlinker's OWN: it decided the copy dead
+//           at a table size it had READ, which covers the child; that read is
+//           sequenced before its release CAS, and the reader, which acquires
+//           the CAS's value (or a later value of the word, through the
+//           release sequence that read-modify-writes extend), has the read
+//           happen-before its own reload, so by read-read coherence the
+//           reload returns that size or a newer one, whatever the order of
+//           the unlinker's load. The acquires of the FROZEN link and of the
+//           child head inside is_dead_now() are not what carries this edge.
+//           The acquires of the walk and the run walk carry something else:
+//           an EARLIER unlinker's edge, which a walker at a stale size
+//           inherits when it bypasses a node whose link that earlier unlinker
+//           rewrote and a tag CAS then extended; for a MARKED link there is
+//           no other route, and for a FROZEN link the child head's publisher
+//           need not have acquired the earlier size either (channel 5).
 //
 // SYNCHRONIZATION CHANNELS (all memory-ordering correctness rides on these)
 //   1. buckets_[j] CAS/store is release; every load of buckets_[j] is acquire.
@@ -581,34 +595,34 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 //      No order on the unlinker's table_size_ load is needed for this (its
 //      acquire is channel 2's: it is what lets the unlinker index the new
 //      buckets), and the acquire of the FROZEN link and the acquire of the
-//      child head are redundant for it. SECOND, EARLIER unlinkers' edges,
-//      through release sequences: when an unlinker rewrote a live link (from
-//      F to E, say) and
-//      a mark or freeze then tagged that link (a read-modify-write, so the
-//      tagged value is still in the unlinker's release sequence), a walker at
-//      a STALE size may bypass the tagged node and install E through its own
-//      pred word; the reader that follows that bypass needs the EARLIER
-//      unlinker's size, and the only route is the walker's acquire of the
-//      tagged link -- the walk's load when the node starts a run, the run
-//      walk's load otherwise. For a MARKED link there is no other route at
-//      all; for a FROZEN link the child head's publisher need not have
-//      acquired the earlier size either. The eraser has a third such route,
-//      the ACQUIRE FAILURE ORDER of its mark CAS: when the mark fails on a
-//      live value that an unlinker wrote (a new successor address), the
-//      retried mark and the self-unlink that follows install that successor
-//      through the pred word, and the failed CAS's read is the eraser's only
-//      acquire of the unlinker's write (the run walk then loads the
-//      successor's own link, which the unlinker did not write); with that
-//      failure order relaxed a reader following the eraser's bypass would
-//      reload the old size. The same acquire of a LIVE pred
-//      word that an earlier unlinker rewrote is what UNREACHABILITY's u_D
-//      clause rests on. Every acquire of the walk and the run walk is
-//      therefore load-bearing, for earlier unlinkers' edges, whatever the
-//      walker's own size. The retire push (push_retired()) is a release CAS
-//      so that an acquire of a retired head orders everything before every
-//      push below it; nothing in this class acquires one, and reclaim()
-//      needs no ordering: the release is reserved for a reclamation that
-//      snapshots the retired heads without quiescence (RECLAMATION).
+//      child head are redundant for it.
+//      SECOND, EARLIER unlinkers' edges, through release sequences: when an
+//      unlinker rewrote a live link (from F to E, say) and a mark or freeze
+//      then tagged that link (a read-modify-write, so the tagged value is
+//      still in the unlinker's release sequence), a walker at a STALE size
+//      may bypass the tagged node and install E through its own pred word;
+//      the reader that follows that bypass needs the EARLIER unlinker's size,
+//      and the only route is the walker's acquire of the tagged link -- the
+//      walk's load when the node starts a run, the run walk's load otherwise.
+//      For a MARKED link there is no other route at all; for a FROZEN link
+//      the child head's publisher need not have acquired the earlier size
+//      either. The eraser has a third such route, the ACQUIRE FAILURE ORDER
+//      of its mark CAS: when the mark fails on a live value that an unlinker
+//      wrote (a new successor address), the retried mark and the self-unlink
+//      that follows install that successor through the pred word, and the
+//      failed CAS's read is the eraser's only acquire of the unlinker's write
+//      (the run walk then loads the successor's own link, which the unlinker
+//      did not write); with that failure order relaxed a reader following
+//      the eraser's bypass would reload the old size. The same acquire of a
+//      LIVE pred word that an earlier unlinker rewrote is what
+//      UNREACHABILITY's u_D clause rests on. Every acquire of the walk and
+//      the run walk is therefore load-bearing, for earlier unlinkers' edges,
+//      whatever the walker's own size.
+//      The retire push (push_retired()) is a release CAS so that an acquire
+//      of a retired head orders everything before every push below it;
+//      nothing in this class acquires one, and reclaim() needs no ordering:
+//      the release is reserved for a reclamation that snapshots the retired
+//      heads without quiescence (RECLAMATION).
 //   Linearizability throughout this class is with respect to happens-before,
 //   which is all the C++ memory model can express: "an erase() that returned
 //   before this call began" means the return happens-before the call (e.g. the
@@ -651,10 +665,10 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 // sense that a failed CAS implies another thread's completed step: the mark
 // and freeze retries on a live failure value (each failure is a completed
 // unlink through the node), the retire push's CAS loop (each failure a
-// completed push, or a spurious failure of its weak CAS, a plain retry),
-// and erase()'s restart (one, after a lost CAS); the
-// opportunistic unlink sites and the cleanup pass make ONE attempt per run
-// and never retry, and erase()'s self-unlink makes at most two.
+// completed push, or a spurious failure of its weak CAS, a plain retry), and
+// erase()'s restart (one, after a lost CAS); the opportunistic unlink sites
+// and the cleanup pass make ONE attempt per run and never retry, and
+// erase()'s self-unlink makes at most two.
 //
 // Template parameters:
 //   T           : element (key) type; must be equality-comparable, hashable,
@@ -791,9 +805,9 @@ public:
         // reclaim() only when it frees the node (a kept FROZEN node's link may
         // be relinked past dead successors there too), so a dead node can
         // always be EXITED through the successor it held when it died, until
-        // the next quiescent point. On a free or limbo list the same
-        // word is the list's next pointer (a bare address); a retired node
-        // keeps its chain link intact (the retired lists use retire_link).
+        // the next quiescent point. On a free or limbo list the same word is
+        // the list's next pointer (a bare address); a retired node keeps its
+        // chain link intact (the retired lists use retire_link).
         std::atomic<word_t> link;
         // The RETIRED LIST's next pointer: a bare node address or EMPTY, tag
         // bits zero. A separate word, and not `link`, because a retired node
@@ -1013,8 +1027,9 @@ private:
     // thread. (2) The push_limbo() loop on retired_head, with RELEASE on
     // success: the push is the one point that orders "this node is
     // unreachable" before whatever later acquires the head (the quiescent
-    // reclaim() needs no ordering, but a future generation bump that
-    // snapshots the heads with an acquire does: see Shard::retired_head).
+    // reclaim() needs no ordering, but a generation bump that snapshots the
+    // heads with an acquire does: the SNAPSHOT form under RECLAMATION in the
+    // class overview, and Shard::retired_head).
     // Failure is relaxed: the value that failed is only the next expected
     // value. Weak CAS: a retry loop anyway, and each failure is another
     // thread's completed push or a spurious failure (a plain retry), so the
@@ -1094,19 +1109,20 @@ private:
         return child < ts && addr_of(buckets_[child].load(std::memory_order_acquire)) != UNINITIALIZED;
     } // is_dead_now()
 
-    // The state of a WRITER WALK over one chain: the predecessor word a run of
-    // dead nodes would be bypassed through, and whether this thread may CAS
-    // it. A walk starts with pred = the bucket head (its full word, level
-    // included) and advances pred onto every LIVE node it passes (the node's
-    // untagged link as loaded, which is the CAS expected value); a tagged node
-    // never becomes pred, so between pred and the walk's current node there
-    // are only tagged nodes the walk could not or did not bypass. pred_ok is
+    // The state of a WRITER WALK over one chain: the pred word a run of dead
+    // nodes would be bypassed through, and whether this thread may CAS it. A
+    // walk starts with pred = the bucket head (its full word, level included)
+    // and advances pred onto every LIVE node it passes (the node's untagged
+    // link as loaded, which is the CAS expected value); a tagged node never
+    // becomes pred, so between pred and the walk's current node there are
+    // only tagged nodes the walk could not or did not bypass. pred_ok is
     // false after a CAS on pred lost: pred_word is then stale and a further
     // CAS on it would be wasted (the one-shot sites never retry); it becomes
     // true again at the next live node. head_word is the current head value
     // as this thread knows it: the value loaded, or the value its OWN
-    // successful head unlink installed (the own-CAS rule: insert()'s publish
-    // CAS expects it, and keeps the level it carries).
+    // successful head unlink installed (the own-CAS rule, CAS VALUE RULES
+    // before contains(); insert()'s publish CAS expects it, and keeps the
+    // level it carries).
     struct WalkState {
         std::atomic<word_t>* pred;    // the word holding the address the walk follows next
         word_t pred_word;             // its value as loaded, or as this thread's own CAS installed it
@@ -1146,24 +1162,25 @@ private:
     // value a tag CAS extended, channel 5 in the class overview) and stops at
     // the first node that is not dead, S, or at EMPTY; the new value is S's
     // address with the pred word's own tag bits (a head keeps its level; a
-    // link pred is untagged). The CAS is release on success (the channel-5
-    // edge: a thread that acquires the new value is ordered after this
-    // unlink, after this thread's read of the table size at which it decided
-    // the run dead, and after every earlier unlink whose edge this thread's
-    // walk acquired) and acquire on failure (the pinned order; no site
-    // dereferences or follows the failed value -- the loser only compares
-    // its address for the loss counters, which needs no happens-before -- so
-    // the failure acquire carries nothing today). The WINNER retires EXACTLY
-    // the recorded run first..last and nothing else: deadness is never
-    // re-evaluated after the CAS, because a FROZEN node's child can publish
-    // between the run walk and the CAS, which would make S dead and a
-    // re-evaluation would retire S while S is reachable. A loser retires
-    // nothing (the winner retires the same nodes) and marks pred stale; the
-    // loss is charged to the site's counters (Shard), as a PEER LOSS when the
-    // failure value's address is S, the successor this thread computed: the
-    // word was rewritten by a bypass of exactly this run, so no dead node is
-    // left behind by the loss. The only writes: the one CAS, the retirement
-    // and the counters.
+    // link pred is untagged).
+    // The CAS is release on success (the channel-5 edge: a thread that
+    // acquires the new value is ordered after this unlink, after this
+    // thread's read of the table size at which it decided the run dead, and
+    // after every earlier unlink whose edge this thread's walk acquired) and
+    // acquire on failure (the pinned order; no site dereferences or follows
+    // the failed value -- the loser only compares its address for the loss
+    // counters, which needs no happens-before -- so the failure acquire
+    // carries nothing in this class).
+    // The WINNER retires EXACTLY the recorded run first..last and nothing
+    // else: deadness is never re-evaluated after the CAS, because a FROZEN
+    // node's child can publish between the run walk and the CAS, which would
+    // make S dead and a re-evaluation would retire S while S is reachable. A
+    // loser retires nothing (the winner retires the same nodes) and marks
+    // pred stale; the loss is charged to the site's counters (Shard), as a
+    // PEER LOSS when the failure value's address is S, the successor this
+    // thread computed: the word was rewritten by a bypass of exactly this
+    // run, so no dead node is left behind by the loss. The only writes: the
+    // one CAS, the retirement and the counters.
     // Why one CAS on an untagged pred cannot lose a node or retire one twice
     // (the Harris argument): two concurrent bypasses can only overlap through
     // a node both treat the same way, and a tagged link is never a CAS
@@ -1217,12 +1234,11 @@ private:
     // on pred has made pred_word stale). Never retried: a lost CAS is another
     // thread's completed step on this word -- often a peer's bypass of this
     // very run, which leaves nothing behind -- and whatever dead nodes it
-    // leaves are collected by a later writer walk, a later cleanup pass over
-    // the chain, or reclaim(). Returns the bare address where the walk
-    // continues: after the run in either case; after a lost CAS the dead run
-    // may already be bypassed by someone else, and the exit still lands in
-    // the current chain (EXIT in the class overview). `site` names the
-    // caller for the loss counters.
+    // leaves are STRAGGLERS (WHY COPY in the class overview). Returns the
+    // bare address where the walk continues: after the run in either case;
+    // after a lost CAS the dead run may already be bypassed by someone else,
+    // and the exit still lands in the current chain (EXIT in the class
+    // overview). `site` names the caller for the loss counters.
     word_t step_over(WalkState& w, Node* node, word_t link, size_t j, size_t ts, UnlinkSite site) {
         if ((link & (MARK_BIT | FROZEN_BIT)) == 0) {   // live: the new pred
             w.pred = &node->link;
@@ -1238,26 +1254,27 @@ private:
 
     // The split winner's CLEANUP PASS over the parent chain, after its
     // publishing CAS (P9: a node FROZEN for j is bypassed only once j is
-    // published). One writer walk with one unlink attempt per dead run (never
-    // retried; a lost CAS is charged to cleanup_cas_failures, and to
-    // cleanup_cas_peer_losses when a peer -- a concurrent writer walk, or the
-    // cleanup of another split of this parent -- bypassed the same run, in
-    // which case nothing is left; otherwise the run stays for a later walk,
-    // cleanup or reclaim()). Dead here, besides any tombstone, is every node
-    // FROZEN for a PUBLISHED child of the parent: the copies this split
-    // superseded (their child is j, just published) and those of earlier
-    // splits of other children that are still here; so the cleanup of ANY
-    // child's split collects the whole parent chain's dead runs, with no hit
-    // to stop it.
+    // published). Called by split_bucket(j) with `parent` = j's parent; j and
+    // 2N below are split_bucket()'s. One writer walk with one unlink attempt
+    // per dead run (never retried; a lost CAS is charged to
+    // cleanup_cas_failures, and to cleanup_cas_peer_losses when a peer -- a
+    // concurrent writer walk, or the cleanup of another split of this parent
+    // -- bypassed the same run, in which case nothing is left; otherwise the
+    // run stays for a later walk, cleanup or reclaim()). Dead here, besides
+    // any tombstone, is every node FROZEN for a PUBLISHED child of the
+    // parent: the copies this split superseded (their child is j, just
+    // published) and those of earlier splits of other children that are still
+    // here; so the cleanup of ANY child's split collects the whole parent
+    // chain's dead runs, with no hit to stop it.
     // The table size is acquired here, once: split_bucket()'s precondition
     // is that its caller acquired, on this thread, a table size above j, so
     // this load returns at least 2N (table_size_ is monotone and the two
-    // loads are sequenced), hence j < ts and the
-    // FROZEN-for-j nodes are decidable; nodes FROZEN for a later doubling
-    // than this `ts` covers are left (not dead to this walk). The head is
-    // reloaded with acquire: nodes prepended by threads at table size >= 2N
-    // since the seal are live and in front of the snapshot. Calls Hash{} on
-    // every FROZEN node it passes (H6). Exceptions: see EXCEPTIONS (W4).
+    // loads are sequenced), hence j < ts and the FROZEN-for-j nodes are
+    // decidable; nodes FROZEN for a later doubling than this `ts` covers are
+    // left (not dead to this walk). The head is reloaded with acquire: nodes
+    // prepended by threads at table size >= 2N since the seal are live and in
+    // front of the snapshot. Calls Hash{} on every FROZEN node it passes
+    // (H6). Exceptions: see EXCEPTIONS in the class overview (W4).
     void cleanup_parent(size_t parent) {
         const size_t ts = table_size_.load(std::memory_order_acquire);
         WalkState w(&buckets_[parent], buckets_[parent].load(std::memory_order_acquire));
@@ -1274,8 +1291,8 @@ private:
     // reload). `w` is the walk state at x: pred is the last live word before
     // x, and between pred and x there are only tagged nodes the walk did not
     // bypass. At most TWO unlink CASes, then give up; the tombstone is then a
-    // straggler for a later writer walk, split or reclaim(), and the return
-    // value of erase() does not depend on any of this.
+    // STRAGGLER (WHY COPY in the class overview), and the return value of
+    // erase() does not depend on any of this.
     //   Attempt 1: if pred is usable (no lost CAS on it), the run bypassed
     //   starts at the node pred leads to, `first`: x itself, or a tagged node
     //   before x. If `first` is tagged and NOT dead (FROZEN with an
@@ -1297,11 +1314,10 @@ private:
     //   done. Else attempt 2 exactly as attempt 1, and whatever its outcome,
     //   GIVE UP (exit 2, "CAS lost twice": two concurrent changes to one chain
     //   inside one erase, the first of them possibly the one that cost the
-    //   walk its own CAS on the predecessor, so that attempt 1 was skipped).
+    //   walk its own CAS on the pred word, so that attempt 1 was skipped).
     //   Neither loss is counted: the residue of a give-up is the tombstone
     //   itself, visible in the accounting as a reachable dead node.
-    // Exceptions: Hash{} may throw inside a run walk here, after the mark;
-    // see EXCEPTIONS (P5).
+    // Exceptions: see EXCEPTIONS in the class overview (P5).
     void self_unlink(WalkState& w, Node* x, word_t x_link, size_t j, size_t ts) {
         bool restarted = false;
         while (true) {   // at most two rounds
@@ -1421,7 +1437,8 @@ private:
     // A parent that is itself still UNINITIALIZED is split first (recursion),
     // so an arbitrarily deep chain of ancestors is materialized on demand.
     //
-    // The split runs in three steps, each of which hands off through one word:
+    // The split runs in three steps, each of which hands off through one word,
+    // and the winner then runs a fourth:
     //   1. SEAL the parent head to the level of table size 2N and take exactly
     //      the sealed head as the snapshot. From here on no thread working with
     //      a table size < 2N can publish into the parent (see insert()), so
@@ -1450,32 +1467,30 @@ private:
     //      false there are no tombstones and nothing races with the copy, so
     //      the tag decides nothing for the key; it is set anyway because a
     //      superseded parent copy must be TAGGED to be dead: the tag is what
-    //      makes its link immutable, and an immutable link is what lets a
-    //      run of dead nodes be bypassed by one CAS on an untagged
-    //      predecessor without a lost unlink or a double retirement (two
-    //      bypasses through a node that one of them treats as live). Every
-    //      dead node in a chain, tombstone or stale copy, is therefore tagged.
+    //      makes its link immutable, and an immutable link is what lets a run
+    //      of dead nodes be bypassed by one CAS on an untagged pred word
+    //      without a lost unlink or a double retirement (two bypasses through
+    //      a node that one of them treats as live). Every dead node in a
+    //      chain, tombstone or superseded copy, is therefore tagged.
     //   3. Publish the subchain with one CAS on bucket j's head. A subchain
     //      that loses the CAS goes to the limbo list, whole.
     //   4. The WINNER's cleanup pass (cleanup_parent()): one walk of the
     //      parent chain that bypasses, with one CAS per run and no retry,
     //      every run of dead nodes it meets -- the copies this split just
     //      superseded, foremost. Losers do nothing: the winner's pass covers
-    //      the same nodes, and the next writer walk or split collects what
-    //      the pass lost to contention. The pass runs AFTER the publication
-    //      (P9 in the class overview): until j is published, a node FROZEN
-    //      for j is the key's only reachable node.
+    //      the same nodes, and what the pass loses to contention is a
+    //      STRAGGLER (WHY COPY in the class overview). The pass runs AFTER the
+    //      publication (P9 in the class overview): until j is published, a
+    //      node FROZEN for j is the key's only reachable node.
     // Exceptions: see EXCEPTIONS in the class overview.
     // The parent chain IS relinked by concurrent operations, by unlink CASes
     // on LIVE links and heads only (unlink_run()); an operation that holds a
     // node's address can still exit the node through its tagged, immutable
     // link (EXIT in the class overview), which is what keeps already-observed
     // node addresses usable for the whole of an operation.
-    // PINNED ORDER H3 (see PINNED ORDERS before contains()): for every node of
-    // the snapshot, the link load, then Hash{}(val), then the freeze CAS whose
-    // expected value is that earlier load, never a reload. PINNED ORDER H6:
-    // the cleanup pass, after the publishing CAS, calls Hash{} on each FROZEN
-    // node of a dead run before that run's unlink CAS (is_dead_now()).
+    // Pinned orders: H3 (the snapshot walk's link load, Hash{}, freeze CAS)
+    // and H6 (the cleanup pass's Hash{} calls) are this function's; see
+    // PINNED ORDERS before contains().
     void split_bucket(size_t j) {
         // Bucket 0 has no parent and is published EMPTY by the constructor, so
         // it can never be UNINITIALIZED and never reaches here. The guard
@@ -1681,6 +1696,7 @@ public:
     // after an operation's OWN successful CAS on a word, its next expected
     // value for that word is the value it installed (a head unlink keeps the
     // level; a publish after an own head unlink expects the unlinked head).
+    // This last rule is the OWN-CAS RULE.
     // ------------------------------------------------------------------------
 
     // Membership test. Lock-free on the fast path (a plain chain walk with no
@@ -1763,7 +1779,7 @@ public:
     // is split first, and a successful insert may perform the DCLP-guarded
     // doubling when the node count exceeds twice the table size.
     // Postcondition of an UNCONTENDED call that returns normally (no other
-    // operation on the set runs meanwhile; see WHY COPY in the class
+    // operation on the set runs meanwhile; POSTCONDITIONS in the class
     // overview): no dead run stays reachable behind the bucket head or a live
     // node the walk passed. Under contention the walk's unlinks are best
     // effort.
@@ -1932,19 +1948,17 @@ public:
     // of the key, across any number of concurrent resizes. A key that is absent
     // or already tombstoned yields false. After a successful mark the call
     // makes a bounded effort to take its tombstone out of the chain at once
-    // (self_unlink(): one CAS on the predecessor tracked during the walk, one
+    // (self_unlink(): one CAS on the pred word tracked during the walk, one
     // restart from the head, then give up); the result is unaffected unless
-    // Hash{} throws there (EXCEPTIONS, P5), and a tombstone that stays may be
-    // collected by a later writer walk that passes it (hit or miss) or by the
-    // cleanup of a split of any child of the bucket, and is always collected
-    // by reclaim(). The walk itself is a
-    // writer walk (step_over()): every dead run it passes behind a live word
-    // gets one unlink attempt. Postconditions of an UNCONTENDED call that
-    // returns normally (no other operation on the set runs meanwhile; see
-    // WHY COPY in the class overview): no dead run stays reachable behind the
-    // bucket head or a live node the walk passed, and the tombstone is
-    // unreachable unless a tagged, not-dead node lies between it and the
-    // last live word before it.
+    // Hash{} throws there (EXCEPTIONS, P5), and a tombstone that stays is a
+    // STRAGGLER (WHY COPY in the class overview). The walk itself is a writer
+    // walk (step_over()): every dead run it passes behind a live word gets one
+    // unlink attempt. Postconditions of an UNCONTENDED call that returns
+    // normally (no other operation on the set runs meanwhile; POSTCONDITIONS
+    // in the class overview): no dead run stays reachable behind the bucket
+    // head or a live node the walk passed, and the tombstone is unreachable
+    // unless a tagged, not-dead node lies between it and the last live word
+    // before it.
     //
     // The decision is the marking CAS, and the geometry is validated by that same
     // CAS: its expected value is the LIVE link (no MARK, no FROZEN). A split that
@@ -2092,12 +2106,12 @@ private:
     //       retired onto shard 1 after shard 0 was exchanged while a resumed
     //       operation still holds that node.
     // reclaim()'s quiescence implies all three. What a caller that resumes
-    // operations after the START would ALSO need, and this file does not
+    // operations after the START would ALSO need, and this class does not
     // provide, is thread-safe free lists: reclaim_sequestered() pushes onto
     // the free lists, and a push concurrent with alloc_node()'s pops breaks
     // the pop's ABA argument (RECLAMATION in the class overview: a head value
     // a popper read can be restored only by a push, and pushes happen only
-    // inside reclaim()); so in this file the two phases run only inside
+    // inside reclaim()); so in this class the two phases run only inside
     // reclaim(), and a drain concurrent with operations is not supported.
 
     // Phase 1, SEQUESTER: take every shard's retired list out of its head and
@@ -2169,20 +2183,21 @@ private:
     // it failed. Every splitter of child therefore saw this node and froze it
     // (for both AllowDelete values), and the winner copied it, or found it
     // marked and skipped it. Either way the copy in child (or, transitively,
-    // in a deeper published bucket)
-    // is what every operation at the current table size consults, and this
-    // node decides nothing any more. Conversely, if child is still
-    // UNINITIALIZED this node is the key's only reachable node and is kept,
-    // FROZEN or not: a FROZEN node whose child is unpublished is still
-    // authoritative (class overview, INVARIANT; it arises when a split threw
-    // between the freeze and the publication), and the next operation that
-    // needs child will split it from this node. A deeper bucket on the path
-    // cannot be published while child is not (split_bucket() publishes the
-    // parent first), so testing the next child alone is sufficient.
+    // in a deeper published bucket) is what every operation at the current
+    // table size consults, and this node decides nothing any more.
+    // Conversely, if child is still UNINITIALIZED this node is the key's only
+    // reachable node and is kept, FROZEN or not: a FROZEN node whose child is
+    // unpublished is still authoritative (class overview, INVARIANT; it arises
+    // when a split threw between the freeze and the publication), and the next
+    // operation that needs child will split it from this node. A deeper bucket
+    // on the path cannot be published while child is not (split_bucket()
+    // publishes the parent first), so testing the next child alone is
+    // sufficient.
     // Relation to the concurrent form (is_dead_now()): the same rule, minus
     // the tag test. Concurrent-dead implies quiescent-dead; a reachable
-    // quiescent-dead node is tagged (the accounting sweep's C2), so at a
-    // quiescent point the two agree on every reachable node.
+    // quiescent-dead node is tagged (C2 of the accounting sweep,
+    // get_internal_accounting(), below), so at a quiescent point the two
+    // agree on every reachable node.
     bool is_dead(const Node* node, word_t link, size_t j, size_t ts) const {
         if (link & MARK_BIT) return true;
         const size_t child = next_child(Hash{}(node->value), j);
@@ -2213,8 +2228,8 @@ public:
     //   system (the arena only ever grows; reclaimed nodes are reused);
     //   every key in the set has exactly one reachable node afterwards (see
     //   below), no dead node is reachable, the limbo and retired lists are
-    //   empty, and
-    //   the return value is that count, exact; node_count_ is reset from it.
+    //   empty, and the return value is that count, exact; node_count_ is
+    //   reset from it.
     //   Requirements on T: copy-assignable (a reused node takes its new value
     //   by assignment; the old value is not destroyed here -- see LIFETIME OF
     //   VALUES in the class overview; callers must not rely on when an erased

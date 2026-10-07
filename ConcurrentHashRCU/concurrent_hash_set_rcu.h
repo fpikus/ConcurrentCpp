@@ -214,10 +214,10 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 //   standalone collector call that walks published chains like a writer
 //   miss walk without inserting anything; both would trade read-path cost
 //   or an API call for fewer stragglers, and this class keeps the read walk
-//   pure and reclaim() as the only collector of the remainder. A retired node is not
-//   reused before reclaim(): the retired lists only separate "dead and out
-//   of its chain" from "dead and still in it", for reclaim() to drain without
-//   a chain walk (RECLAMATION).
+//   pure and reclaim() as the only collector of the remainder. A retired
+//   node is not reused before reclaim(): the retired lists only separate
+//   "dead and out of its chain" from "dead and still in it", for reclaim()
+//   to drain without a chain walk (RECLAMATION).
 //
 // EXCEPTIONS: WHAT IS AND IS NOT HANDLED (the one place that says it all)
 //   Exception behavior is mostly out of scope for this class, as it is for
@@ -502,13 +502,14 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 //   bypasses a live node or a FROZEN node whose child is unpublished
 //   (is_dead_now()): the only nodes a walk can miss through a bypass are
 //   tombstones, (a), and superseded copies, (b). (d) The edge of (b) is the
-//   unlinker's OWN: it decided the copy dead at a table size it had
-//   acquired, which covers the child, so the resizer's release store of that
-//   size happens-before the unlinker's release CAS, and the reader, which
-//   acquires the CAS's value (or a later value of the word, through the
-//   release sequence that read-modify-writes extend), reloads a size no
-//   smaller. The acquires of the FROZEN link and of the child head inside
-//   is_dead_now() are not what carries this edge. The acquires of the walk
+//   unlinker's OWN: it decided the copy dead at a table size it had READ,
+//   which covers the child; that read is sequenced before its release CAS,
+//   and the reader, which acquires the CAS's value (or a later value of the
+//   word, through the release sequence that read-modify-writes extend), has
+//   the read happen-before its own reload, so by read-read coherence the
+//   reload returns that size or a newer one, whatever the order of the
+//   unlinker's load. The acquires of the FROZEN link and of the child head
+//   inside is_dead_now() are not what carries this edge. The acquires of the walk
 //   and the run walk carry something else: an EARLIER unlinker's edge, which
 //   a walker at a stale size inherits when it bypasses a node whose link
 //   that earlier unlinker rewrote and a tag CAS then extended; for a MARKED
@@ -580,8 +581,9 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 //      No order on the unlinker's table_size_ load is needed for this (its
 //      acquire is channel 2's: it is what lets the unlinker index the new
 //      buckets), and the acquire of the FROZEN link and the acquire of the
-//      child head are redundant for it. SECOND, EARLIER unlinkers' edges, through release
-//      sequences: when an unlinker rewrote a live link (from F to E, say) and
+//      child head are redundant for it. SECOND, EARLIER unlinkers' edges,
+//      through release sequences: when an unlinker rewrote a live link (from
+//      F to E, say) and
 //      a mark or freeze then tagged that link (a read-modify-write, so the
 //      tagged value is still in the unlinker's release sequence), a walker at
 //      a STALE size may bypass the tagged node and install E through its own
@@ -632,10 +634,10 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 //   (the bypassed word, then table_size_), closed by read-read coherence:
 //   the unlinker's READ of the larger size (or, through a release sequence,
 //   an earlier unlinker's) happens-before the reader's reload, so the reload
-//   cannot return an older value, whatever the order of that read. A miss that is confirmed by an
-//   unchanged table_size_ (contains(), erase()) linearizes at the first
-//   table_size_ load; see contains() and the two halves under STALE
-//   GEOMETRY.
+//   cannot return an older value, whatever the order of that read. A miss
+//   that is confirmed by an unchanged table_size_ (contains(), erase())
+//   linearizes at the first table_size_ load; see contains() and the two
+//   halves under STALE GEOMETRY.
 //
 // PROGRESS: this structure is lock-free on the pure read/traverse path, but it
 // is NOT wait-free and not lock-free end to end: contains(), insert() and
@@ -1061,12 +1063,13 @@ private:
 
     // CONCURRENT deadness: may a concurrent operation bypass `node` (in the
     // chain of bucket j, link value `link` as loaded by the caller, at the
-    // caller's acquired table size `ts`)? Dead iff MARKED, or FROZEN with its
-    // next child (next_child()) below `ts` AND published (an ACQUIRE load of
-    // the child head, channel 1: a caller that goes on to read the child
-    // chain is ordered after its publication; the edge a stale reader needs
-    // after a bypass is carried by the caller's own acquire of `ts`, channel
-    // 5). An untagged
+    // table size `ts` the caller loaded from table_size_)? Dead iff MARKED,
+    // or FROZEN with its next child (next_child()) below `ts` AND published
+    // (an ACQUIRE load of the child head, channel 1: a caller that goes on
+    // to read the child chain is ordered after its publication; the edge a
+    // stale reader needs after a bypass is carried by the caller's READ of
+    // `ts`, through read-read coherence, channel 5 -- the acquire on that
+    // load is channel 2's, for indexing buckets_[child] at all). An untagged
     // node is never dead to a concurrent operation, whatever its child's
     // state: every node that reclaim()'s quiescent rule (is_dead()) calls
     // dead is tagged (a tombstone by its mark, a superseded copy by the
@@ -1145,13 +1148,12 @@ private:
     // address with the pred word's own tag bits (a head keeps its level; a
     // link pred is untagged). The CAS is release on success (the channel-5
     // edge: a thread that acquires the new value is ordered after this
-    // unlink, after this thread's acquire of the table size at which it
-    // decided the run dead, and after every earlier unlink whose edge this
-    // thread's walk acquired) and acquire on failure (the pinned order; no
-    // site dereferences or follows the failed value -- the loser only
-    // compares its address for the loss counters, which needs no
-    // happens-before -- so the failure acquire carries nothing today). The
-    // WINNER retires EXACTLY
+    // unlink, after this thread's read of the table size at which it decided
+    // the run dead, and after every earlier unlink whose edge this thread's
+    // walk acquired) and acquire on failure (the pinned order; no site
+    // dereferences or follows the failed value -- the loser only compares
+    // its address for the loss counters, which needs no happens-before -- so
+    // the failure acquire carries nothing today). The WINNER retires EXACTLY
     // the recorded run first..last and nothing else: deadness is never
     // re-evaluated after the CAS, because a FROZEN node's child can publish
     // between the run walk and the CAS, which would make S dead and a

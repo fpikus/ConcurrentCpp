@@ -33,18 +33,36 @@
 //      that made k a member returns, contains(k) is true for every thread until
 //      some call removes it, and vice versa. No key is ever lost by a resize and
 //      no erased key is ever resurrected by one.
-//   4. reclaim(), called at a quiescent point (nothing else runs on the set, and
-//      the caller's joins order it against every other call), changes no
+//   4. At every quiescent point (nothing runs on the set, and the caller's joins
+//      order the point against every call) each arena slot is in exactly one of
+//      four places (get_internal_accounting()): reachable from a published
+//      bucket, on a free list, on a limbo list (a node that was never
+//      published), or on a retired list (a dead node that an operation unlinked
+//      from its chain). reclaim(), called at a quiescent point, changes no
 //      membership, returns the exact number of keys, leaves exactly one
-//      reachable node per key, and recycles every other arena slot: after it,
-//      every slot is reachable, on a free list, or on a limbo list, exactly once
-//      (get_internal_accounting()), and the limbo lists are empty. Later
-//      allocations take free slots before they grow the arena, and a reused slot
-//      takes its new value by copy assignment. See the header's RECLAMATION
-//      section and the contract on reclaim().
-// Anything weaker than this (a "best effort" boolean, an under-counting insert)
+//      reachable node per key, and recycles every other arena slot: after it the
+//      limbo and retired lists are empty and every other slot is on a free list.
+//      Later allocations take free slots before they grow the arena, and a
+//      reused slot takes its new value by copy assignment. See the header's
+//      RECLAMATION section and the contract on reclaim().
+//   5. Between reclaim() calls a dead node (a tombstone, or a parent copy that a
+//      split superseded) may be unlinked from its chain by a WRITER -- the
+//      erase() that made it a tombstone, the split that superseded it, or a later
+//      insert() or erase() whose walk passes it -- and retired; contains() never
+//      writes. Where a dead node ends up is asserted only for operations that
+//      ran UNCONTENDED, as POSTCONDITIONS of those operations: an uncontended
+//      erase() leaves its own node unreachable unless the node's predecessor is
+//      tagged and not dead; an uncontended split leaves no superseded parent copy
+//      and no tombstone reachable in the parent behind an untagged predecessor;
+//      an uncontended insert() or erase() walk leaves no dead run reachable
+//      behind the bucket head or a live predecessor it passed. They are not
+//      guarantees: under contention a dead node may stay in its chain (a
+//      STRAGGLER) until a later writer walks past it or reclaim() runs, and no
+//      test treats a straggler as a defect.
+// Anything weaker than 1-4 (a "best effort" boolean, an under-counting insert)
 // is a defect, not a documented relaxation -- see the header's "STALE GEOMETRY"
-// section, which states 1 and 2 verbatim.
+// section, which states 1 and 2 verbatim. The stragglers of 5 are the one
+// documented relaxation, and they concern memory, never membership.
 // ===========================================================================
 #include "concurrent_hash_set_rcu.h"
 #include <gtest/gtest.h>
@@ -60,6 +78,49 @@
 #include <algorithm>
 #include <stdexcept>
 #include <functional>
+#include <optional>
+#include <cstdio>
+#include <cstdint>
+
+// ---------------------------------------------------------------------------
+// Build identification: one line, printed before the first test, naming the
+// compiler (__VERSION__), the sanitizer this binary was built with, and whether
+// the header's assert()s are live, so that a saved run log says which build
+// produced it. A gtest global environment rather than a main(), since main()
+// comes from gtest_main; gtest allows registering one from a namespace-scope
+// initializer, before RUN_ALL_TESTS() runs. GCC defines __SANITIZE_ADDRESS__ /
+// __SANITIZE_THREAD__; clang answers __has_feature() (and recent versions define
+// the GCC macros too).
+// ---------------------------------------------------------------------------
+#if defined(__SANITIZE_ADDRESS__)
+#  define HASH_TEST_SANITIZER "AddressSanitizer"
+#elif defined(__SANITIZE_THREAD__)
+#  define HASH_TEST_SANITIZER "ThreadSanitizer"
+#elif defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define HASH_TEST_SANITIZER "AddressSanitizer"
+#  elif __has_feature(thread_sanitizer)
+#    define HASH_TEST_SANITIZER "ThreadSanitizer"
+#  endif
+#endif
+#ifndef HASH_TEST_SANITIZER
+#  define HASH_TEST_SANITIZER "none"
+#endif
+#ifdef NDEBUG
+#  define HASH_TEST_ASSERTS "off (NDEBUG)"
+#else
+#  define HASH_TEST_ASSERTS "live"
+#endif
+
+class BuildInfoEnvironment : public ::testing::Environment {
+public:
+    void SetUp() override {
+        std::printf("[   INFO   ] compiler: %s; sanitizer: %s; assert(): %s\n", __VERSION__, HASH_TEST_SANITIZER, HASH_TEST_ASSERTS);
+        std::fflush(stdout);
+    }
+}; // class BuildInfoEnvironment
+// gtest takes ownership of the environment.
+static ::testing::Environment* const build_info_environment = ::testing::AddGlobalTestEnvironment(new BuildInfoEnvironment);
 
 // ---------------------------------------------------------------------------
 // Key scrambler -- REQUIRED by every test whose point is to exercise resizes.
@@ -133,44 +194,120 @@ static void run_threads(int T, F fn) {
 // ---------------------------------------------------------------------------
 // Reclamation helpers. All of them call the test-only sweeps, so all of them
 // share reclaim()'s precondition: call them only at a quiescent point (every
-// worker joined).
+// worker joined). The sweep calls Hash{} on every reachable node that is not
+// MARKED, so a test that arms ProbeKey's hooks disarms them before it calls any
+// of these (see the hooks at ProbeKey).
 // ---------------------------------------------------------------------------
 
 // Accounting sweep: every arena slot must be reachable from a published bucket,
-// on a free list, or on a limbo list, exactly once, and the three counts must
-// sum to the slot count. The sum is also part of `consistent`; it is asserted
-// separately only for its clearer failure message. No accessor is cross-checked
-// here: get_internal_free_count() and get_internal_limbo_count() return fields of
-// this same sweep, and `slots` is get_internal_node_count() by construction.
-// `where` names the phase in failure messages. Returns the sweep for further,
-// test-specific checks.
+// on a free list, on a limbo list, or on a retired list, exactly once; the four
+// counts must sum to the slot count; every reachable dead node must be tagged
+// (MARKED or FROZEN); and every retired node must be tagged with its chain link
+// intact. All of that is `consistent` (the header's C1, C2, C3); the sum is
+// asserted separately only for its clearer failure message. No accessor is
+// cross-checked here: get_internal_free_count(), get_internal_limbo_count() and
+// get_internal_retired_count() return fields of this same sweep, and `slots` is
+// get_internal_node_count() by construction. `where` names the phase in failure
+// messages. Returns the sweep for further, test-specific checks.
 template <typename SetT>
 static typename SetT::InternalAccounting expect_consistent(const SetT& set, const std::string& where) {
     const typename SetT::InternalAccounting acc = set.get_internal_accounting();
-    EXPECT_TRUE(acc.consistent) << where << ": some arena slot is unaccounted for or on two lists (slots " << acc.slots
-                                << ", reachable " << acc.reachable << ", free " << acc.free_nodes << ", limbo " << acc.limbo << ")";
-    EXPECT_EQ(acc.reachable + acc.free_nodes + acc.limbo, acc.slots) << where;
+    EXPECT_TRUE(acc.consistent) << where << ": some arena slot is unaccounted for or on two lists, a dead node is untagged,"
+                                << " or a retired node is untagged or lost its chain link (slots " << acc.slots
+                                << ", reachable " << acc.reachable << " of them dead " << acc.reachable_dead
+                                << ", free " << acc.free_nodes << ", limbo " << acc.limbo << ", retired " << acc.retired << ")";
+    EXPECT_EQ(acc.reachable + acc.free_nodes + acc.limbo + acc.retired, acc.slots) << where;
     return acc;
 } // expect_consistent()
 
 // reclaim() with every postcondition its contract promises, against the oracle
-// `expected_live` (the number of keys in the set, known to the test): the
-// return value is exact; the sweep is consistent before and after; reclaim()
-// neither grows nor shrinks the arena and only ever unlinks; afterwards exactly
-// one node per key is reachable (so reachable == the return value) and the limbo
-// lists are empty. Returns what reclaim() returned.
+// `expected_live` (the number of keys in the set, known to the test):
+//   - before it, the sweep must be consistent, and that is ASSERTed: a node
+//     retired twice makes a cycle in a retired list, which the sweep reports and
+//     stops at, but which reclaim()'s drain would walk forever in a build
+//     without assert();
+//   - the return value is exact, and it is the number of reachable nodes the
+//     sweep before it found not dead (the membership cross-check: exactly one
+//     non-dead reachable node per key at any quiescent point);
+//   - reclaim() neither grows nor shrinks the arena, unlinks exactly the
+//     reachable dead nodes and nothing else, and afterwards exactly one node per
+//     key is reachable and none of them dead;
+//   - the limbo and retired lists are empty afterwards, and the free lists grew
+//     by exactly what reclaim() collected: the limbo nodes, the retired nodes and
+//     the dead nodes its chain walk unlinked.
+// Not size_t-returning, so that it can ASSERT: callers wrap it in
+// ASSERT_NO_FATAL_FAILURE. `live_out`, if given, receives reclaim()'s return
+// value.
 template <typename SetT>
-static size_t reclaim_and_check(SetT& set, size_t expected_live, const std::string& where) {
+static void reclaim_and_check(SetT& set, size_t expected_live, const std::string& where, size_t* live_out = nullptr) {
     const typename SetT::InternalAccounting before = expect_consistent(set, where + ", before reclaim()");
+    ASSERT_TRUE(before.consistent) << where << ": reclaim() not called on an inconsistent set (a retired-list cycle would hang its drain)";
     const size_t live = set.reclaim();
+    if (live_out != nullptr) *live_out = live;
     EXPECT_EQ(live, expected_live) << where << ": reclaim() must return the exact number of keys";
+    EXPECT_EQ(live, before.reachable - before.reachable_dead) << where << ": reclaim()'s count disagrees with the reachable nodes the sweep found not dead";
     const typename SetT::InternalAccounting after = expect_consistent(set, where + ", after reclaim()");
     EXPECT_EQ(after.slots, before.slots) << where << ": reclaim() must not change the arena size";
-    EXPECT_LE(after.reachable, before.reachable) << where << ": reclaim() only unlinks";
+    EXPECT_EQ(after.reachable, before.reachable - before.reachable_dead) << where << ": reclaim() must unlink exactly the dead nodes";
     EXPECT_EQ(after.reachable, live) << where << ": more than one reachable node for some key after reclaim()";
+    EXPECT_EQ(after.reachable_dead, 0u) << where << ": a dead node is still reachable after reclaim()";
     EXPECT_EQ(after.limbo, 0u) << where << ": reclaim() must drain every limbo list";
-    return live;
+    EXPECT_EQ(after.retired, 0u) << where << ": reclaim() must drain every retired list";
+    EXPECT_EQ(after.free_nodes, before.free_nodes + before.limbo + before.retired + before.reachable_dead)
+        << where << ": the free lists did not grow by exactly the limbo, retired and dead nodes";
 } // reclaim_and_check()
+
+// Whether bucket j of `set` is published (neither a pending split nor out of
+// range), for settle_writers(). The header answers through its test-only
+// get_internal_bucket_published() where it has one; a header without it is
+// treated as if every bucket were published, and settle_writers() then also
+// splits the pending buckets it erases in: each such split is uncontended and
+// its own cleanup leaves nothing dead behind, so the oracles after settling
+// hold either way, but the set's geometry changes.
+template <typename SetT>
+static bool bucket_published(const SetT& set, size_t j) {
+    if constexpr (requires { set.get_internal_bucket_published(j); }) {
+        return set.get_internal_bucket_published(j);
+    } else {
+        return true;
+    }
+} // bucket_published()
+
+// settle_writers(set): a writer MISS walk over every published bucket, so that
+// every dead node a CONCURRENT history left in a chain (a straggler: a one-shot
+// unlink CAS that lost, an erase() that gave up, a run a walker with a stale
+// table size could not decide) is unlinked and retired, as the next writer to
+// pass it would do. Afterwards the eager oracles hold that a concurrent history
+// alone does not promise: no reachable dead node, exactly one reachable node per
+// key, every other slot retired, on a limbo list or free. How: for every
+// published bucket j of the current table, erase() one ABSENT key that maps to
+// exactly j under the identity hash -- the first of j, j + ts, j + 2*ts, ... that
+// contains() reports absent --, so that the erase() walks the whole chain (a
+// miss) and unlinks every dead run it passes behind the head or a live
+// predecessor. Every such erase() must return false.
+// Requirements: quiescent and single-threaded; ProbeKey hooks disarmed; an
+// AllowDelete == true set of int keys whose hash is the identity (std::hash<int>
+// here, so j + m*ts maps to j; not StringKeys); and no dead run behind a FROZEN
+// node whose child is unpublished (a split that threw between its freeze and its
+// publication): such a run is behind a tagged predecessor, which no walk may
+// CAS, and only a split of the child or reclaim() collects it.
+// Not an oracle in itself: on a set with a concurrent history it is not a no-op.
+template <typename SetT>
+static void settle_writers(SetT& set) {
+    const size_t ts = set.get_internal_table_size();
+    for (size_t j = 0; j < ts; ++j) {
+        if (!bucket_published(set, j)) continue;
+        bool erased_in_j = false;
+        for (size_t m = 0; m < 64 && !erased_in_j; ++m) {
+            const size_t k = j + m*ts;
+            if (k > static_cast<size_t>(INT32_MAX)) break;
+            if (set.contains(static_cast<int>(k))) continue;   // present: not a miss walk
+            ASSERT_FALSE(set.erase(static_cast<int>(k))) << "settle_writers(): erase() of an absent key returned true";
+            erased_in_j = true;
+        } // look for an absent key of bucket j
+        ASSERT_TRUE(erased_in_j) << "settle_writers(): no absent key found for bucket " << j;
+    } // loop over the buckets
+} // settle_writers()
 
 // Membership oracle sweep: the number of wrong contains() answers, where every
 // key of `in` must be present and every key of `out` absent. Side effect worth
@@ -493,8 +630,11 @@ TEST(ConcurrentHashSetRcuTest, TombstoneErase) {
 // Meant to be run under ThreadSanitizer: it validates that concurrent
 // cooperative splits are DATA-RACE free (many threads racing inside
 // split_bucket() on the same UNINITIALIZED buckets, one CAS winner, losers'
-// subchains abandoned). No deletes here (AllowDelete=false), so it exercises the
-// split/publish paths only. The final EXPECT_EQ also checks that every attempted
+// subchains abandoned). No deletes here (AllowDelete=false), so the only dead
+// nodes are the parent copies the splits supersede; the split still freezes them
+// (for both AllowDelete values), and the winner's cleanup and the inserters'
+// walks unlink and retire them while other threads insert into, seal and walk
+// the same parent chains. The final EXPECT_EQ also checks that every attempted
 // key is present -- membership must be exact across every resize.
 // Racing in the same split takes threads that work in the same bucket WHEN it
 // splits, and with CollisionHash the bucket of a key is its low bits. By rule 1 of
@@ -681,9 +821,11 @@ TEST(ConcurrentHashSetRcuTest, InsertContention_NoMemoryLeak) {
 // it stops doing so.
 //
 // Tallies are per thread, so no thread writes a location another reads; they are
-// summed after the join. The two AllowDelete flavors alternate because the freeze
-// step of split_bucket() is compiled out when AllowDelete is false, which changes
-// the split's timing and the code under test.
+// summed after the join. The two AllowDelete flavors alternate because they are
+// two instantiations of the header: their insert and split code is the same
+// source (the split freezes the nodes it moves for both values), compiled
+// twice, and the accounting after the race checks for each that every
+// superseded parent copy still reachable is tagged.
 //
 // The same race is also the best producer of LIMBO nodes the suite has: a thread
 // that loses a publishing CAS to another inserter of the same key orphans its
@@ -696,18 +838,22 @@ TEST(ConcurrentHashSetRcuTest, InsertContention_NoMemoryLeak) {
 // Interface: T threads each insert the same N scrambled keys into a fresh set with
 // `shards` arena shards (0 = the default); `rep` and `flavor` label messages.
 // `prefill` > 0 first inserts that many OTHER keys single-threaded, settles their
-// pending splits with a contains() sweep (which leaves a stale parent copy of
-// every key that moved), erases them again if the set has erase(), and reclaims,
-// so the race starts with non-empty free lists: its allocations then POP while
-// its orphans and lost subchains are pushed to limbo, on the same shard when
-// `shards` is 1 (see ReclaimLimboPushesRaceFreeListPops). Without erase() the
-// prefill keys stay in the set and the free lists hold only those stale copies,
-// which is why the sweep is there, and why the prefill must cross doublings
-// AFTER keys exist (see the prefill sizes in ReclaimLimboPushesRaceFreeListPops).
-// `min_free` is the floor the free lists must reach after the prefill reclaim().
-// Returns the number of nodes that were on limbo lists before reclaim().
+// pending splits with a contains() sweep (whose splits supersede the parent copy
+// of every key that moves, and retire it), erases them again if the set has
+// erase(), and reclaims, so the race starts with non-empty free lists: its
+// allocations then POP while its orphans and lost subchains are pushed to limbo,
+// on the same shard when `shards` is 1 (see ReclaimLimboPushesRaceFreeListPops).
+// Without erase() the prefill keys stay in the set and the free lists hold only
+// those superseded copies, which is why the sweep is there, and why the prefill
+// must cross doublings AFTER keys exist (see the prefill sizes in
+// ReclaimLimboPushesRaceFreeListPops). `min_free` is the floor the free lists
+// must reach after the prefill reclaim(). `limbo` receives the number of nodes
+// that were on limbo lists before the race's reclaim(). Callers wrap it in
+// ASSERT_NO_FATAL_FAILURE (it ASSERTs through reclaim_and_check()); its template
+// argument goes through an alias there, since a comma inside the macro's
+// argument would split it.
 template <typename SetT>
-static size_t one_winner_per_key_body(int T, int N, int rep, const char* flavor, size_t shards = 0, int prefill = 0, size_t min_free = 0) {
+static void one_winner_per_key_body(int T, int N, int rep, const char* flavor, size_t& limbo, size_t shards = 0, int prefill = 0, size_t min_free = 0) {
     SetT set(4, shards);
     size_t prefilled = 0;   // prefill keys still in the set when the race starts
     std::vector<int> prefill_keys;
@@ -722,7 +868,7 @@ static size_t one_winner_per_key_body(int T, int N, int rep, const char* flavor,
         } else {
             prefilled = static_cast<size_t>(prefill);
         }
-        reclaim_and_check(set, prefilled, std::string("prefill, rep ") + std::to_string(rep));
+        ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, prefilled, std::string("prefill, rep ") + std::to_string(rep)));
         EXPECT_GE(set.get_internal_free_count(), min_free) << "prefill, rep " << rep << " (" << flavor
                                                            << "): test precondition: the race would start with a short free list";
     } // start with non-empty free lists
@@ -734,8 +880,8 @@ static size_t one_winner_per_key_body(int T, int N, int rep, const char* flavor,
         }
     });
     const std::string where = std::string("rep ") + std::to_string(rep) + " (" + flavor + ")";
-    const size_t limbo = expect_consistent(set, where + ", after the insert race").limbo;
-    reclaim_and_check(set, expected, where);
+    limbo = expect_consistent(set, where + ", after the insert race").limbo;
+    ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, expected, where));
     int over = 0, under = 0, missing = 0;
     for (int k = 0; k < N; ++k) {
         int c = 0;
@@ -747,16 +893,20 @@ static size_t one_winner_per_key_body(int T, int N, int rep, const char* flavor,
     EXPECT_EQ(over, 0) << over << " key(s) had MORE than one successful insert(), " << where;
     EXPECT_EQ(under, 0) << under << " key(s) had NO successful insert(), " << where;
     EXPECT_EQ(missing, 0) << missing << " key(s) absent after all inserts and a reclaim(), " << where;
-    return limbo;
 } // one_winner_per_key_body()
+
+// The two instantiations the reclamation tests alternate between.
+using IntSetDel = ConcurrentResizableHashSetRCU<int, true>;
+using IntSetNoDel = ConcurrentResizableHashSetRCU<int, false>;
 
 TEST(ConcurrentHashSetRcuTest, ExactlyOneWinnerPerKey) {
     const int T = 16, N = 400;
     for (int rep = 0; rep < 60; ++rep) {
+        size_t limbo = 0;   // not used here
         if (rep & 1) {
-            one_winner_per_key_body<ConcurrentResizableHashSetRCU<int, true>>(T, N, rep, "AllowDelete=true");
+            ASSERT_NO_FATAL_FAILURE(one_winner_per_key_body<IntSetDel>(T, N, rep, "AllowDelete=true", limbo));
         } else {
-            one_winner_per_key_body<ConcurrentResizableHashSetRCU<int, false>>(T, N, rep, "AllowDelete=false");
+            ASSERT_NO_FATAL_FAILURE(one_winner_per_key_body<IntSetNoDel>(T, N, rep, "AllowDelete=false", limbo));
         }
     } // repetitions
 } // ExactlyOneWinnerPerKey
@@ -1038,14 +1188,15 @@ TEST(ConcurrentHashSetRcuTest, InsertEraseChurnPerKeyAccounting) {
 
 // An erase must not be undone by a resize, ever.
 //
-// The weak spot: a split COPIES live nodes forward and never unlinks the originals,
-// so a key can have a stale, still-live node sitting in an ancestor bucket. If an
-// erase marks only the authoritative copy and some later doubling then copies the
-// stale node into a new bucket, the erased key comes back from the dead -- with no
-// insert() call anywhere. Two things must hold for that to be impossible: no stale
-// live node may exist for a key that was published under a sealed head, and any
-// node a split copies must be frozen first so a concurrent erase cannot leave a
-// live copy behind.
+// The weak spot: a split COPIES live nodes forward and supersedes the originals
+// in place, so for a while a key has a second node in an ancestor bucket (until
+// the split's cleanup, a later writer or reclaim() unlinks it). If an erase marks
+// only the authoritative copy and some later doubling then copies the stale node
+// into a new bucket, the erased key comes back from the dead -- with no insert()
+// call anywhere. Two things must hold for that to be impossible: no stale live
+// node may exist for a key that was published under a sealed head, and any node a
+// split copies must be frozen first so a concurrent erase cannot leave a live
+// copy behind.
 //
 // Shape and oracle:
 //   Phase 1 -- T threads race to insert the same K keys while filler inserts double
@@ -1069,10 +1220,11 @@ TEST(ConcurrentHashSetRcuTest, InsertEraseChurnPerKeyAccounting) {
 // forward when bucket j's CHILD is split, and by the time the strand happens that
 // child has long since been published -- so the stranded node is dead weight and
 // never resurrects. In other words this test guards a property that no known defect
-// violates. It is kept because the property is load-bearing (the whole
-// copy-never-unlink design rests on it), the check is exact and costs half a
-// second, and a future change to split_bucket() -- relinking, re-splitting a
-// published bucket, copying an unfrozen node -- would break it first. Do not count
+// violates. It is kept because the property is load-bearing (copying instead of
+// moving rests on it), the check is exact and costs half a second, and a future
+// change to split_bucket() -- re-splitting a published bucket, copying an
+// unfrozen node, unlinking a FROZEN node before its child is published -- would
+// break it first. Do not count
 // it as a detector for the four known defects (a header without the freeze passes
 // it); NoDoubleWinnerAcrossResize and ExactlyOneEraseWinnerPerKeyDuringGrowth are
 // the detectors.
@@ -1187,8 +1339,10 @@ TEST(ConcurrentHashSetRcuTest, ThreadPrivateKeySequenceDuringGrowth) {
 
 // ===========================================================================
 // Quiescent reclamation: reclaim(), the per-shard free lists popped lock-free by
-// alloc_node(), and the per-shard limbo lists. Contract clause 4 at the top of
-// this file; the header's RECLAMATION section and the contract on reclaim().
+// alloc_node(), the per-shard limbo lists, and the per-shard retired lists that
+// dead nodes reach when an operation unlinks them from their chain. Contract
+// clauses 4 and 5 at the top of this file; the header's RECLAMATION section and
+// the contract on reclaim().
 //
 // Every call to reclaim() and to the test-only sweeps below happens after
 // run_threads() has joined its workers (or on the only thread there is), which
@@ -1198,24 +1352,31 @@ TEST(ConcurrentHashSetRcuTest, ThreadPrivateKeySequenceDuringGrowth) {
 // test relies on the documented node_count_ batching (256 per batch), it says so.
 // ===========================================================================
 
-// Pre-sized (no doubling), so every node the arena holds is a key or a tombstone
-// and every count is exact. One arena shard: reclaim() deals freed slots
+// Pre-sized (no doubling), so every node the arena holds is a key or an erased
+// node and every count is exact. One arena shard: reclaim() deals freed slots
 // round-robin over ALL shards, and a thread pops only its own shard's list, so
 // with the default shard count the main thread could reuse only 1/shards of what
 // it freed and "the arena did not grow" would be false by design, not by defect
 // (ReclaimReuseAcrossShards covers the multi-shard dealing).
-// Weak spots: the unlink walk over tombstones scattered through chains (first,
-// middle and last nodes of a chain, runs of consecutive dead nodes); reclaim()
-// run twice with nothing to do in between (it must be idempotent: same count,
-// nothing new freed, no slot pushed twice -- a double push would show as a cycle
-// or a duplicate in the accounting sweep); and the free-list pop path serving
-// every reinsertion, including the one that empties the list.
+// Weak spots: the drain of the retired lists. Every erase() here is uncontended,
+// so it unlinks its own node at once and retires it (contract clause 5): the
+// erased nodes reach reclaim() on a retired list, not in a chain, reclaim()'s
+// chain walk finds nothing dead, and the K slots reach the free list only through
+// the drain's two phases (take every shard's retired list, then deal it). "free
+// == K" afterwards fails if the drain is skipped or follows the wrong word.
+// Before the first reclaim() the erased nodes are counted where they are --
+// retired, or still in a chain as dead nodes --, K in total whoever unlinked
+// them. Also: reclaim() run twice with nothing to do in between (it must be
+// idempotent: same count, nothing new freed, no slot pushed twice -- a double
+// push would show as a cycle or a duplicate in the accounting sweep); and the
+// free-list pop path serving every reinsertion, including the one that empties
+// the list.
 // Sizes: N = 1000 keys in 1024 buckets. The resize hint then peaks at 1024 (four
 // append batches of 256) before reclaim() and at 750 + 24 (append credit) + 256
 // (first pop batch) after it, both below the doubling threshold 2*1024.
 TEST(ConcurrentHashSetRcuTest, ReclaimExactPreSized) {
     const int N = 1000, K = 250;
-    {   // AllowDelete == true: tombstones are the only dead nodes
+    {   // AllowDelete == true: the erased nodes are the only dead nodes
         ConcurrentResizableHashSetRCU<int, true> set(1024, 1);
         std::vector<int> kept, erased, fresh;
         for (int i = 0; i < N; ++i) EXPECT_TRUE(set.insert(scramble(i)));
@@ -1223,7 +1384,7 @@ TEST(ConcurrentHashSetRcuTest, ReclaimExactPreSized) {
         EXPECT_EQ(filled.slots, size_t(N));
         EXPECT_EQ(filled.reachable, size_t(N));
         for (int i = 0; i < N; ++i) {
-            if (i%4 == 1) {   // every 4th key: tombstones land anywhere in their chains
+            if (i%4 == 1) {   // every 4th key: the erased nodes sit anywhere in their chains
                 EXPECT_TRUE(set.erase(scramble(i)));
                 erased.push_back(scramble(i));
             } else {
@@ -1231,12 +1392,14 @@ TEST(ConcurrentHashSetRcuTest, ReclaimExactPreSized) {
             }
         } // erase every 4th key
         ASSERT_EQ(erased.size(), size_t(K));
-        reclaim_and_check(set, N - K, "first reclaim()");
-        EXPECT_EQ(set.get_internal_free_count(), size_t(K)) << "every tombstone, and nothing else, is freed";
+        const ConcurrentResizableHashSetRCU<int, true>::InternalAccounting before = expect_consistent(set, "after the erases");
+        EXPECT_EQ(before.retired + before.reachable_dead, size_t(K)) << "an erased node is neither retired nor dead in its chain";
+        ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, N - K, "first reclaim()"));
+        EXPECT_EQ(set.get_internal_free_count(), size_t(K)) << "every erased node, and nothing else, is freed";
         EXPECT_EQ(membership_errors(set, kept, erased), 0);
 
         // Idempotence: nothing died since, so nothing more is freed.
-        reclaim_and_check(set, N - K, "second reclaim()");
+        ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, N - K, "second reclaim()"));
         EXPECT_EQ(set.get_internal_free_count(), size_t(K)) << "a second reclaim() freed something, or pushed a slot twice";
 
         // Reinsert K new keys: every one must be served from the free list.
@@ -1247,7 +1410,7 @@ TEST(ConcurrentHashSetRcuTest, ReclaimExactPreSized) {
         EXPECT_EQ(set.get_internal_node_count(), size_t(N)) << "the arena grew although the free list held a node for every insert";
         EXPECT_EQ(set.get_internal_free_count(), 0u);
         expect_consistent(set, "after the reinsertion");
-        reclaim_and_check(set, N, "third reclaim()");
+        ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, N, "third reclaim()"));
         EXPECT_EQ(set.get_internal_free_count(), 0u);
         EXPECT_EQ(membership_errors(set, kept, erased), 0);
         EXPECT_EQ(membership_errors(set, fresh, std::vector<int>{}), 0);
@@ -1260,11 +1423,11 @@ TEST(ConcurrentHashSetRcuTest, ReclaimExactPreSized) {
             EXPECT_TRUE(set.insert(keys.back()));
             absent.push_back(scramble(N + i));
         }
-        reclaim_and_check(set, N, "AllowDelete=false, first reclaim()");
+        ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, N, "AllowDelete=false, first reclaim()"));
         EXPECT_EQ(set.get_internal_free_count(), 0u) << "reclaim() freed a live node";
         for (int k : keys) EXPECT_FALSE(set.insert(k));   // duplicates: no allocation, no change
         EXPECT_EQ(set.get_internal_node_count(), size_t(N));
-        reclaim_and_check(set, N, "AllowDelete=false, second reclaim()");
+        ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, N, "AllowDelete=false, second reclaim()"));
         EXPECT_EQ(membership_errors(set, keys, absent), 0);
     } // AllowDelete == false
 } // ReclaimExactPreSized
@@ -1281,8 +1444,11 @@ TEST(ConcurrentHashSetRcuTest, ReclaimExactPreSized) {
 // every bucket the keys need). Hence many fresh sets, stopped at many sizes
 // (1 to ~800 keys: on both sides of the doublings and of the 256-node batches),
 // each reclaimed BEFORE anything reads it. Both AllowDelete values: with false,
-// the dead nodes are the stale parent copies splits leave behind, with true they
-// are frozen parent copies and tombstones.
+// the dead nodes are the parent copies splits supersede, with true also the
+// erased nodes. The burst is single-threaded, so the operations themselves unlink
+// and retire all of those (contract clause 5) and reclaim() collects them from the
+// retired lists; what its chain walk must decide is the live nodes whose child
+// is still UNINITIALIZED, which it must keep.
 // The reuse phase has a trap: a reinsertion can land in a bucket that is still
 // UNINITIALIZED and split it, which allocates copies. So the node-count baseline
 // is taken only after a contains() sweep over every key, which publishes every
@@ -1310,17 +1476,17 @@ static void reclaim_with_pending_splits_body() {
             } // if erase() exists
             in.push_back(scramble(i));
         } // erase every third key
-        reclaim_and_check(set, in.size(), where + ", reclaim() right after the burst");
+        ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, in.size(), where + ", reclaim() right after the burst"));
         const size_t free1 = set.get_internal_free_count();
-        reclaim_and_check(set, in.size(), where + ", second reclaim()");
+        ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, in.size(), where + ", second reclaim()"));
         EXPECT_EQ(set.get_internal_free_count(), free1) << where << ": the second reclaim() freed something new";
         EXPECT_EQ(membership_errors(set, in, out), 0) << where << ": reclaim() changed membership";
 
         // Reuse, with the baseline taken after the contains() sweep just done. That
         // sweep's splits popped the free list (with AllowDelete == false it is
-        // usually empty afterwards) and left fresh stale copies behind; a reclaim()
-        // now recycles those, so the reuse below has free slots to take.
-        reclaim_and_check(set, in.size(), where + ", reclaim() after the settling sweep");
+        // usually empty afterwards) and retired the parent copies they superseded;
+        // a reclaim() now recycles those, so the reuse below has free slots to take.
+        ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, in.size(), where + ", reclaim() after the settling sweep"));
         const size_t slots0 = set.get_internal_node_count();
         const size_t free0 = set.get_internal_free_count();
         for (size_t i = 0; i < free0/2; ++i) {
@@ -1332,7 +1498,7 @@ static void reclaim_with_pending_splits_body() {
             << where << ": the arena grew from " << slots0 << " to " << set.get_internal_node_count()
             << " while the free list still held " << free2 << " node(s)";
         if (free0 > 0 && free2 > 0) ++reuse_exercised;
-        reclaim_and_check(set, in.size(), where + ", reclaim() after the reuse");
+        ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, in.size(), where + ", reclaim() after the reuse"));
         EXPECT_EQ(membership_errors(set, in, out), 0) << where << ": membership after the reuse";
     } // for each burst size
     // Not an oracle on the header: a guard that the reuse check above is not vacuous.
@@ -1344,17 +1510,21 @@ TEST(ConcurrentHashSetRcuTest, ReclaimWithPendingSplits) {
     reclaim_with_pending_splits_body<false>();
 } // ReclaimWithPendingSplits
 
-// AllowDelete == false, concurrent growth: the dead nodes are the stale parent
-// copies splits leave in place (the freeze is compiled out, so they are not even
-// marked: nothing but the rule "next child published" tells them apart from live
-// nodes). Four threads insert disjoint scrambled keys, one arena shard each.
-// Phase 1 reclaims straight after the join (pending splits, as in
-// ReclaimWithPendingSplits but with nodes of four shards). Phase 2 then settles
-// the keys' splits with a contains() sweep, which leaves a stale copy behind for
-// every key that moved, and reclaims again: the sweep's reachable count must have
-// exceeded the key count (otherwise the phase tests nothing), and reclaim() must
-// bring it back to exactly one node per key. Every insert() boolean is exact: the
-// keys are disjoint and each is inserted once, so each call must return true.
+// AllowDelete == false, concurrent growth: the dead nodes are the parent copies
+// splits supersede. The split FREEZES each of them (for both AllowDelete values),
+// and the split that superseded it unlinks and retires it -- or, when that
+// split's one cleanup CAS lost to a concurrent writer, a later writer or
+// reclaim()'s rule "next child published" does. Four threads insert disjoint
+// scrambled keys, one arena shard each. Phase 1 reclaims straight after the join
+// (pending splits, as in ReclaimWithPendingSplits but with nodes of four shards),
+// which leaves no dead node anywhere. Phase 2 then settles the keys' splits with
+// a single-threaded contains() sweep (it publishes only the buckets the probed
+// keys map to): each of its splits supersedes the parent copy of every key that
+// moves and, uncontended, retires them all (contract clause 5). So after the
+// sweep exactly one node per key is reachable, none of them dead, and the retired
+// lists hold the superseded copies (more than none, or the phase tests nothing),
+// which reclaim() then recycles. Every insert() boolean is exact: the keys are
+// disjoint and each is inserted once, so each call must return true.
 TEST(ConcurrentHashSetRcuTest, ReclaimStaleSplitCopiesNoDelete) {
     using Set = ConcurrentResizableHashSetRCU<int, false>;
     const int T = 4, PER = 500, REPS = 4;
@@ -1369,14 +1539,17 @@ TEST(ConcurrentHashSetRcuTest, ReclaimStaleSplitCopiesNoDelete) {
         std::vector<int> in, out;
         for (int i = 0; i < T*PER; ++i) in.push_back(scramble(rep*T*PER + i));
         for (int i = 0; i < 100; ++i) out.push_back(scramble(1000000 + i));
-        reclaim_and_check(set, T*PER, where + ", phase 1");
+        ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, T*PER, where + ", phase 1"));
         EXPECT_EQ(membership_errors(set, in, out), 0) << where << ": reclaim() with pending splits changed membership";
-        const size_t reachable = expect_consistent(set, where + ", after the settling sweep").reachable;
+        const Set::InternalAccounting swept = expect_consistent(set, where + ", after the settling sweep");
+        EXPECT_EQ(swept.reachable, size_t(T*PER)) << where << ": an uncontended split left a superseded parent copy reachable";
+        EXPECT_EQ(swept.reachable_dead, 0u) << where << ": a dead node is reachable after single-threaded splits";
         // EMPIRICAL precondition, not derived: with scrambled keys over many doublings
-        // it is overwhelmingly likely that many keys moved, but nothing forces it.
-        ASSERT_GT(reachable, size_t(T*PER)) << where << ": test precondition: the sweep left no stale split copy to reclaim";
-        reclaim_and_check(set, T*PER, where + ", phase 2");
-        EXPECT_EQ(membership_errors(set, in, out), 0) << where << ": reclaim() of stale copies changed membership";
+        // it is overwhelmingly likely that the sweep's splits moved many keys, but
+        // nothing forces it.
+        ASSERT_GT(swept.retired, 0u) << where << ": test precondition: the sweep's splits superseded no parent copy";
+        ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, T*PER, where + ", phase 2"));
+        EXPECT_EQ(membership_errors(set, in, out), 0) << where << ": reclaim() of superseded copies changed membership";
         for (int k : in) EXPECT_FALSE(set.insert(k)) << where << ": a duplicate insert() returned true after reclaim()";
     } // repetitions
 } // ReclaimStaleSplitCopiesNoDelete
@@ -1401,6 +1574,14 @@ TEST(ConcurrentHashSetRcuTest, ReclaimStaleSplitCopiesNoDelete) {
 // So the arena must not grow at all, and the free count must drop by exactly the
 // number of inserts. Dealing everything to one shard, or popping another
 // thread's shard, both show as arena growth.
+// The K erases run on the main thread, uncontended, so each unlinks its own node
+// and retires it onto the MAIN thread's shard's retired list (contract clause 5):
+// before the first reclaim() all K are retired and none is left dead in a chain
+// (both checked), reclaim()'s chain walk finds nothing, and the K slots reach the
+// free lists only through the drain of the retired lists. That drain must deal
+// them round-robin like every other source: handing each retired list to its own
+// shard would put all K on one shard, and the threads of the other shard would
+// grow the arena.
 // Pre-sizing: 16384 buckets, doubling threshold 32768; the resize hint peaks at
 // 2048 live + 8 pop batches of 256, far below it.
 TEST(ConcurrentHashSetRcuTest, ReclaimReuseAcrossShards) {
@@ -1422,7 +1603,10 @@ TEST(ConcurrentHashSetRcuTest, ReclaimReuseAcrossShards) {
                 out.push_back(scramble(i));
             }
         } // erase the even-indexed keys
-        reclaim_and_check(set, N - K, where + ", after the erases");
+        const Set::InternalAccounting erased = expect_consistent(set, where + ", after the erases");
+        EXPECT_EQ(erased.retired, size_t(K)) << where << ": an uncontended erase() did not retire its node";
+        EXPECT_EQ(erased.reachable_dead, 0u) << where << ": an uncontended erase() left its node in its chain";
+        ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, N - K, where + ", after the erases"));
         ASSERT_EQ(set.get_internal_free_count(), size_t(K)) << where;
         const size_t slots = set.get_internal_node_count();
 
@@ -1434,18 +1618,19 @@ TEST(ConcurrentHashSetRcuTest, ReclaimReuseAcrossShards) {
         for (int i = 0; i < T*per; ++i) in.push_back(scramble(N + i));
         EXPECT_EQ(set.get_internal_node_count(), slots) << where << ": the arena grew although every thread's shard held a free slot for each of its inserts";
         EXPECT_EQ(set.get_internal_free_count(), size_t(K - T*per)) << where;
-        reclaim_and_check(set, in.size(), where + ", after the reuse");
+        ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, in.size(), where + ", after the reuse"));
         EXPECT_EQ(membership_errors(set, in, out), 0) << where;
     } // for each shape
 } // ReclaimReuseAcrossShards
 
 // After reclaim(), the structure is a mix of KEPT nodes (in chains whose dead
-// neighbours were unlinked, links rewritten through their predecessors) and
-// REUSED nodes (popped from a free list, value copy-assigned, link rewritten).
-// Both must take part in the concurrent protocol exactly like fresh nodes: the
-// erase MARK CAS and the split FREEZE CAS expect a live link, the split SEAL CAS
-// expects the head reclaim() left behind (with its seal level kept), and a split
-// copies from chains reclaim() relinked. This test runs concurrent erases and
+// neighbours were unlinked, by an operation's unlink CAS or by reclaim(), links
+// rewritten through their predecessors) and REUSED nodes (popped from a free
+// list, value copy-assigned, link rewritten). Both must take part in the
+// concurrent protocol exactly like fresh nodes: the erase MARK CAS, the split
+// FREEZE CAS and the UNLINK CAS expect a live link, the split SEAL CAS expects
+// the head reclaim() left behind (with its seal level kept), and a split copies
+// from chains that were relinked. This test runs concurrent erases and
 // inserts, with the table doubling, over such a structure, round after round
 // with a reclaim() between rounds so slots are recycled more than once.
 // Oracle: every key is owned by one thread, so every boolean is fixed by the
@@ -1481,7 +1666,7 @@ TEST(ConcurrentHashSetRcuTest, ReclaimThenConcurrentEraseAndGrowth) {
                 present.push_back(k);
             }
         } // phase A
-        reclaim_and_check(set, present.size(), "rep " + std::to_string(rep) + ", phase A");
+        ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, present.size(), "rep " + std::to_string(rep) + ", phase A"));
 
         for (int round = 0; round < ROUNDS; ++round) {
             const std::string where = "rep " + std::to_string(rep) + ", round " + std::to_string(round);
@@ -1519,7 +1704,7 @@ TEST(ConcurrentHashSetRcuTest, ReclaimThenConcurrentEraseAndGrowth) {
                 EXPECT_EQ(bad[t], 0u) << where << ", thread " << t << ": a determined result was wrong";
                 for (int i = 0; i < F; ++i) ((i & 1) ? present : absent).push_back(fresh[t][i]);
             }
-            reclaim_and_check(set, present.size(), where);
+            ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, present.size(), where));
             EXPECT_EQ(membership_errors(set, present, absent), 0) << where;
         } // rounds
     } // repetitions
@@ -1536,8 +1721,46 @@ TEST(ConcurrentHashSetRcuTest, ReclaimThenConcurrentEraseAndGrowth) {
 // It also carries a one-shot HOOK, run from inside a copy assignment, which is
 // how ReclaimRecoversPendingInsertNodeWhenRetryThrows injects another operation
 // between an insert()'s read of a bucket head and its publishing CAS.
-// The counters and the hook are global, so ProbeKey is used only by
+// The counters and the hooks are global, so ProbeKey is used only by
 // single-threaded tests.
+//
+// CALL HOOKS (hash_hook, equal_hook), for the tests that suspend an operation at
+// one of its pinned call sites and run a nested operation, or throw, there: an
+// interleaving another thread could produce, made deterministic on one thread.
+// The header pins the order in which every operation loads a word, hashes or
+// compares a key, and performs its deciding CAS (PINNED ORDERS before contains(),
+// H1-H6), so a hook that fires on a counted call opens a known window. Rules:
+//   - Hooks live only in Hash{} (ProbeKeyHash) and operator==. Not in the copy
+//     constructor or the copy assignment: those run inside alloc_node(), and on
+//     its append path under the arena shard's SpinLock, where a nested
+//     allocation would deadlock (on_assign above runs on the pop path only,
+//     which holds no lock).
+//   - A hook fires on the Nth QUALIFYING call after it is armed: a Hash{} call on
+//     a key with the hook's value, or an operator== call whose LEFT operand has
+//     it (the header compares node->value == key, so the left operand is the
+//     node's value: equal_hook selects the comparison against one node). N is
+//     derived at each test from the operation's sequence of Hash{} and
+//     operator== calls; an action may arm the next hook (chained arming).
+//   - hook_depth separates the outer operation's calls from the nested ones:
+//     while an action runs, no call counts toward a hook or toward the outer
+//     tally, so the nested operations' own hashing (and that of any accounting
+//     sweep an action reads) neither fires a hook nor shifts a count.
+//   - Tests disarm every hook right after the outer call returns or throws, and
+//     before any reclaim(), settle_writers() or sweep: get_internal_accounting()
+//     and reclaim() hash every reachable unmarked node and would otherwise fire
+//     an armed hook.
+//   - Every hook test asserts that its hooks fired and the EFFECT its window
+//     exists for, so a changed call order fails loudly instead of testing
+//     nothing.
+// One call hook. Plain members, not atomics: only single-threaded tests use
+// ProbeKey. (At namespace scope, not nested in ProbeKey: its default member
+// initializers must be complete where ProbeKey's static hooks are defined.)
+struct CallHook {
+    int countdown = 0;              // > 0: armed; the qualifying call that brings it to 0 fires
+    int value = 0;                  // the key value that makes a call qualify
+    std::function<void()> action;   // run once when the hook fires; may throw out of the hooked call
+}; // struct CallHook
+
 struct ProbeKey {
     static constexpr int MAGIC = 0x5eed;
     int v;       // the key
@@ -1552,6 +1775,49 @@ struct ProbeKey {
     // before the assignment itself) and clears it first, so an assignment made
     // by the hook's own operations does not run it again.
     static inline std::function<void()> on_assign;
+
+    // The call hooks (see CALL HOOKS above, and CallHook).
+    using Hook = CallHook;
+    static inline Hook hash_hook;       // fired from ProbeKeyHash::operator()
+    static inline Hook equal_hook;      // fired from operator==, on its left operand
+    static inline int hook_depth = 0;   // > 0 while an action runs: calls then neither count nor fire
+    // The outer tally: Hash{} calls made outside every action on a key equal to
+    // *tally_value; tally_value empty means no tally is kept.
+    static inline std::optional<int> tally_value;
+    static inline int tally = 0;
+
+    // Arms `hook` to fire on the `countdown`-th qualifying call (key value
+    // `value`) made outside every action, running `action` there.
+    static void arm(Hook& hook, int value, int countdown, std::function<void()> action) {
+        hook.value = value;
+        hook.countdown = countdown;
+        hook.action = std::move(action);
+    } // ProbeKey::arm()
+    // Disarms both call hooks and stops the tally (its count stays readable).
+    static void disarm_hooks() {
+        hash_hook = Hook{};
+        equal_hook = Hook{};
+        tally_value.reset();
+    } // ProbeKey::disarm_hooks()
+    // Called by every hooked call with the qualifying value (the key, or the left
+    // operand): counts the call toward `hook` and fires it when its countdown
+    // runs out. The action is moved out before it runs, so it may re-arm the
+    // same hook; hook_depth is restored even if the action throws.
+    static void observe(Hook& hook, int value) {
+        if (hook_depth > 0 || hook.countdown <= 0 || value != hook.value || --hook.countdown > 0) return;
+        std::function<void()> action = std::move(hook.action);
+        hook.action = nullptr;
+        struct Depth {
+            Depth() { ++hook_depth; }
+            ~Depth() { --hook_depth; }
+        } depth;
+        action();
+    } // ProbeKey::observe()
+    // Hash{}'s hook entry: the outer tally, then hash_hook.
+    static void observe_hash(int value) {
+        if (hook_depth == 0 && tally_value == value) ++tally;
+        observe(hash_hook, value);
+    } // ProbeKey::observe_hash()
 
     ProbeKey(int x = 0) : v(x), magic(MAGIC) {}
     ProbeKey(const ProbeKey& o) : v(o.v), magic(MAGIC) {
@@ -1576,10 +1842,15 @@ struct ProbeKey {
         magic = 0;
         ++destructions;
     }
-    bool operator==(const ProbeKey& o) const { return v == o.v; }
+    // The left operand is the node's value (see CALL HOOKS).
+    bool operator==(const ProbeKey& o) const {
+        observe(equal_hook, v);
+        return v == o.v;
+    }
     static void check(const ProbeKey& k) {
         if (k.magic != MAGIC) ++corrupt;
     }
+    // Clears the counters and every hook, the call hooks and the tally included.
     static void reset_counters() {
         copy_constructions = 0;
         copy_assignments = 0;
@@ -1587,13 +1858,20 @@ struct ProbeKey {
         corrupt = 0;
         throw_countdown = 0;
         on_assign = nullptr;
+        disarm_hooks();
+        tally = 0;
+        hook_depth = 0;
     } // reset_counters()
 }; // struct ProbeKey
 
 // Identity hash of the key, like CollisionHash: the tests that use ProbeKey pick
-// buckets by hand, or scramble the keys themselves.
+// buckets by hand, or scramble the keys themselves. Every call goes through
+// ProbeKey's hash hook.
 struct ProbeKeyHash {
-    size_t operator()(const ProbeKey& k) const { return static_cast<size_t>(static_cast<unsigned>(k.v)); }
+    size_t operator()(const ProbeKey& k) const {
+        ProbeKey::observe_hash(k.v);
+        return static_cast<size_t>(static_cast<unsigned>(k.v));
+    }
 };
 
 // Reuse copy-assigns, reclaim() destroys nothing, and a throwing assignment on a
@@ -1628,7 +1906,7 @@ TEST(ConcurrentHashSetRcuTest, ReclaimThrowingAssignment) {
                 in.push_back(scramble(i));
             }
         } // erase the first E keys
-        reclaim_and_check(set, N - E, "after the erases");
+        ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, N - E, "after the erases"));
         ASSERT_EQ(set.get_internal_free_count(), size_t(E));
         const size_t slots = set.get_internal_node_count();
 
@@ -1649,7 +1927,7 @@ TEST(ConcurrentHashSetRcuTest, ReclaimThrowingAssignment) {
         EXPECT_EQ(set.get_internal_limbo_count(), 1u);
 
         ProbeKey::destructions = 0;
-        reclaim_and_check(set, in.size(), "after the retry");
+        ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, in.size(), "after the retry"));
         EXPECT_EQ(ProbeKey::destructions.load(), 0) << "reclaim() must not destroy values (they are assigned over at reuse)";
         const size_t free_slots = set.get_internal_free_count();
         EXPECT_EQ(free_slots, size_t(E - 1)) << "the limbo slot must be back on a free list";
@@ -1664,7 +1942,7 @@ TEST(ConcurrentHashSetRcuTest, ReclaimThrowingAssignment) {
         EXPECT_EQ(set.get_internal_free_count(), 0u);
         EXPECT_EQ(ProbeKey::copy_assignments.load(), static_cast<int>(free_slots)) << "a reused slot takes its value by copy assignment";
         EXPECT_EQ(ProbeKey::copy_constructions.load(), 0) << "reuse constructed a value";
-        reclaim_and_check(set, in.size(), "after the reuse");
+        ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, in.size(), "after the reuse"));
         EXPECT_EQ(membership_errors(set, in, out), 0);
     } // the set's lifetime
     EXPECT_EQ(ProbeKey::corrupt.load(), 0) << "an operation met a destroyed or never-constructed value";
@@ -1676,8 +1954,9 @@ TEST(ConcurrentHashSetRcuTest, ReclaimThrowingAssignment) {
 // size up to 1024 (bits 8 and 9 are clear), and a doubling to 512 therefore
 // moves NO fill key and splits nothing they need. The PROBE keys below have bit
 // 8 set: they move to bucket (low byte) + 256 at the doubling to 512, and a
-// contains() of one then splits that bucket, which leaves a stale parent copy
-// behind (reachable count = keys + 1). That is how these tests SEE a doubling.
+// contains() of one then splits that bucket: the probe keys are what such a
+// split copies, which is what the exception tests below make throw. These tests
+// see a doubling through get_internal_table_size().
 static int fill_key(int i) { return (i & 255) | ((i >> 8) << 10); }
 static constexpr int PROBE_X1 = 5 | 256;          // bucket 5 at size 256, 261 at 512
 static constexpr int PROBE_X2 = 5 | 256 | 4096;   // same two buckets; a second key to move
@@ -1685,8 +1964,9 @@ static constexpr int PROBE_E = 5 | (7 << 10);     // bucket 5 at every size up t
 
 // Fills a set built as SetT(256, 1) with the keys of `first`, in order, then with
 // fill_key(0), fill_key(1), ... until the arena holds exactly 512 slots; erases
-// fill_key(0 .. erase-1); reclaims, checking the result. Returns the index of the
-// first fill key not yet used.
+// fill_key(0 .. erase-1); reclaims, checking the result. `next` receives the
+// index of the first fill key not yet used. Callers wrap it in
+// ASSERT_NO_FATAL_FAILURE.
 // The arithmetic, from the header's documented batching of node_count_ (the
 // resize hint; a doubling happens after a successful insert that sees it above
 // 2*table_size, i.e. above 512 here): the appends at indices 0 and 256 add 256
@@ -1695,14 +1975,15 @@ static constexpr int PROBE_E = 5 | (7 << 10);     // bucket 5 at every size up t
 // 512 is a multiple of 256. From then on the first pop after each reclaim() adds
 // 256, so it doubles the table iff live + 256 > 512, i.e. iff live > 256.
 template <typename SetT>
-static int fill_to_512_and_reclaim(SetT& set, const std::vector<int>& first, int erase) {
+static void fill_to_512_and_reclaim(SetT& set, const std::vector<int>& first, int erase, int& next) {
     for (int k : first) EXPECT_TRUE(set.insert(k));
     const int fills = 512 - static_cast<int>(first.size());
     for (int i = 0; i < fills; ++i) EXPECT_TRUE(set.insert(fill_key(i)));
     for (int i = 0; i < erase; ++i) EXPECT_TRUE(set.erase(fill_key(i)));
-    reclaim_and_check(set, 512 - erase, "fill_to_512_and_reclaim()");
+    ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, 512 - erase, "fill_to_512_and_reclaim()"));
     EXPECT_EQ(set.get_internal_free_count(), size_t(erase));
-    return fills;
+    ASSERT_EQ(set.get_internal_table_size(), 256u) << "test precondition: the fill doubled the table";
+    next = fills;
 } // fill_to_512_and_reclaim()
 
 // The first pop after reclaim() restarts the resize hint's batching.
@@ -1717,11 +1998,10 @@ static int fill_to_512_and_reclaim(SetT& set, const std::vector<int>& first, int
 // add nothing until the counter reaches its next multiple of 256).
 // Neither is visible to any other test: membership, booleans and accounting are
 // all unaffected; only the moment of a doubling moves. So this test builds the
-// arithmetic in fill_to_512_and_reclaim() and watches for the doubling with the
-// probe key:
+// arithmetic in fill_to_512_and_reclaim() and watches the table size:
 //   1. fill, erase 300 fill keys, reclaim(): live 212 (PROBE_X1 + 211 fills);
 //   2. cycle 1: 100 inserts, all pops. The first adds 256: hint 468, no doubling
-//      (probe check: no split). The pop counter now stands at 100;
+//      (the table still has 256 buckets). The pop counter now stands at 100;
 //   3. reclaim(): live 312, hint 312, counter cleared;
 //   4. cycle 2: ONE insert, a pop. It must add 256: hint 568 > 512, so the insert
 //      doubles the table to 512. contains(PROBE_X1) then splits bucket 261.
@@ -1730,71 +2010,230 @@ static int fill_to_512_and_reclaim(SetT& set, const std::vector<int>& first, int
 TEST(ConcurrentHashSetRcuTest, ReclaimRestartsPopBatching) {
     using Set = ConcurrentResizableHashSetRCU<int, true, CollisionHash>;
     Set set(256, 1);
-    int next = fill_to_512_and_reclaim(set, {PROBE_X1}, 300);
+    int next = 0;
+    ASSERT_NO_FATAL_FAILURE(fill_to_512_and_reclaim(set, {PROBE_X1}, 300, next));
     size_t live = 212;
 
     for (int i = 0; i < 100; ++i) EXPECT_TRUE(set.insert(fill_key(next++)));   // cycle 1
     live += 100;
-    EXPECT_TRUE(set.contains(PROBE_X1));
-    ASSERT_EQ(expect_consistent(set, "cycle 1").reachable, live)
+    ASSERT_EQ(set.get_internal_table_size(), 256u)
         << "test precondition: the table doubled during cycle 1, so the arithmetic above does not hold";
     ASSERT_EQ(set.get_internal_node_count(), 512u) << "test precondition: cycle 1 must be served from the free list";
-    reclaim_and_check(set, live, "after cycle 1");
+    ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, live, "after cycle 1"));
 
     EXPECT_TRUE(set.insert(fill_key(next++)));   // cycle 2: the first pop after reclaim()
     ++live;
-    EXPECT_TRUE(set.contains(PROBE_X1));   // at size 512 this splits bucket 261
-    EXPECT_EQ(expect_consistent(set, "cycle 2").reachable, live + 1)
+    EXPECT_EQ(set.get_internal_table_size(), 512u)
         << "the first pop after reclaim() did not add its batch to the resize hint: the table did not double";
-    reclaim_and_check(set, live, "after cycle 2");   // the stale parent copy of PROBE_X1 is dead now
+    EXPECT_TRUE(set.contains(PROBE_X1));   // at size 512 this splits bucket 261
+    ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, live, "after cycle 2"));
 } // ReclaimRestartsPopBatching
+
+// Builds a FROZEN node whose split never finished, for the tests below: a set
+// built as SetT(256, 1) over ProbeKey is filled by fill_to_512_and_reclaim() with
+// `first` (which must end with PROBE_X2 and contain PROBE_X1, every other key in
+// bucket 5 at sizes up to 1024 and absent from the fill keys), erasing 200 fill
+// keys; one more insert, the first pop, doubles the table to 512; and
+// contains(PROBE_X1) then splits bucket 261, which walks bucket 5's chain newest
+// first, freezes PROBE_X2 (the first node of the chain that moves: fill_key(261)
+// = 1029, the only newer node, stays) and throws on its copy, whose popped slot's
+// assignment is armed to throw. Afterwards bucket 5's chain is, newest first,
+//     1029 -> PROBE_X2 (FROZEN, child 261 UNINITIALIZED) -> rest of `first`
+// reversed (PROBE_X1, still live, last), and limbo holds the throwing slot.
+// fill_key(5), the other fill key of bucket 5, was among the erased ones.
+// `next` receives the first unused fill index and `live` the key count. Callers
+// wrap it in ASSERT_NO_FATAL_FAILURE; it ASSERTs its own steps.
+template <typename SetT>
+static void build_unfinished_split(SetT& set, const std::vector<int>& first, int& next, size_t& live) {
+    ASSERT_EQ(first.back(), PROBE_X2);
+    ASSERT_NO_FATAL_FAILURE(fill_to_512_and_reclaim(set, first, 200, next));
+    live = 312;
+    ASSERT_TRUE(set.insert(fill_key(next++)));   // the first pop: doubles the table to 512
+    ++live;
+    ASSERT_EQ(set.get_internal_table_size(), 512u) << "test precondition: the first pop after reclaim() did not double the table";
+    ProbeKey::throw_countdown = 1;   // the split's first copy throws
+    EXPECT_THROW(set.contains(PROBE_X1), std::runtime_error);
+    ProbeKey::throw_countdown = 0;
+    const typename SetT::InternalAccounting acc = expect_consistent(set, "after the split threw");
+    ASSERT_EQ(acc.limbo, 1u) << "the slot whose assignment threw must be on limbo";
+    ASSERT_EQ(acc.reachable_dead, 0u) << "test precondition: PROBE_X2 is FROZEN with its child unpublished, so not dead";
+} // build_unfinished_split()
 
 // A FROZEN node whose split never finished is KEPT by reclaim(), and a dead node
 // after it is unlinked through its (FROZEN) link.
 //
 // Weak spots: (1) the dead-node rule must keep a FROZEN node whose child bucket is
 // still UNINITIALIZED: it is then the key's only node (INVARIANT in the header);
-// (2) the relink through a kept predecessor's link must keep its tag bits.
+// (2) the relink through a kept predecessor's link must keep its tag bits;
+// (3) erase() must not unlink its node through such a predecessor.
 // A FROZEN node with an unpublished child exists at a quiescent point only when a
 // split threw between the freeze and the publication, so this test makes one
-// throw: the first copy the split of bucket 261 makes pops a free slot whose
-// assignment throws. The split froze exactly one node when that happens (the
-// first moving node of the walk), and allocated nothing yet, so nothing leaks
-// (compare ReclaimAccountsForSplitCopiesWhenAssignmentThrows below, where the
-// SECOND copy throws).
+// throw (build_unfinished_split()): the first copy the split of bucket 261 makes
+// pops a free slot whose assignment throws. The split froze exactly one node when
+// that happens (the first moving node of the walk), and allocated nothing yet, so
+// nothing leaks (compare ReclaimAccountsForSplitCopiesWhenAssignmentThrows below,
+// where the SECOND copy throws).
 // Chain order is newest first; the insert order PROBE_X1, PROBE_E, PROBE_X2 makes
-// bucket 5's chain end in  ... PROBE_X2 -> PROBE_E -> PROBE_X1, so the split
-// freezes PROBE_X2, and after PROBE_E is erased, reclaim() unlinks PROBE_E through
-// PROBE_X2's FROZEN link. Afterwards both probe keys must still be members (the
-// next split of 261 copies the frozen and the live one alike), and the key count
-// and accounting must be exact.
+// bucket 5's chain 1029 -> PROBE_X2 (FROZEN) -> PROBE_E -> PROBE_X1. erase(PROBE_E)
+// marks PROBE_E and then cannot unlink it: its predecessor PROBE_X2 is tagged and
+// not dead, and a tagged link is never a CAS target, so the erase gives up its
+// self-unlink (contract clause 5's exception) and nothing is retired; PROBE_E
+// stays reachable, dead. A header that unlinked through the tagged predecessor
+// would retire PROBE_E; one that treated a FROZEN node as dead with its child
+// unpublished would unlink PROBE_X2 too and lose the key. Then reclaim() unlinks
+// PROBE_E through PROBE_X2's FROZEN link. Afterwards both probe keys must still be
+// members (the next split of 261 copies the frozen and the live one alike), and
+// the key count and accounting must be exact.
 TEST(ConcurrentHashSetRcuTest, ReclaimKeepsFrozenNodeOfUnfinishedSplit) {
     using Set = ConcurrentResizableHashSetRCU<ProbeKey, true, ProbeKeyHash>;
     ProbeKey::reset_counters();
     {
         Set set(256, 1);
-        int next = fill_to_512_and_reclaim(set, {PROBE_X1, PROBE_E, PROBE_X2}, 200);
-        size_t live = 312;
-        EXPECT_TRUE(set.insert(fill_key(next++)));   // the first pop: doubles the table to 512
-        ++live;
-
-        ProbeKey::throw_countdown = 1;   // the split's first copy throws
-        EXPECT_THROW(set.contains(PROBE_X1), std::runtime_error);
-        ProbeKey::throw_countdown = 0;
-        expect_consistent(set, "after the split threw");
-        EXPECT_EQ(set.get_internal_limbo_count(), 1u) << "the slot whose assignment threw must be on limbo";
+        int next = 0;
+        size_t live = 0;
+        ASSERT_NO_FATAL_FAILURE(build_unfinished_split(set, {PROBE_X1, PROBE_E, PROBE_X2}, next, live));
+        const size_t reachable = set.get_internal_accounting().reachable;
 
         EXPECT_TRUE(set.erase(PROBE_E));   // the dead node behind the FROZEN one
         --live;
-        reclaim_and_check(set, live, "after the erase");
+        const Set::InternalAccounting erased = expect_consistent(set, "after the erase");
+        EXPECT_EQ(erased.retired, 0u) << "erase() unlinked its node through a tagged predecessor, or unlinked the FROZEN node of an unfinished split";
+        EXPECT_EQ(erased.reachable, reachable) << "PROBE_E, or PROBE_X2, left the chain";
+        EXPECT_EQ(erased.reachable_dead, 1u) << "PROBE_E must stay in its chain, dead";
+        ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, live, "after the erase"));
         EXPECT_TRUE(set.contains(PROBE_X1));
         EXPECT_TRUE(set.contains(PROBE_X2));
         EXPECT_FALSE(set.contains(PROBE_E));
         EXPECT_FALSE(set.insert(PROBE_X2)) << "a key kept only by its FROZEN node was lost";
-        reclaim_and_check(set, live, "after the split finished");
+        ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, live, "after the split finished"));
     } // the set's lifetime
     EXPECT_EQ(ProbeKey::corrupt.load(), 0);
 } // ReclaimKeepsFrozenNodeOfUnfinishedSplit
+
+// erase() gives up its self-unlink after its unlink CAS loses twice, and leaves
+// the retirement to whoever unlinked the node.
+//
+// Kills: erase() retiring its run after a lost unlink CAS (a double retirement:
+// the node is then on a retired list twice, a cycle the accounting reports).
+// Hooks: (1) operator== on node 1029, the first operator== of erase(1029) (1029
+// is the chain's first node, so it is the walk's first comparison: H2, between
+// the link load and the mark CAS); (2) armed by (1), the SECOND Hash{}(PROBE_X2)
+// the outer erase(1029) makes after (1): each unlink attempt's run walk passes the
+// MARKED 1029 and hashes the FROZEN PROBE_X2 to find that the run ends there (H5)
+// -- the first such call is attempt 1's, the second attempt 2's, after the
+// restart, whose walk from the head to 1029 hashes nothing.
+// Flow, on the build_unfinished_split() chain 1029 -> PROBE_X2 (FROZEN, child
+// unpublished) -> PROBE_E -> PROBE_X1:
+//   - hook (1): insert(Y1), a new key of bucket 5, prepends Y1: the head moves to
+//     Y1, and 1029's link is unchanged;
+//   - the mark CAS on 1029's link succeeds: erase(1029) is the deletion;
+//   - attempt 1, a CAS on the head word erase() loaded before (1), fails;
+//   - the restart re-reads the head and finds 1029 behind Y1: attempt 2's
+//     predecessor is Y1's link;
+//   - hook (2), in attempt 2's window: insert(Y2), another new key of bucket 5,
+//     whose walk meets the dead 1029 behind the live Y1, unlinks it through Y1's
+//     link and retires it;
+//   - attempt 2's CAS on Y1's link fails, and erase() gives up.
+// Oracles: both hooks fired (their inserts returned true); erase(1029) returned
+// true; 1029 is unreachable and retired exactly once (by Y2's walk); the
+// accounting is consistent. Y1 and Y2 are fill_key(517) and fill_key(773): bucket
+// 5 at sizes 512 and 1024, beyond the fill keys used. Neither insert doubles the
+// table (the hint stays at 568, below 2*512).
+TEST(ConcurrentHashSetRcuTest, EraseGivesUpAfterTwoLostUnlinks) {
+    using Set = ConcurrentResizableHashSetRCU<ProbeKey, true, ProbeKeyHash>;
+    const int HEAD = fill_key(261), Y1 = fill_key(517), Y2 = fill_key(773);
+    ProbeKey::reset_counters();
+    {
+        Set set(256, 1);
+        int next = 0;
+        size_t live = 0;
+        ASSERT_NO_FATAL_FAILURE(build_unfinished_split(set, {PROBE_X1, PROBE_E, PROBE_X2}, next, live));
+        const Set::InternalCounters before = set.get_internal_counters();
+
+        bool y1_inserted = false, y2_inserted = false;
+        ProbeKey::arm(ProbeKey::equal_hook, HEAD, 1, [&set, &y1_inserted, &y2_inserted, Y1, Y2]() {   // (1)
+            y1_inserted = set.insert(Y1);
+            ProbeKey::arm(ProbeKey::hash_hook, PROBE_X2, 2, [&set, &y2_inserted, Y2]() {   // (2)
+                y2_inserted = set.insert(Y2);
+            });
+        });
+        const bool erased = set.erase(HEAD);
+        ProbeKey::disarm_hooks();
+        ASSERT_TRUE(y1_inserted) << "test precondition: hook (1) did not insert Y1 inside erase()'s compare-to-mark window";
+        ASSERT_TRUE(y2_inserted) << "test precondition: hook (2) did not insert Y2 inside erase()'s second unlink attempt";
+        live += 2;
+        EXPECT_TRUE(erased) << "erase() of a present key returned false";
+        --live;
+
+        const Set::InternalAccounting acc = expect_consistent(set, "after erase(1029)");
+        EXPECT_EQ(acc.retired, 1u) << "1029 must be retired exactly once, by Y2's walk";
+        EXPECT_EQ(acc.reachable_dead, 0u) << "1029 is still in its chain";
+        const Set::InternalCounters after = set.get_internal_counters();
+        EXPECT_EQ(after.retire_runs - before.retire_runs, 1u);
+        EXPECT_FALSE(set.contains(HEAD));
+        EXPECT_TRUE(set.contains(Y1));
+        EXPECT_TRUE(set.contains(Y2));
+        ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, live, "after erase(1029)"));
+        EXPECT_TRUE(set.contains(PROBE_X2));
+        EXPECT_TRUE(set.contains(PROBE_E));
+    } // the set's lifetime
+    EXPECT_EQ(ProbeKey::corrupt.load(), 0);
+} // EraseGivesUpAfterTwoLostUnlinks
+
+// What erase() leaves in a chain when it cannot unlink, and how reclaim() relinks
+// it: a run of tombstones behind a FROZEN node whose split never finished
+// (relinked through that node's tagged link), and a tombstone at the bucket head
+// left by an erase() whose Hash{} threw after the mark (relinked through the head
+// word, which keeps its seal level).
+//
+// Hook: Hash{}(PROBE_X2), the first one erase(1029) makes: the walk stops at 1029,
+// the chain's first node, so it hashes nothing; after the mark, attempt 1's run
+// walk passes the MARKED 1029 and hashes the FROZEN PROBE_X2 (H5). It throws: the
+// key is deleted (the mark is the deletion) but the caller sees the exception,
+// and 1029 stays at the head, dead (the header's EXCEPTIONS).
+// Flow, on the build_unfinished_split() chain 1029 -> PROBE_X2 (FROZEN, child
+// unpublished) -> PROBE_E -> E2 -> E3 -> PROBE_X1, E2 and E3 being two more keys of
+// bucket 5 that stay there at 512 and 1024:
+//   - erase(PROBE_E), erase(E2), erase(E3): each marks its node and gives up its
+//     self-unlink, since its predecessor is PROBE_X2, tagged and not dead; the
+//     three tombstones form a run behind PROBE_X2. Nothing is retired;
+//   - erase(1029) with the hook armed: throws after its mark;
+//   - four dead nodes are reachable, none retired; reclaim() must unlink all four,
+//     the head one through the head and the run through PROBE_X2's link, with the
+//     exact key count, and every remaining key must still be a member.
+TEST(ConcurrentHashSetRcuTest, ReclaimRelinksWhatEraseLeftBehind) {
+    using Set = ConcurrentResizableHashSetRCU<ProbeKey, true, ProbeKeyHash>;
+    const int HEAD = fill_key(261), E2 = 5 | (6 << 10), E3 = 5 | (5 << 10);
+    ProbeKey::reset_counters();
+    {
+        Set set(256, 1);
+        int next = 0;
+        size_t live = 0;
+        ASSERT_NO_FATAL_FAILURE(build_unfinished_split(set, {PROBE_X1, E3, E2, PROBE_E, PROBE_X2}, next, live));
+        for (int k : {PROBE_E, E2, E3}) {
+            EXPECT_TRUE(set.erase(k));
+            --live;
+        }
+        const Set::InternalAccounting run = expect_consistent(set, "after the erases behind PROBE_X2");
+        EXPECT_EQ(run.retired, 0u) << "an erase() unlinked its node through the tagged PROBE_X2";
+        EXPECT_EQ(run.reachable_dead, 3u);
+
+        ProbeKey::arm(ProbeKey::hash_hook, PROBE_X2, 1, []() { throw std::runtime_error("Hash{} armed to throw"); });
+        EXPECT_THROW(set.erase(HEAD), std::runtime_error);
+        ProbeKey::disarm_hooks();
+        --live;   // the mark landed: 1029 is deleted although the caller saw an exception
+        const Set::InternalAccounting left = expect_consistent(set, "after erase(1029) threw");
+        EXPECT_EQ(left.retired, 0u);
+        ASSERT_EQ(left.reachable_dead, 4u) << "test precondition: erase(1029) did not leave its tombstone at the head";
+        EXPECT_FALSE(set.contains(HEAD));
+
+        ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, live, "after the erases"));
+        for (int k : {PROBE_X1, PROBE_X2}) EXPECT_TRUE(set.contains(k));
+        for (int k : {HEAD, PROBE_E, E2, E3}) EXPECT_FALSE(set.contains(k));
+        ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, live, "after the split finished"));
+    } // the set's lifetime
+    EXPECT_EQ(ProbeKey::corrupt.load(), 0);
+} // ReclaimRelinksWhatEraseLeftBehind
 
 // NO ARENA SLOT IS LOST TO A THROW (header, "EXCEPTIONS: WHAT IS AND IS NOT
 // HANDLED"): the partial subchain of a split that throws.
@@ -1817,7 +2256,8 @@ TEST(ConcurrentHashSetRcuTest, ReclaimAccountsForSplitCopiesWhenAssignmentThrows
     ProbeKey::reset_counters();
     {
         Set set(256, 1);
-        int next = fill_to_512_and_reclaim(set, {PROBE_X1, PROBE_X2}, 200);
+        int next = 0;
+        ASSERT_NO_FATAL_FAILURE(fill_to_512_and_reclaim(set, {PROBE_X1, PROBE_X2}, 200, next));
         size_t live = 312;
         EXPECT_TRUE(set.insert(fill_key(next++)));   // the first pop: doubles the table to 512
         ++live;
@@ -1829,7 +2269,7 @@ TEST(ConcurrentHashSetRcuTest, ReclaimAccountsForSplitCopiesWhenAssignmentThrows
         EXPECT_EQ(set.get_internal_limbo_count(), 2u) << "the throwing slot and the one-node partial subchain must both be on limbo";
         EXPECT_TRUE(set.contains(PROBE_X1));
         EXPECT_TRUE(set.contains(PROBE_X2));
-        reclaim_and_check(set, live, "after the split finished");
+        ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, live, "after the split finished"));
     } // the set's lifetime
     EXPECT_EQ(ProbeKey::corrupt.load(), 0);
 } // ReclaimAccountsForSplitCopiesWhenAssignmentThrows
@@ -1869,7 +2309,8 @@ TEST(ConcurrentHashSetRcuTest, ReclaimRecoversPendingInsertNodeWhenRetryThrows) 
     ProbeKey::reset_counters();
     {
         Set set(256, 1);
-        fill_to_512_and_reclaim(set, {PROBE_X1}, 200);
+        int next = 0;   // not used: the keys below are chosen by hand
+        ASSERT_NO_FATAL_FAILURE(fill_to_512_and_reclaim(set, {PROBE_X1}, 200, next));
         size_t live = 312;
 
         bool nested_inserted = false;
@@ -1887,10 +2328,10 @@ TEST(ConcurrentHashSetRcuTest, ReclaimRecoversPendingInsertNodeWhenRetryThrows) 
         EXPECT_FALSE(set.contains(PROBE_K)) << "the insert that threw before publishing made its key a member";
         EXPECT_TRUE(set.contains(NESTED));
         EXPECT_TRUE(set.contains(PROBE_X1));
-        reclaim_and_check(set, live, "after the retry threw");
+        ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, live, "after the retry threw"));
         EXPECT_TRUE(set.insert(PROBE_K));
         ++live;
-        reclaim_and_check(set, live, "after PROBE_K was inserted");
+        ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, live, "after PROBE_K was inserted"));
     } // the set's lifetime
     EXPECT_EQ(ProbeKey::corrupt.load(), 0);
 } // ReclaimRecoversPendingInsertNodeWhenRetryThrows
@@ -1915,11 +2356,13 @@ TEST(ConcurrentHashSetRcuTest, ReclaimDrainsContendedLimbo) {
     const int T = 8, K = 64, REPS = 40;
     size_t limbo_total = 0;
     for (int rep = 0; rep < REPS; ++rep) {
+        size_t limbo = 0;
         if (rep & 1) {
-            limbo_total += one_winner_per_key_body<ConcurrentResizableHashSetRCU<int, true>>(T, K, rep, "AllowDelete=true", 2);
+            ASSERT_NO_FATAL_FAILURE(one_winner_per_key_body<IntSetDel>(T, K, rep, "AllowDelete=true", limbo, 2));
         } else {
-            limbo_total += one_winner_per_key_body<ConcurrentResizableHashSetRCU<int, false>>(T, K, rep, "AllowDelete=false", 2);
+            ASSERT_NO_FATAL_FAILURE(one_winner_per_key_body<IntSetNoDel>(T, K, rep, "AllowDelete=false", limbo, 2));
         }
+        limbo_total += limbo;
     } // repetitions
     EXPECT_GT(limbo_total, 0u) << "no node ever reached a limbo list: the races this test exists for did not happen";
 } // ReclaimDrainsContendedLimbo
@@ -1960,11 +2403,13 @@ TEST(ConcurrentHashSetRcuTest, ReclaimLimboPushesRaceFreeListPops) {
     const int T = 8, K = 64, PREFILL = 600, REPS = 40;
     size_t limbo_total = 0;
     for (int rep = 0; rep < REPS; ++rep) {
+        size_t limbo = 0;
         if (rep & 1) {
-            limbo_total += one_winner_per_key_body<ConcurrentResizableHashSetRCU<int, true>>(T, K, rep, "AllowDelete=true, one shard", 1, PREFILL, PREFILL);
+            ASSERT_NO_FATAL_FAILURE(one_winner_per_key_body<IntSetDel>(T, K, rep, "AllowDelete=true, one shard", limbo, 1, PREFILL, PREFILL));
         } else {
-            limbo_total += one_winner_per_key_body<ConcurrentResizableHashSetRCU<int, false>>(T, K, rep, "AllowDelete=false, one shard", 1, PREFILL, PREFILL/4);
+            ASSERT_NO_FATAL_FAILURE(one_winner_per_key_body<IntSetNoDel>(T, K, rep, "AllowDelete=false, one shard", limbo, 1, PREFILL, PREFILL/4));
         }
+        limbo_total += limbo;
     } // repetitions
     EXPECT_GT(limbo_total, 0u) << "no node ever reached a limbo list: the races this test exists for did not happen";
 } // ReclaimLimboPushesRaceFreeListPops
@@ -2018,7 +2463,7 @@ TEST(ConcurrentHashSetRcuTest, ReclaimBoundsTheArena) {
             } // churn
             for (int t = 0; t < T; ++t) EXPECT_EQ(bad[t], 0u) << where << ", thread " << t << ": a determined result was wrong";
             if (with_reclaim) {
-                reclaim_and_check(set, L, where);
+                ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, L, where));
                 EXPECT_LE(set.get_internal_node_count(), BOUND*L) << where << ": the arena outgrew " << BOUND << " times the live count";
             } else {
                 expect_consistent(set, where);
@@ -2038,3 +2483,678 @@ TEST(ConcurrentHashSetRcuTest, ReclaimBoundsTheArena) {
         EXPECT_EQ(membership_errors(set, in, out), 0) << flavor;
     } // with and without reclaim()
 } // ReclaimBoundsTheArena
+
+// ===========================================================================
+// Dead nodes leave their chains: the unlinking writers (contract clause 5).
+//
+// A dead node -- a tombstone, or a parent copy that a split superseded -- is
+// removed from its chain by a writer: erase() unlinks its own node right after
+// the mark; the split that published a child unlinks the parent copies it
+// superseded (its CLEANUP, one CAS per run of dead nodes, after the publication);
+// and an insert() or erase() whose walk passes a dead run behind a live
+// predecessor or the bucket head unlinks it (one CAS, never retried). Every
+// unlink is a CAS on the predecessor's word, never on a tagged link; the winner
+// pushes exactly the run it bypassed onto its own shard's retired list, where a
+// node keeps its chain link, so an operation that reached it before the unlink
+// can still walk out of it.
+//
+// The single-threaded tests below pin the postconditions of uncontended
+// operations. The hook tests reproduce, on one thread, interleavings in which a
+// concurrent writer changes a word between an operation's load and its CAS,
+// through ProbeKey's call hooks (see CALL HOOKS at ProbeKey). Their geometries
+// use the identity hash on small keys, and the doubling rule of WHEN THE TABLE
+// DOUBLES: a fresh one-shard set below 128 buckets doubles on EVERY successful
+// insert, so after k inserts into a Set(4, 1) the table has 4*2^k buckets
+// (insert_in_order() checks it). Keys congruent to 1 modulo 32 that differ only
+// in bits 5 and 6 live in bucket 1 -- one of the constructor's buckets, published
+// from the start -- at every size up to 32, so they share one chain, newest
+// first; at 64 those with bit 5 set move to bucket 33. Key 2 lives in bucket 2
+// at every size, so inserting it doubles the table without touching that chain.
+// Each test names what it kills: the protocol step it exists for, removed.
+// ===========================================================================
+
+// Inserts `keys` in order into `set` (each must be new), then checks that the
+// table has `expected_ts` buckets: the geometry the calling test derived. Callers
+// wrap it in ASSERT_NO_FATAL_FAILURE.
+template <typename SetT>
+static void insert_in_order(SetT& set, const std::vector<int>& keys, size_t expected_ts) {
+    for (int k : keys) ASSERT_TRUE(set.insert(k)) << "insert(" << k << ") of a new key returned false";
+    ASSERT_EQ(set.get_internal_table_size(), expected_ts) << "test precondition: the set-up did not reach the derived table size";
+} // insert_in_order()
+
+// T1: an uncontended erase() unlinks and retires its own node, every time.
+//
+// Kills: erase() sending its unlinked node to a LIMBO list (or anywhere but a
+// retired list): retired and limbo counts then disagree with the erases.
+// 8 chains of 16 colliding keys (b + 1024*i, bucket b of a 1024-bucket table,
+// which never doubles: 128 nodes are one append batch, hint 256, threshold 2048)
+// are erased OLDEST first, so each erase finds its node at the tail of its chain
+// behind the live nodes inserted after it, and no earlier dead node lies between
+// its predecessor and it (every earlier erase already took its own node out);
+// the last erase of each chain finds its node at the head. Each erase unlinks
+// exactly its node, so with no reclaim() at all every slot ends up retired.
+// (The erased node is the tail, so a run walk that overshoots its run has
+// nothing to overshoot into: GrowthLeavesNoDeadNodeReachable catches that.)
+TEST(ConcurrentHashSetRcuTest, EraseAllUnlinksEveryNode) {
+    using Set = ConcurrentResizableHashSetRCU<int, true, CollisionHash>;
+    const int B = 8, PER = 16, C = 1024;
+    Set set(C, 1);
+    for (int i = 0; i < PER; ++i) {
+        for (int b = 0; b < B; ++b) EXPECT_TRUE(set.insert(b + C*i));
+    }
+    ASSERT_EQ(set.get_internal_table_size(), size_t(C)) << "test precondition: the table doubled";
+    const Set::InternalCounters before = set.get_internal_counters();
+    for (int i = 0; i < PER; ++i) {   // oldest first: each target is its chain's tail
+        for (int b = 0; b < B; ++b) {
+            EXPECT_TRUE(set.erase(b + C*i));
+            EXPECT_FALSE(set.contains(b + C*i));
+        }
+    } // erase every key
+    ASSERT_EQ(set.get_internal_table_size(), size_t(C)) << "test precondition: the table doubled";
+    const Set::InternalAccounting acc = expect_consistent(set, "after erasing every key");
+    EXPECT_EQ(acc.slots, size_t(B*PER));
+    EXPECT_EQ(acc.reachable, 0u) << "an uncontended erase() left its node in its chain";
+    EXPECT_EQ(acc.reachable_dead, 0u);
+    EXPECT_EQ(acc.retired, size_t(B*PER)) << "every erased node must be retired, and only once";
+    EXPECT_EQ(acc.limbo, 0u) << "an unlinked node went to limbo";
+    EXPECT_EQ(acc.free_nodes, 0u);
+    const Set::InternalCounters after = set.get_internal_counters();
+    EXPECT_EQ(after.retire_runs - before.retire_runs, size_t(B*PER)) << "one retired run per erase";
+    EXPECT_EQ(after.retire_nodes - before.retire_nodes, size_t(B*PER));
+} // EraseAllUnlinksEveryNode
+
+// T2: uncontended growth leaves no dead node reachable.
+//
+// Kills: a split that does not FREEZE the nodes it moves in one AllowDelete
+// instantiation (the superseded copies are then untagged dead nodes, which no
+// writer may unlink: the accounting's tag check fails and they stay reachable);
+// and a run walk that overshoots its run into the first live node (that node is
+// unlinked and retired: a key is lost and a retired node is untagged).
+// Single-threaded inserts of scrambled keys through many doublings, then a
+// contains() sweep over them, which splits every bucket a key maps to that is
+// still pending. Every split is uncontended, so its cleanup unlinks every parent
+// copy it superseded; with no erase() and no throw nothing else dies. Afterwards,
+// with no reclaim(): exactly one node per key is reachable and none of them dead,
+// nothing is on a limbo or free list, every other slot is retired, and no
+// cleanup CAS lost. Both AllowDelete values: the freeze runs for both.
+template <bool AllowDelete>
+static void growth_leaves_no_dead_node_body() {
+    using Set = ConcurrentResizableHashSetRCU<int, AllowDelete>;
+    const int N = 5000;
+    const std::string where = AllowDelete ? "AllowDelete=true" : "AllowDelete=false";
+    Set set(4, 1);
+    std::vector<int> keys;
+    for (int i = 0; i < N; ++i) {
+        keys.push_back(scramble(i));
+        EXPECT_TRUE(set.insert(keys.back())) << where;
+    }
+    EXPECT_EQ(membership_errors(set, keys, std::vector<int>{}), 0) << where;
+    const typename Set::InternalAccounting acc = expect_consistent(set, where + ", after the sweep");
+    EXPECT_EQ(acc.reachable, size_t(N)) << where << ": a superseded parent copy is still reachable";
+    EXPECT_EQ(acc.reachable_dead, 0u) << where;
+    EXPECT_EQ(acc.limbo, 0u) << where;
+    EXPECT_EQ(acc.free_nodes, 0u) << where;
+    EXPECT_EQ(acc.retired, acc.slots - N) << where << ": every slot that is not a key's node must be retired";
+    EXPECT_GT(acc.retired, 0u) << where << ": test precondition: no split moved a key";
+    const typename Set::InternalCounters c = set.get_internal_counters();
+    EXPECT_EQ(c.retire_nodes, acc.retired) << where;
+    EXPECT_EQ(c.cleanup_cas_failures, 0u) << where << ": a cleanup CAS lost with no other thread running";
+    EXPECT_EQ(c.splits_published, c.split_attempts) << where << ": a single-threaded split lost its publication";
+} // growth_leaves_no_dead_node_body()
+
+TEST(ConcurrentHashSetRcuTest, GrowthLeavesNoDeadNodeReachable) {
+    growth_leaves_no_dead_node_body<false>();
+    growth_leaves_no_dead_node_body<true>();
+} // GrowthLeavesNoDeadNodeReachable
+
+// T3d: erase()'s mark CAS fails on a LIVE value, and erase() must retry it.
+//
+// Kills: erase() falling through after a failed mark CAS whose failure value is
+// live (the key is still present, and the erase reports it absent).
+// Hook: operator== on node 1, the first operator== of erase(1) (1 is the chain's
+// first node): H2, between the link load and the mark CAS, whose expected value
+// is the link loaded before the comparison.
+// Geometry: insert(9), insert(1) take a Set(4, 1) to 16 buckets; at sizes 4 and 8
+// both keys are in bucket 1 (chain 1 -> 9). At 16, key 9 belongs to bucket 9,
+// still UNINITIALIZED, and key 1 stays in bucket 1. The doubling happens BEFORE
+// erase(1) loads the table size, on purpose: an erase whose own size is stale
+// retries in the new geometry after any failed CAS, which would hide a
+// fallthrough behind that retry.
+// In the window, contains(9) splits bucket 9: it freezes 9's node in bucket 1 and
+// publishes the copy, and the split's cleanup unlinks the now dead parent copy
+// through node 1's LIVE link (1 -> 9 becomes 1 -> EMPTY) and retires it. The
+// retirement is read inside the hook: the accounting sweep runs single-threaded
+// in the middle of erase(1), which has loaded values but written nothing yet.
+// erase(1)'s mark CAS then fails with a live value; retried on it, it succeeds.
+// Afterwards: erase(1) returned true, 1 is absent, 9 present, and erase() unlinked
+// its own node too (its first attempt, on the head word it loaded before the
+// split sealed the head, fails; the restart succeeds): two nodes retired.
+TEST(ConcurrentHashSetRcuTest, EraseRetriesMarkAfterLiveLinkChange) {
+    using Set = ConcurrentResizableHashSetRCU<ProbeKey, true, ProbeKeyHash>;
+    const int K = 1, S = 9;
+    ProbeKey::reset_counters();
+    {
+        Set set(4, 1);
+        ASSERT_NO_FATAL_FAILURE(insert_in_order(set, {S, K}, 16));
+        bool hook_ran = false, nested_found = false;
+        size_t retired_in_window = 0;
+        ProbeKey::arm(ProbeKey::equal_hook, K, 1, [&]() {
+            hook_ran = true;
+            nested_found = set.contains(S);
+            retired_in_window = set.get_internal_accounting().retired;
+        });
+        const bool erased = set.erase(K);
+        ProbeKey::disarm_hooks();
+        ASSERT_TRUE(hook_ran) << "test precondition: the hook on erase(1)'s comparison did not fire";
+        ASSERT_TRUE(nested_found);
+        ASSERT_EQ(retired_in_window, 1u) << "test precondition: the split's cleanup did not unlink 9's parent copy through 1's link";
+        EXPECT_TRUE(erased) << "erase() of a present key returned false after a live change of its link";
+        EXPECT_FALSE(set.contains(K));
+        EXPECT_TRUE(set.contains(S));
+        const Set::InternalAccounting acc = expect_consistent(set, "after erase(1)");
+        EXPECT_EQ(acc.retired, 2u) << "9's parent copy and 1's node must both be retired";
+        EXPECT_EQ(acc.reachable, 1u);
+        EXPECT_EQ(acc.reachable_dead, 0u);
+    } // the set's lifetime
+    EXPECT_EQ(ProbeKey::corrupt.load(), 0);
+} // EraseRetriesMarkAfterLiveLinkChange
+
+// T5d: a miss in a chain from which the key's FROZEN copy was unlinked must reload
+// the table size and retry in the new geometry (the reload is what finds the
+// key's live copy in the child).
+//
+// Kills: a miss returned without reloading the table size. Before dead nodes
+// left their chains a stale walker still found the key's FROZEN parent copy (a
+// hit); now that copy may be gone, and only the reload finds the key.
+// Geometry: insert(33), insert(65), insert(1) take a Set(4, 1) to 32 buckets with
+// bucket 1's chain 1 -> 65 -> 33. In the window, insert(2) doubles the table to 64
+// and contains(33) splits bucket 33 from bucket 1: it freezes 33's node and
+// publishes its copy, and the cleanup unlinks the parent copy through 65's LIVE
+// link -- a mid-chain unlink -- and retires it (read inside the hook).
+// The outer operation, which loaded size 32, then walks bucket 1 without 33,
+// misses, reloads the size (64), and retries in bucket 33. It hashes 33 exactly
+// twice outside the hook (one H1 per pass; the nested operations' calls are not
+// counted, see CALL HOOKS), and finds the key. The variants:
+//   - contains(33), hook on Hash{}(33), its first call (H1: between the size load
+//     and the head load);
+//   - erase(33), hook on Hash{}(33), its first call (H1): it then erases the copy
+//     in bucket 33 and unlinks it too, so two nodes are retired;
+//   - contains(33), hook on operator== against node 1, its first comparison (H4:
+//     node 1's link is loaded before the comparison, node 65's after it), i.e.
+//     two nodes before the copy: the outer walk is already inside the chain when
+//     33 is unlinked from it, and reads 65's link after the unlink. (Suspended one
+//     node later, at 65, it would have loaded 65's link before the unlink and
+//     walked into the unlinked copy -- a legal hit on a FROZEN node.)
+// `erase`: the outer operation is erase(33), else contains(33); `at_compare`:
+// the third variant's hook. Callers wrap it in ASSERT_NO_FATAL_FAILURE.
+static void miss_after_unlink_body(bool erase, bool at_compare) {
+    using Set = ConcurrentResizableHashSetRCU<ProbeKey, true, ProbeKeyHash>;
+    const int K = 33, W = 1;
+    ProbeKey::reset_counters();
+    {
+        Set set(4, 1);
+        ASSERT_NO_FATAL_FAILURE(insert_in_order(set, {K, 65, W}, 32));
+        bool hook_ran = false, doubled = false, nested_found = false;
+        size_t retired_in_window = 0;
+        std::function<void()> window = [&]() {
+            hook_ran = true;
+            doubled = set.insert(2) && set.get_internal_table_size() == 64;
+            nested_found = set.contains(K);
+            retired_in_window = set.get_internal_accounting().retired;
+        };
+        if (at_compare) {
+            ProbeKey::arm(ProbeKey::equal_hook, W, 1, window);
+        } else {
+            ProbeKey::arm(ProbeKey::hash_hook, K, 1, window);
+        }
+        ProbeKey::tally_value = K;
+        ProbeKey::tally = 0;
+        const bool result = erase ? set.erase(K) : set.contains(K);
+        const int outer_hashes = ProbeKey::tally;
+        ProbeKey::disarm_hooks();
+        ASSERT_TRUE(hook_ran) << "test precondition: the hook did not fire";
+        ASSERT_TRUE(doubled) << "test precondition: insert(2) did not double the table to 64";
+        ASSERT_TRUE(nested_found);
+        ASSERT_EQ(retired_in_window, 1u) << "test precondition: the split's cleanup did not unlink 33's parent copy";
+        EXPECT_TRUE(result) << (erase ? "erase" : "contains") << "(33) missed a present key whose FROZEN copy was unlinked";
+        EXPECT_EQ(outer_hashes, 2) << "the outer operation must hash 33 once per pass: once in bucket 1, once after the reload";
+        EXPECT_EQ(set.contains(K), !erase);
+        const Set::InternalAccounting acc = expect_consistent(set, "after the outer operation");
+        EXPECT_EQ(acc.retired, erase ? 2u : 1u);
+        EXPECT_EQ(acc.reachable_dead, 0u);
+    } // the set's lifetime
+    EXPECT_EQ(ProbeKey::corrupt.load(), 0);
+} // miss_after_unlink_body()
+
+TEST(ConcurrentHashSetRcuTest, ContainsReloadsAfterUnlinkedCopy) {
+    ASSERT_NO_FATAL_FAILURE(miss_after_unlink_body(false, false));
+} // ContainsReloadsAfterUnlinkedCopy
+
+TEST(ConcurrentHashSetRcuTest, EraseReloadsAfterUnlinkedCopy) {
+    ASSERT_NO_FATAL_FAILURE(miss_after_unlink_body(true, false));
+} // EraseReloadsAfterUnlinkedCopy
+
+TEST(ConcurrentHashSetRcuTest, ContainsReloadsAfterMidChainUnlink) {
+    ASSERT_NO_FATAL_FAILURE(miss_after_unlink_body(false, true));
+} // ContainsReloadsAfterMidChainUnlink
+
+// The split's freeze CAS fails on a LIVE value, and the split must retry it.
+//
+// Kills: the split falling through after a failed freeze CAS whose failure value
+// is live, and copying the node without freezing it: the key then has two live
+// nodes (the parent's and the child's), a stale eraser can mark the parent's and
+// return true while the child keeps the key, and the untagged parent node is dead
+// and can never be unlinked (the accounting's tag check fails).
+// Hook: Hash{}(33), the SECOND call contains(33) makes: the first is H1; then
+// bucket 33 is UNINITIALIZED, and split_bucket(33)'s walk loads each node's link
+// and hashes its value before the freeze CAS (H3), and 33 is the chain's first
+// node.
+// Geometry: insert(1), insert(65), insert(33), insert(2) take a Set(4, 1) to 64
+// buckets with bucket 1's chain 33 -> 65 -> 1; at 64 only 33 moves (to bucket
+// 33). The node behind the frozen one must stay in the parent (here 1, after the
+// unlink): the parent chain then keeps exactly one live node per key.
+// In the window, erase(65) marks 65 and unlinks it through 33's LIVE link (33 ->
+// 65 becomes 33 -> 1) and retires it. The split's freeze CAS then fails with the
+// live value 33 -> 1; retried on it, it freezes 33, the split copies 33, publishes
+// bucket 33, and its cleanup unlinks the FROZEN parent copy.
+// Afterwards one node per key is reachable (1 in bucket 1, 33 in bucket 33), none
+// dead, and two nodes are retired.
+TEST(ConcurrentHashSetRcuTest, SplitRetriesFreezeAfterLiveLinkChange) {
+    using Set = ConcurrentResizableHashSetRCU<ProbeKey, true, ProbeKeyHash>;
+    const int MOVER = 33, VICTIM = 65, STAYER = 1;
+    ProbeKey::reset_counters();
+    {
+        Set set(4, 1);
+        ASSERT_NO_FATAL_FAILURE(insert_in_order(set, {STAYER, VICTIM, MOVER, 2}, 64));
+        bool hook_ran = false, nested_erased = false;
+        size_t retired_in_window = 0;
+        ProbeKey::arm(ProbeKey::hash_hook, MOVER, 2, [&]() {
+            hook_ran = true;
+            nested_erased = set.erase(VICTIM);
+            retired_in_window = set.get_internal_accounting().retired;
+        });
+        const bool found = set.contains(MOVER);
+        ProbeKey::disarm_hooks();
+        ASSERT_TRUE(hook_ran) << "test precondition: the hook on the split's Hash{}(33) did not fire";
+        ASSERT_TRUE(nested_erased);
+        ASSERT_EQ(retired_in_window, 1u) << "test precondition: erase(65) did not unlink its node through 33's link";
+        EXPECT_TRUE(found);
+        const Set::InternalAccounting acc = expect_consistent(set, "after the split");
+        EXPECT_EQ(acc.reachable, 2u) << "a key has two reachable nodes: the split copied a node it did not freeze";
+        EXPECT_EQ(acc.reachable_dead, 0u);
+        EXPECT_EQ(acc.retired, 2u);
+        EXPECT_TRUE(set.contains(MOVER));
+        EXPECT_TRUE(set.contains(STAYER));
+        EXPECT_FALSE(set.contains(VICTIM));
+        EXPECT_FALSE(set.erase(VICTIM));
+        EXPECT_TRUE(set.erase(MOVER));
+        EXPECT_FALSE(set.contains(MOVER)) << "erase(33) returned true and the key is still present";
+    } // the set's lifetime
+    EXPECT_EQ(ProbeKey::corrupt.load(), 0);
+} // SplitRetriesFreezeAfterLiveLinkChange
+
+// A head unlink keeps the head's seal level, and a stale insert() is turned away
+// by it.
+//
+// Kills: an unlink CAS on a bucket head that drops the seal level. A stale
+// inserter decides by a CAS on the head with the level it validated against its
+// table size; a split for a larger size raises the level first, so a stale insert
+// fails or retries. If the split's own cleanup then wrote the head back without
+// the level, the stale insert would pass the check and publish its key into the
+// parent after the child was built: the key is lost.
+// Hook: Hash{}(49), the first call of insert(49) (H1: between its size load and
+// its head load).
+// Geometry: insert(1), insert(17) take a Set(4, 1) to 16 buckets with bucket 1's
+// chain 17 -> 1. Key 49 maps to bucket 1 at 16 and to bucket 17 at 32, like 17.
+// In the window, insert(2) doubles the table to 32 and contains(17) splits bucket
+// 17 from bucket 1: it seals bucket 1's head (level of size 32), copies 17, and
+// its cleanup unlinks 17's parent copy AT THE HEAD (head 17 -> 1 becomes 1, with
+// the level) and retires it.
+// insert(49), which loaded size 16, then reads bucket 1's head, finds a level
+// above its own, reloads the size, and inserts into bucket 17: two passes, so it
+// hashes 49 twice outside the hook. Afterwards 49 must be found.
+TEST(ConcurrentHashSetRcuTest, HeadUnlinkKeepsSealLevel) {
+    using Set = ConcurrentResizableHashSetRCU<ProbeKey, true, ProbeKeyHash>;
+    const int STALE = 49, MOVER = 17;
+    ProbeKey::reset_counters();
+    {
+        Set set(4, 1);
+        ASSERT_NO_FATAL_FAILURE(insert_in_order(set, {1, MOVER}, 16));
+        bool hook_ran = false, doubled = false, nested_found = false;
+        size_t retired_in_window = 0;
+        ProbeKey::arm(ProbeKey::hash_hook, STALE, 1, [&]() {
+            hook_ran = true;
+            doubled = set.insert(2) && set.get_internal_table_size() == 32;
+            nested_found = set.contains(MOVER);
+            retired_in_window = set.get_internal_accounting().retired;
+        });
+        ProbeKey::tally_value = STALE;
+        ProbeKey::tally = 0;
+        const bool inserted = set.insert(STALE);
+        const int outer_hashes = ProbeKey::tally;
+        ProbeKey::disarm_hooks();
+        ASSERT_TRUE(hook_ran) << "test precondition: the hook on insert(49)'s Hash{} did not fire";
+        ASSERT_TRUE(doubled) << "test precondition: insert(2) did not double the table to 32";
+        ASSERT_TRUE(nested_found);
+        ASSERT_EQ(retired_in_window, 1u) << "test precondition: the split's cleanup did not unlink 17's parent copy at the head";
+        EXPECT_TRUE(inserted);
+        EXPECT_EQ(outer_hashes, 2) << "insert(49) did not retry after meeting the raised seal level";
+        EXPECT_TRUE(set.contains(STALE)) << "the stale insert published its key into the sealed parent: the key is lost";
+        EXPECT_FALSE(set.insert(STALE)) << "a second insert of the key succeeded";
+        const Set::InternalAccounting acc = expect_consistent(set, "after insert(49)");
+        EXPECT_EQ(acc.reachable - acc.reachable_dead, 4u);
+    } // the set's lifetime
+    EXPECT_EQ(ProbeKey::corrupt.load(), 0);
+} // HeadUnlinkKeepsSealLevel
+
+// A retired node can still be walked OUT of, by an operation that reached it
+// before its unlink (the header's EXIT): retirement must not touch its link.
+//
+// Kills: a retirement that rewrites the node's chain link -- a push onto a limbo
+// list (which links through `link`), or a retired-list push through `link`
+// instead of the node's own retire link.
+// Hook: operator== on node 2053, the first operator== of contains(5) (2053 is the
+// chain's first node; H4: its link, pointing to 1029, is loaded before the
+// comparison).
+// Geometry: a pre-sized Set(1024, 1) (no doubling) and keys 5, 1029, 2053, all in
+// bucket 5, inserted in that order: chain 2053 -> 1029 -> 5.
+// In the window, erase(1029) marks 1029, unlinks it through 2053's live link and
+// retires it. contains(5) resumes AT 1029 (it loaded 2053's link before the
+// unlink), reads 1029's link and must reach 5. A retirement that rewrote 1029's
+// link would have written the head of the list it pushed onto, which is EMPTY
+// (both lists are empty beforehand, checked): the walk would end at 1029 and miss
+// a present key.
+TEST(ConcurrentHashSetRcuTest, RetiredNodeStaysExitable) {
+    using Set = ConcurrentResizableHashSetRCU<ProbeKey, true, ProbeKeyHash>;
+    const int K = 5, X = 5 + 1024, W = 5 + 2048;
+    ProbeKey::reset_counters();
+    {
+        Set set(1024, 1);
+        ASSERT_NO_FATAL_FAILURE(insert_in_order(set, {K, X, W}, 1024));
+        const Set::InternalAccounting empty = expect_consistent(set, "before");
+        ASSERT_EQ(empty.limbo, 0u);
+        ASSERT_EQ(empty.retired, 0u);
+        bool hook_ran = false, nested_erased = false;
+        size_t retired_in_window = 0;
+        ProbeKey::arm(ProbeKey::equal_hook, W, 1, [&]() {
+            hook_ran = true;
+            nested_erased = set.erase(X);
+            retired_in_window = set.get_internal_accounting().retired;
+        });
+        const bool found = set.contains(K);
+        ProbeKey::disarm_hooks();
+        ASSERT_TRUE(hook_ran) << "test precondition: the hook on contains(5)'s first comparison did not fire";
+        ASSERT_TRUE(nested_erased);
+        ASSERT_EQ(retired_in_window, 1u) << "test precondition: erase(1029) did not unlink and retire its node";
+        EXPECT_TRUE(found) << "a walk that reached a node before its unlink could not walk out of it";
+        EXPECT_FALSE(set.contains(X));
+        EXPECT_TRUE(set.contains(W));
+        const Set::InternalAccounting acc = expect_consistent(set, "after contains(5)");
+        EXPECT_EQ(acc.reachable, 2u);
+        EXPECT_EQ(acc.retired, 1u);
+    } // the set's lifetime
+    EXPECT_EQ(ProbeKey::corrupt.load(), 0);
+} // RetiredNodeStaysExitable
+
+// The geometry of the split-cleanup tests below: insert(1), insert(33),
+// insert(65), insert(2) take a Set(4, 1) to 64 buckets with bucket 1's chain
+// 65 -> 33 -> 1; at 64 only 33 moves (to bucket 33, UNINITIALIZED).
+// contains(33) then splits bucket 33 and makes these Hash{}(33) calls: (1) H1;
+// (2) the split's walk hashes every node of the chain before its freeze CAS (H3);
+// the split publishes bucket 33; (3) the cleanup walks bucket 1 again and hashes
+// the FROZEN 33 to find that its child is published, i.e. that it is dead, before
+// it CASes 65's link to unlink it (H6). arm_cleanup_window() hooks (2) and, from
+// it, (3), and runs `action` in (3)'s window, i.e. after the publication and
+// before the cleanup's CAS. The hooks check the window: the published-split
+// counter has not moved yet at (2) and has moved by one at (3).
+struct CleanupWindow {
+    bool before_publish = false;   // hook (2) fired, before the split published
+    bool after_publish = false;    // hook (3) fired, right after the split published
+}; // struct CleanupWindow
+
+template <typename SetT>
+static void arm_cleanup_window(SetT& set, CleanupWindow& w, std::function<void()> action) {
+    ProbeKey::arm(ProbeKey::hash_hook, 33, 2, [&set, &w, action]() {   // (2)
+        const size_t published = set.get_internal_counters().splits_published;
+        w.before_publish = true;
+        ProbeKey::arm(ProbeKey::hash_hook, 33, 1, [&set, &w, action, published]() {   // (3)
+            w.after_publish = set.get_internal_counters().splits_published == published + 1;
+            action();
+        });
+    });
+} // arm_cleanup_window()
+
+// The split's cleanup loses its one CAS on a run, and the loser retires nothing.
+//
+// Kills: a retirement after a LOST unlink CAS (the run's winner retires it too:
+// a node on a retired list twice, a cycle the accounting reports).
+// Hooks: arm_cleanup_window(), on contains(33).
+// In the cleanup's window, insert(129) -- a new key of bucket 1 -- walks bucket 1,
+// meets 33's FROZEN parent copy behind the live 65 (dead: its child is
+// published), unlinks it through 65's link and retires it (the opportunistic
+// unlink of a writer walk), then publishes 129. The cleanup's CAS on 65's link
+// then fails, counted as a lost cleanup CAS, and the cleanup retires nothing:
+// 33's parent copy is retired exactly once.
+TEST(ConcurrentHashSetRcuTest, CleanupLosingItsCasRetiresNothing) {
+    using Set = ConcurrentResizableHashSetRCU<ProbeKey, true, ProbeKeyHash>;
+    ProbeKey::reset_counters();
+    {
+        Set set(4, 1);
+        ASSERT_NO_FATAL_FAILURE(insert_in_order(set, {1, 33, 65, 2}, 64));
+        const Set::InternalCounters before = set.get_internal_counters();
+        CleanupWindow w;
+        bool nested_inserted = false;
+        size_t retired_in_window = 0;
+        arm_cleanup_window(set, w, [&set, &nested_inserted, &retired_in_window]() {
+            nested_inserted = set.insert(129);
+            retired_in_window = set.get_internal_accounting().retired;
+        });
+        const bool found = set.contains(33);
+        ProbeKey::disarm_hooks();
+        ASSERT_TRUE(w.before_publish) << "test precondition: the hook on the split's Hash{}(33) did not fire";
+        ASSERT_TRUE(w.after_publish) << "test precondition: the hook on the cleanup's Hash{}(33) did not fire right after the publication";
+        ASSERT_TRUE(nested_inserted);
+        ASSERT_EQ(retired_in_window, 1u) << "test precondition: insert(129)'s walk did not unlink 33's parent copy";
+        EXPECT_TRUE(found);
+        const Set::InternalAccounting acc = expect_consistent(set, "after the cleanup");
+        EXPECT_EQ(acc.retired, 1u) << "33's parent copy must be retired exactly once";
+        EXPECT_EQ(acc.reachable_dead, 0u);
+        const Set::InternalCounters after = set.get_internal_counters();
+        EXPECT_EQ(after.cleanup_cas_failures - before.cleanup_cas_failures, 1u) << "the cleanup's CAS on 65's link must have lost";
+        EXPECT_EQ(after.retire_runs - before.retire_runs, 1u);
+        for (int k : {1, 2, 33, 65, 129}) EXPECT_TRUE(set.contains(k)) << k;
+    } // the set's lifetime
+    EXPECT_EQ(ProbeKey::corrupt.load(), 0);
+} // CleanupLosingItsCasRetiresNothing
+
+// A Hash{} that throws in the split's cleanup leaves a superseded parent copy in
+// its chain (a straggler), and the next writer walk past it collects it.
+//
+// Kills: a writer walk that does not unlink a dead run behind a live predecessor
+// it passes (the straggler would stay until reclaim()).
+// Hooks: arm_cleanup_window(), on contains(33); the action throws.
+// The throw leaves the cleanup after the publication (the header's EXCEPTIONS):
+// contains(33) throws, bucket 33 is published, and 33's FROZEN parent copy stays
+// in bucket 1 behind the live 65, dead. insert(129), a new key of bucket 1, walks
+// past it, unlinks it and retires it.
+TEST(ConcurrentHashSetRcuTest, WriterWalkCollectsCleanupStraggler) {
+    using Set = ConcurrentResizableHashSetRCU<ProbeKey, true, ProbeKeyHash>;
+    ProbeKey::reset_counters();
+    {
+        Set set(4, 1);
+        ASSERT_NO_FATAL_FAILURE(insert_in_order(set, {1, 33, 65, 2}, 64));
+        CleanupWindow w;
+        arm_cleanup_window(set, w, []() { throw std::runtime_error("Hash{} armed to throw in the cleanup"); });
+        EXPECT_THROW(set.contains(33), std::runtime_error);
+        ProbeKey::disarm_hooks();
+        ASSERT_TRUE(w.before_publish) << "test precondition: the hook on the split's Hash{}(33) did not fire";
+        ASSERT_TRUE(w.after_publish) << "test precondition: the hook on the cleanup's Hash{}(33) did not fire right after the publication";
+        const Set::InternalAccounting left = expect_consistent(set, "after the cleanup threw");
+        ASSERT_EQ(left.reachable_dead, 1u) << "test precondition: the throw did not leave 33's parent copy in its chain";
+        EXPECT_TRUE(set.insert(129));
+        const Set::InternalAccounting acc = expect_consistent(set, "after insert(129)");
+        EXPECT_EQ(acc.reachable_dead, 0u) << "insert()'s walk passed a dead node behind a live predecessor and left it";
+        EXPECT_EQ(acc.retired, left.retired + 1);
+        for (int k : {1, 2, 33, 65, 129}) EXPECT_TRUE(set.contains(k)) << k;
+    } // the set's lifetime
+    EXPECT_EQ(ProbeKey::corrupt.load(), 0);
+} // WriterWalkCollectsCleanupStraggler
+
+// The hot-growth construction, shared with the benchmark's insert probe: the key
+// of index i (0 <= i < kHotKeys) keeps a "hot" pattern of 64 values in bits 0..5,
+// bits 6..11 zero, three mobile bits at 12..14, and the index above bit 16
+// (distinct, positive). All keys then fall into 64 chains while the table has at
+// most 4096 buckets; the doublings to 8192 and 16384 split those ~100-node chains
+// (by bits 12 and 13) while the threads are still prepending to them, which is
+// where a split's one cleanup CAS per run loses to a concurrent writer. mix() is
+// the benchmark's key mixer (the MurmurHash3 32-bit finalizer), so that both pick
+// the same bits.
+static constexpr int kHotKeys = 1 << 14;
+static_assert(kHotKeys <= (1 << 14), "the index must fit above bit 16 of a positive int");
+static int mix(int k) {
+    uint32_t x = static_cast<uint32_t>(k);
+    x ^= x >> 16; x *= 0x85ebca6bu; x ^= x >> 13; x *= 0xc2b2ae35u; x ^= x >> 16;
+    return static_cast<int>(x);
+} // mix()
+static int hot_growth_key(int index) {
+    const uint32_t m = static_cast<uint32_t>(mix(index));
+    return static_cast<int>((m & 63) | (((m >> 6) & 7) << 12) | (static_cast<uint32_t>(index) << 16));
+} // hot_growth_key()
+
+// The residue concurrent growth on hot chains leaves: the cleanups' lost CASes.
+//
+// Not a mutant test: it measures (prints) what a contended growth leaves behind
+// and checks that a writer pass over every bucket collects all of it.
+// T threads insert the kHotKeys keys of the hot-growth construction (interleaved
+// indices), AllowDelete == true, one arena shard per thread. After the join: the
+// accounting is consistent and has exactly one non-dead reachable node per key.
+// It prints the dead nodes still reachable (stragglers, mostly runs whose cleanup
+// CAS lost to a prepend or a seal), the lost cleanup CASes and the splits.
+// Then settle_writers(), after which the eager oracles hold: one reachable node per
+// key, none dead, nothing free, every other slot retired or on a limbo list (the
+// lost split subchains).
+TEST(ConcurrentHashSetRcuTest, HotGrowthResidue) {
+    using Set = ConcurrentResizableHashSetRCU<int, true>;
+    const int T = 8;
+    Set set(4, T);
+    std::vector<size_t> bad(T, 0);
+    run_threads(T, [&set, &bad](int t) {
+        for (int i = t; i < kHotKeys; i += T) bad[t] += !set.insert(hot_growth_key(i));
+    });
+    for (int t = 0; t < T; ++t) EXPECT_EQ(bad[t], 0u) << "insert() of a new, uncontended key returned false, thread " << t;
+    const Set::InternalAccounting joined = expect_consistent(set, "after the join");
+    EXPECT_EQ(joined.reachable - joined.reachable_dead, size_t(kHotKeys)) << "not exactly one non-dead reachable node per key";
+    const Set::InternalCounters c = set.get_internal_counters();
+    std::printf("[   INFO   ] HotGrowthResidue: table %zu, splits published %zu of %zu, cleanup CAS lost %zu, "
+                "retired %zu nodes in %zu runs, reachable dead before settling %zu, limbo %zu, slots %zu\n",
+                set.get_internal_table_size(), c.splits_published, c.split_attempts, c.cleanup_cas_failures,
+                joined.retired, c.retire_runs, joined.reachable_dead, joined.limbo, joined.slots);
+    ASSERT_NO_FATAL_FAILURE(settle_writers(set));
+    const Set::InternalAccounting settled = expect_consistent(set, "after settle_writers()");
+    EXPECT_EQ(settled.reachable, size_t(kHotKeys));
+    EXPECT_EQ(settled.reachable_dead, 0u) << "a dead node survived a writer walk over its chain";
+    EXPECT_EQ(settled.free_nodes, 0u);
+    EXPECT_EQ(settled.retired + settled.limbo, settled.slots - kHotKeys);
+    int missing = 0;
+    for (int i = 0; i < kHotKeys; ++i) missing += !set.contains(hot_growth_key(i));
+    EXPECT_EQ(missing, 0) << "keys lost";
+} // HotGrowthResidue
+
+// T4: churn stress with the full accounting after every join.
+//
+// Not a mutant test: a stress of the unlinking protocol under contention --
+// erases unlinking their own nodes, walks unlinking what they pass, splits'
+// cleanups, all on the same chains -- whose oracles are exact at every quiescent
+// point: the accounting is consistent (every slot in one of the four places once,
+// every reachable dead node and every retired node tagged), there is exactly one
+// non-dead reachable node per key, and the per-key insert/erase tally fixes
+// membership (InsertEraseChurnPerKeyAccounting's oracle, cumulative over rounds).
+// Each repetition is a fresh set churned for ROUNDS rounds, joined after each:
+//   - kWithReclaim: then reclaim(), with its full postconditions;
+//   - kSettle (no reclaim() at all; identity hash): then settle_writers(), after
+//     which no dead node is reachable, one node per key is, nothing is free, and
+//     every other slot is retired or on a limbo list. The dead nodes reachable
+//     BEFORE settling (the stragglers the churn left) are printed per round,
+//     summed and maximized over the repetitions;
+//   - kLongChains: ConstantHash (every key in bucket 0, so splits copy nothing and
+//     the one chain holds every key and every dead node), with reclaim(): erases
+//     unlinking through mid-chain predecessors that other erases are marking and
+//     unlinking.
+// Key k is scramble(k + 1), for k < R; the set has 2*T shards.
+enum class ChurnCheck { kWithReclaim, kSettle, kLongChains };
+
+template <typename Hash>
+static void churn_accounting_body(ChurnCheck check, int T, int R, int REPS, int ROUNDS, int OPS) {
+    using Set = ConcurrentResizableHashSetRCU<int, true, Hash>;
+    std::vector<size_t> dead_sum(ROUNDS, 0), dead_max(ROUNDS, 0);   // kSettle: reachable dead before settling
+    for (int rep = 0; rep < REPS; ++rep) {
+        Set set(4, 2*T);
+        std::vector<std::vector<int>> ins(T, std::vector<int>(R, 0));
+        std::vector<std::vector<int>> ers(T, std::vector<int>(R, 0));
+        for (int round = 0; round < ROUNDS; ++round) {
+            const std::string where = "rep " + std::to_string(rep) + ", round " + std::to_string(round);
+            run_threads(T, [&set, &ins, &ers, rep, round, R, OPS](int t) {
+                std::minstd_rand rng(static_cast<unsigned>((rep*31 + round)*977 + t + 1));
+                for (int op = 0; op < OPS; ++op) {
+                    const unsigned x = rng();
+                    const int i = static_cast<int>((x >> 4)%static_cast<unsigned>(R));
+                    switch (x & 3u) {
+                        case 0:
+                        case 1:   // insert twice as often as erase, so the set stays populated
+                            if (set.insert(scramble(i + 1))) ++ins[t][i];
+                            break;
+                        case 2:
+                            if (set.erase(scramble(i + 1))) ++ers[t][i];
+                            break;
+                        default:
+                            set.contains(scramble(i + 1));
+                            break;
+                    } // operation kind
+                } // operation loop
+            });
+            // The state the churn left, before any membership probe splits a bucket.
+            const typename Set::InternalAccounting acc = expect_consistent(set, where + ", after the join");
+            size_t live = 0;
+            for (int i = 0; i < R; ++i) {
+                long d = 0;
+                for (int t = 0; t < T; ++t) d += ins[t][i] - ers[t][i];
+                EXPECT_TRUE(d == 0 || d == 1) << where << ", key index " << i << ": insert/erase tally " << d;
+                EXPECT_EQ(set.contains(scramble(i + 1)), d == 1) << where << ", key index " << i << ": membership disagrees with the tally " << d;
+                live += d == 1;
+            } // per-key check
+            EXPECT_EQ(acc.reachable - acc.reachable_dead, live) << where << ": not exactly one non-dead reachable node per key";
+            if (check == ChurnCheck::kSettle) {
+                dead_sum[round] += acc.reachable_dead;
+                dead_max[round] = std::max(dead_max[round], acc.reachable_dead);
+                if constexpr (std::is_same_v<Hash, std::hash<int>>) {
+                    ASSERT_NO_FATAL_FAILURE(settle_writers(set));
+                }
+                const typename Set::InternalAccounting settled = expect_consistent(set, where + ", after settle_writers()");
+                EXPECT_EQ(settled.reachable_dead, 0u) << where << ": a dead node survived a writer walk over its chain";
+                EXPECT_EQ(settled.reachable, live) << where;
+                EXPECT_EQ(settled.free_nodes, 0u) << where;
+                EXPECT_EQ(settled.retired + settled.limbo, settled.slots - live) << where;
+            } else {
+                ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, live, where));
+            } // settle or reclaim
+        } // rounds
+    } // repetitions
+    if (check == ChurnCheck::kSettle) {
+        for (int round = 0; round < ROUNDS; ++round) {
+            std::printf("[   INFO   ] churn without reclaim(), round %d: reachable dead before settling: %zu over %d sets, at most %zu in one\n",
+                        round, dead_sum[round], REPS, dead_max[round]);
+        }
+    } // print the stragglers
+} // churn_accounting_body()
+
+TEST(ConcurrentHashSetRcuTest, ChurnAccountingWithReclaim) {
+    ASSERT_NO_FATAL_FAILURE(churn_accounting_body<std::hash<int>>(ChurnCheck::kWithReclaim, 8, 48, 20, 4, 800));
+} // ChurnAccountingWithReclaim
+
+TEST(ConcurrentHashSetRcuTest, ChurnAccountingSettled) {
+    ASSERT_NO_FATAL_FAILURE(churn_accounting_body<std::hash<int>>(ChurnCheck::kSettle, 8, 48, 20, 4, 800));
+} // ChurnAccountingSettled
+
+TEST(ConcurrentHashSetRcuTest, ChurnAccountingLongChains) {
+    ASSERT_NO_FATAL_FAILURE(churn_accounting_body<ConstantHash>(ChurnCheck::kLongChains, 4, 32, 100, 3, 200));
+} // ChurnAccountingLongChains

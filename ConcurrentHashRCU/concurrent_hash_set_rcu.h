@@ -172,14 +172,21 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 //   self-unlink: one attempt through the predecessor it tracked, one restart
 //   from the head, then give up); and the walks of insert() and erase(),
 //   which attempt to bypass every dead run they pass behind a live word, on
-//   the way to their key (a hit stops a walk, so only a MISS walks a whole
-//   chain). contains()'s own walk writes nothing: a reader pays for no
-//   unlinking except by starting a split. Every one of these is ONE CAS per
-//   run, never retried (erase()'s restart is the one exception, bounded at
-//   two): a lost CAS is another thread's completed step on the same word,
-//   and the run it leaves behind is a STRAGGLER for the next writer MISS
-//   walk that passes it, the next split of the bucket, or reclaim()'s chain
-//   walk, which collects everything. Unlinking is therefore best effort
+//   the way to their key (a hit stops a walk at its key, so a hit walk
+//   attempts the runs before the key and only a MISS walks the whole chain).
+//   contains()'s own walk writes nothing: a reader pays for no unlinking
+//   except by starting a split. Every one of these is ONE CAS per run, never
+//   retried (erase()'s restart is the one exception, bounded at two): a lost
+//   CAS is another thread's completed step on the same word. When that step
+//   was a peer's bypass of the same run (the word already holds the successor
+//   this thread computed), nothing is left behind. Otherwise -- the word
+//   gained a prepended node, a seal level, a tag of the predecessor, or a
+//   peer's bypass of a run of a different extent -- the dead nodes still
+//   reachable are a STRAGGLER, collected by the next writer walk that passes
+//   them (hit or miss), the next cleanup pass over the chain (every doubling
+//   gives the bucket a new child, and the split of ANY child of the bucket
+//   walks the whole parent chain with no hit to stop it), or reclaim()'s
+//   chain walk, which collects everything. Unlinking is therefore best effort
 //   under contention: no operation guarantees that a dead node has left its
 //   chain when it returns. What an UNCONTENDED call does guarantee -- one
 //   during which no other operation on the set runs, and that returns
@@ -192,12 +199,15 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 //   which in uncontended use arises only after an earlier split threw
 //   between its freeze and its publish (behind such a node nothing can be
 //   bypassed until its child is published and a later walk passes it).
-//   Stragglers arise mostly from contention and from a stale view (a walker
-//   whose table size does not yet cover the doubling a node was frozen for
-//   cannot decide it), less often from a split stalled or thrown between its
-//   freeze and its publish, or from Hash{} throwing inside an unlinking site;
-//   and a dead run no writer MISS ever walks past again (every later writer
-//   hits before it, or none comes) stays until reclaim(). Two designs are
+//   Stragglers also arise from a stale view (a walker whose table size does
+//   not yet cover the doubling a node was frozen for cannot decide it), from
+//   an erase() that gave up (two lost attempts, the first of which may have
+//   been skipped because the walk's own CAS on the predecessor was lost),
+//   from a split stalled or thrown between its freeze and its publish, and
+//   from Hash{} throwing inside an unlinking site. A dead run that no writer
+//   walks past again, in a bucket none of whose new children is accessed,
+//   stays until reclaim(): its lifetime is unbounded only when the table
+//   stops doubling or the bucket's new children are never accessed. Two designs are
 //   deliberately NOT taken here: a contains() that bypasses the dead runs it
 //   passes (it would make every reader a writer), and a standalone
 //   collector call that walks published chains like a writer miss walk
@@ -864,7 +874,18 @@ private:
         // relaxed increment on a line the thread already owns.
         std::atomic<size_t> retire_runs{0};             // push_retired() calls: one per unlinked run
         std::atomic<size_t> retire_nodes{0};            // nodes those runs held in total
-        std::atomic<size_t> cleanup_cas_failures{0};    // one-shot unlink CASes of a split winner's cleanup pass (cleanup_parent()) that lost
+        // Lost one-shot unlink CASes, by site and by kind. A loss is a PEER
+        // LOSS when the failure value already holds the successor this thread
+        // computed: another thread bypassed the same run, and nothing is left
+        // behind. Every other loss (the word gained a prepended node, a seal
+        // level, a tag, or a peer's bypass of a run of a different extent) may
+        // leave dead nodes reachable, so `failures - peer_losses` bounds the
+        // stragglers a site produced; the total alone measures contention on
+        // the word, not stragglers.
+        std::atomic<size_t> cleanup_cas_failures{0};    // lost CASes of a split winner's cleanup pass (cleanup_parent()), all kinds
+        std::atomic<size_t> cleanup_cas_peer_losses{0}; // of those, peer losses
+        std::atomic<size_t> walk_cas_failures{0};       // lost CASes of insert()'s and erase()'s walks (step_over()), all kinds
+        std::atomic<size_t> walk_cas_peer_losses{0};    // of those, peer losses
         std::atomic<size_t> split_attempts{0};          // split_bucket() calls that sealed a parent and walked it, recursive parent splits included
         std::atomic<size_t> splits_published{0};        // of those, the ones whose publishing CAS won
     }; // struct Shard
@@ -1090,6 +1111,12 @@ private:
         word_t succ;
     }; // struct Unlink
 
+    // Which site calls the unlink primitive: decides which of the shard's
+    // test-only loss counters a lost CAS is charged to (none for the eraser's
+    // self-unlink, whose losses are bounded at two per call and whose
+    // residue is the tombstone itself).
+    enum class UnlinkSite { walk, cleanup, self_unlink };
+
     // THE UNLINK PRIMITIVE. Bypass the maximal run of consecutive dead nodes
     // that starts at `first` (link value `first_link` as loaded with acquire
     // by the caller) with ONE strong CAS on the predecessor word w.pred, whose
@@ -1111,8 +1138,12 @@ private:
     // re-evaluated after the CAS, because a FROZEN node's child can publish
     // between the run walk and the CAS, which would make S dead and a
     // re-evaluation would retire S while S is reachable. A loser retires
-    // nothing (the winner retires the same nodes) and marks pred stale. The
-    // only writes: the one CAS and the retirement.
+    // nothing (the winner retires the same nodes) and marks pred stale; the
+    // loss is charged to the site's counters (Shard), as a PEER LOSS when the
+    // failure value's address is S, the successor this thread computed: the
+    // word was rewritten by a bypass of exactly this run, so no dead node is
+    // left behind by the loss. The only writes: the one CAS, the retirement
+    // and the counters.
     // Why one CAS on an untagged pred cannot lose a node or retire one twice
     // (the Harris argument): two concurrent bypasses can only overlap through
     // a node both treat the same way, and a tagged link is never a CAS
@@ -1122,7 +1153,7 @@ private:
     // from. Why the CAS cannot succeed on a stale view: within one period no
     // address is published twice (RECLAMATION), so the expected value names
     // the same node in the same chain for the whole operation.
-    Unlink unlink_run(WalkState& w, Node* first, word_t first_link, size_t j, size_t ts) {
+    Unlink unlink_run(WalkState& w, Node* first, word_t first_link, size_t j, size_t ts, UnlinkSite site) {
         assert(w.pred_ok && addr_of(w.pred_word) == word_of(first) && "the pred word does not lead to the run");
         assert((w.pred_word & (MARK_BIT | FROZEN_BIT)) == 0 && "unlink CAS on a tagged word: only a LIVE link or a head is a CAS target");
         Node* last = first;
@@ -1144,16 +1175,16 @@ private:
             return {true, succ};
         } // if the unlink won
         w.pred_ok = false;                                   // the word changed under us: one shot, never retried here
+        if (site != UnlinkSite::self_unlink) {   // test-only counters: the loss, and whether a peer bypassed this very run
+            Shard& shard = my_shard();
+            const bool cleanup = site == UnlinkSite::cleanup;
+            std::atomic<size_t>& failures = cleanup ? shard.cleanup_cas_failures : shard.walk_cas_failures;
+            std::atomic<size_t>& peer_losses = cleanup ? shard.cleanup_cas_peer_losses : shard.walk_cas_peer_losses;
+            failures.fetch_add(1, std::memory_order_relaxed);
+            if (addr_of(expected) == succ) peer_losses.fetch_add(1, std::memory_order_relaxed);
+        } // if a counted site
         return {false, succ};
     } // unlink_run()
-
-    // What step_over() reports: where the walk continues, and whether this
-    // step attempted an unlink and whether it won (for the cleanup counter).
-    struct Step {
-        word_t next;
-        bool tried;
-        bool won;
-    }; // struct Step
 
     // One step of a writer walk past `node` (link value `link` as loaded with
     // acquire), the shared shape of insert()'s and erase()'s walks and of the
@@ -1164,33 +1195,40 @@ private:
     // a tagged node that is not dead between pred and here, e.g. FROZEN with
     // an unpublished child, makes pred useless for this run, and a lost CAS
     // on pred has made pred_word stale). Never retried: a lost CAS is another
-    // thread's completed step on this word, and the run it leaves behind is
-    // collected by a later walk, split or reclaim(). The walk continues after
-    // the run in either case; after a lost CAS the dead run may already be
-    // bypassed by someone else, and the exit still lands in the current chain
-    // (EXIT in the class overview).
-    Step step_over(WalkState& w, Node* node, word_t link, size_t j, size_t ts) {
+    // thread's completed step on this word -- often a peer's bypass of this
+    // very run, which leaves nothing behind -- and whatever dead nodes it
+    // leaves are collected by a later writer walk, a later cleanup pass over
+    // the chain, or reclaim(). Returns the bare address where the walk
+    // continues: after the run in either case; after a lost CAS the dead run
+    // may already be bypassed by someone else, and the exit still lands in
+    // the current chain (EXIT in the class overview). `site` names the
+    // caller for the loss counters.
+    word_t step_over(WalkState& w, Node* node, word_t link, size_t j, size_t ts, UnlinkSite site) {
         if ((link & (MARK_BIT | FROZEN_BIT)) == 0) {   // live: the new pred
             w.pred = &node->link;
             w.pred_word = link;
             w.pred_ok = true;
-            return {addr_of(link), false, false};
+            return addr_of(link);
         } // if live
         if (w.pred_ok && addr_of(w.pred_word) == word_of(node) && is_dead_now(node, link, j, ts)) {
-            const Unlink u = unlink_run(w, node, link, j, ts);
-            return {u.succ, true, u.won};
+            return unlink_run(w, node, link, j, ts, site).succ;
         } // if dead and bypassable
-        return {addr_of(link), false, false};   // tagged, not dead or not bypassable: exit through it; pred unchanged
+        return addr_of(link);   // tagged, not dead or not bypassable: exit through it; pred unchanged
     } // step_over()
 
     // The split winner's CLEANUP PASS over the parent chain, after its
     // publishing CAS (P9: a node FROZEN for j is bypassed only once j is
     // published). One writer walk with one unlink attempt per dead run (never
-    // retried; a lost CAS is counted in cleanup_cas_failures and the run is
-    // left for a later walk, split or reclaim()). Dead here, besides any
-    // tombstone, is every node FROZEN for a PUBLISHED child of the parent:
-    // the copies this split superseded (their child is j, just published)
-    // and those of earlier splits of other children that are still here.
+    // retried; a lost CAS is charged to cleanup_cas_failures, and to
+    // cleanup_cas_peer_losses when a peer -- a concurrent writer walk, or the
+    // cleanup of another split of this parent -- bypassed the same run, in
+    // which case nothing is left; otherwise the run stays for a later walk,
+    // cleanup or reclaim()). Dead here, besides any tombstone, is every node
+    // FROZEN for a PUBLISHED child of the parent: the copies this split
+    // superseded (their child is j, just published) and those of earlier
+    // splits of other children that are still here; so the cleanup of ANY
+    // child's split collects the whole parent chain's dead runs, with no hit
+    // to stop it.
     // The table size is acquired here, once: split_bucket()'s precondition
     // is that its caller acquired, on this thread, a table size above j, so
     // this load returns at least 2N (table_size_ is monotone and the two
@@ -1207,9 +1245,7 @@ private:
         while (addr_of(curr) != EMPTY) {   // walk the parent chain
             Node* node = node_of(curr);
             const word_t link = node->link.load(std::memory_order_acquire);
-            const Step s = step_over(w, node, link, parent, ts);
-            if (s.tried && !s.won) my_shard().cleanup_cas_failures.fetch_add(1, std::memory_order_relaxed);   // test-only counter
-            curr = s.next;
+            curr = step_over(w, node, link, parent, ts, UnlinkSite::cleanup);
         } // walk the parent chain
     } // cleanup_parent()
 
@@ -1240,7 +1276,10 @@ private:
     //   attempt 2. If x is no longer reachable, someone else bypassed it:
     //   done. Else attempt 2 exactly as attempt 1, and whatever its outcome,
     //   GIVE UP (exit 2, "CAS lost twice": two concurrent changes to one chain
-    //   inside one erase).
+    //   inside one erase, the first of them possibly the one that cost the
+    //   walk its own CAS on the predecessor, so that attempt 1 was skipped).
+    //   Neither loss is counted: the residue of a give-up is the tombstone
+    //   itself, visible in the accounting as a reachable dead node.
     // Exceptions: Hash{} may throw inside a run walk here, after the mark;
     // see EXCEPTIONS (P5).
     void self_unlink(WalkState& w, Node* x, word_t x_link, size_t j, size_t ts) {
@@ -1250,7 +1289,7 @@ private:
                 Node* first = node_of(w.pred_word);   // never EMPTY: pred leads to x through tagged nodes at most
                 const word_t first_link = first == x ? x_link : first->link.load(std::memory_order_acquire);
                 if (first != x && !is_dead_now(first, first_link, j, ts)) return;   // exit 1: tagged pred, not dead: no CAS target leads to x
-                if (unlink_run(w, first, first_link, j, ts).won) return;
+                if (unlink_run(w, first, first_link, j, ts, UnlinkSite::self_unlink).won) return;
             } // if pred is usable
             if (restarted) return;   // exit 2: the CAS was lost on both attempts
             restarted = true;
@@ -1778,7 +1817,7 @@ public:
                         exists = true;
                         break;
                     }
-                    curr = step_over(w, node, check_curr, j, ts).next;
+                    curr = step_over(w, node, check_curr, j, ts, UnlinkSite::walk);
                 } // walk chain
                 head = w.head_word;
                 if (exists) {
@@ -1873,8 +1912,9 @@ public:
     // (self_unlink(): one CAS on the predecessor tracked during the walk, one
     // restart from the head, then give up); the result is unaffected unless
     // Hash{} throws there (EXCEPTIONS, P5), and a tombstone that stays may be
-    // collected by a later writer MISS walk that passes it or by a split of
-    // the bucket, and is always collected by reclaim(). The walk itself is a
+    // collected by a later writer walk that passes it (hit or miss) or by the
+    // cleanup of a split of any child of the bucket, and is always collected
+    // by reclaim(). The walk itself is a
     // writer walk (step_over()): every dead run it passes behind a live word
     // gets one unlink attempt. Postconditions of an UNCONTENDED call that
     // returns normally (no other operation on the set runs meanwhile; see
@@ -1964,7 +2004,7 @@ public:
                     stale = (check_curr & FROZEN_BIT) != 0;
                     break;
                 } // if found an unmarked node of our key
-                curr = step_over(w, node, check_curr, j, ts).next;
+                curr = step_over(w, node, check_curr, j, ts, UnlinkSite::walk);
             } // walk chain
 
             size_t new_ts = table_size_.load(std::memory_order_acquire);
@@ -2275,19 +2315,25 @@ public:
     // there for what each counts). Exact at a quiescent point; a snapshot of
     // monotone counters otherwise. Never reset.
     struct InternalCounters {
-        size_t retire_runs;            // push_retired() calls (one per unlinked run)
-        size_t retire_nodes;           // nodes those runs held in total
-        size_t cleanup_cas_failures;   // lost one-shot CASes of a split winner's cleanup pass
-        size_t split_attempts;         // split_bucket() calls that walked a parent chain
-        size_t splits_published;       // of those, the ones whose publishing CAS won
+        size_t retire_runs;              // push_retired() calls (one per unlinked run)
+        size_t retire_nodes;             // nodes those runs held in total
+        size_t cleanup_cas_failures;     // lost one-shot CASes of a split winner's cleanup pass, all kinds
+        size_t cleanup_cas_peer_losses;  // of those, losses to a peer that bypassed the same run (nothing left behind)
+        size_t walk_cas_failures;        // lost one-shot CASes of insert()'s and erase()'s walks, all kinds
+        size_t walk_cas_peer_losses;     // of those, peer losses
+        size_t split_attempts;           // split_bucket() calls that walked a parent chain
+        size_t splits_published;         // of those, the ones whose publishing CAS won
     }; // struct InternalCounters
     InternalCounters get_internal_counters() const {
-        InternalCounters c{0, 0, 0, 0, 0};
+        InternalCounters c{0, 0, 0, 0, 0, 0, 0, 0};
         for (size_t s = 0; s <= arena_mask_; ++s) {
             const Shard& shard = shards_[s];
             c.retire_runs += shard.retire_runs.load(std::memory_order_relaxed);
             c.retire_nodes += shard.retire_nodes.load(std::memory_order_relaxed);
             c.cleanup_cas_failures += shard.cleanup_cas_failures.load(std::memory_order_relaxed);
+            c.cleanup_cas_peer_losses += shard.cleanup_cas_peer_losses.load(std::memory_order_relaxed);
+            c.walk_cas_failures += shard.walk_cas_failures.load(std::memory_order_relaxed);
+            c.walk_cas_peer_losses += shard.walk_cas_peer_losses.load(std::memory_order_relaxed);
             c.split_attempts += shard.split_attempts.load(std::memory_order_relaxed);
             c.splits_published += shard.splits_published.load(std::memory_order_relaxed);
         } // loop over the shards

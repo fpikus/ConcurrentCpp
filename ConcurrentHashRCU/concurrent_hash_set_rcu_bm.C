@@ -594,7 +594,7 @@ template <typename Cfg> typename Cfg::Set* ChurnFixture<Cfg>::set = nullptr;
 // Why measure: in this container an uncontended erase() marks its node (one
 // CAS), unlinks it (one CAS on its predecessor's word) and retires it (one
 // release CAS on the retired head of the erasing thread's shard): three
-// read-modify-writes where an erase that only marks does one, plus a mark
+// CASes where an erase that only marks does one, plus a mark
 // retried when a concurrent unlink through the node's link changes it, and a
 // second walk from the bucket head when the first unlink attempt loses. The
 // Erased churn cells measure what that buys the later walks; this row measures

@@ -167,7 +167,7 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 //   - the split winner's cleanup pass over the parent chain, right after it
 //     publishes the child (the copies it superseded leave with the split that
 //     superseded them, and the pass is lazy with respect to the doubling, as
-//     splitting is; whichever operation started the split runs it, a
+//     splitting is; whichever operation won the split's publish runs it, a
 //     contains() included);
 //   - erase(), right after its mark (an eager self-unlink: one attempt
 //     through the predecessor it tracked, one restart from the head, then
@@ -177,7 +177,7 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 //     a walk at its key, so a hit walk attempts the runs before the key and
 //     only a MISS walks the whole chain).
 //   contains()'s own walk writes nothing: a reader pays for no unlinking
-//   except by starting a split.
+//   except by winning a split.
 //   STRAGGLERS. Every one of these is ONE CAS per run, never retried
 //   (erase()'s restart is the one exception, bounded at two): a lost CAS is
 //   another thread's completed step on the same word. When that step was a

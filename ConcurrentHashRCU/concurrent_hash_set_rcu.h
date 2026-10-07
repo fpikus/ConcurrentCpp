@@ -322,10 +322,11 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 //   retired head, so that every node below the snapshot was pushed, and
 //   unlinked, before the bump (the SNAPSHOT form). Second, thread-safe free
 //   lists: a drain that runs while alloc_node() pops pushes concurrently with
-//   the pops, which the pop's ABA argument below excludes (the free head's
-//   9-bit pop count is a version tag that wraps at 512, or one drain at a
-//   time started under the drain precondition keeps a popper from ever
-//   having seen an address the drain resurrects). Third, an answer to the
+//   the pops, which the pop's ABA argument below excludes; two options, both
+//   open: option A, use the free head's 9-bit pop count as a version tag,
+//   which wraps at 512 pops; option B, one drain at a time, started under
+//   the drain precondition, so that no popper can have seen an address the
+//   drain resurrects. Third, an answer to the
 //   unlink CAS's own ABA premise, that every expected value of an unlink CAS
 //   (the pred word and the recorded run) is loaded and used within one such
 //   handle. That premise needs a BRIDGE from a node's retirement to the head
@@ -482,10 +483,12 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 //   and whose snapshot of the parent was taken after a winner's cleanup
 //   missed the copies the winner already bypassed; that is harmless only
 //   because its publish CAS must fail, which it does with no happens-before
-//   needed: the CAS is a read-modify-write and therefore reads the last
-//   value in the child head's modification order ([atomics.order]), and
-//   that value is no longer UNINITIALIZED once any publish of j succeeded --
-//   and one did, since a copy can be bypassed only after it.
+//   needed: two CASes from UNINITIALIZED on bucket j cannot both succeed,
+//   since a successful CAS is a read-modify-write that reads the value
+//   immediately before its own write in the head's modification order
+//   ([atomics.order]), and after the first successful publish no later
+//   value in that order is UNINITIALIZED -- and a publish of j did succeed,
+//   since a copy can be bypassed only after it.
 //   LINEARIZABILITY of a miss, with dead nodes leaving concurrently, in two
 //   halves.
 //   (i) A miss is linearized before every insert that does NOT happen-before
@@ -881,10 +884,11 @@ private:
         // at a quiescent point, and nothing pops. Push-only makes the CAS
         // ABA-free for the same reason the limbo push is. The release on every
         // push means an ACQUIRE load of this head is a happens-before boundary
-        // for the whole list below the value loaded: every push below it is a
-        // read-modify-write extending the release sequence of the push whose
-        // value was loaded, so a reader that acquires the head sees every
-        // unlink that preceded any of those pushes.
+        // for the whole list below the value loaded: the push whose value was
+        // loaded is a read-modify-write and so lies in the release sequence
+        // of every push below it (RECLAMATION in the class overview), and a
+        // reader that acquires the head synchronizes with all of them and
+        // sees every unlink that preceded any of those pushes.
         alignas(64) std::atomic<word_t> retired_head{EMPTY};
         // The drain's private slot: the retired list sequester_retired() took
         // from retired_head, held between the two drain phases for
@@ -1022,9 +1026,10 @@ private:
     // run of a different extent (a FROZEN node's child can publish between
     // two recorders' walks), and corrupt the list. The chain links are
     // reloaded relaxed: the caller loaded each one with acquire when it
-    // recorded the run, a tagged link is never written by a concurrent
-    // operation, and read-read coherence returns the same value to this
-    // thread. (2) The push_limbo() loop on retired_head, with RELEASE on
+    // recorded the run, or installed it by its own CAS (the first node's
+    // link, for an eraser's own tombstone), a tagged link is never written
+    // by a concurrent operation, and coherence returns the same value to
+    // this thread. (2) The push_limbo() loop on retired_head, with RELEASE on
     // success: the push is the one point that orders "this node is
     // unreachable" before whatever later acquires the head (the quiescent
     // reclaim() needs no ordering, but a generation bump that snapshots the
@@ -1153,9 +1158,12 @@ private:
 
     // THE UNLINK PRIMITIVE. Bypass the maximal run of consecutive dead nodes
     // that starts at `first` (link value `first_link` as loaded with acquire
-    // by the caller) with ONE strong CAS on the predecessor word w.pred, whose
-    // value w.pred_word (loaded with acquire, untagged, address == first) is
-    // the expected value, never a reload. Preconditions: w.pred_ok; `first`
+    // by the caller, or as installed by the caller's own mark CAS) with ONE
+    // strong CAS on the predecessor word w.pred, whose value w.pred_word
+    // (loaded with acquire, or installed by this thread's own earlier unlink
+    // CAS on that word -- coherence makes either the current value as this
+    // thread knows it; untagged; address == first) is the expected value,
+    // never a reload. Preconditions: w.pred_ok; `first`
     // is dead by is_dead_now() at the caller's `ts`.
     // The run walk follows the dead nodes' IMMUTABLE tagged links (acquire
     // loads: each is load-bearing for the edge of an EARLIER unlinker whose
@@ -1232,8 +1240,8 @@ private:
     // a tagged node that is not dead between pred and here, e.g. FROZEN with
     // an unpublished child, makes pred useless for this run, and a lost CAS
     // on pred has made pred_word stale). Never retried: a lost CAS is another
-    // thread's completed step on this word -- often a peer's bypass of this
-    // very run, which leaves nothing behind -- and whatever dead nodes it
+    // thread's completed step on this word -- possibly a peer's bypass of
+    // this very run, which leaves nothing behind -- and whatever dead nodes it
     // leaves are STRAGGLERS (WHY COPY in the class overview). Returns the
     // bare address where the walk continues: after the run in either case;
     // after a lost CAS the dead run may already be bypassed by someone else,
@@ -1692,8 +1700,9 @@ public:
     //       copies this split froze are hashed here after their H3 hash.
     // CAS VALUE RULES. Every deciding CAS is one strong CAS on one word with
     // the FULL expected value as loaded (a head with its level, a link with
-    // its tags), loaded before the compare or hash that precedes the CAS;
-    // after an operation's OWN successful CAS on a word, its next expected
+    // its tags), loaded before the compare or hash that precedes the CAS,
+    // or, on a retry of the mark or freeze CAS, the failure value of the
+    // previous attempt; after an operation's OWN successful CAS on a word, its next expected
     // value for that word is the value it installed (a head unlink keeps the
     // level; a publish after an own head unlink expects the unlinked head).
     // This last rule is the OWN-CAS RULE.

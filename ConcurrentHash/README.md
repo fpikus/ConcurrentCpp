@@ -128,7 +128,10 @@ make run_tests  # run all three test binaries
 
 The compiler, C++ standard and library paths come from `../config.mk`, shared
 by every directory in this repository and written once per machine; binaries
-go to `build/<hostname>/`. Requires Google Benchmark and GoogleTest.
+go to `build/<hostname>/`. Requires Google Benchmark and GoogleTest. The
+benchmark also includes `../Spinlock/gb_wall_clock.h` (through
+`-I../Spinlock`), the wall-clock accounting behind its `wall_items_per_second`
+and `finish_spread` counters.
 
 - `concurrent_hash_set.h` — the hash set
 - `concurrent_deque.h` — the backing store (see `../ConcurrentDeque`)

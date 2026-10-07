@@ -2389,16 +2389,17 @@ TEST(ConcurrentHashSetRcuTest, ReclaimDrainsContendedLimbo) {
 // exists for never happened.
 // Prefill size, and the free-list floor asserted before each race. With
 // AllowDelete == true every prefill key is erased, so the free list holds at
-// least PREFILL slots by construction (more, with the stale split copies). With
-// AllowDelete == false the free list holds ONLY stale split copies of the
-// prefill, which exist only for keys that moved at a doubling after they were
-// inserted: a one-shard set jumps to 128 buckets within its first five inserts
-// (the first append counts 256), so a 256-key prefill leaves only a handful of
-// free slots, too few to be popped during the race. 600 keys cross the doublings
-// at 256 and 512 slots with the keys already in place, and the settling sweep
-// turns those splits into a few hundred stale copies. The floor for that flavor,
-// PREFILL/4, is therefore an EMPIRICAL precondition, not a derived one (the
-// prefill is single-threaded, so the count is the same every run).
+// least PREFILL slots by construction (more, with the superseded split copies).
+// With AllowDelete == false the free list holds ONLY the parent copies the
+// prefill's splits superseded (retired by those splits, or unlinked by reclaim()),
+// which exist only for keys that moved at a doubling after they were inserted:
+// a one-shard set jumps to 128 buckets within its first five inserts (the first
+// append counts 256), so the first keys cross no doubling. 600 keys cross the
+// doublings at 256 and 512 slots with most keys already in place, and the
+// settling sweep turns those splits into a few hundred superseded copies. The
+// floor for that flavor, PREFILL/4, is therefore an EMPIRICAL precondition, not
+// a derived one (the prefill is single-threaded, so the count is the same every
+// run).
 TEST(ConcurrentHashSetRcuTest, ReclaimLimboPushesRaceFreeListPops) {
     const int T = 8, K = 64, PREFILL = 600, REPS = 40;
     size_t limbo_total = 0;
@@ -2865,7 +2866,9 @@ TEST(ConcurrentHashSetRcuTest, HeadUnlinkKeepsSealLevel) {
 // unlink), reads 1029's link and must reach 5. A retirement that rewrote 1029's
 // link would have written the head of the list it pushed onto, which is EMPTY
 // (both lists are empty beforehand, checked): the walk would end at 1029 and miss
-// a present key.
+// a present key. The window's precondition is only that 1029 left the chain
+// (two reachable nodes), whichever list it went to, so that such a retirement
+// fails on the walk itself; that it went to a retired list is checked after.
 TEST(ConcurrentHashSetRcuTest, RetiredNodeStaysExitable) {
     using Set = ConcurrentResizableHashSetRCU<ProbeKey, true, ProbeKeyHash>;
     const int K = 5, X = 5 + 1024, W = 5 + 2048;
@@ -2877,17 +2880,17 @@ TEST(ConcurrentHashSetRcuTest, RetiredNodeStaysExitable) {
         ASSERT_EQ(empty.limbo, 0u);
         ASSERT_EQ(empty.retired, 0u);
         bool hook_ran = false, nested_erased = false;
-        size_t retired_in_window = 0;
+        size_t reachable_in_window = 0;
         ProbeKey::arm(ProbeKey::equal_hook, W, 1, [&]() {
             hook_ran = true;
             nested_erased = set.erase(X);
-            retired_in_window = set.get_internal_accounting().retired;
+            reachable_in_window = set.get_internal_accounting().reachable;
         });
         const bool found = set.contains(K);
         ProbeKey::disarm_hooks();
         ASSERT_TRUE(hook_ran) << "test precondition: the hook on contains(5)'s first comparison did not fire";
         ASSERT_TRUE(nested_erased);
-        ASSERT_EQ(retired_in_window, 1u) << "test precondition: erase(1029) did not unlink and retire its node";
+        ASSERT_EQ(reachable_in_window, 2u) << "test precondition: erase(1029) did not unlink its node";
         EXPECT_TRUE(found) << "a walk that reached a node before its unlink could not walk out of it";
         EXPECT_FALSE(set.contains(X));
         EXPECT_TRUE(set.contains(W));

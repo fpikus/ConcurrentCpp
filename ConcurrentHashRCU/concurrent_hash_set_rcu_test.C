@@ -3184,7 +3184,9 @@ TEST(ConcurrentHashSetRcuTest, UnlinkLossClassification) {
             EXPECT_EQ(acc.retired, retired_before + 1) << where << ": 33's parent copy must be retired once, by the nested insert";
             EXPECT_EQ(acc.reachable_dead, 0u) << where;
             for (int k : {1, 2, 33, 65, 129}) EXPECT_TRUE(set.contains(k)) << where << ", key " << k;
-            if (!c.cleanup) EXPECT_TRUE(set.contains(193)) << where;
+            if (!c.cleanup) {
+                EXPECT_TRUE(set.contains(193)) << where;
+            }
         } // the set's lifetime
         EXPECT_EQ(ProbeKey::corrupt.load(), 0) << where;
     } // loop over the cases

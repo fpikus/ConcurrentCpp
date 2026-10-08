@@ -688,14 +688,26 @@ inline unsigned thread_number() {
 //   GEOMETRY are the argument that such a point exists, and this comment does
 //   not name it.
 //
-// PROGRESS: this structure is lock-free on the pure read/traverse path, but it
-// is NOT wait-free and not lock-free end to end: contains(), insert() and
-// erase() all fall into split_bucket() when they meet an UNINITIALIZED bucket,
-// and split_bucket() allocates through its arena shard, as does an insert()
-// whose walk misses its key (alloc_node()): a lock-free pop from the shard's
-// free list when it has one, else an append under the deque's internal
-// SpinLock; with one thread per shard that lock is uncontended, but it is a
-// lock. Resize itself is serialized by resize_lock_. reclaim() is not a
+// PROGRESS: the hash's own protocol takes no lock. The walks, the splits,
+// the unlinks, the publishing CAS and every retry loop are lock-free, and
+// the pure read/traverse path writes nothing; none of it is wait-free. The
+// class's only two locks are where it allocates, so an operation is
+// lock-free end to end exactly when it allocates nothing:
+//   (1) alloc_node(): a lock-free pop from the calling thread's arena shard's
+//       free list when it has a node, else an append under that shard's
+//       deque SpinLock; with one thread per shard that lock is uncontended,
+//       but it is a lock. An insert() whose walk misses its key allocates
+//       this way, and so does split_bucket() for its copies, so contains(),
+//       insert() and erase() can all reach the lock by meeting an
+//       UNINITIALIZED bucket.
+//   (2) resize_lock_: taken by an insert() after its own publishing CAS,
+//       when the node count crosses the doubling threshold for its table
+//       size, to grow buckets_ (an allocation) and mark the new buckets
+//       UNINITIALIZED. Only another insert() that has crossed a threshold
+//       too waits on it; no other operation takes it.
+// The locks belong to the allocation, not to the hash: an allocator that
+// allocates blocks under a lock and hands nodes over lock-free leaves the
+// lock with whichever thread allocates the block. reclaim() is not a
 // concurrent operation at all (see its contract). Every loop that unlinking
 // adds is lock-free in the sense that a failed CAS implies another thread's
 // completed step: the mark and freeze retries on a live failure value (each
@@ -992,7 +1004,9 @@ private:
     std::atomic<size_t> table_size_;
 
     // A SpinLock used to serialize table resizes via the Double-Checked Locking Pattern.
-    // Only one thread can expand the buckets_ array at a time.
+    // Only one thread can expand the buckets_ array at a time. Taken only by
+    // an insert() after its publishing CAS, when the node count crosses the
+    // doubling threshold; no other operation waits on it (see PROGRESS).
     SpinLock resize_lock_;
 
     // Arena occupancy, over-counted by up to 255 per touched shard and

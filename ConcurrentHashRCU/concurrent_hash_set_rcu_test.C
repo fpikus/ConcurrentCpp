@@ -374,15 +374,15 @@ TEST(ConcurrentHashSetRcuTest, ArenaShardsParameter) {
 // has no representable result for it. The death is SIGABRT from std::abort()
 // itself, with nothing on stderr; an exception (bad_alloc or length_error from
 // an attempted resize) or any other signal fails the test. The empty stderr is
-// what tells the constructor's check from libstdc++'s own: an unoptimized build
-// (these tests are -O0) enables _GLIBCXX_ASSERTIONS, and std::bit_ceil() then
-// prints an assertion message before it aborts. Both arguments exceed 2^63;
-// 2^63 itself is valid and would ask for 2^63 buckets, so the boundary is not
-// tested from below. The suite name ends in DeathTest, as GoogleTest asks, so
-// the suite runs before every other; the threadsafe style re-executes the
-// binary for the child instead of cloning a process that may run other threads
-// (a sanitizer runtime's among them). GoogleTest restores the flag after the
-// test.
+// what tells the constructor's check from libstdc++'s own: libstdc++ 15 and
+// later enable _GLIBCXX_ASSERTIONS in an unoptimized build (these tests are
+// -O0), and std::bit_ceil() then prints an assertion message before it aborts.
+// Both arguments exceed 2^63; 2^63 itself is valid and would ask for 2^63
+// buckets, so the boundary is not tested from below. The suite name ends in
+// DeathTest, as GoogleTest asks, so the suite runs before every other; the
+// threadsafe style re-executes the binary for the child instead of cloning a
+// process that may run other threads (a sanitizer runtime's among them).
+// GoogleTest restores the flag after the test.
 TEST(ConcurrentHashSetRcuDeathTest, ConstructorAbortsOnUnrepresentableCapacity) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     for (size_t capacity : {static_cast<size_t>(-1), (size_t{1} << 63) + 1}) {

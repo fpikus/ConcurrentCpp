@@ -172,8 +172,8 @@ inline unsigned thread_number() {
 //     splitting is; whichever operation won the split's publish runs it, a
 //     contains() included. The copies the split superseded get an unlink
 //     attempt from that same split, unless a tagged, not-dead node stands
-//     between them and the pass's last live word (the one exception, under
-//     STRAGGLERS); a writer walk that passes them after the publish may
+//     between them and the pass's last live word (STRAGGLERS: the one
+//     exception, and the stale view); a writer walk that passes them after the publish may
 //     bypass them first, and the pass's attempt then loses or never meets
 //     them;
 //   - erase(), right after its mark (an eager self-unlink: one attempt
@@ -2156,9 +2156,9 @@ public:
     // Quiescent reclamation. reclaim() and the quiescent-only diagnostics
     // below (the accounting sweep, the counts taken from it, and
     // get_internal_bucket_published(); the other diagnostics are race-free,
-    // see DIAGNOSTICS) share one precondition, QUIESCENCE: no
-    // other call on this set is in progress while the function runs, every
-    // earlier call happens-before it, and it happens-before every later call
+    // see DIAGNOSTICS) share one precondition, QUIESCENCE: no other call on
+    // this set is in progress while the function runs, every earlier call
+    // happens-before it, and it happens-before every later call
     // (e.g. the caller joins or barriers the worker threads before and starts
     // or releases them after). Under that precondition every atomic access
     // here is relaxed: the values these functions read were published to
@@ -2488,7 +2488,7 @@ public:
         size_t cleanup_cas_peer_losses;  // of those, losses to a peer that bypassed the same run (nothing left behind)
         size_t walk_cas_failures;        // lost one-shot CASes of insert()'s and erase()'s walks, all kinds
         size_t walk_cas_peer_losses;     // of those, peer losses
-        size_t split_attempts;           // split_bucket() calls that reached the walk of the sealed parent
+        size_t split_attempts;           // split_bucket() calls that reached the walk of the sealed parent, recursive parent splits included
         size_t splits_published;         // of those, the ones whose publishing CAS won
     }; // struct InternalCounters
     InternalCounters get_internal_counters() const {

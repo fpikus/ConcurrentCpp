@@ -101,7 +101,8 @@ GCC's layout is fast or slow depending on the order of the branches — this cod
 happens to get the fast one, the reversed if/else would not. The hint takes the
 luck out of it. Measured with GCC 16 on a 128-thread Zen 5 server, hinted and
 plain DCLP are indistinguishable at every thread count, updates or not, while
-the same hint is worth 1.2–1.6× to the CAS loop when nothing changes: GCC's
+the same hint is worth 1.2–1.6× to the CAS loop from two threads up when
+nothing changes (and nothing on one thread): GCC's
 default layout for the `while` loop is the slow one. Hinting the DCLP update as
 *likely* forces the other layout and shows what the luck is worth: 12–15% with
 GCC on that server, half the throughput with Clang on a Zen 4 laptop.

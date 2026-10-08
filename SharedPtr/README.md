@@ -110,8 +110,10 @@ make build/$(hostname)/atomic_shared_ptr_bursts_bm  # on demand: + destruction-b
 Binaries go to `build/<hostname>/`. Requires Linux (every binary links
 `mm_hp`, which issues `membarrier(2)`), Google Benchmark and GoogleTest; point
 `GBENCH_DIR` and `GTEST_DIR` at your installations if they are not in
-`$HOME/GoogleBench` and `$HOME/GoogleTest`. The compiler, `-march` target and
-C++ standard come from `../config.mk` (the reference one selects `clang++-22`
+`$HOME/GoogleBench` and `$HOME/GoogleTest`. The benchmark also includes
+`../Spinlock/gb_wall_clock.h` (through `-I../Spinlock`), the wall-clock
+accounting behind its `wall_items_per_second` and `finish_spread` counters.
+The compiler, `-march` target and C++ standard come from `../config.mk` (the reference one selects `clang++-22`
 and C++23; the code also builds with `g++-16`).
 
 ### Third-party code

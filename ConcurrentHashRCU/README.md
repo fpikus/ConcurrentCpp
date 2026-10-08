@@ -131,32 +131,42 @@ Measured against the original on the same fixtures, each pair built by the
 same compiler, on four machines: a Ryzen 7940HS laptop (16 hardware threads,
 clang-22), a 2-socket Xeon 6767P with 256 hardware threads, a 128-thread Zen 5
 EPYC, and an Apple M3 Ultra running Linux (24 threads), the last three with
-gcc 16.2; all at `-O3 -march=native`, one arena shard per hardware thread,
-threads unpinned. The figure quoted is the copy's wall-clock throughput over
-the original's, the median over rounds, across thread counts from 1 to the
-machine's, and every figure includes the cost of the 24-byte node against the
-original's 16.
+gcc 16.2; all at `-O3 -march=native`, with the header's default arena shard
+count (the hardware thread count rounded up to a power of two: 16, 256, 128
+and 32 shards) and threads unpinned. The figure quoted is the copy's
+wall-clock throughput over the original's: the median over rounds (six on the
+laptop, three on the servers), at thread counts from 1 to the machine's. Every
+figure includes the cost of the 24-byte node against the original's 16.
 
 - For read-heavy workloads (99% lookups on a stable set, 1% inserts) the
-  speed is the same within 10-20%; what loss there is comes from the bigger
-  node, not from the unlinking.
+  speed is the same within 10-20%, except on the 2-socket Xeon at high thread
+  counts (up to 25% slower). What loss there is comes mostly from the bigger
+  node.
 - For lookups over a set with many deletions (half the keys erased, no
-  `reclaim()`) the copy is 1.15-1.5x faster.
+  `reclaim()`) the copy is 1.1-1.5x faster, on every machine at every thread
+  count.
 - For insert-heavy growth (every key new, the table doubling through the run)
-  the speed is within 20% on x86, and within 10% on the servers at most thread
-  counts; the M3 Ultra is 10-30% slower at 2-16 threads.
-- For inserts into a pre-sized set the copy is 5-13% slower at 1-16 threads
-  on x86, and up to 18% slower on the M3 Ultra.
-- For erase-heavy workloads the original is about twice as fast (three CASes
-  per erase against one); 1.4x on the M3 Ultra; and 4x on the 2-socket Xeon
-  at 32-128 threads.
-- For inserts into a set with many deletions the copy is 0.9-1.2x: up to 20%
-  faster on three of the four machines, a wash at best on the Xeon.
-- A delete-free instantiation (`AllowDelete == false`) pays for the freeze the
-  original compiles out: growth inserts 5-10% slower at 1 thread and at 64
-  threads or more, 10-40% slower at 2-8 threads (worst on the EPYC); pre-sized
-  inserts, built with gcc 16.2, a further 10-25% slower than the deletable
-  instantiation, a difference clang-22 does not show.
+  the speed is within about 20% on x86; on the M3 Ultra the copy is 11-31%
+  slower.
+- For inserts into a pre-sized set the copy is 4-13% slower on x86 (up to 5%
+  faster on the EPYC at high thread counts) and 1-18% slower on the M3 Ultra;
+  the 2-socket Xeon is up to 28% slower at high thread counts.
+- For erase-heavy workloads the original is 1.6-2.1x as fast (three CASes per
+  erase against one) on the laptop, on the EPYC, and on the Xeon at low
+  thread counts, and 1.4x on the M3 Ultra at low thread counts; it gets worse
+  with threads on the big machines, up to 4.4x on the 2-socket Xeon and 2.6x
+  on the M3 Ultra.
+- For inserts into a set with many deletions (half the keys erased, no
+  `reclaim()`) the copy is 5-22% faster on the laptop, on the M3 Ultra and on
+  the EPYC at low thread counts, but up to 43% slower on the 2-socket Xeon at
+  mid-range thread counts; elsewhere on the two servers it is within 10%
+  either way where the rounds agree at all.
+- A delete-free instantiation (`AllowDelete == false`), where the original
+  skips the freeze and the copy does not: growth inserts are up to 40% slower
+  than the original's delete-free instantiation, and the freeze itself costs
+  the original up to 37% (on the EPYC). Pre-sized inserts built with gcc 16.2
+  come out up to 27% slower than the copy's deletable instantiation from the
+  same source; clang-22 does not show that difference.
 
 No cell mixes inserts, lookups and erases, so there is no steady-state churn
 number here: each line measures one kind of operation at a time, two of them

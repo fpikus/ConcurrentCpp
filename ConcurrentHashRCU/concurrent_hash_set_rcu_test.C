@@ -2387,12 +2387,12 @@ TEST(ConcurrentHashSetRcuTest, ReclaimDrainsContendedLimbo) {
 // prefill's splits superseded (retired by those splits, or unlinked by reclaim()),
 // which exist only for keys that moved at a doubling after they were inserted:
 // a one-shard set jumps to 128 buckets within its first five inserts (the first
-// append counts 256), so the first keys cross no doubling. 600 keys cross the
-// doublings at 256 and 512 slots with most keys already in place, and the
-// settling sweep turns those splits into a few hundred superseded copies. The
-// floor for that flavor, PREFILL/4, is therefore an EMPIRICAL precondition, not
-// a derived one (the prefill is single-threaded, so the count is the same every
-// run).
+// append counts 256), so those early doublings find at most five keys in place
+// and move few. 600 keys cross the doublings at 256 and 512 slots with hundreds
+// of keys already in place, and the settling sweep turns those splits into a
+// few hundred superseded copies. The floor for that flavor, PREFILL/4, is
+// therefore an EMPIRICAL precondition, not a derived one (the prefill is
+// single-threaded, so the count is the same every run).
 TEST(ConcurrentHashSetRcuTest, ReclaimLimboPushesRaceFreeListPops) {
     const int T = 8, K = 64, PREFILL = 600, REPS = 40;
     size_t limbo_total = 0;

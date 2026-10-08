@@ -1346,7 +1346,8 @@ TEST(ConcurrentHashSetRcuTest, ThreadPrivateKeySequenceDuringGrowth) {
 // there is), which is the quiescence the contract requires. Oracles are the
 // contract's: the key count the test itself knows, the accounting identity
 // (every slot in exactly one place), and "allocation takes a free slot before it
-// grows the arena". Where a test relies on the documented node_count_ batching (256 per batch), it says so.
+// grows the arena". Where a test relies on the documented node_count_ batching
+// (256 per batch), it says so.
 // ===========================================================================
 
 // Pre-sized (no doubling), so every node the arena holds is a key or an erased

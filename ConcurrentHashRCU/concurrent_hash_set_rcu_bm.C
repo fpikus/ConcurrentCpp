@@ -553,7 +553,8 @@ static_assert(sizeof(ConcurrentSet::Node) == sizeof(ConcurrentSetDel::Node), "th
 // What the fixture does to the set after the prefill: nothing (Control), erase
 // every victim and reclaim() (Reclaimed), or erase every victim and nothing more
 // (Erased). Every Reclaimed and Erased configuration has a Control with the same
-// live keys and the same buckets.
+// live keys and the same initial bucket count (the growth cells' Reclaimed table
+// ends one doubling larger; see above).
 enum class Churn { Control, Reclaimed, Erased };
 
 // The insert fixtures' churn population: kChurnPairs survivors, and as many

@@ -148,18 +148,18 @@ figure includes the cost of the 24-byte node against the original's 16.
 - For insert-heavy growth (every key new, the table doubling through the run)
   the speed is within about 20% on x86; on the M3 Ultra the copy is 11-31%
   slower.
-- For inserts into a pre-sized set the copy is 4-13% slower on x86 (up to 5%
+- For inserts into a pre-sized set the copy is 3-13% slower on x86 (up to 5%
   faster on the EPYC at high thread counts) and 1-18% slower on the M3 Ultra;
   the 2-socket Xeon is up to 28% slower at high thread counts.
-- For erase-heavy workloads the original is 1.6-2.1x as fast (three CASes per
+- For erase-heavy workloads the original is 1.6-2.3x as fast (three CASes per
   erase against one) on the laptop, on the EPYC, and on the Xeon at low
   thread counts, and 1.4x on the M3 Ultra at low thread counts; it gets worse
   with threads on the big machines, up to 4.4x on the 2-socket Xeon and 2.6x
   on the M3 Ultra.
 - For inserts into a set with many deletions (half the keys erased, no
   `reclaim()`) the copy is 5-22% faster on the laptop, on the M3 Ultra and on
-  the EPYC at low thread counts, but up to 43% slower on the 2-socket Xeon at
-  mid-range thread counts; elsewhere on the two servers it is within 10%
+  the EPYC at low thread counts, but 16-43% slower on the 2-socket Xeon at 16
+  and 32 threads; elsewhere on the two servers it is within 10%
   either way where the rounds agree at all.
 - A delete-free instantiation (`AllowDelete == false`), where the original
   skips the freeze and the copy does not: growth inserts are up to 40% slower

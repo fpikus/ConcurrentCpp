@@ -88,8 +88,8 @@ leaves no dead run reachable behind the head or any live node it passed; an
 not yet published stands between the tombstone and the last live word before
 it, which, uncontended, only an earlier split that threw can leave behind.
 
-What it costs, in kind (the numbers are a measurement, and this README does
-not quote one):
+What it costs, in kind (what it costs in numbers, per type of workload, is
+under [Performance](#performance)):
 
 - a node grows by one word, the retired list's link — a word of its own,
   because the chain link of a retired node must stay as it was for the threads
@@ -124,6 +124,43 @@ Possible next steps, none of them started and none of them promised:
   chains like a writer miss walk, unlinking what it passes and inserting
   nothing), *sequester* (set the retired lists aside, one pointer per shard),
   and *reclaim* (return what was set aside to the free lists).
+
+## Performance
+
+Measured against the original on the same fixtures, each pair built by the
+same compiler, on four machines: a Ryzen 7940HS laptop (16 hardware threads,
+clang-22), a 2-socket Xeon 6767P with 256 hardware threads, a 128-thread Zen 5
+EPYC, and an Apple M3 Ultra running Linux (24 threads), the last three with
+gcc 16.2; all at `-O3 -march=native`, one arena shard per hardware thread,
+threads unpinned. The figure quoted is the copy's wall-clock throughput over
+the original's, the median over rounds, across thread counts from 1 to the
+machine's, and every figure includes the cost of the 24-byte node against the
+original's 16.
+
+- For read-heavy workloads (99% lookups on a stable set, 1% inserts) the
+  speed is the same within 10-20%; what loss there is comes from the bigger
+  node, not from the unlinking.
+- For lookups over a set with many deletions (half the keys erased, no
+  `reclaim()`) the copy is 1.15-1.5x faster.
+- For insert-heavy growth (every key new, the table doubling through the run)
+  the speed is within 20% on x86, and within 10% on the servers at most thread
+  counts; the M3 Ultra is 10-30% slower at 2-16 threads.
+- For inserts into a pre-sized set the copy is 5-13% slower at 1-16 threads
+  on x86, and up to 18% slower on the M3 Ultra.
+- For erase-heavy workloads the original is about twice as fast (three CASes
+  per erase against one); 1.4x on the M3 Ultra; and 4x on the 2-socket Xeon
+  at 32-128 threads.
+- For inserts into a set with many deletions the copy is 0.9-1.2x: up to 20%
+  faster on three of the four machines, a wash at best on the Xeon.
+- A delete-free instantiation (`AllowDelete == false`) pays for the freeze the
+  original compiles out: growth inserts 5-10% slower at 1 thread and at 64
+  threads or more, 10-40% slower at 2-8 threads (worst on the EPYC); pre-sized
+  inserts, built with gcc 16.2, a further 10-25% slower than the deletable
+  instantiation, a difference clang-22 does not show.
+
+No cell mixes inserts, lookups and erases, so there is no steady-state churn
+number here: each line measures one kind of operation at a time, two of them
+on a state that erases built.
 
 ## Building and testing
 

@@ -199,4 +199,7 @@ and `finish_spread` counters.
   binary
 - `concurrent_hash_set_rcu_bm.C` — the benchmarks: the original's fixtures,
   so that the two sets' rows pair up, plus the cells the original lacks: two
-  whose state erases built, and one that times `erase()` itself
+  whose state erases built, one that times `erase()` itself, and a probe
+  (`InsertHotGrowth`) that splits long, hot chains while threads insert into
+  them, and counts the unlink CASes the splits' cleanup loses and the dead
+  nodes left in their chains

@@ -52,9 +52,6 @@ inline unsigned thread_number() {
 }
 } // namespace concurrent_hash_rcu_detail
 
-template <typename T, typename... Args>
-using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
-
 // ===========================================================================
 // ConcurrentResizableHashSetRCU -- design overview (read this before the code).
 //
@@ -688,14 +685,11 @@ using DefaultConcurrentDequeRCU = ConcurrentAppendDeque<T, 1024>;
 //                 meet (to find the node's child bucket): a cost per FROZEN
 //                 node passed, and the place where a throwing Hash{} leaves
 //                 a dead run behind (EXCEPTIONS).
-//   Container   : the append-only, address-stable arena template: elements
-//                 never move once constructed (see channel 3).
 // ===========================================================================
 template <
     typename T,
     bool AllowDelete = false,
-    typename Hash = std::hash<T>,
-    template <typename, typename...> class Container = DefaultConcurrentDequeRCU
+    typename Hash = std::hash<T>
 >
 class ConcurrentResizableHashSetRCU {
 private:
@@ -754,6 +748,11 @@ private:
     // Largest arena shard count the constructor accepts (a power of two); more
     // shards than this serve no thread count that exists.
     static constexpr size_t MAX_ARENA_SHARDS = size_t{1} << 16;
+    // Elements per block of both deques, buckets_ and every Shard::nodes.
+    // Larger blocks allocate less often (one allocation, under the deque's
+    // append lock, per ARENA_BLOCK elements); smaller ones leave less unused
+    // memory, since every shard a thread allocates from holds a whole block.
+    static constexpr size_t ARENA_BLOCK = 1024;
     static_assert(PTR_MASK == 0x03FFFFFFFFFFFFF8, "bit diagram above and the masks disagree");
     static_assert(std::atomic<word_t>::is_always_lock_free, "head and link words must be lock-free atomics");
 
@@ -832,7 +831,7 @@ private:
     // The dynamically resizable array of atomic bucket heads.
     // Each entry holds the address of the first node in the bucket's chain,
     // plus the bucket's seal level (see the word encoding).
-    Container<std::atomic<word_t>> buckets_;
+    ConcurrentAppendDeque<std::atomic<word_t>, ARENA_BLOCK> buckets_;
 
     // One arena shard: the append-only node deque and the heads of the shard's
     // free, limbo and retired lists (see RECLAMATION in the class overview),
@@ -859,7 +858,7 @@ private:
     struct Shard {
         // Nodes are appended block-by-block and never destructed until the set
         // is destroyed; a slot's address is stable for the life of the set.
-        Container<Node> nodes;
+        ConcurrentAppendDeque<Node, ARENA_BLOCK> nodes;
         // Free list: the encoded top node address and pop counter (see the
         // FREE-LIST HEAD encoding). Popped by alloc_node() with a relaxed CAS;
         // pushed and reset by reclaim() only.
@@ -2429,7 +2428,7 @@ public:
         std::vector<word_t> slots;
         slots.reserve(get_internal_node_count());
         for (size_t s = 0; s <= arena_mask_; ++s) {
-            const Container<Node>& nodes = shards_[s].nodes;
+            const ConcurrentAppendDeque<Node, ARENA_BLOCK>& nodes = shards_[s].nodes;
             for (size_t i = 0, n = nodes.size(); i < n; ++i) slots.push_back(word_of(&nodes[i]));
         }
         std::sort(slots.begin(), slots.end());

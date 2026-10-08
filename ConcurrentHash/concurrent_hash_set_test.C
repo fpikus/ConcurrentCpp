@@ -1950,10 +1950,10 @@ TEST(ConcurrentHashSetTest, ReclaimDrainsContendedLimbo) {
 // AllowDelete == false the free list holds ONLY stale split copies of the
 // prefill, which exist only for keys that moved at a doubling after they were
 // inserted: a one-shard set jumps to 128 buckets within its first five inserts
-// (the first append counts 256), so a 256-key prefill leaves only a handful of
-// free slots, too few to be popped during the race. 600 keys cross the doublings
-// at 256 and 512 slots with the keys already in place, and the settling sweep
-// turns those splits into a few hundred stale copies. The floor for that flavor,
+// (the first append counts 256), so those early doublings find at most five
+// keys in place and move few. 600 keys cross the doublings at 256 and 512
+// slots with hundreds of keys already in place, and the settling sweep turns
+// those splits into a few hundred stale copies. The floor for that flavor,
 // PREFILL/4, is therefore an EMPIRICAL precondition, not a derived one (the
 // prefill is single-threaded, so the count is the same every run).
 TEST(ConcurrentHashSetTest, ReclaimLimboPushesRaceFreeListPops) {

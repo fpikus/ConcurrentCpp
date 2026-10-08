@@ -21,9 +21,10 @@ and may continue to evolve past the version printed in the book.
   and a lock-free producer–consumer handoff.
 - **[ConcurrentHash](ConcurrentHash/)** — `ConcurrentResizableHashSet`, a
   chained hash set with lock-free lookups and live resizing (inserts publish
-  with one CAS but allocate under a spinlock), built on three refusals: never
-  free, never relink, never unlink (the one exception, `reclaim()`, runs when
-  the caller has quiesced the set).
+  with one CAS, and append a new node under a spinlock unless `reclaim()` left
+  one on a free list), built on three refusals: never free, never relink,
+  never unlink (the one exception, `reclaim()`, runs when the caller has
+  quiesced the set).
 - **[LockFreeList](LockFreeList/)** — a Harris-style lock-free singly-linked
   list that reclaims memory for real, with never-invalidated iterators,
   parameterized over four atomic shared pointer implementations.

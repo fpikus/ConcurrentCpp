@@ -130,11 +130,12 @@ inline unsigned thread_number() {
 //   key now hashes to j under the wider mask. The copied nodes stay in the
 //   parent chain, FROZEN, until a writer bypasses them or reclaim() unlinks
 //   them (the split's own winner tries right after it publishes j, except
-//   for copies behind a FROZEN node whose own child is not yet published; a
-//   writer walk that passes them after the publish may get there first, and
-//   a try can lose: see WHY COPY below), so for a while a key that moved to
-//   j exists in BOTH the parent chain (a superseded, FROZEN copy) and bucket
-//   j. Splitting is recursive: a parent that is itself still
+//   for copies behind a FROZEN node the pass cannot decide dead (its child
+//   unpublished, or beyond the table size the pass loaded); a writer walk
+//   that passes them after the publish may get there first, and a try can
+//   lose: see WHY COPY below), so for a while a key that moved to j exists
+//   in BOTH the parent chain (a superseded, FROZEN copy) and bucket j.
+//   Splitting is recursive: a parent that is itself still
 //   UNINITIALIZED is split first, so the bucket tree is filled in on demand.
 //
 // WHY COPY, AND WHEN A DEAD NODE LEAVES ITS CHAIN
@@ -681,29 +682,9 @@ inline unsigned thread_number() {
 //   an earlier unlinker's) happens-before the reader's reload, so the reload
 //   cannot return an older value, whatever the order of that read.
 //   A miss that is confirmed by an unchanged table_size_ (contains(), erase())
-//   linearizes at the table_size_ load that began its final pass, unless the
-//   mark CAS of some node of the key happens-before the call's return without
-//   happening-before the call; then it linearizes immediately after the last
-//   such mark CAS. "Last" is defined: the marks of one key's nodes are
-//   ordered by happens-before, since an insert acquires the previous node's
-//   mark, or a word that a bypass of it rewrote, before its publishing CAS
-//   (INVARIANT). The point is inside the call because a selected mark
-//   happens-before the return but not the call. The point is right because
-//   every node of the key published before the call has its mark ordered
-//   before the return: the walk either met it live (a hit, not this case),
-//   met it tombstoned (an acquire of the mark), or did not reach it from the
-//   head value it loaded, which means an unlink CAS cut every path to it;
-//   that unlinker had acquired the node's mark, directly or through earlier
-//   unlinks, and every later write to the cut word is a read-modify-write,
-//   so the walk's acquire load of the word it did read orders the mark
-//   before it (UNREACHABILITY, channel 5). Such a mark either happens-before
-//   the call (an earlier lineage, insert and deletion complete before the
-//   call) or is one the rule selects. At the chosen point, therefore, every
-//   lineage published before the call is deleted, every lineage marked at or
-//   before the last selected mark is complete, and every later insert of the
-//   key published after that mark, with a publishing CAS that does not
-//   happen-before the call (half (i)); the miss is ordered after the former
-//   and before the latter.
+//   linearizes at a point inside the call; the two halves under STALE
+//   GEOMETRY are the argument that such a point exists, and this comment does
+//   not name it.
 //
 // PROGRESS: this structure is lock-free on the pure read/traverse path, but it
 // is NOT wait-free and not lock-free end to end: contains(), insert() and

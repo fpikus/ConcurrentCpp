@@ -30,7 +30,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
-#include <type_traits>
 #include <bit>
 #include <vector>
 #include <memory>
@@ -38,8 +37,6 @@
 #include <thread>
 #include <mutex>
 #include "spinlock.h"
-
-struct empty_struct_rcu {};
 
 namespace concurrent_hash_rcu_detail {
 // Process-wide sequential thread numbering, shared by every instantiation of

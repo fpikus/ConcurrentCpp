@@ -90,7 +90,7 @@ written under `build/<hostname>/`, so several machines can build concurrently in
 a shared tree.
 
 - `concurrent_deque.h` — the container (used as the backing store by the
-  concurrent hash set in `../ConcurrentHash`)
+  concurrent hash sets in `../ConcurrentHash` and `../ConcurrentHashRCU`)
 - `concurrent_deque_test.C` — unit tests (built with ASan and TSan)
 - `concurrent_deque_bm.C` — the benchmarks quoted above
 

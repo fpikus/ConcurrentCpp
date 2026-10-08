@@ -55,6 +55,13 @@ and documented on their own terms.
   operation runs under a handle, erased nodes are recycled through a free
   list by a caller-driven `reclaim()`, and an iterator stays valid until the
   handle it was obtained under is destroyed, refreshed or move-assigned over.
+- **[ConcurrentHashRCU](ConcurrentHashRCU/)** — a copy of
+  `ConcurrentResizableHashSet` in which dead nodes (tombstones, superseded
+  split copies) are bypassed by the concurrent writers themselves, best
+  effort, one CAS per run (an erase tries its own tombstone at most twice),
+  instead of waiting in their chains for `reclaim()`; a lookup's own walk
+  still writes nothing, and memory still becomes reusable only through
+  `reclaim()`. The first step toward reclaiming it by generations.
 
 ## Building
 
@@ -70,12 +77,13 @@ Requirements: a recent clang (the Makefiles use `clang++-22`, C++23),
 [Google Benchmark](https://github.com/google/benchmark) and
 [GoogleTest](https://github.com/google/googletest); set `GBENCH_DIR` and
 `GTEST_DIR` if they are not in `$HOME/GoogleBench` and `$HOME/GoogleTest`.
-Some projects (ConcurrentDeque, ConcurrentHash, ConcurrentQueue) share headers
-via relative symlinks, so clone on a filesystem that supports them (on Windows,
-use WSL or enable `core.symlinks`); SharedPtr and LockFreeList include their
-sibling projects' headers through `-I` instead, and so do the benchmarks of
-ConcurrentHash, ConcurrentQueue, IntrSharedPtr and LockFreeListRCU, for the
-wall-clock accounting in `Spinlock/gb_wall_clock.h`.
+Some projects (ConcurrentDeque, ConcurrentHash, ConcurrentHashRCU,
+ConcurrentQueue) share headers via relative symlinks, so clone on a filesystem
+that supports them (on Windows, use WSL or enable `core.symlinks`); SharedPtr
+and LockFreeList include their sibling projects' headers through `-I` instead,
+and so do the benchmarks of ConcurrentHash, ConcurrentHashRCU, ConcurrentQueue,
+IntrSharedPtr and LockFreeListRCU, for the wall-clock accounting in
+`Spinlock/gb_wall_clock.h`.
 IntrSharedPtr, SharedPtr and LockFreeList build on Linux only: the hazard
 pointers they link issue `membarrier(2)`. Before their first build, clone the
 third-party code they use (SharedPtr's README, "Third-party code"); their

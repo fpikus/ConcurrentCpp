@@ -83,6 +83,7 @@
 #include <optional>
 #include <cstdio>
 #include <cstdint>
+#include <type_traits>
 
 // ---------------------------------------------------------------------------
 // Build identification: one line, printed before the first test, naming the
@@ -194,11 +195,13 @@ static void run_threads(int T, F fn) {
 } // run_threads()
 
 // ---------------------------------------------------------------------------
-// Reclamation helpers. All of them call the test-only sweeps, so all of them
-// share reclaim()'s precondition: call them only at a quiescent point (every
-// worker joined). The sweep calls Hash{} on every reachable node that is not
-// MARKED, so a test that arms ProbeKey's hooks disarms them before it calls any
-// of these (see the hooks at ProbeKey).
+// Reclamation helpers. expect_consistent() and reclaim_and_check() call the
+// header's accounting sweep, get_internal_accounting(), and settle_writers()
+// calls get_internal_bucket_published(); both are diagnostics valid only at a
+// quiescent point, so these helpers share reclaim()'s precondition: call them
+// only at a quiescent point (every worker joined). The sweep calls Hash{} on
+// every reachable node that is not MARKED, so a test that arms ProbeKey's hooks
+// disarms them before it calls any of these (see the hooks at ProbeKey).
 // ---------------------------------------------------------------------------
 
 // Accounting sweep: every arena slot must be reachable from a published bucket,
@@ -271,12 +274,13 @@ static void reclaim_and_check(SetT& set, size_t expected_live, const std::string
 // contains() reports absent --, so that the erase() walks the whole chain (a
 // miss) and unlinks every dead run it passes behind the head or a live
 // predecessor. Every such erase() must return false.
-// It skips the pending (UNINITIALIZED) buckets, asking the header's test-only
-// get_internal_bucket_published(): a contains() or erase() there would split the
-// bucket, and that split's cleanup walks the parent chain and unlinks its dead
-// runs itself, so the settling would succeed even if the writer walks it exists
-// to exercise unlinked nothing. Skipping them also leaves the geometry as the
-// history left it: settling splits nothing.
+// It skips the pending (UNINITIALIZED) buckets, asking the header's
+// get_internal_bucket_published() (a diagnostic valid only at a quiescent
+// point, as here): a contains() or erase() there would split the bucket, and
+// that split's cleanup walks the parent chain and unlinks its dead runs itself,
+// so the settling would succeed even if the writer walks it exists to exercise
+// unlinked nothing. Skipping them also leaves the geometry as the history left
+// it: settling splits nothing.
 // Requirements: quiescent and single-threaded; ProbeKey hooks disarmed; an
 // AllowDelete == true set of int keys whose hash is the identity (std::hash<int>
 // here, so j + m*ts maps to j; not StringKeys); and no dead run behind a FROZEN
@@ -1336,12 +1340,13 @@ TEST(ConcurrentHashSetRcuTest, ThreadPrivateKeySequenceDuringGrowth) {
 // clauses 4 and 5 at the top of this file; the header's RECLAMATION section and
 // the contract on reclaim().
 //
-// Every call to reclaim() and to the test-only sweeps below happens after
-// run_threads() has joined its workers (or on the only thread there is), which
-// is the quiescence the contract requires. Oracles are the contract's: the key
-// count the test itself knows, the accounting identity (every slot in exactly one
-// place), and "allocation takes a free slot before it grows the arena". Where a
-// test relies on the documented node_count_ batching (256 per batch), it says so.
+// Every call to reclaim() and to the quiescent-only diagnostics below (the
+// accounting sweep and the free, limbo and retired counts derived from it)
+// happens after run_threads() has joined its workers (or on the only thread
+// there is), which is the quiescence the contract requires. Oracles are the
+// contract's: the key count the test itself knows, the accounting identity
+// (every slot in exactly one place), and "allocation takes a free slot before it
+// grows the arena". Where a test relies on the documented node_count_ batching (256 per batch), it says so.
 // ===========================================================================
 
 // Pre-sized (no doubling), so every node the arena holds is a key or an erased
@@ -3101,8 +3106,9 @@ TEST(ConcurrentHashSetRcuTest, InsertPublishAfterOwnHeadUnlink) {
 // when the predecessor word already holds the successor the loser computed (a
 // peer bypassed the same run, so nothing is left behind), any other loss
 // otherwise (a prepend, a seal, a tag of the predecessor, or a bypass of a run of
-// another extent: possibly a straggler). The test-only counters keep both, for
-// the split winner's cleanup and for insert()'s and erase()'s walks.
+// another extent: possibly a straggler). The diagnostic counters
+// (get_internal_counters()) keep both, for the split winner's cleanup and for
+// insert()'s and erase()'s walks.
 //
 // Kills: the classification inverted (a peer loss counted as a possible
 // straggler and the other way round), at either site.
@@ -3288,8 +3294,9 @@ static int hot_growth_key(int index) {
 
 // What concurrent growth on hot chains leaves behind.
 //
-// Not a mutant test: a GUARD on the accounting under the contention that makes
-// the splits' one-shot cleanup CASes lose, and a print of what it left.
+// Kills: no specific protocol step. A GUARD on the accounting under the
+// contention that makes the splits' one-shot cleanup CASes lose, and a print of
+// what it left.
 // T threads insert the kHotKeys keys of the hot-growth construction (interleaved
 // indices), AllowDelete == true, one arena shard per thread. After the join: the
 // accounting is consistent and has exactly one non-dead reachable node per key.
@@ -3331,13 +3338,14 @@ TEST(ConcurrentHashSetRcuTest, HotGrowthResidue) {
 
 // Churn stress with the full accounting after every join.
 //
-// Not a mutant test: a stress of the unlinking protocol under contention --
-// erases unlinking their own nodes, walks unlinking what they pass, splits'
-// cleanups, all on the same chains -- whose oracles are exact at every quiescent
-// point: the accounting is consistent (every slot in one of the four places once,
-// every reachable dead node and every retired node tagged), there is exactly one
-// non-dead reachable node per key, and the per-key insert/erase tally fixes
-// membership (InsertEraseChurnPerKeyAccounting's oracle, cumulative over rounds).
+// Kills: no specific protocol step. A stress of the unlinking protocol under
+// contention -- erases unlinking their own nodes, walks unlinking what they pass,
+// splits' cleanups, all on the same chains -- whose oracles are exact at every
+// quiescent point: the accounting is consistent (every slot in one of the four
+// places once, every reachable dead node and every retired node tagged), there is
+// exactly one non-dead reachable node per key, and the per-key insert/erase tally
+// fixes membership (InsertEraseChurnPerKeyAccounting's oracle, cumulative over
+// rounds).
 // Each repetition is a fresh set churned for ROUNDS rounds, joined after each:
 //   - kWithReclaim: then reclaim(), with its full postconditions;
 //   - kSettle (no reclaim() at all; identity hash): then settle_writers(), after

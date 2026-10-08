@@ -129,10 +129,11 @@ inline unsigned thread_number() {
 //   copying the still-live nodes of its parent bucket (parent = j - N) whose
 //   key now hashes to j under the wider mask. The copied nodes stay in the
 //   parent chain, FROZEN, until a writer bypasses them or reclaim() unlinks
-//   them (the split's own winner tries right after it publishes j, a writer
-//   walk that passes them after the publish may get there first, and a try
-//   can lose: see WHY COPY below), so for a while a key that moved to j
-//   exists in BOTH the parent chain (a superseded, FROZEN copy) and bucket
+//   them (the split's own winner tries right after it publishes j, except
+//   for copies behind a FROZEN node whose own child is not yet published; a
+//   writer walk that passes them after the publish may get there first, and
+//   a try can lose: see WHY COPY below), so for a while a key that moved to
+//   j exists in BOTH the parent chain (a superseded, FROZEN copy) and bucket
 //   j. Splitting is recursive: a parent that is itself still
 //   UNINITIALIZED is split first, so the bucket tree is filled in on demand.
 //
@@ -166,10 +167,13 @@ inline unsigned thread_number() {
 //   (unlink_run(), push_retired()). Where this happens:
 //   - the split winner's cleanup pass over the parent chain, right after it
 //     publishes the child (the copies it superseded get an unlink attempt
-//     from the split that superseded them, unless a writer walk that passed
-//     them after the publish has bypassed them already, and the pass is lazy
-//     with respect to the doubling, as splitting is; whichever operation won
-//     the split's publish runs it, a contains() included);
+//     from the split that superseded them unless a tagged, not-dead node
+//     stands between them and the pass's last live word, the one exception
+//     under STRAGGLERS; a writer walk that passes them after the publish may
+//     bypass them first, and the pass's attempt then loses or never meets
+//     them. The pass is lazy with respect to the doubling, as splitting is;
+//     whichever operation won the split's publish runs it, a contains()
+//     included);
 //   - erase(), right after its mark (an eager self-unlink: one attempt
 //     through the predecessor it tracked, one restart from the head, then
 //     give up);
@@ -682,15 +686,20 @@ inline unsigned thread_number() {
 //   CAS does not happen-before the call; then it linearizes immediately
 //   after the last such mark CAS. Both points lie inside the call: that mark
 //   CAS happens-before the walk's acquire load of the tombstoned link or of
-//   the rewritten pred word. Both points precede every insert of the key
-//   that the walk did not meet: one key's inserts and marks alternate in
-//   happens-before order (an insert acquires the previous node's mark, or
-//   its bypass, before its publishing CAS: INVARIANT), so an insert the walk
-//   did not meet published after every mark it did meet, and its publishing
-//   CAS does not happen-before the call (half (i)). A tombstone whose mark
-//   happens-before the call belongs to an earlier lineage of the key, whose
-//   insert and deletion both precede the call, and selects nothing; see
-//   contains() and the two halves under STALE GEOMETRY.
+//   the rewritten pred word. Both points are consistent with every insert
+//   of the key that the walk did not meet. One key's inserts and marks
+//   alternate in happens-before order (an insert acquires the previous
+//   node's mark, or its bypass, before its publishing CAS: INVARIANT), so
+//   such an insert either has its node's mark CAS happen-before the chosen
+//   point -- its lineage, insert and deletion, is complete before the miss,
+//   as for a tombstone self-unlinked before the call -- or published after
+//   every mark the walk met, with a publishing CAS that does not
+//   happen-before the call (half (i)). No third case exists: a node
+//   published before the walk's head load is met unless bypassed, and a
+//   bypassed node is found bypassed, so its mark is one the walk met. A
+//   tombstone whose mark happens-before the call belongs to an earlier
+//   lineage of the key, whose insert and deletion both precede the call, and
+//   selects nothing; see contains() and the two halves under STALE GEOMETRY.
 //
 // PROGRESS: this structure is lock-free on the pure read/traverse path, but it
 // is NOT wait-free and not lock-free end to end: contains(), insert() and
@@ -737,8 +746,9 @@ inline unsigned thread_number() {
 //                 cleanup passes and erase()'s self-unlink to the FROZEN
 //                 nodes they meet (to find the node's child bucket: a walk or
 //                 cleanup pass hashes a FROZEN node it passes at most once,
-//                 twice if the node ends a dead run, and not at all when its
-//                 pred is unusable, and the self-unlink adds its own; see
+//                 at most twice if the node ends a dead run, the second hash
+//                 following only a won CAS, and not at all when its pred is
+//                 unusable, and the self-unlink adds its own; see
 //                 PINNED ORDERS, H5', H5 and H6. It is also the place where
 //                 a throwing Hash{} leaves a dead run behind, EXCEPTIONS);
 //                 and by reclaim() and get_internal_accounting() to every

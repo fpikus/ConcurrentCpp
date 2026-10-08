@@ -824,10 +824,6 @@ public:
         // word. A free or limbo node's retire_link is stale and never read.
         std::atomic<word_t> retire_link;
 
-        // Default ctor: an unlinked live node whose successor is EMPTY. Rarely
-        // used -- the arena is filled via the (val, next) ctor below; this
-        // exists only for the container's value-initialization path.
-        Node() : value(), link(EMPTY), retire_link(EMPTY) {}
         Node(const T& val, word_t next) : value(val), link(next), retire_link(EMPTY) {}
     };
     static_assert(alignof(Node) >= 8, "the low three bits of a node address are the link's tag bits");

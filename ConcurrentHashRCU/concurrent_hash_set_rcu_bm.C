@@ -114,6 +114,73 @@
  * of the loop, the mean loop time is shorter than the run, and
  * items_per_second overstates the throughput by more the less evenly the
  * threads progress; the wall rate is the throughput the run delivered.
+ *
+ * Table of contents: every registration, in the order of the file, each run
+ * at the thread counts of ThreadRange(1, num_cpu) (one row per thread count,
+ * all rows of a registration the same workload), with why it is measured. The
+ * details are at each definition; the churn states (Control, Reclaimed,
+ * Erased) are described above the ChurnFixture.
+ *
+ *  Insert_MostlyNew_Concurrent    pure insertion through live doublings and
+ *                                 lazy splits: the growth path of this set.
+ *  Insert_MostlyNew_RWLocked      the same inserts on the baseline: the price
+ *                                 of a writer-exclusive rehash.
+ *  Insert_MostlyNew_Presized_Concurrent
+ *                                 the same inserts into a table that never
+ *                                 doubles: the arena alone, with the doubling
+ *                                 and split path subtracted out.
+ *  Insert_MostlyNew_Presized_RWLocked
+ *                                 the baseline without rehashes: its lock
+ *                                 alone.
+ *  Lookup_MostlyOld_Concurrent    mostly lookups at a fixed hit rate with a
+ *                                 trickle of inserts and no resize: what
+ *                                 readers pay for coexisting with writers.
+ *  Lookup_MostlyOld_RWLocked      the same on the baseline: the RMW every
+ *                                 reader pays to be visible to a rehash.
+ *  Insert_MostlyNew_Del           the growth inserts on an EMPTY AllowDelete
+ *                                 set: against _Concurrent, whether compiling
+ *                                 erase() in costs the insert path anything.
+ *  Insert_MostlyNew_Del_Control   the same on a set prefilled with live keys
+ *                                 and empty free lists: a resident population
+ *                                 with every allocation an append.
+ *  Insert_MostlyNew_Del_Reclaimed the same population reached by churn and
+ *                                 reclaim(): inserts that pop freed slots in a
+ *                                 table the larger prefill grew further --
+ *                                 "churn, then growth", not an allocator cell.
+ *  Insert_MostlyNew_Presized_Del  the pre-sized inserts on an EMPTY
+ *                                 AllowDelete set: erase() compiled in, the
+ *                                 arena alone.
+ *  Insert_MostlyNew_Presized_Del_Control
+ *                                 prefilled, no churn, the same buckets as the
+ *                                 next two: the control for the free lists.
+ *  Insert_MostlyNew_Presized_Del_Reclaimed
+ *                                 churn and reclaim() at fixed geometry: the
+ *                                 free-list pop path and the locality of the
+ *                                 popped slots, the controlled allocator cell.
+ *  Insert_MostlyNew_Presized_Del_Erased
+ *                                 churn without reclaim(): inserts whose scans
+ *                                 walk chains the erases already unlinked
+ *                                 from; what eager unlinking buys a writer.
+ *  Lookup_MostlyOld_Del           the lookup workload on the AllowDelete set:
+ *                                 against _Concurrent, erase() compiled in on
+ *                                 the read path.
+ *  Lookup_MostlyOld_Del_Control   the same prefill through the churn fixture:
+ *                                 a check of the fixture against _Del.
+ *  Lookup_MostlyOld_Del_Reclaimed the misses walk chains reclaim() relinked
+ *                                 and the trickle inserts pop freed slots.
+ *  Lookup_MostlyOld_Del_Erased    the misses walk chains the erases unlinked
+ *                                 from, nothing reclaimed: what eager
+ *                                 unlinking buys a reader.
+ *  Erase_Presized_Del             timed erase() of present keys, disjoint per
+ *                                 thread: what eager unlinking costs the
+ *                                 eraser, and the share of erases that
+ *                                 retired their own node.
+ *  InsertHotGrowth_Concurrent     growth on a few hot chains, split while the
+ *                                 threads still prepend to them: the cleanup
+ *                                 pass's lost CASes and the stragglers they
+ *                                 leave, counted; the throughput is not the
+ *                                 point.
+ *  InsertHotGrowth_Del            the same probe with erase() compiled in.
  */
 
 static const int num_cpu = sysconf(_SC_NPROCESSORS_CONF);
@@ -176,7 +243,7 @@ public:
     // The second parameter mirrors ConcurrentResizableHashSetRCU's arena_shards so
     // the fixtures can construct both containers the same way; it is ignored.
     explicit LockedHashSet(size_t initial_buckets = 1024, size_t /*arena_shards*/ = 0) : set_(initial_buckets) {}
-    // Mirrors the concurrent set's test accessor for the arena_nodes_per_key
+    // Mirrors the concurrent set's diagnostic accessor for the arena_nodes_per_key
     // counter: the baseline has one node per key, so this is the key count.
     size_t get_internal_node_count() const { return set_.size(); }
     bool insert(const T& v) {
@@ -621,7 +688,7 @@ template <typename Cfg> typename Cfg::Set* ChurnFixture<Cfg>::set = nullptr;
 // thread's shard, not to the node's, so the timed erases do not all push onto one
 // retired head.
 // Counter, read by thread 0 after the loop (every thread has left it, so the
-// container's test-only counters are exact there), untimed:
+// container's diagnostic counters are exact there), untimed:
 //   retired_per_erase -- nodes retired during the timed loop per timed erase: 1
 //                        when every erase took its own node out of its chain,
 //                        less by the share left in place under contention (for
@@ -664,7 +731,7 @@ template <typename SetType> size_t EraseFixture<SetType>::retired_before = 0;
 // CAS per dead run loses to a concurrent insert, and where a lost CAS can
 // leave a frozen node in its chain for a later walk or reclaim() to collect.
 // The counters, all read by thread 0 after the loop (the loop's end is a
-// barrier, so the container is quiescent and its test-only accessors are
+// barrier, so the container is quiescent and its diagnostic accessors are
 // exact), untimed, are what a decision to retry the cleanup CAS would rest
 // on; the throughput of this cell is not a headline, its chains are long by
 // construction.
@@ -680,7 +747,7 @@ template <typename SetType> size_t EraseFixture<SetType>::retired_before = 0;
 //   limbo_nodes        -- the subchains of lost publishing CASes.
 //   arena_nodes_per_key, consistent -- as in the insert cells, and the
 //                         accounting sweep's verdict.
-// The test-only counters of this container (hot_growth_counters() below):
+// The diagnostic counters of this container (hot_growth_counters() below):
 //   table_size, splits_published, split_attempts, moved_per_split -- the
 //                         construction: the final bucket count, the splits
 //                         and how many nodes each moved;
@@ -735,7 +802,7 @@ public:
 }; // class HotGrowthFixture
 template <typename SetType> SetType* HotGrowthFixture<SetType>::set = nullptr;
 
-// The counters of InsertHotGrowth that only this container's test-only
+// The counters of InsertHotGrowth that only this container's diagnostic
 // accessors provide (listed above), set on `state` by thread 0 after the loop;
 // `a` is the accounting sweep the body already took, `moved` its moved-node
 // count. Kept apart from the body so that the body is the same for any
@@ -855,7 +922,7 @@ BENCHMARK_TEMPLATE_DEFINE_F(EraseFixture, Erase_Presized_Del, ConcurrentSetDel)(
     }
     state.SetItemsProcessed(state.iterations());
     report_wall(state, records, double(state.iterations())*state.threads());
-    if (state.thread_index() == 0) {   // the container's test-only counter (see the fixture)
+    if (state.thread_index() == 0) {   // the container's diagnostic counter (see the fixture)
         const double erased = double(state.iterations())*state.threads();
         state.counters["retired_per_erase"] = benchmark::Counter(
             double(set->get_internal_counters().retire_nodes - retired_before)/erased);

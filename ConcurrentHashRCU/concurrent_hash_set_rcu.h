@@ -679,27 +679,31 @@ inline unsigned thread_number() {
 //   (the bypassed word, then table_size_), closed by read-read coherence:
 //   the unlinker's READ of the larger size (or, through a release sequence,
 //   an earlier unlinker's) happens-before the reader's reload, so the reload
-//   cannot return an older value, whatever the order of that read. A miss
-//   that is confirmed by an unchanged table_size_ (contains(), erase())
+//   cannot return an older value, whatever the order of that read.
+//   A miss that is confirmed by an unchanged table_size_ (contains(), erase())
 //   linearizes at the table_size_ load that began its final pass, unless the
-//   walk found tombstoned, or found bypassed, a node of the key whose mark
-//   CAS does not happen-before the call; then it linearizes immediately
-//   after the last such mark CAS. Both points lie inside the call: that mark
-//   CAS happens-before the walk's acquire load of the tombstoned link or of
-//   the rewritten pred word. Both points are consistent with every insert
-//   of the key that the walk did not meet. One key's inserts and marks
-//   alternate in happens-before order (an insert acquires the previous
-//   node's mark, or its bypass, before its publishing CAS: INVARIANT), so
-//   such an insert either has its node's mark CAS happen-before the chosen
-//   point -- its lineage, insert and deletion, is complete before the miss,
-//   as for a tombstone self-unlinked before the call -- or published after
-//   every mark the walk met, with a publishing CAS that does not
-//   happen-before the call (half (i)). No third case exists: a node
-//   published before the walk's head load is met unless bypassed, and a
-//   bypassed node is found bypassed, so its mark is one the walk met. A
-//   tombstone whose mark happens-before the call belongs to an earlier
-//   lineage of the key, whose insert and deletion both precede the call, and
-//   selects nothing; see contains() and the two halves under STALE GEOMETRY.
+//   mark CAS of some node of the key happens-before the call's return without
+//   happening-before the call; then it linearizes immediately after the last
+//   such mark CAS. "Last" is defined: the marks of one key's nodes are
+//   ordered by happens-before, since an insert acquires the previous node's
+//   mark, or a word that a bypass of it rewrote, before its publishing CAS
+//   (INVARIANT). The point is inside the call because a selected mark
+//   happens-before the return but not the call. The point is right because
+//   every node of the key published before the call has its mark ordered
+//   before the return: the walk either met it live (a hit, not this case),
+//   met it tombstoned (an acquire of the mark), or did not reach it from the
+//   head value it loaded, which means an unlink CAS cut every path to it;
+//   that unlinker had acquired the node's mark, directly or through earlier
+//   unlinks, and every later write to the cut word is a read-modify-write,
+//   so the walk's acquire load of the word it did read orders the mark
+//   before it (UNREACHABILITY, channel 5). Such a mark either happens-before
+//   the call (an earlier lineage, insert and deletion complete before the
+//   call) or is one the rule selects. At the chosen point, therefore, every
+//   lineage published before the call is deleted, every lineage marked at or
+//   before the last selected mark is complete, and every later insert of the
+//   key published after that mark, with a publishing CAS that does not
+//   happen-before the call (half (i)); the miss is ordered after the former
+//   and before the latter.
 //
 // PROGRESS: this structure is lock-free on the pure read/traverse path, but it
 // is NOT wait-free and not lock-free end to end: contains(), insert() and

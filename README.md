@@ -57,10 +57,10 @@ and documented on their own terms.
 - **[ConcurrentHashRCU](ConcurrentHashRCU/)** — a copy of
   `ConcurrentResizableHashSet` in which dead nodes (tombstones, superseded
   split copies) are bypassed by the concurrent writers themselves, best
-  effort, one CAS per run (an erase tries its own tombstone twice), instead
-  of waiting in their chains for `reclaim()`; a lookup's own walk still
-  writes nothing, and memory is still reused only by `reclaim()`. The first
-  step toward reclaiming it by generations.
+  effort, one CAS per run (an erase tries its own tombstone at most twice),
+  instead of waiting in their chains for `reclaim()`; a lookup's own walk
+  still writes nothing, and memory still becomes reusable only through
+  `reclaim()`. The first step toward reclaiming it by generations.
 
 ## Building
 

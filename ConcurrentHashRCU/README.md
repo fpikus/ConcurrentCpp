@@ -3,11 +3,28 @@
 A copy of `ConcurrentResizableHashSet` (see `../ConcurrentHash`) with one
 change: a node that goes dead — the tombstone `erase()` leaves, or the parent
 copy a lazy split superseded — is taken out of its chain by the concurrent
-operations themselves, instead of waiting in it for `reclaim()`. Everything
-else is the original's: the append-only sharded arena, the lazy copying split,
-lock-free lookups, inserts that publish with one CAS, and `reclaim()` at a
-quiescent point. Read the original's README first; this one says only what is
-different, and why.
+operations themselves, best effort, instead of waiting in it for `reclaim()`.
+Everything else is the original's: the append-only sharded arena, the lazy
+copying split, inserts that publish with one CAS, `reclaim()` at a quiescent
+point, and operations that are lock-free except where they allocate: the
+hash's own protocol (walks, splits, unlinks, the publishing CAS) takes no
+lock; a node comes from the arena shard's free list without a lock, or from an
+append under that shard's spinlock (a lookup can get there too, by splitting a
+bucket it meets uninitialized); and the insert that crosses the doubling
+threshold grows the bucket array under the table's resize lock, after its own
+key is published, while another insert that has also crossed a doubling
+threshold waits for it. Read the original's README first; this one says only
+what is different, and why.
+
+The requirements on `T` and `Hash` are the original's, spelled out here in one
+place: `Hash` must be default-constructible and callable on a `const T&`,
+returning the same value for a key every call, and since it is
+default-constructed wherever a hash is needed and never stored, a `Hash` with
+state only ever has its default state; `T` must be copy-constructible and
+copy-assignable (every node holds a copy of its key, and a node reused after
+`reclaim()` takes its new value by assignment) and comparable as
+`value == key`, a stored `T` against a `const T&`, consistently with `Hash`:
+keys that compare equal must hash equal.
 
 ## Why
 
@@ -19,11 +36,11 @@ for one. The road to reclaiming memory *without* stopping the world — by
 epochs, generations, RCU, whatever you call it — begins by splitting "dead" in
 two. A dead node still in its chain can be reached by any operation that starts
 later, so nobody can ever say who might be looking at it. A dead node out of
-its chain can be held only by an operation that started before it left, and it
-can be freed once every such operation has finished. This copy manufactures
-the second kind. The bookkeeping that would act on it — handles, generations,
-reclamation that runs alongside the readers — is not here yet. This is step
-one.
+its chain can be held only by an operation that did not start after it left,
+in happens-before order, and it can be freed once every such operation has
+finished, in the same order. This copy manufactures the second kind. The
+bookkeeping that would act on it — handles, generations, reclamation that runs
+alongside the readers — is not here yet. This is step one.
 
 ## What differs
 
@@ -43,16 +60,18 @@ published still answers for its key, and no walk bypasses it). Dead nodes
 leave their chains here:
 
 - The split's winner, right after it publishes the child bucket, makes one
-  pass over the parent chain and removes the copies it has just superseded,
-  along with any other dead node it passes. The pass is lazy with respect to
-  the doubling, as splitting is, and it belongs to whichever operation won
-  the split.
-- `erase()` removes its own tombstone at once: one attempt through the
+  pass over the parent chain and tries to remove the copies it has just
+  superseded, along with any other dead node it passes — except those behind
+  a frozen node the pass cannot yet decide (its own child unpublished, or
+  published for a doubling the pass has not seen), which it cannot touch
+  (stragglers, below). The pass is lazy with respect to the doubling, as
+  splitting is, and it belongs to whichever operation won the split.
+- `erase()` tries to remove its own tombstone at once: one attempt through the
   predecessor it tracked on the way in, one restart from the head, then it
   gives up.
-- The walks of `insert()` and `erase()` bypass every dead run they pass behind
-  a live word. A hit stops a walk at its key, so only a miss walks a whole
-  chain.
+- The walks of `insert()` and `erase()` try to bypass every dead run they pass
+  behind a live word. A hit stops a walk at its key, so only a miss walks a
+  whole chain.
 - `contains()`'s own walk never writes; a lookup pays for none of this. The
   one way a lookup unlinks anything is by winning a split, in which case it
   runs that split's cleanup pass like any other splitter — just as, in the
@@ -66,27 +85,37 @@ word, and this one moves on. When that step was a peer bypassing the same run,
 nothing is left behind. Otherwise — a node was prepended, the bucket was
 sealed for the next doubling, the predecessor was itself tagged, a peer
 bypassed a run of a different extent — the dead nodes stay reachable for a
-while: a *straggler*. Stragglers also come from a walker whose view of the
-table size is too stale to decide a frozen node, from a split stalled or
-thrown between freezing a node and publishing its copy, and from a few
-exception paths where `Hash{}` throws in the middle of an unlink. A straggler
-is collected by the next writer walk that passes it, by the next split of any
-child of its bucket (that pass walks the whole parent chain), or by
-`reclaim()`, which still walks every chain and collects everything.
+while: a *straggler*. Stragglers also come from a walker or a cleanup pass
+whose view of the table size is too stale to decide a frozen node, from a
+split stalled or thrown between freezing a node and publishing its copy, and
+from a few exception paths where `Hash{}` throws in the middle of an unlink. A
+straggler gets another attempt from the next writer walk that passes it and
+from the next split of any child of its bucket (that pass walks the whole
+parent chain), and `reclaim()`, which still walks every chain, collects
+everything. The exception is a straggler behind a frozen node whose child is
+not yet published: that node is not dead, so no walk bypasses it, and its
+link, the word in front of the straggler, is written by no concurrent
+operation; the straggler stays through any number of walks, splits and
+doublings, until the node's child is published (from then on the cleanup pass
+of the split that published it, or any writer walk that passes the node, can
+take the node and the straggler out together) or until `reclaim()`.
 
-What no concurrent operation does, in this step, is reuse memory. An unlinked
-node goes onto a per-shard *retired* list and waits there, as a tombstone waits
-in the original, for `reclaim()` at a quiescent point. Retirement changes when
-a dead node stops being walked, not when its memory comes back.
+What no concurrent operation does, in this step, is make memory reusable:
+inserts and splits do take nodes off the free lists, but only `reclaim()` puts
+nodes on them. An unlinked node goes onto a per-shard *retired* list and waits
+there, as a tombstone waits in the original, for `reclaim()` at a quiescent
+point. Retirement changes when a dead node stops being walked, not when its
+memory comes back.
 
-What the class does promise, it promises for an uncontended call — one during
-which nothing else runs on the set, and which returns normally. Then: a split's
-cleanup leaves no dead node reachable in the parent chain behind an untagged
-word (the bucket head or a live node's link); an `insert()` or `erase()` walk
-leaves no dead run reachable behind the head or any live node it passed; an
-`erase()` leaves its tombstone unreachable, unless a frozen node whose child is
-not yet published stands between the tombstone and the last live word before
-it, which, uncontended, only an earlier split that threw can leave behind.
+What the class does promise about removal, it promises for an uncontended
+call — one that every other call on the set happens-before or happens-after,
+and which returns normally. Then: a split's cleanup leaves no dead node
+reachable in the parent chain behind an untagged word (the bucket head or a
+live node's link); an `insert()` or `erase()` walk leaves no dead run
+reachable behind the head or any live node it passed; an `erase()` leaves its
+tombstone unreachable, unless a frozen node whose child is not yet published
+stands between the tombstone and the last live word before it, which,
+uncontended, only an earlier split that threw can leave behind.
 
 What it costs, in kind (what it costs in numbers, per type of workload, is
 under [Performance](#performance)):
@@ -99,9 +128,9 @@ under [Performance](#performance)):
 - every split copy freezes its parent node, for both values of `AllowDelete`
   (the original compiles the freeze out of the delete-free instantiation),
   because removing a run depends on every dead node in it being tagged;
-- a writer walk re-hashes the frozen nodes it passes (once each; twice for
-  one that ends a run), to find the child bucket that decides whether the
-  node is dead; a lookup does not.
+- a writer walk re-hashes the frozen nodes it passes (at most once each; at
+  most twice for one that ends a run), to find the child bucket that decides
+  whether the node is dead; a lookup's own walk does not.
 
 ## What is not here yet
 
@@ -112,10 +141,11 @@ Possible next steps, none of them started and none of them promised:
   old enough to have seen it is alive.
 - Reclamation alongside the readers. The drain that returns retired nodes to
   the free lists needs less than quiescence (it must start after every
-  operation that could still hold a retired node has finished, and operations
-  ordered after its start may run while it drains, since nothing they can
-  reach is on its lists), but the free lists would then take pushes while
-  inserts pop from them, which today they do not have to.
+  operation that could still hold a retired node has finished, in
+  happens-before order, and operations ordered after its start may run while
+  it drains, since nothing they can reach is on its lists), but the free lists
+  would then take pushes while inserts pop from them, which today they do not
+  have to.
 - A `contains()` that also bypasses the dead runs it passes. It would make
   every reader a writer, which is why it was not done here; whether it pays
   is a measurement, and this version is the baseline it would be measured

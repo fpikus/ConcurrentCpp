@@ -850,11 +850,13 @@ private:
 public:
     // Initializes the hash set with the given capacity, rounded up to the
     // nearest power of two (minimum 4, since the bucket mask math assumes a
-    // power-of-two table of at least a few slots). Every initial bucket starts
-    // EMPTY (not UNINITIALIZED) at seal level 0: the original buckets have no
-    // parent to split from. table_size_ is released LAST so that any thread
-    // which later acquires it is guaranteed to see the fully initialized bucket
-    // array.
+    // power-of-two table of at least a few slots). A capacity above 2^63 is a
+    // caller's bug: std::bit_ceil() of it has no representable result, so the
+    // constructor calls std::abort(), in every build, before rounding. Every
+    // initial bucket starts EMPTY (not UNINITIALIZED) at seal level 0: the
+    // original buckets have no parent to split from. table_size_ is released
+    // LAST so that any thread which later acquires it is guaranteed to see the
+    // fully initialized bucket array.
     //
     // arena_shards: number of arena shards, rounded up to a power of two;
     // 0 (the default) means the hardware concurrency, rounded up. As many
@@ -872,6 +874,7 @@ public:
         shards_ = std::make_unique<Shard[]>(arena_shards);
         arena_mask_ = arena_shards - 1;
         if (initial_capacity < 4) initial_capacity = 4;
+        if (initial_capacity > (size_t{1} << 63)) std::abort();   // a caller's bug: bit_ceil() cannot represent the result
         initial_capacity = std::bit_ceil(initial_capacity);
         buckets_.resize(initial_capacity);
         for (size_t i = 0; i < initial_capacity; ++i) {

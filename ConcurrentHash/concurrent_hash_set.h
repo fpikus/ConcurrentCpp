@@ -30,7 +30,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
-#include <type_traits>
 #include <bit>
 #include <vector>
 #include <memory>
@@ -38,8 +37,6 @@
 #include <thread>
 #include <mutex>
 #include "spinlock.h"
-
-struct empty_struct {};
 
 namespace concurrent_hash_detail {
 // Process-wide sequential thread numbering, shared by every instantiation of
@@ -54,9 +51,6 @@ inline unsigned thread_number() {
     return number;
 }
 } // namespace concurrent_hash_detail
-
-template <typename T, typename... Args>
-using DefaultConcurrentDeque = ConcurrentAppendDeque<T, 1024>;
 
 // ===========================================================================
 // ConcurrentResizableHashSet -- design overview (read this before the code).
@@ -392,14 +386,11 @@ using DefaultConcurrentDeque = ConcurrentAppendDeque<T, 1024>;
 //                 no-ops and every chain is append-only.
 //   Hash        : hash functor; must return the SAME hash for a key every call
 //                 (the split math re-hashes keys under wider masks).
-//   Container   : the append-only, address-stable arena template: elements
-//                 never move once constructed (see channel 3).
 // ===========================================================================
 template <
     typename T,
     bool AllowDelete = false,
-    typename Hash = std::hash<T>,
-    template <typename, typename...> class Container = DefaultConcurrentDeque
+    typename Hash = std::hash<T>
 >
 class ConcurrentResizableHashSet {
 private:
@@ -456,6 +447,14 @@ private:
     // Largest arena shard count the constructor accepts (a power of two); more
     // shards than this serve no thread count that exists.
     static constexpr size_t MAX_ARENA_SHARDS = size_t{1} << 16;
+    // Elements per block of both deques, buckets_ and every Shard::nodes.
+    // Larger blocks allocate less often (one block allocation, under the
+    // deque's lock, per ARENA_BLOCK elements; the deque also reallocates its
+    // block directory under that lock, a number of times logarithmic in the
+    // block count); smaller ones leave less memory unused, since a deque's
+    // storage comes in whole blocks: buckets_ is rounded up to whole blocks,
+    // and every shard a thread has allocated from holds at least one.
+    static constexpr size_t ARENA_BLOCK = 1024;
     static_assert(PTR_MASK == 0x03FFFFFFFFFFFFF8, "bit diagram above and the masks disagree");
     static_assert(std::atomic<word_t>::is_always_lock_free, "head and link words must be lock-free atomics");
 
@@ -506,10 +505,6 @@ public:
         // the same word is the list's next pointer (a bare address).
         std::atomic<word_t> link;
 
-        // Default ctor: an unlinked live node whose successor is EMPTY. Rarely
-        // used -- the arena is filled via the (val, next) ctor below; this
-        // exists only for the container's value-initialization path.
-        Node() : value(), link(EMPTY) {}
         Node(const T& val, word_t next) : value(val), link(next) {}
     }; // struct Node
     static_assert(alignof(Node) >= 8, "the low three bits of a node address are the link's tag bits");
@@ -518,7 +513,7 @@ private:
     // The dynamically resizable array of atomic bucket heads.
     // Each entry holds the address of the first node in the bucket's chain,
     // plus the bucket's seal level (see the word encoding).
-    Container<std::atomic<word_t>> buckets_;
+    ConcurrentAppendDeque<std::atomic<word_t>, ARENA_BLOCK> buckets_;
 
     // One arena shard: the append-only node deque and the heads of the shard's
     // free and limbo lists (see RECLAMATION in the class overview). The two
@@ -532,7 +527,7 @@ private:
     struct Shard {
         // Nodes are appended block-by-block and never destructed until the set
         // is destroyed; a slot's address is stable for the life of the set.
-        Container<Node> nodes;
+        ConcurrentAppendDeque<Node, ARENA_BLOCK> nodes;
         // Free list: the encoded top node address and pop counter (see the
         // FREE-LIST HEAD encoding). Popped by alloc_node() with a relaxed CAS;
         // pushed and reset by reclaim() only.
@@ -1396,7 +1391,7 @@ public:
         std::vector<word_t> slots;
         slots.reserve(get_internal_node_count());
         for (size_t s = 0; s <= arena_mask_; ++s) {
-            const Container<Node>& nodes = shards_[s].nodes;
+            const ConcurrentAppendDeque<Node, ARENA_BLOCK>& nodes = shards_[s].nodes;
             for (size_t i = 0, n = nodes.size(); i < n; ++i) slots.push_back(word_of(&nodes[i]));
         }
         std::sort(slots.begin(), slots.end());

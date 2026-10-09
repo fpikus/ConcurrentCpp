@@ -63,8 +63,10 @@
 //      test treats a straggler as a defect.
 // Anything weaker than 1-4 (a "best effort" boolean, an under-counting insert)
 // is a defect, not a documented relaxation -- see the header's "STALE GEOMETRY"
-// section, which states 1 and 2 verbatim. The stragglers of 5 are the one
-// documented relaxation, and they concern memory, never membership.
+// section, which states 1 and 2 with one caveat: a call that exits by an
+// exception after the CAS that made its transition does not return true
+// (see EXCEPTIONS there). The stragglers of 5 are the one documented
+// relaxation, and they concern memory, never membership.
 // ===========================================================================
 #include "concurrent_hash_set_rcu.h"
 #include <gtest/gtest.h>
@@ -338,7 +340,7 @@ TEST(ConcurrentHashSetRcuTest, BasicOperations) {
     EXPECT_TRUE(set.contains(1));
     EXPECT_TRUE(set.contains(2));
     EXPECT_FALSE(set.contains(3));
-}
+} // BasicOperations
 
 // The arena_shards constructor parameter: rounded up to a power of two, 0 means
 // the hardware concurrency. A set works with any shard count, including one
@@ -487,7 +489,7 @@ TEST(ConcurrentHashSetRcuTest, CollisionHeavyChains) {
     for (int i = 0; i < N; ++i) EXPECT_TRUE(set.insert(i));
     for (int i = 0; i < N; ++i) EXPECT_TRUE(set.contains(i));
     EXPECT_FALSE(set.contains(N + 1));
-}
+} // CollisionHeavyChains
 
 // Non-trivial key type to confirm the container is not hard-wired to integers.
 TEST(ConcurrentHashSetRcuTest, StringKeys) {

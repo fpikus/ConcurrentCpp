@@ -26,7 +26,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <unistd.h>
-#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -254,7 +253,7 @@ public:
         std::shared_lock lock(mtx_);              // <-- the RMW every reader pays
         return set_.find(v) != set_.end();
     }
-};
+}; // class LockedHashSet
 
 using ConcurrentSet = ConcurrentResizableHashSetRCU<int, false, std::hash<int>>;
 using LockedSet     = LockedHashSet<int, std::hash<int>>;
@@ -279,7 +278,7 @@ public:
     void TearDown(const ::benchmark::State& state) override {
         if (state.thread_index() == 0) { delete set; set = nullptr; }
     }
-};
+}; // class MostlyNewFixture
 template <typename SetType> SetType* MostlyNewFixture<SetType>::set = nullptr;
 
 // The same insert workload into a table constructed with kPresizedBuckets
@@ -301,7 +300,7 @@ public:
     void TearDown(const ::benchmark::State& state) override {
         if (state.thread_index() == 0) { delete set; set = nullptr; }
     }
-};
+}; // class MostlyNewPresizedFixture
 template <typename SetType> SetType* MostlyNewPresizedFixture<SetType>::set = nullptr;
 
 template <typename SetType>
@@ -330,14 +329,14 @@ public:
              * Resize behavior under load is a tail-latency story and gets
              * its own benchmark; it has no business inside a mean.
              */
-            set = new SetType(2 * kPrefill, arena_shards_from_env());
+            set = new SetType(2*kPrefill, arena_shards_from_env());
             for (int k = 0; k < kPrefill; ++k) set->insert(mix(k));   // untimed
         }
     }
     void TearDown(const ::benchmark::State& state) override {
         if (state.thread_index() == 0) { delete set; set = nullptr; }
     }
-};
+}; // class MostlyOldFixture
 template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
 
 // ---------------------------------------------------------------------------
@@ -365,7 +364,7 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
     BENCHMARK_TEMPLATE_DEFINE_F(FIXTURE, NAME, SET_TYPE)                      \
     (benchmark::State& state) {                                               \
         static constinit WallRecords records;                                 \
-        const int base = state.thread_index() * kKeyStride;                   \
+        const int base = state.thread_index()*kKeyStride;                     \
         int next = 0;                                                         \
         int64_t ok = 0;                                                       \
         records.allocate(state);                                              \
@@ -378,7 +377,7 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
         }                                                                     \
         state.SetItemsProcessed(state.iterations());                          \
         report_wall(state, records,                                           \
-                    double(state.iterations()) * state.threads());            \
+                    double(state.iterations())*state.threads());              \
         /* Arena nodes per inserted key, read by thread 0 once every thread */ \
         /* has left the loop (its end is a barrier): 1.0 means no waste;    */ \
         /* above it are split copies and subchains abandoned by splitters   */ \
@@ -386,8 +385,8 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
         /* cooperative splits get as the thread count grows.                */ \
         if (state.thread_index() == 0) {                                      \
             state.counters["arena_nodes_per_key"] = benchmark::Counter(       \
-                double(set->get_internal_node_count()) /                      \
-                (double(state.iterations()) * state.threads()));              \
+                double(set->get_internal_node_count())/                       \
+                (double(state.iterations())*state.threads()));                \
         }                                                                     \
         records.release(state);                                               \
     }                                                                         \
@@ -405,8 +404,8 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
     BENCHMARK_TEMPLATE_DEFINE_F(FIXTURE, NAME, SET_TYPE)                      \
     (benchmark::State& state) {                                               \
         static constinit WallRecords records;                                 \
-        XorShift32 rng(0x1234567u + 0x9e3779b9u * state.thread_index());      \
-        const int base = kNewBase + state.thread_index() * kKeyStride;        \
+        XorShift32 rng(0x1234567u + 0x9e3779b9u*state.thread_index());        \
+        const int base = kNewBase + state.thread_index()*kKeyStride;          \
         int next = 0;                                                         \
         int op = 0;                                                           \
         int64_t ok = 0, tries = 0;                                            \
@@ -428,7 +427,7 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
         }                                                                     \
         state.SetItemsProcessed(state.iterations());                          \
         report_wall(state, records,                                           \
-                    double(state.iterations()) * state.threads());            \
+                    double(state.iterations())*state.threads());              \
         state.counters["inserts"] =                                           \
             benchmark::Counter((double)tries, benchmark::Counter::kDefaults); \
         records.release(state);                                               \

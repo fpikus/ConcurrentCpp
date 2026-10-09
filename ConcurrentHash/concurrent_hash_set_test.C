@@ -44,7 +44,9 @@
 //      section and the contract on reclaim().
 // Anything weaker than this (a "best effort" boolean, an under-counting insert)
 // is a defect, not a documented relaxation -- see the header's "STALE GEOMETRY"
-// section, which states 1 and 2 verbatim.
+// section, which states 1 and 2 with one caveat: a call that exits by an
+// exception after the CAS that made its transition does not return true
+// (see EXCEPTIONS there).
 // ===========================================================================
 #include "concurrent_hash_set.h"
 #include <gtest/gtest.h>
@@ -173,9 +175,10 @@ static void run_threads(int T, F fn) {
 } // run_threads()
 
 // ---------------------------------------------------------------------------
-// Reclamation helpers. All of them call the test-only sweeps, so all of them
-// share reclaim()'s precondition: call them only at a quiescent point (every
-// worker joined).
+// Reclamation helpers. expect_consistent() and reclaim_and_check() call the
+// header's accounting sweep, get_internal_accounting(), a diagnostic valid only
+// at a quiescent point, so these helpers share reclaim()'s precondition: call
+// them only at a quiescent point (every worker joined).
 // ---------------------------------------------------------------------------
 
 // Accounting sweep: every arena slot must be reachable from a published bucket,
@@ -246,7 +249,7 @@ TEST(ConcurrentHashSetTest, BasicOperations) {
     EXPECT_TRUE(set.contains(1));
     EXPECT_TRUE(set.contains(2));
     EXPECT_FALSE(set.contains(3));
-}
+} // BasicOperations
 
 // The arena_shards constructor parameter: rounded up to a power of two, 0 means
 // the hardware concurrency. A set works with any shard count, including one
@@ -395,7 +398,7 @@ TEST(ConcurrentHashSetTest, CollisionHeavyChains) {
     for (int i = 0; i < N; ++i) EXPECT_TRUE(set.insert(i));
     for (int i = 0; i < N; ++i) EXPECT_TRUE(set.contains(i));
     EXPECT_FALSE(set.contains(N + 1));
-}
+} // CollisionHeavyChains
 
 // Non-trivial key type to confirm the container is not hard-wired to integers.
 TEST(ConcurrentHashSetTest, StringKeys) {
@@ -1253,7 +1256,8 @@ TEST(ConcurrentHashSetTest, ThreadPrivateKeySequenceDuringGrowth) {
 // alloc_node(), and the per-shard limbo lists. Contract clause 4 at the top of
 // this file; the header's RECLAMATION section and the contract on reclaim().
 //
-// Every call to reclaim() and to the test-only sweeps below happens after
+// Every call to reclaim() and to the quiescent-only diagnostics below (the
+// accounting sweep and the free and limbo counts derived from it) happens after
 // run_threads() has joined its workers (or on the only thread there is), which
 // is the quiescence the contract requires. Oracles are the contract's: the key
 // count the test itself knows, the accounting identity (every slot in exactly one

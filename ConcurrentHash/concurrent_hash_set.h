@@ -511,7 +511,7 @@ public:
         // exists only for the container's value-initialization path.
         Node() : value(), link(EMPTY) {}
         Node(const T& val, word_t next) : value(val), link(next) {}
-    };
+    }; // struct Node
     static_assert(alignof(Node) >= 8, "the low three bits of a node address are the link's tag bits");
 
 private:
@@ -755,7 +755,7 @@ private:
             // The parent is published now and a published head never returns to
             // UNINITIALIZED, so the seal below never seals an unsplit bucket.
             parent_head = buckets_[parent].load(std::memory_order_acquire);
-        }
+        } // if the parent is not split yet
 
         // Step 1, SEAL. Raise the parent's level to that of table size 2N unless
         // it is already there (another splitter of j, or a split of a later
@@ -817,7 +817,7 @@ private:
                             Node* copy = alloc_node(val, new_subchain_head);
                             if (new_subchain_tail == nullptr) new_subchain_tail = copy;
                             new_subchain_head = word_of(copy);
-                        }
+                        } // if still live: copy it
                     } // if key belongs to bucket j
                 } // if not tombstoned
                 curr = next_raw;
@@ -881,7 +881,7 @@ public:
             buckets_[i].store(EMPTY, std::memory_order_relaxed);
         }
         table_size_.store(initial_capacity, std::memory_order_release);
-    }
+    } // ConcurrentResizableHashSet()
 
     // Membership test. Lock-free on the fast path (a plain chain walk with no
     // atomic writes); it can, however, fall into split_bucket() -- which
@@ -942,7 +942,7 @@ public:
                 return false;   // table stable: a miss is authoritative
             }
             ts = new_ts;        // table grew under us: retry in new geometry
-        }
+        } // retry loop
     } // contains()
 
     // Insertion. Returns true iff THIS call made the key a member: exactly one
@@ -976,7 +976,7 @@ public:
                 word_t head = buckets_[j].load(std::memory_order_acquire);
                 if (addr_of(head) == UNINITIALIZED) {
                     split_bucket(j);
-                    continue; // Retry after split (re-read head, which is now published)
+                    continue;   // Retry after split (re-read head, which is now published)
                 }
                 // GEOMETRY CHECK. A seal level above ours means a child split for a
                 // larger table has snapshotted (or is about to snapshot) this chain:
@@ -1309,7 +1309,7 @@ public:
         for (size_t s = 0; s <= arena_mask_; ++s) {   // step 1: clear the pop counters
             Shard& shard = shards_[s];
             shard.free_head.store(free_word(free_addr_of(shard.free_head.load(std::memory_order_relaxed)), 0), std::memory_order_relaxed);
-        }
+        } // for each shard's pop counter
         for (size_t s = 0; s <= arena_mask_; ++s) {   // step 2: limbo lists
             Shard& shard = shards_[s];
             word_t curr = shard.limbo_head.load(std::memory_order_relaxed);
@@ -1359,7 +1359,7 @@ public:
         size_t n = 0;
         for (size_t i = 0; i <= arena_mask_; ++i) n += shards_[i].nodes.size();
         return n;
-    }
+    } // get_internal_node_count()
     // Test-only accessor: the number of arena shards (a power of two).
     size_t get_internal_arena_shards() const { return arena_mask_ + 1; }
     // Test-only accessors: the number of nodes on all free lists / on all

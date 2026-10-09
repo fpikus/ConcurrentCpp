@@ -65,8 +65,9 @@
 // is a defect, not a documented relaxation -- see the header's "STALE GEOMETRY"
 // section, which states 1 and 2 with one caveat: a call that exits by an
 // exception after the CAS that made its transition does not return true
-// (see EXCEPTIONS there). The stragglers of 5 are the one documented
-// relaxation, and they concern memory, never membership.
+// (see EXCEPTIONS there). Besides that caveat, which concerns a call that does
+// not return, the stragglers of 5 are the one documented relaxation, and they
+// concern memory, never membership.
 // ===========================================================================
 #include "concurrent_hash_set_rcu.h"
 #include <gtest/gtest.h>
@@ -374,11 +375,11 @@ TEST(ConcurrentHashSetRcuTest, ArenaShardsParameter) {
 
 // A capacity above 2^63 aborts the constructor, in every build: std::bit_ceil()
 // has no representable result for it. The death is SIGABRT from std::abort()
-// itself, with nothing on stderr; an exception (bad_alloc or length_error from
-// an attempted resize) or any other signal fails the test. The empty stderr is
-// what tells the constructor's check from libstdc++'s own: libstdc++ 15 and
-// later enable _GLIBCXX_ASSERTIONS in an unoptimized build (these tests are
-// -O0), and std::bit_ceil() then prints an assertion message before it aborts.
+// itself, with nothing on stderr; an exception, a normal return or any other
+// signal fails the test. The empty stderr is what tells the constructor's
+// check from libstdc++'s own: libstdc++ 15 and later enable
+// _GLIBCXX_ASSERTIONS in an unoptimized build (these tests are -O0), and
+// std::bit_ceil() then prints an assertion message before it aborts.
 // Both arguments exceed 2^63; 2^63 itself is valid and would ask for 2^63
 // buckets, so the boundary is not tested from below. The suite name ends in
 // DeathTest, as GoogleTest asks, so the suite runs before every other; the

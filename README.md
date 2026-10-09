@@ -20,11 +20,13 @@ and may continue to evolve past the version printed in the book.
   fixed-capacity MPMC ring-buffer queue with two isolated spinlock domains
   and a lock-free producer–consumer handoff.
 - **[ConcurrentHash](ConcurrentHash/)** — `ConcurrentResizableHashSet`, a
-  chained hash set with lock-free lookups and live resizing (inserts publish
-  with one CAS, and append a new node under a spinlock unless `reclaim()` left
-  one on a free list), built on three refusals: never free, never relink,
-  never unlink (the one exception, `reclaim()`, runs when the caller has
-  quiesced the set).
+  chained hash set with live resizing, lock-free except where it allocates:
+  a lookup's walk writes nothing and an insert publishes with one CAS, while
+  a new node, whether an insert's or a copy made by a lazy split (which a
+  lookup can run too), is appended under a spinlock unless `reclaim()` left
+  one on a free list, and the bucket array grows under a resize lock. It is
+  built on three refusals: never free, never relink, never unlink (the one
+  exception, `reclaim()`, runs when the caller has quiesced the set).
 - **[LockFreeList](LockFreeList/)** — a Harris-style lock-free singly-linked
   list that reclaims memory for real, with never-invalidated iterators,
   parameterized over four atomic shared pointer implementations.

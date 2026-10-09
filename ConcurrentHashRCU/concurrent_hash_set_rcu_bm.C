@@ -64,18 +64,20 @@
  *    semantics under concurrent resize (the seal on the bucket head).
  *
  *  - Lookup_MostlyOld: the table is pre-populated with PREFILL keys (untimed)
- *    at full capacity, so that no resize can occur during the timed region in
- *    either container (see the caution in MostlyOldFixture::SetUp). The
+ *    at full capacity, so that no resize occurs during the timed region in
+ *    either container up to the thread counts the table of contents gives
+ *    (see also the caution in MostlyOldFixture::SetUp). The
  *    steady-state workload is 99% contains() with a ~50% hit rate (the
  *    lookup range is exactly twice the prefilled range, so misses exercise the
  *    negative-result revalidation path, which an all-hits workload never
  *    touches), and 1% insertion of brand-new keys on a deterministic schedule
  *    (every 100th operation), drawn from thread-disjoint ranges *above* the
  *    lookup range so the hit rate stays fixed for the whole run. The insert
- *    budget stays a factor of ~3 below the resize trigger. This benchmark
- *    measures what readers pay for coexisting with writers when nothing
- *    "happens"; what readers pay when a resize DOES happen is a tail-latency
- *    question and needs a tail-latency benchmark, not a mean.
+ *    budget stays below either container's resize trigger up to the thread
+ *    counts the table of contents gives. This benchmark measures what readers
+ *    pay for coexisting with writers when nothing "happens"; what readers pay
+ *    when a resize DOES happen is a tail-latency question and needs a
+ *    tail-latency benchmark, not a mean.
  *
  * The baseline, LockedHashSet, is std::unordered_set behind a
  * std::shared_mutex: shared_lock for readers, unique_lock for writers. This
@@ -118,19 +120,28 @@
  * at the thread counts of ThreadRange(1, num_cpu) (one row per thread count,
  * all rows of a registration the same workload), with why it is measured. The
  * details are at each definition; the churn states (Control, Reclaimed,
- * Erased) are described above the ChurnFixture.
+ * Erased) are described above the ChurnFixture. A bucket count chosen so that
+ * a table does not resize holds only up to some thread count: the pre-sized
+ * concurrent table doubles once its arena holds about 2*kPresizedBuckets
+ * nodes (64 threads' worth of timed inserts, fewer after a prefill); the
+ * lookup table once it holds about 4*kPrefill, which no thread count up to
+ * 256 reaches except in the Erased cell, whose arena keeps the erased
+ * victims' slots (2*kPrefill in all after the prefill), so its table doubles
+ * past about 200 threads. A baseline std::unordered_set rehashes once it
+ * holds more keys than buckets: never at 32 threads or fewer in the
+ * pre-sized cell, 100 or fewer in the lookup cell.
  *
  *  Insert_MostlyNew_Concurrent    pure insertion through live doublings and
  *                                 lazy splits: the growth path of this set.
  *  Insert_MostlyNew_RWLocked      the same inserts on the baseline: the price
  *                                 of a writer-exclusive rehash.
  *  Insert_MostlyNew_Presized_Concurrent
- *                                 the same inserts into a table that never
- *                                 doubles: the arena alone, with the doubling
- *                                 and split path subtracted out.
+ *                                 the same inserts into a pre-sized table: the
+ *                                 arena alone, with the doubling and split
+ *                                 path subtracted out.
  *  Insert_MostlyNew_Presized_RWLocked
- *                                 the baseline without rehashes: its lock
- *                                 alone.
+ *                                 the baseline pre-sized the same way: its
+ *                                 lock alone.
  *  Lookup_MostlyOld_Concurrent    mostly lookups at a fixed hit rate with a
  *                                 trickle of inserts and no resize: what
  *                                 readers pay for coexisting with writers.
@@ -322,10 +333,13 @@ public:
              * nominally lock-free lookup benchmark degenerates into a
              * spinlock convoy (wall time grows with threads while CPU
              * stays flat).
-             * Constructing at 2*kPrefill means the table never doubles:
-             * every bucket is born EMPTY, no split ever exists, no stale
-             * copies inflate the chains. The unordered_set baseline gets the
-             * same courtesy (2*kPrefill buckets, so no rehash either).
+             * Constructing at 2*kPrefill means the table does not double,
+             * up to the thread count the table of contents (at the top of
+             * this file) gives: every bucket is born EMPTY, no split ever
+             * exists, no stale copies inflate the chains. The unordered_set
+             * baseline gets the same courtesy (2*kPrefill buckets, so no
+             * rehash either, up to the thread count the table of contents
+             * gives for it).
              * Resize behavior under load is a tail-latency story and gets
              * its own benchmark; it has no business inside a mean.
              */
@@ -524,7 +538,7 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
 //     large, run the Del benchmarks again with HASH_ARENA_SHARDS=16 to get the
 //     half-and-half regime.
 //   lookup fixture: kPrefill = 2^20 victims over S shards, against
-//     kOldIters/kInsertEvery = 10486 inserts per thread: all pops for S <= 64,
+//     kOldIters/kInsertEvery = 10485 inserts per thread: all pops for S <= 64,
 //     8192 pops then appends at S = 128, 4096 at S = 256.
 // The fixture prints one line per configuration and process, before the first
 // row that uses it, with the free-list total it measured (see report_prep()).
@@ -936,7 +950,8 @@ BENCHMARK_REGISTER_F(EraseFixture, Erase_Presized_Del)
 DEFINE_HOT_GROWTH(InsertHotGrowth_Concurrent, ConcurrentSet)
 DEFINE_HOT_GROWTH(InsertHotGrowth_Del,        ConcurrentSetDel)
 
-// Same start-up as BENCHMARK_MAIN(), including its re-exec without ASLR, plus
+// BENCHMARK_MAIN()'s start-up, including its re-exec without ASLR, less its
+// guard against a null argv (argv is never null in a hosted program), plus
 // the identification every output carries (the console header and the JSON
 // "context"): the container this binary measures, the size of its Node (the
 // node layout is part of what is measured), and the compiler.

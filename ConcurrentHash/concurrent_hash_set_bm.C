@@ -62,18 +62,20 @@
  *    semantics under concurrent resize (the seal on the bucket head).
  *
  *  - Lookup_MostlyOld: the table is pre-populated with PREFILL keys (untimed)
- *    at full capacity, so that no resize can occur during the timed region in
- *    either container (see the caution in MostlyOldFixture::SetUp). The
+ *    at full capacity, so that no resize occurs during the timed region in
+ *    either container up to the thread counts the table of contents gives
+ *    (see also the caution in MostlyOldFixture::SetUp). The
  *    steady-state workload is 99% contains() with a ~50% hit rate (the
  *    lookup range is exactly twice the prefilled range, so misses exercise the
  *    negative-result revalidation path, which an all-hits workload never
  *    touches), and 1% insertion of brand-new keys on a deterministic schedule
  *    (every 100th operation), drawn from thread-disjoint ranges *above* the
  *    lookup range so the hit rate stays fixed for the whole run. The insert
- *    budget stays a factor of ~3 below the resize trigger. This benchmark
- *    measures what readers pay for coexisting with writers when nothing
- *    "happens"; what readers pay when a resize DOES happen is a tail-latency
- *    question and needs a tail-latency benchmark, not a mean.
+ *    budget stays below either container's resize trigger up to the thread
+ *    counts the table of contents gives. This benchmark measures what readers
+ *    pay for coexisting with writers when nothing "happens"; what readers pay
+ *    when a resize DOES happen is a tail-latency question and needs a
+ *    tail-latency benchmark, not a mean.
  *
  * The baseline, LockedHashSet, is std::unordered_set behind a
  * std::shared_mutex: shared_lock for readers, unique_lock for writers. This
@@ -111,6 +113,68 @@
  * of the loop, the mean loop time is shorter than the run, and
  * items_per_second overstates the throughput by more the less evenly the
  * threads progress; the wall rate is the throughput the run delivered.
+ *
+ * Table of contents: every registration, in the order of the file, each run
+ * at the thread counts of ThreadRange(1, num_cpu) (one row per thread count,
+ * all rows of a registration the same workload), with why it is measured. The
+ * details are at each definition; the churn states (Control, Reclaimed) are
+ * described above the ChurnFixture. A bucket count chosen so that a table does
+ * not resize holds only up to some thread count: the pre-sized concurrent
+ * table doubles once its arena holds about 2*kPresizedBuckets nodes (64
+ * threads' worth of timed inserts, fewer after a prefill); the lookup table
+ * once it holds about 4*kPrefill, which no thread count up to 256 reaches. A
+ * baseline std::unordered_set rehashes once it holds more keys than buckets:
+ * never at 32 threads or fewer in the pre-sized cell, 100 or fewer in the
+ * lookup cell.
+ *
+ *  Insert_MostlyNew_Concurrent    pure insertion through live doublings and
+ *                                 lazy splits: the growth path of this set.
+ *  Insert_MostlyNew_RWLocked      the same inserts on the baseline: the price
+ *                                 of a writer-exclusive rehash.
+ *  Insert_MostlyNew_Presized_Concurrent
+ *                                 the same inserts into a pre-sized table: the
+ *                                 arena alone, with the doubling and split
+ *                                 path subtracted out.
+ *  Insert_MostlyNew_Presized_RWLocked
+ *                                 the baseline pre-sized the same way: its
+ *                                 lock alone.
+ *  Lookup_MostlyOld_Concurrent    mostly lookups at a fixed hit rate with a
+ *                                 trickle of inserts and no resize: what
+ *                                 readers pay for coexisting with writers.
+ *  Lookup_MostlyOld_RWLocked      the same on the baseline: the RMW every
+ *                                 reader pays to be visible to a rehash.
+ *  Insert_MostlyNew_Del           the growth inserts on an EMPTY AllowDelete
+ *                                 set: against _Concurrent, the price of
+ *                                 compiling erase() in, i.e. of the freeze of
+ *                                 the nodes a split moves, which is compiled
+ *                                 out when AllowDelete == false.
+ *  Insert_MostlyNew_Del_Control   the same on a set prefilled with live keys
+ *                                 and empty free lists: a resident population
+ *                                 with every allocation an append.
+ *  Insert_MostlyNew_Del_Reclaimed the same population reached by churn and
+ *                                 reclaim(): inserts that pop freed slots in a
+ *                                 table the larger prefill grew further --
+ *                                 "churn, then growth", not an allocator cell.
+ *  Insert_MostlyNew_Presized_Del  the pre-sized inserts on an EMPTY
+ *                                 AllowDelete set: erase() compiled in, the
+ *                                 arena alone.
+ *  Insert_MostlyNew_Presized_Del_Control
+ *                                 prefilled, no churn, the same buckets as the
+ *                                 next: the control for the free lists.
+ *  Insert_MostlyNew_Presized_Del_Reclaimed
+ *                                 churn and reclaim() at fixed geometry: the
+ *                                 free-list pop path and the locality of the
+ *                                 popped slots, the controlled allocator cell.
+ *  Lookup_MostlyOld_Del           the lookup workload on the AllowDelete set:
+ *                                 against _Concurrent, erase() compiled in on
+ *                                 the read path, whose code does not depend
+ *                                 on it (both instantiations test the mark,
+ *                                 and no split runs): a check that it costs
+ *                                 nothing there.
+ *  Lookup_MostlyOld_Del_Control   the same prefill through the churn fixture:
+ *                                 a check of the fixture against _Del.
+ *  Lookup_MostlyOld_Del_Reclaimed the misses walk chains reclaim() relinked
+ *                                 and the trickle inserts pop freed slots.
  */
 
 static const int num_cpu = sysconf(_SC_NPROCESSORS_CONF);
@@ -173,7 +237,7 @@ public:
     // The second parameter mirrors ConcurrentResizableHashSet's arena_shards so
     // the fixtures can construct both containers the same way; it is ignored.
     explicit LockedHashSet(size_t initial_buckets = 1024, size_t /*arena_shards*/ = 0) : set_(initial_buckets) {}
-    // Mirrors the concurrent set's test accessor for the arena_nodes_per_key
+    // Mirrors the concurrent set's diagnostic accessor for the arena_nodes_per_key
     // counter: the baseline has one node per key, so this is the key count.
     size_t get_internal_node_count() const { return set_.size(); }
     bool insert(const T& v) {
@@ -252,10 +316,13 @@ public:
              * nominally lock-free lookup benchmark degenerates into a
              * spinlock convoy (wall time grows with threads while CPU
              * stays flat).
-             * Constructing at 2*kPrefill means the table never doubles:
-             * every bucket is born EMPTY, no split ever exists, no stale
-             * copies inflate the chains. The unordered_set baseline gets the
-             * same courtesy (2*kPrefill buckets, so no rehash either).
+             * Constructing at 2*kPrefill means the table does not double,
+             * up to the thread count the table of contents (at the top of
+             * this file) gives: every bucket is born EMPTY, no split ever
+             * exists, no stale copies inflate the chains. The unordered_set
+             * baseline gets the same courtesy (2*kPrefill buckets, so no
+             * rehash either, up to the thread count the table of contents
+             * gives for it).
              * Resize behavior under load is a tail-latency story and gets
              * its own benchmark; it has no business inside a mean.
              */
@@ -372,10 +439,16 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
 // in three states of the set, and every cell has a purpose:
 //
 //   *_Del            the workload above, on an EMPTY AllowDelete == true set (the
-//                    MostlyOld fixture prefills as before). Against the
-//                    AllowDelete == false rows this is the price of compiling
-//                    erase() in: the FROZEN handling in the split, the mark
-//                    tests on the read paths. Nothing is erased.
+//                    MostlyOld fixture prefills as before). Nothing is erased.
+//                    Against the AllowDelete == false rows this is the price of
+//                    compiling erase() in, which is the split's freeze of the
+//                    nodes it moves: with AllowDelete == false the freeze is
+//                    compiled out, while the MARK tests on the read paths are
+//                    in both instantiations (with AllowDelete == false they
+//                    test a bit that is never set). So it is a cost only where
+//                    the timed region splits -- the growth cells, and the
+//                    pre-sized cells past the thread count at which they double
+//                    -- and elsewhere the pair checks that it costs nothing.
 //   *_Del_Control    the same workload on a set PREFILLED (untimed, by thread 0)
 //                    with a population of live keys and nothing else: no erase,
 //                    no reclaim(), every free list empty, so every allocation
@@ -432,7 +505,7 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
 //     large, run the Del benchmarks again with HASH_ARENA_SHARDS=16 to get the
 //     half-and-half regime.
 //   lookup fixture: kPrefill = 2^20 victims over S shards, against
-//     kOldIters/kInsertEvery = 10486 inserts per thread: all pops for S <= 64,
+//     kOldIters/kInsertEvery = 10485 inserts per thread: all pops for S <= 64,
 //     8192 pops then appends at S = 128, 4096 at S = 256.
 // The fixture prints one line per configuration and process, before the first
 // row that uses it, with the free-list total it measured (see report_prep()).

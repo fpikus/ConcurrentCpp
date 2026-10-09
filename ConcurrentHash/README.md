@@ -2,12 +2,19 @@
 
 A chained concurrent hash set with optional deletion and live resizing — safe
 for any number of threads, in any mix of operations, with no external
-synchronization (the one exception, `reclaim()`, is described below). Lookups take no lock and write no shared memory, except when a
-lookup is the first to touch a bucket after a resize and performs its lazy
-split. Inserts publish with a single CAS; their node is popped, lock-free,
-from the free list of the calling thread's arena shard when `reclaim()` has
-left one there, and otherwise appended under the shard's spinlock (see
-[Performance](#performance)), so insertion is not lock-free.
+synchronization (the one exception, `reclaim()`, is described below). Its
+operations are lock-free except where they allocate: the hash's own protocol
+(walks, lazy splits, the publishing CAS) takes no lock. Lookups write no
+shared memory, except when a lookup meets its bucket still uninitialized after
+a resize: then it performs the lazy split itself, as does every other thread
+that meets the bucket so. Inserts publish with a single CAS; their node is
+popped, lock-free, from the free list of the calling thread's arena shard when
+`reclaim()` has left one there, and otherwise appended under the shard's
+spinlock (see [Performance](#performance)), so insertion is not lock-free —
+and neither is the lazy split, which allocates its copies the same way,
+whoever runs it. The insert that crosses the doubling threshold grows the
+bucket array under the table's resize lock, after its own key is published,
+while another insert that has also crossed a doubling threshold waits for it.
 
 If you have ever tried to design a concurrent hash table, you know that two
 problems dominate the effort: safe memory reclamation (when may a node be
@@ -69,9 +76,15 @@ The limits are as much a part of the design as the speed, and they are strict:
 - There is no `size()`, no iteration, no `clear()` — deliberately. Every
   concurrent operation offered is transactional; those are not. (`reclaim()`
   returns the exact element count: at a quiescent point, exactness is free.)
-- The hash functor must be stateless; element copies must be equivalent to
-  their originals; elements must be copy-assignable, because a recycled node
-  is reused by assignment; an erased element's resources are released when
+- `Hash` must be default-constructible and callable on a `const T&`,
+  returning the same value for a key every call; it is default-constructed
+  wherever a hash is needed and never stored, so a `Hash` with state only
+  ever has its default state. Elements must be comparable as `value == key`,
+  a stored `T` against a `const T&`, consistently with `Hash` (keys that
+  compare equal must hash equal); element copies must be equivalent to their
+  originals; elements must be copy-constructible, because every node holds a
+  copy of its key, and copy-assignable, because a recycled node is reused by
+  assignment; an erased element's resources are released when
   its node is reused (the assignment overwrites it) and its destructor runs
   only when the set dies, never in `erase()`; the destructor and
   `reclaim()` are not concurrent operations.
@@ -123,6 +136,8 @@ concurrency benchmark falls quiet, be suspicious.
 
 ```sh
 make            # benchmark + ASan/TSan unit tests + the -O3 store-buffering test
+make tests      # the three test binaries only
+make benchmarks # the benchmark only
 make run_tests  # run all three test binaries
 ```
 
@@ -135,6 +150,8 @@ and `finish_spread` counters.
 
 - `concurrent_hash_set.h` — the hash set
 - `concurrent_deque.h` — the backing store (see `../ConcurrentDeque`)
+- `spinlock.h` — the lock the arena's deques append under, and the resize
+  lock (see `../Spinlock`)
 - `concurrent_hash_set_test.C` — unit tests (built with ASan and TSan)
 - `concurrent_hash_set_tso_test.C` — the store-buffering regression test; it
   can only fail when built `-O3` without a sanitizer, so it is its own binary

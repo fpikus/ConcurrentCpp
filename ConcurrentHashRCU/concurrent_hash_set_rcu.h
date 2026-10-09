@@ -248,11 +248,11 @@ inline unsigned thread_number() {
 //   Hash{} is expected not to throw; where it can, the limbo pushes below
 //   apply to it as to any other throw. What CAN throw here is the user's
 //   code -- T's copy constructor, copy assignment and operator==, and
-//   Hash{} -- and allocation (bad_alloc): the deques', the constructor's
-//   shard array, and the vectors of get_internal_accounting(); nothing else
-//   in this class throws. An arena address the word encoding cannot
-//   represent is not an exception either: alloc_node() calls std::abort(),
-//   as the constructor does on an initial capacity above 2^63.
+//   Hash{} -- and allocation (bad_alloc): the deques' storage, the
+//   constructor's shard array, and the vectors of get_internal_accounting();
+//   nothing else in this class throws. An arena address the word encoding
+//   cannot represent is not an exception either: alloc_node() calls
+//   std::abort(), as the constructor does on an initial capacity above 2^63.
 //   The one deliberate guarantee: NO ARENA SLOT IS LOST TO A THROW. Every
 //   private node an operation holds when an exception passes through it is
 //   pushed to limbo before the exception leaves, so get_internal_accounting()
@@ -274,15 +274,20 @@ inline unsigned thread_number() {
 //     subchain is being built (step 2), the copies made so far are
 //     referenced by nothing but that frame; the catch around the walk pushes
 //     the partial subchain to limbo, whole (its tail is remembered for this
-//     as for a lost CAS), and rethrows. Bucket j stays UNINITIALIZED, and the
-//     nodes already FROZEN remain authoritative for their keys, which the
-//     INVARIANT allows: the next operation that needs j splits it again from
-//     them, so the work is redone, not lost. If Hash{} throws inside the
-//     winner's cleanup pass (step 4), AFTER the publishing CAS (the case the
-//     comments below call W4), bucket j is published and complete; the
-//     exception leaves the dead nodes of the parent chain reachable, as a
-//     lost CAS would, for a later walk, split or reclaim() to collect. The
-//     caller of split_bucket() sees the exception, not the published bucket.
+//     as for a lost CAS), and rethrows. The call does not publish j (a
+//     parent split it ran first stays published): bucket j is still
+//     UNINITIALIZED unless another splitter of j has published it meanwhile.
+//     The nodes this call froze stay FROZEN; while j is unpublished they
+//     remain authoritative for their keys (INVARIANT), and the next operation
+//     that needs j splits it again from them, so the work is redone, not
+//     lost; once a competitor publishes j, its copies take over and the
+//     nodes this call froze are DEAD NODES, exactly as after a lost
+//     publishing CAS. If Hash{} throws inside the winner's cleanup pass
+//     (step 4), AFTER the publishing CAS (the case the comments below call
+//     W4), bucket j is published and complete; the exception leaves the dead
+//     nodes of the parent chain reachable, as a lost CAS would, for a later
+//     walk, split or reclaim() to collect. The caller of split_bucket() sees
+//     the exception, not the published bucket.
 //   - insert(): a throw before the publishing CAS -- from alloc_node(),
 //     Hash{}, T's operator==, or a split_bucket() met on any attempt --
 //     leaves the key as it was; the catch around the retry loop pushes the
@@ -394,7 +399,7 @@ inline unsigned thread_number() {
 //     view: the only thing contains(), insert() and erase() can observe
 //     across a reclaim() is MEMBERSHIP -- a value in the set before it is in
 //     the set after it, a value not in it still is not (the get_internal_*
-//     diagnostics see the arena as well, which reclaim() does change). The
+//     diagnostics also see the arena, which reclaim() does change). The
 //     client holds no references into the table (the API hands out none), so
 //     nothing of the client's can outlive a period, and no ABA problem can
 //     reach the client. The INTERNAL view: slots never move (a slot's address
@@ -521,9 +526,9 @@ inline unsigned thread_number() {
 //   (i) A miss is linearized before every insert whose publishing CAS does
 //       NOT happen-before the call: no mechanism is needed, and no test may
 //       assert a hit for a key unless the insert's publishing CAS -- not
-//       merely its call -- happens-before the call, through the inserter's
-//       return or through any call that observed the key and then
-//       synchronized with the caller.
+//       merely its invocation -- happens-before the call, through the
+//       inserter's return or through any call that observed the key and
+//       then synchronized with the caller.
 //   (ii) For an insert whose publishing CAS DOES happen-before the call, a
 //       miss is final only if the key was deleted:
 //       (a) if the key's node was MARKED and then bypassed, the deletion
@@ -683,7 +688,8 @@ inline unsigned thread_number() {
 //   the unlinker's READ of the larger size (or, through a release sequence,
 //   an earlier unlinker's) happens-before the reader's reload, so the reload
 //   cannot return an older value, whatever the order of that read.
-//   A miss that is confirmed by an unchanged table_size_ (contains(), erase())
+//   A miss that is confirmed by an unchanged table_size_ (contains();
+//   erase(), whose walk must also have found no FROZEN node of the key)
 //   linearizes at a point inside the call; the two halves under STALE
 //   GEOMETRY are the argument that such a point exists, and this comment does
 //   not name it.
@@ -691,8 +697,9 @@ inline unsigned thread_number() {
 // PROGRESS: the hash's own protocol takes no lock. The walks, the splits,
 // the unlinks, the publishing CAS and every retry loop are lock-free, and
 // the pure read/traverse path writes nothing; none of it is wait-free. The
-// class's only two locks are where it allocates, so an operation is
-// lock-free end to end exactly when it allocates nothing:
+// class takes a lock in only two places, both on the allocation side, and
+// only an operation that allocates can reach either, so an operation that
+// allocates nothing is lock-free end to end:
 //   (1) alloc_node(): a lock-free pop from the calling thread's arena shard's
 //       free list when it has a node, else an append under that shard's
 //       deque SpinLock; with one thread per shard that lock is uncontended,
@@ -701,10 +708,14 @@ inline unsigned thread_number() {
 //       insert() and erase() can all reach the lock by meeting an
 //       UNINITIALIZED bucket.
 //   (2) resize_lock_: taken by an insert() after its own publishing CAS,
-//       when the node count crosses the doubling threshold for its table
-//       size, to grow buckets_ (an allocation) and mark the new buckets
-//       UNINITIALIZED. Only another insert() that has crossed a threshold
-//       too waits on it; no other operation takes it.
+//       when node_count_ exceeds twice the table size it inserted at. If
+//       table_size_ is still that size, the holder grows buckets_ (an
+//       allocation, under the bucket deque's own SpinLock, which after the
+//       constructor only the holder of resize_lock_ takes) and marks the new
+//       buckets UNINITIALIZED; otherwise another insert() has doubled first,
+//       and the holder releases the lock having allocated nothing. Only
+//       another insert() past its own threshold waits on it; no other
+//       operation takes it.
 // The locks belong to the allocation, not to the hash: an allocator that
 // allocates blocks under a lock and hands nodes over lock-free leaves the
 // lock with whichever thread allocates the block. reclaim() is not a
@@ -815,7 +826,7 @@ private:
     // Largest arena shard count the constructor accepts (a power of two); more
     // shards than this serve no thread count that exists.
     static constexpr size_t MAX_ARENA_SHARDS = size_t{1} << 16;
-    // Elements per block of both deques, buckets_ and every Shard::nodes.
+    // Elements per block of each deque: buckets_ and every Shard::nodes.
     // Larger blocks allocate less often (one block allocation, under the
     // deque's lock, per ARENA_BLOCK elements; the deque also reallocates its
     // block directory under that lock, a number of times logarithmic in the
@@ -2339,8 +2350,8 @@ public:
     //   memory is returned to the system (the arena only ever grows;
     //   reclaimed nodes are reused); every key in the set has exactly one
     //   reachable node afterwards (see below), no dead node is reachable, the
-    //   limbo and retired lists are empty, and the return value is that
-    //   count, exact; node_count_ is reset from it.
+    //   limbo and retired lists are empty, and the return value is the
+    //   number of keys, exact; node_count_ is reset from it.
     //   Requirements on T: copy-assignable (a reused node takes its new value
     //   by assignment; the old value is not destroyed here -- see LIFETIME OF
     //   VALUES in the class overview; callers must not rely on when an erased

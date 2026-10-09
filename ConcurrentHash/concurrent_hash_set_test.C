@@ -283,11 +283,11 @@ TEST(ConcurrentHashSetTest, ArenaShardsParameter) {
 
 // A capacity above 2^63 aborts the constructor, in every build: std::bit_ceil()
 // has no representable result for it. The death is SIGABRT from std::abort()
-// itself, with nothing on stderr; an exception (bad_alloc or length_error from
-// an attempted resize) or any other signal fails the test. The empty stderr is
-// what tells the constructor's check from libstdc++'s own: libstdc++ 15 and
-// later enable _GLIBCXX_ASSERTIONS in an unoptimized build (these tests are
-// -O0), and std::bit_ceil() then prints an assertion message before it aborts.
+// itself, with nothing on stderr; an exception, a normal return or any other
+// signal fails the test. The empty stderr is what tells the constructor's
+// check from libstdc++'s own: libstdc++ 15 and later enable
+// _GLIBCXX_ASSERTIONS in an unoptimized build (these tests are -O0), and
+// std::bit_ceil() then prints an assertion message before it aborts.
 // Both arguments exceed 2^63; 2^63 itself is valid and would ask for 2^63
 // buckets, so the boundary is not tested from below. The suite name ends in
 // DeathTest, as GoogleTest asks, so the suite runs before every other; the

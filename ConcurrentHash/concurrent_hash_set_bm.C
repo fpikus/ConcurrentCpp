@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <unistd.h>
 #include <cstdint>
+#include <string>
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_set>
@@ -583,4 +584,20 @@ DEFINE_MOSTLY_OLD(Lookup_MostlyOld_Del, ConcurrentSetDel)
 DEFINE_MOSTLY_OLD_ON(ChurnFixture, Lookup_MostlyOld_Del_Control,   OldControl)
 DEFINE_MOSTLY_OLD_ON(ChurnFixture, Lookup_MostlyOld_Del_Reclaimed, OldReclaimed)
 
-BENCHMARK_MAIN();
+// BENCHMARK_MAIN()'s start-up, including its re-exec without ASLR, less its
+// guard against a null argv (argv is never null in a hosted program), plus
+// the identification every output carries (the console header and the JSON
+// "context"): the container this binary measures, the size of its Node (the
+// node layout is part of what is measured; both instantiations share it), and
+// the compiler.
+int main(int argc, char** argv) {
+    benchmark::MaybeReenterWithoutASLR(argc, argv);
+    benchmark::AddCustomContext("container", "ConcurrentResizableHashSet");
+    benchmark::AddCustomContext("sizeof_node", std::to_string(sizeof(ConcurrentSetDel::Node)));
+    benchmark::AddCustomContext("compiler", __VERSION__);
+    benchmark::Initialize(&argc, argv);
+    if (benchmark::ReportUnrecognizedArguments(argc, argv)) return 1;
+    benchmark::RunSpecifiedBenchmarks();
+    benchmark::Shutdown();
+    return 0;
+} // main()

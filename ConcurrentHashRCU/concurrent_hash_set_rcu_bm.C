@@ -283,7 +283,7 @@ using LockedSet     = LockedHashSet<int, std::hash<int>>;
 // Every operation of ConcurrentResizableHashSetRCU runs under a handle. Each
 // fixture keeps one per thread of a run: thread 0 creates them all at the END
 // of its SetUp(), after every prep step -- any handle the prep itself used is
-// released before the prep's reclaim(), and the threads' handles are created
+// released before the prep's advance(), and the threads' handles are created
 // after it, so that it runs with no handle alive -- and each thread uses its
 // own only INSIDE the state loop, whose start is a barrier: the happens-before
 // edge a handle created on one thread needs before another thread uses it
@@ -746,7 +746,7 @@ public:
         // victims are present when erased); a failure would silently change
         // the population, so it aborts the run instead.
         long failed = 0;
-        {   // the prep's own handle, released before the reclaim() below (see ThreadHandles)
+        {   // the prep's own handle, released before the advance() below (see ThreadHandles)
             const typename SetType::handle h = set->new_handle();
             for (int k = 0; k < Cfg::pairs; ++k) {
                 failed += !set->insert(h, mix(Cfg::survivor(k)));
@@ -756,13 +756,15 @@ public:
                 for (int k = 0; k < Cfg::pairs; ++k) failed += !set->erase(h, mix(Cfg::victim(k)));
             } // erase every victim
         } // the prep's handle
-        if constexpr (Cfg::churn == Churn::Reclaimed) set->reclaim();
+        // With no handle live, one advance() bags every retired node and frees the bag in the
+        // same call; the prep leaves no dead node reachable, so its walk retires nothing.
+        if constexpr (Cfg::churn == Churn::Reclaimed) (void)set->advance();
         if (failed != 0) {
             fprintf(stderr, "ChurnFixture: %ld prep operations failed in %s\n", failed, state.name().c_str());
             abort();
         } // if the prep did not build the population it describes
         report_prep(state);
-        handles.make(*set, state.threads());   // after the prep's reclaim() (see ThreadHandles)
+        handles.make(*set, state.threads());   // after the prep's advance() (see ThreadHandles)
     } // ChurnFixture::SetUp()
     void TearDown(const ::benchmark::State& state) override {
         if (state.thread_index() == 0) { handles.clear(); delete set; set = nullptr; }

@@ -31,7 +31,9 @@
 #include <string>
 #include <mutex>
 #include <shared_mutex>
+#include <type_traits>
 #include <unordered_set>
+#include <vector>
 #include "concurrent_hash_set_rcu.h"
 #include "gb_wall_clock.h"      // WallRecords, WallTimed, report_wall() (../Spinlock)
 
@@ -253,14 +255,20 @@ public:
     // The second parameter mirrors ConcurrentResizableHashSetRCU's arena_shards so
     // the fixtures can construct both containers the same way; it is ignored.
     explicit LockedHashSet(size_t initial_buckets = 1024, size_t /*arena_shards*/ = 0) : set_(initial_buckets) {}
+    // Mirrors the concurrent set's handle, the first argument of each of its
+    // operations, so that the fixtures and the bodies compile over both
+    // containers: the baseline needs none, so its handle is an empty type,
+    // new_handle() returns one, and the operations ignore it.
+    struct handle {};
+    handle new_handle() const noexcept { return {}; }
     // Mirrors the concurrent set's diagnostic accessor for the arena_nodes_per_key
     // counter: the baseline has one node per key, so this is the key count.
     size_t get_internal_node_count() const { return set_.size(); }
-    bool insert(const T& v) {
+    bool insert(const handle& /*h*/, const T& v) {
         std::unique_lock lock(mtx_);
         return set_.insert(v).second;
     }
-    bool contains(const T& v) const {
+    bool contains(const handle& /*h*/, const T& v) const {
         std::shared_lock lock(mtx_);              // <-- the RMW every reader pays
         return set_.find(v) != set_.end();
     }
@@ -270,6 +278,76 @@ using ConcurrentSet = ConcurrentResizableHashSetRCU<int, false, std::hash<int>>;
 using LockedSet     = LockedHashSet<int, std::hash<int>>;
 
 // ---------------------------------------------------------------------------
+// The benchmark threads' handles.
+//
+// Every operation of ConcurrentResizableHashSetRCU runs under a handle. Each
+// fixture keeps one per thread of a run: thread 0 creates them all at the END
+// of its SetUp(), after every prep step -- any handle the prep itself used is
+// released before the prep's reclaim(), and the threads' handles are created
+// after it, so that it runs with no handle alive -- and each thread uses its
+// own only INSIDE the state loop, whose start is a barrier: the happens-before
+// edge a handle created on one thread needs before another thread uses it
+// (see the CAUTION below). A thread never refreshes its handle, and releases
+// it on its own LAST iteration (Google Benchmark runs every thread for exactly
+// state.max_iterations iterations): a thread that has finished and waits at
+// the loop's end barrier then pins no generation of the set for the threads
+// still running. Thread 0 destroys the empty handles in TearDown(), before it
+// deletes the set: a live handle must not outlive its set. Each handle sits
+// on its own 128-byte block, since a release writes its thread's handle and
+// handles packed into one line would false-share. For the baseline the handle
+// is an empty type and the same calls cost one compare per iteration.
+// ---------------------------------------------------------------------------
+template <typename SetType>
+class ThreadHandles {
+public:
+    using Handle = typename SetType::handle;
+
+    // Thread 0 only, at the end of SetUp(): one handle of `set` per thread of
+    // the run, indexed by thread_index().
+    void make(const SetType& set, int threads) {
+        recs_ = std::vector<Rec>(threads);
+        for (Rec& rec : recs_) rec.h = set.new_handle();
+    } // ThreadHandles::make()
+
+    // Thread 0 only, in TearDown(), before the set is deleted: destroys every
+    // handle, each already released by its thread on its last iteration.
+    void clear() { recs_.clear(); }
+
+    // One thread's use of its handle, a local of the body. Trivially
+    // destructible (asserted below), so no destructor is live across the
+    // state loop (see the note above the benchmark bodies). Constructed
+    // before the loop, it reads nothing of the handles there.
+    class Own {
+    public:
+        Own(ThreadHandles& handles, const benchmark::State& state)
+            : handles_(handles), thread_(state.thread_index()), last_(state.max_iterations) {}
+        // The thread's handle. Inside the state loop only, and not after
+        // finish_iteration() has released it.
+        const Handle& get() const { return handles_.recs_[thread_].h; }
+        // Called at the end of every iteration; on the thread's last
+        // iteration it releases the handle.
+        void finish_iteration() {
+            if (++done_ == last_) [[unlikely]] {
+                handles_.recs_[thread_].h = Handle{};
+            }
+        } // ThreadHandles::Own::finish_iteration()
+    private:
+        ThreadHandles& handles_;                  // the fixture's handles
+        const int thread_;                        // this thread's index in the run
+        const benchmark::IterationCount last_;    // the iterations this thread runs (state.max_iterations)
+        benchmark::IterationCount done_ = 0;      // iterations finished so far
+    }; // class ThreadHandles::Own
+    static_assert(std::is_trivially_destructible_v<Own>, "a body local with a destructor would be live across the state loop");
+
+private:
+    // One thread's handle on its own 128-byte block (see above).
+    struct alignas(128) Rec {
+        Handle h;   // the thread's handle: joined by thread 0 in SetUp(), released on the thread's last iteration
+    }; // struct Rec
+    std::vector<Rec> recs_;   // one per thread of the run; built by make(), destroyed by clear()
+}; // class ThreadHandles
+
+// ---------------------------------------------------------------------------
 // Fixtures.
 //
 // CAUTION: Google Benchmark runs SetUp() per thread with NO implicit barrier
@@ -277,20 +355,27 @@ using LockedSet     = LockedHashSet<int, std::hash<int>>;
 // barrier is the benchmark loop itself. Therefore: thread 0
 // creates (and, for MostlyOld, prefills) the container in its SetUp(), and no
 // thread dereferences `set` anywhere except INSIDE the loop (or after it, once
-// the loop's end barrier has been crossed).
+// the loop's end barrier has been crossed). The same holds for the threads'
+// handles, `handles` (ThreadHandles above), which thread 0 creates last.
 // ---------------------------------------------------------------------------
 template <typename SetType>
 class MostlyNewFixture : public benchmark::Fixture {
 public:
     static SetType* set;
+    using Handles = ThreadHandles<SetType>;
+    static Handles handles;   // the threads' handles (ThreadHandles above)
     void SetUp(const ::benchmark::State& state) override {
-        if (state.thread_index() == 0) set = new SetType(1024, arena_shards_from_env());
+        if (state.thread_index() == 0) {
+            set = new SetType(1024, arena_shards_from_env());
+            handles.make(*set, state.threads());
+        }
     }
     void TearDown(const ::benchmark::State& state) override {
-        if (state.thread_index() == 0) { delete set; set = nullptr; }
+        if (state.thread_index() == 0) { handles.clear(); delete set; set = nullptr; }
     }
 }; // class MostlyNewFixture
 template <typename SetType> SetType* MostlyNewFixture<SetType>::set = nullptr;
+template <typename SetType> ThreadHandles<SetType> MostlyNewFixture<SetType>::handles;
 
 // The same insert workload into a table constructed with kPresizedBuckets
 // buckets, so that no doubling and no lazy split happens until the arena holds
@@ -305,19 +390,27 @@ template <typename SetType>
 class MostlyNewPresizedFixture : public benchmark::Fixture {
 public:
     static SetType* set;
+    using Handles = ThreadHandles<SetType>;
+    static Handles handles;   // the threads' handles (ThreadHandles above)
     void SetUp(const ::benchmark::State& state) override {
-        if (state.thread_index() == 0) set = new SetType(kPresizedBuckets, arena_shards_from_env());
+        if (state.thread_index() == 0) {
+            set = new SetType(kPresizedBuckets, arena_shards_from_env());
+            handles.make(*set, state.threads());
+        }
     }
     void TearDown(const ::benchmark::State& state) override {
-        if (state.thread_index() == 0) { delete set; set = nullptr; }
+        if (state.thread_index() == 0) { handles.clear(); delete set; set = nullptr; }
     }
 }; // class MostlyNewPresizedFixture
 template <typename SetType> SetType* MostlyNewPresizedFixture<SetType>::set = nullptr;
+template <typename SetType> ThreadHandles<SetType> MostlyNewPresizedFixture<SetType>::handles;
 
 template <typename SetType>
 class MostlyOldFixture : public benchmark::Fixture {
 public:
     static SetType* set;
+    using Handles = ThreadHandles<SetType>;
+    static Handles handles;   // the threads' handles (ThreadHandles above)
     void SetUp(const ::benchmark::State& state) override {
         if (state.thread_index() == 0) {
             /*
@@ -344,14 +437,19 @@ public:
              * its own benchmark; it has no business inside a mean.
              */
             set = new SetType(2*kPrefill, arena_shards_from_env());
-            for (int k = 0; k < kPrefill; ++k) set->insert(mix(k));   // untimed
+            {   // the prefill's own handle, released before the threads' handles are made
+                const typename SetType::handle h = set->new_handle();
+                for (int k = 0; k < kPrefill; ++k) set->insert(h, mix(k));   // untimed
+            }
+            handles.make(*set, state.threads());
         }
     }
     void TearDown(const ::benchmark::State& state) override {
-        if (state.thread_index() == 0) { delete set; set = nullptr; }
+        if (state.thread_index() == 0) { handles.clear(); delete set; set = nullptr; }
     }
 }; // class MostlyOldFixture
 template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
+template <typename SetType> ThreadHandles<SetType> MostlyOldFixture<SetType>::handles;
 
 // ---------------------------------------------------------------------------
 // Benchmark bodies (as macros, so each container gets an identical body).
@@ -365,7 +463,10 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
 // on thread 0 alone; state.iterations() is read only after the loop, and the
 // per-thread SkipWithError() is called after the loop, never inside it. No
 // object with a destructor is live across the loop: its cleanup region can
-// change the loop's code.
+// change the loop's code. Each operation runs under the thread's own handle,
+// through the trivially destructible ThreadHandles::Own, whose
+// finish_iteration() ends every iteration (it releases the handle on the
+// last one).
 // ---------------------------------------------------------------------------
 
 /*
@@ -381,9 +482,11 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
         const int base = state.thread_index()*kKeyStride;                     \
         int next = 0;                                                         \
         int64_t ok = 0;                                                       \
+        Handles::Own own(handles, state);                                     \
         records.allocate(state);                                              \
         for (auto _ : WallTimed(state, records)) {                            \
-            ok += set->insert(mix(base + next++));                            \
+            ok += set->insert(own.get(), mix(base + next++));                 \
+            own.finish_iteration();                                           \
         }                                                                     \
         if (ok != state.iterations()) {                                       \
             state.SkipWithError("insert() returned false for a unique key "   \
@@ -424,16 +527,19 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
         int op = 0;                                                           \
         int64_t ok = 0, tries = 0;                                            \
         bool hit = false;                                                     \
+        Handles::Own own(handles, state);                                     \
         records.allocate(state);                                              \
         for (auto _ : WallTimed(state, records)) {                            \
             if (++op == kInsertEvery) {                                       \
                 op = 0;                                                       \
                 ++tries;                                                      \
-                ok += set->insert(mix(base + next++));                        \
+                ok += set->insert(own.get(), mix(base + next++));             \
             } else {                                                          \
-                hit = set->contains(mix((int)(rng.next() & kLookupMask)));    \
+                hit = set->contains(own.get(),                                \
+                                    mix((int)(rng.next() & kLookupMask)));    \
                 benchmark::DoNotOptimize(hit);                                \
             }                                                                 \
+            own.finish_iteration();                                           \
         }                                                                     \
         if (ok != tries) {                                                    \
             state.SkipWithError("insert() returned false for a unique key "   \
@@ -631,6 +737,8 @@ class ChurnFixture : public benchmark::Fixture {
 public:
     using SetType = typename Cfg::Set;
     static SetType* set;
+    using Handles = ThreadHandles<SetType>;
+    static Handles handles;   // the threads' handles (ThreadHandles above)
     void SetUp(const ::benchmark::State& state) override {
         if (state.thread_index() != 0) return;
         set = new SetType(Cfg::buckets, arena_shards_from_env());
@@ -638,22 +746,26 @@ public:
         // victims are present when erased); a failure would silently change
         // the population, so it aborts the run instead.
         long failed = 0;
-        for (int k = 0; k < Cfg::pairs; ++k) {
-            failed += !set->insert(mix(Cfg::survivor(k)));
-            if constexpr (Cfg::churn != Churn::Control) failed += !set->insert(mix(Cfg::victim(k)));
-        } // prefill, survivors and victims alternating
-        if constexpr (Cfg::churn != Churn::Control) {
-            for (int k = 0; k < Cfg::pairs; ++k) failed += !set->erase(mix(Cfg::victim(k)));
-        } // erase every victim
+        {   // the prep's own handle, released before the reclaim() below (see ThreadHandles)
+            const typename SetType::handle h = set->new_handle();
+            for (int k = 0; k < Cfg::pairs; ++k) {
+                failed += !set->insert(h, mix(Cfg::survivor(k)));
+                if constexpr (Cfg::churn != Churn::Control) failed += !set->insert(h, mix(Cfg::victim(k)));
+            } // prefill, survivors and victims alternating
+            if constexpr (Cfg::churn != Churn::Control) {
+                for (int k = 0; k < Cfg::pairs; ++k) failed += !set->erase(h, mix(Cfg::victim(k)));
+            } // erase every victim
+        } // the prep's handle
         if constexpr (Cfg::churn == Churn::Reclaimed) set->reclaim();
         if (failed != 0) {
             fprintf(stderr, "ChurnFixture: %ld prep operations failed in %s\n", failed, state.name().c_str());
             abort();
         } // if the prep did not build the population it describes
         report_prep(state);
+        handles.make(*set, state.threads());   // after the prep's reclaim() (see ThreadHandles)
     } // ChurnFixture::SetUp()
     void TearDown(const ::benchmark::State& state) override {
-        if (state.thread_index() == 0) { delete set; set = nullptr; }
+        if (state.thread_index() == 0) { handles.clear(); delete set; set = nullptr; }
     }
 private:
     // Prints the arena state the timed region starts from, once per
@@ -681,6 +793,7 @@ private:
     } // ChurnFixture::report_prep()
 }; // class ChurnFixture
 template <typename Cfg> typename Cfg::Set* ChurnFixture<Cfg>::set = nullptr;
+template <typename Cfg> ThreadHandles<typename Cfg::Set> ChurnFixture<Cfg>::handles;
 
 // ---------------------------------------------------------------------------
 // Erase_Presized_Del: timed erase() of present keys.
@@ -713,23 +826,30 @@ template <typename SetType>
 class EraseFixture : public benchmark::Fixture {
 public:
     static SetType* set;
+    using Handles = ThreadHandles<SetType>;
+    static Handles handles;   // the threads' handles (ThreadHandles above)
     static size_t retired_before;   // the container's retired-node counter after the prefill
     void SetUp(const ::benchmark::State& state) override {
         if (state.thread_index() != 0) return;
         set = new SetType(kPresizedBuckets, arena_shards_from_env());
         long failed = 0;
-        for (int k = 0; k < kErasePrefill; ++k) failed += !set->insert(mix(k));
+        {   // the prefill's own handle, released before the threads' handles are made
+            const typename SetType::handle h = set->new_handle();
+            for (int k = 0; k < kErasePrefill; ++k) failed += !set->insert(h, mix(k));
+        }
         if (failed != 0) {
             fprintf(stderr, "EraseFixture: %ld prefill inserts failed in %s\n", failed, state.name().c_str());
             abort();
         } // if the prefill did not build the population it describes
         retired_before = set->get_internal_counters().retire_nodes;
+        handles.make(*set, state.threads());
     } // EraseFixture::SetUp()
     void TearDown(const ::benchmark::State& state) override {
-        if (state.thread_index() == 0) { delete set; set = nullptr; }
+        if (state.thread_index() == 0) { handles.clear(); delete set; set = nullptr; }
     }
 }; // class EraseFixture
 template <typename SetType> SetType* EraseFixture<SetType>::set = nullptr;
+template <typename SetType> ThreadHandles<SetType> EraseFixture<SetType>::handles;
 template <typename SetType> size_t EraseFixture<SetType>::retired_before = 0;
 
 // ---------------------------------------------------------------------------
@@ -807,14 +927,20 @@ template <typename SetType>
 class HotGrowthFixture : public benchmark::Fixture {
 public:
     static SetType* set;
+    using Handles = ThreadHandles<SetType>;
+    static Handles handles;   // the threads' handles (ThreadHandles above)
     void SetUp(const ::benchmark::State& state) override {
-        if (state.thread_index() == 0) set = new SetType(1024, arena_shards_from_env());
+        if (state.thread_index() == 0) {
+            set = new SetType(1024, arena_shards_from_env());
+            handles.make(*set, state.threads());
+        }
     }
     void TearDown(const ::benchmark::State& state) override {
-        if (state.thread_index() == 0) { delete set; set = nullptr; }
+        if (state.thread_index() == 0) { handles.clear(); delete set; set = nullptr; }
     }
 }; // class HotGrowthFixture
 template <typename SetType> SetType* HotGrowthFixture<SetType>::set = nullptr;
+template <typename SetType> ThreadHandles<SetType> HotGrowthFixture<SetType>::handles;
 
 // The counters of InsertHotGrowth that only this container's diagnostic
 // accessors provide (listed above), set on `state` by thread 0 after the loop;
@@ -864,10 +990,12 @@ static void register_hot_growth() {
         const int threads = state.threads();                                  \
         int index = state.thread_index();                                     \
         int64_t ok = 0;                                                       \
+        Handles::Own own(handles, state);                                     \
         records.allocate(state);                                              \
         for (auto _ : WallTimed(state, records)) {                            \
-            ok += set->insert(hot_growth_key(index));                         \
+            ok += set->insert(own.get(), hot_growth_key(index));              \
             index += threads;                                                 \
+            own.finish_iteration();                                           \
         }                                                                     \
         if (ok != state.iterations()) {                                       \
             state.SkipWithError("insert() returned false for a unique key "   \
@@ -927,9 +1055,11 @@ BENCHMARK_TEMPLATE_DEFINE_F(EraseFixture, Erase_Presized_Del, ConcurrentSetDel)(
     const int base = state.thread_index()*(kErasePrefill/num_cpu);
     int next = 0;
     int64_t ok = 0;
+    Handles::Own own(handles, state);
     records.allocate(state);
     for (auto _ : WallTimed(state, records)) {
-        ok += set->erase(mix(base + next++));
+        ok += set->erase(own.get(), mix(base + next++));
+        own.finish_iteration();
     }
     if (ok != state.iterations()) {
         state.SkipWithError("erase() returned false for a present key no other thread erases");

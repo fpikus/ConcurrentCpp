@@ -181,18 +181,22 @@ static int scramble(int i) {
 // rule 2 counts arena slots, not keys.
 // ---------------------------------------------------------------------------
 
-// Run fn(t) on T threads released together by a barrier, then join them all.
+// Run fn(h, t) on T threads released together by a barrier, then join them all.
 // The barrier (rather than a spin on a start flag) is what makes the racing
-// window open at the same instant on every thread.
-template <typename F>
-static void run_threads(int T, F fn) {
+// window open at the same instant on every thread. `h` is thread t's own handle
+// of `set`: the thread joins it BEFORE the barrier, so that no join (an RMW on
+// the generation's shared count) runs inside the racing window, and destroys it
+// when fn returns, before the thread is joined, so it never outlives `set`.
+template <typename SetT, typename F>
+static void run_threads(int T, SetT& set, F fn) {
     std::barrier start(T);
     std::vector<std::thread> threads;
     threads.reserve(T);
     for (int t = 0; t < T; ++t) {
-        threads.emplace_back([&start, &fn, t]() {
+        threads.emplace_back([&start, &set, &fn, t]() {
+            const typename SetT::handle h = set.new_handle();
             start.arrive_and_wait();
-            fn(t);
+            fn(h, t);
         });
     } // spawn loop
     for (std::thread& th : threads) th.join();
@@ -266,7 +270,7 @@ static void reclaim_and_check(SetT& set, size_t expected_live, const std::string
         << where << ": the free lists did not grow by exactly the limbo, retired and dead nodes";
 } // reclaim_and_check()
 
-// settle_writers(set): a writer MISS walk over every published bucket, so that
+// settle_writers(set, h): a writer MISS walk over every published bucket, so that
 // every dead node a CONCURRENT history left in a chain (a straggler: a one-shot
 // unlink CAS that lost, an erase() that gave up, a run a walker with a stale
 // table size could not decide) is unlinked and retired, as the next writer to
@@ -292,8 +296,9 @@ static void reclaim_and_check(SetT& set, size_t expected_live, const std::string
 // publication): such a run is behind a tagged predecessor, which no walk may
 // CAS, and only a split of the child or reclaim() collects it.
 // Not an oracle in itself: on a set with a concurrent history it is not a no-op.
+// `h`: the calling thread's handle of `set`, under which every probe runs.
 template <typename SetT>
-static void settle_writers(SetT& set) {
+static void settle_writers(SetT& set, const typename SetT::handle& h) {
     const size_t ts = set.get_internal_table_size();
     for (size_t j = 0; j < ts; ++j) {
         if (!set.get_internal_bucket_published(j)) continue;
@@ -301,8 +306,8 @@ static void settle_writers(SetT& set) {
         for (size_t m = 0; m < 64 && !erased_in_j; ++m) {
             const size_t k = j + m*ts;
             if (k > static_cast<size_t>(INT32_MAX)) break;
-            if (set.contains(static_cast<int>(k))) continue;   // present: not a miss walk
-            ASSERT_FALSE(set.erase(static_cast<int>(k))) << "settle_writers(): erase() of an absent key returned true";
+            if (set.contains(h, static_cast<int>(k))) continue;   // present: not a miss walk
+            ASSERT_FALSE(set.erase(h, static_cast<int>(k))) << "settle_writers(): erase() of an absent key returned true";
             erased_in_j = true;
         } // look for an absent key of bucket j
         ASSERT_TRUE(erased_in_j) << "settle_writers(): no absent key found for bucket " << j;
@@ -312,12 +317,13 @@ static void settle_writers(SetT& set) {
 // Membership oracle sweep: the number of wrong contains() answers, where every
 // key of `in` must be present and every key of `out` absent. Side effect worth
 // knowing: contains() splits every UNINITIALIZED bucket it lands on, so after
-// this sweep every probed key's current bucket is published.
+// this sweep every probed key's current bucket is published. `h`: the calling
+// thread's handle of `set`, under which every probe runs.
 template <typename SetT, typename K>
-static int membership_errors(SetT& set, const std::vector<K>& in, const std::vector<K>& out) {
+static int membership_errors(SetT& set, const typename SetT::handle& h, const std::vector<K>& in, const std::vector<K>& out) {
     int errors = 0;
-    for (const K& k : in) errors += !set.contains(k);
-    for (const K& k : out) errors += set.contains(k);
+    for (const K& k : in) errors += !set.contains(h, k);
+    for (const K& k : out) errors += set.contains(h, k);
     return errors;
 } // membership_errors()
 
@@ -335,12 +341,13 @@ struct CollisionHash {
 // Test basic insertions and reads
 TEST(ConcurrentHashSetRcuTest, BasicOperations) {
     ConcurrentResizableHashSetRCU<int> set;
-    EXPECT_TRUE(set.insert(1));
-    EXPECT_FALSE(set.insert(1));
-    EXPECT_TRUE(set.insert(2));
-    EXPECT_TRUE(set.contains(1));
-    EXPECT_TRUE(set.contains(2));
-    EXPECT_FALSE(set.contains(3));
+    const ConcurrentResizableHashSetRCU<int>::handle h = set.new_handle();
+    EXPECT_TRUE(set.insert(h, 1));
+    EXPECT_FALSE(set.insert(h, 1));
+    EXPECT_TRUE(set.insert(h, 2));
+    EXPECT_TRUE(set.contains(h, 1));
+    EXPECT_TRUE(set.contains(h, 2));
+    EXPECT_FALSE(set.contains(h, 3));
 } // BasicOperations
 
 // The arena_shards constructor parameter: rounded up to a power of two, 0 means
@@ -358,16 +365,17 @@ TEST(ConcurrentHashSetRcuTest, ArenaShardsParameter) {
     const int T = 4, N = 2000;
     for (size_t shards : {size_t(1), size_t(2), size_t(64)}) {
         ConcurrentResizableHashSetRCU<int> set(4, shards);
+        const ConcurrentResizableHashSetRCU<int>::handle h = set.new_handle();
         EXPECT_EQ(set.get_internal_arena_shards(), shards);
         std::atomic<int> inserted{0};
-        run_threads(T, [&set, &inserted](int t) {
+        run_threads(T, set, [&set, &inserted](const ConcurrentResizableHashSetRCU<int>::handle& h, int t) {
             for (int k = t; k < N; k += T) {
-                if (set.insert(scramble(k))) inserted.fetch_add(1, std::memory_order_relaxed);
+                if (set.insert(h, scramble(k))) inserted.fetch_add(1, std::memory_order_relaxed);
             }
         });
         EXPECT_EQ(inserted.load(), N);
-        for (int k = 0; k < N; ++k) EXPECT_TRUE(set.contains(scramble(k)));
-        EXPECT_FALSE(set.contains(scramble(N)));
+        for (int k = 0; k < N; ++k) EXPECT_TRUE(set.contains(h, scramble(k)));
+        EXPECT_FALSE(set.contains(h, scramble(N)));
         // Every inserted key has a node; split copies add more, never fewer.
         EXPECT_GE(set.get_internal_node_count(), size_t(N));
     } // for each shard count
@@ -401,18 +409,19 @@ TEST(ConcurrentHashSetRcuDeathTest, ConstructorAbortsOnUnrepresentableCapacity) 
 // leave the low keys in place and never split their chains (see scramble()).
 TEST(ConcurrentHashSetRcuTest, ManyResizesSingleThread) {
     ConcurrentResizableHashSetRCU<int> set(4);
+    const ConcurrentResizableHashSetRCU<int>::handle h = set.new_handle();
     const int N = 100000;
     for (int i = 0; i < N; ++i) {
-        EXPECT_TRUE(set.insert(scramble(i))) << "insert(" << i << ") wrongly reported duplicate";
+        EXPECT_TRUE(set.insert(h, scramble(i))) << "insert(" << i << ") wrongly reported duplicate";
     }
     for (int i = 0; i < N; i += 997) {
-        EXPECT_FALSE(set.insert(scramble(i))) << "re-insert(" << i << ") wrongly reported new";
+        EXPECT_FALSE(set.insert(h, scramble(i))) << "re-insert(" << i << ") wrongly reported new";
     }
     for (int i = 0; i < N; ++i) {
-        EXPECT_TRUE(set.contains(scramble(i))) << "missing key " << i;
+        EXPECT_TRUE(set.contains(h, scramble(i))) << "missing key " << i;
     }
     for (int i = N; i < N + 5000; ++i) {
-        EXPECT_FALSE(set.contains(scramble(i))) << "false positive for " << i;
+        EXPECT_FALSE(set.contains(h, scramble(i))) << "false positive for " << i;
     }
 } // ManyResizesSingleThread
 
@@ -428,12 +437,13 @@ TEST(ConcurrentHashSetRcuTest, ManyResizesSingleThread) {
 // is what the contract says.
 TEST(ConcurrentHashSetRcuTest, ConcurrentDisjointRanges) {
     ConcurrentResizableHashSetRCU<int> set(4);
+    const ConcurrentResizableHashSetRCU<int>::handle h = set.new_handle();
     const int T = 8, per = 20000;
     std::atomic<int> inserted{0};
-    run_threads(T, [&set, &inserted](int t) {
+    run_threads(T, set, [&set, &inserted](const ConcurrentResizableHashSetRCU<int>::handle& h, int t) {
         int local = 0;
         for (int k = 0; k < per; ++k) {
-            if (set.insert(scramble(t*per + k))) ++local;
+            if (set.insert(h, scramble(t*per + k))) ++local;
         }
         inserted += local;
     });
@@ -441,7 +451,7 @@ TEST(ConcurrentHashSetRcuTest, ConcurrentDisjointRanges) {
     EXPECT_EQ(inserted.load(), T*per) << "insert() did not report exactly one winner per key";
     for (int t = 0; t < T; ++t) {
         for (int k = 0; k < per; ++k) {
-            EXPECT_TRUE(set.contains(scramble(t*per + k))) << "missing " << (t*per + k);
+            EXPECT_TRUE(set.contains(h, scramble(t*per + k))) << "missing " << (t*per + k);
         }
     } // membership sweep
 } // ConcurrentDisjointRanges
@@ -462,19 +472,20 @@ TEST(ConcurrentHashSetRcuTest, ConcurrentDisjointRanges) {
 TEST(ConcurrentHashSetRcuTest, ConcurrentSameKeyMembership) {
     for (int rep = 0; rep < 10; ++rep) {
         ConcurrentResizableHashSetRCU<int> set(4);
+        const ConcurrentResizableHashSetRCU<int>::handle h = set.new_handle();
         const int T = 16, N = 4000;
         std::atomic<int> true_count{0};
-        run_threads(T, [&set, &true_count](int) {
+        run_threads(T, set, [&set, &true_count](const ConcurrentResizableHashSetRCU<int>::handle& h, int) {
             int local = 0;
             for (int k = 0; k < N; ++k) {
-                if (set.insert(scramble(k))) ++local;
+                if (set.insert(h, scramble(k))) ++local;
             }
             true_count += local;
         });
 
         EXPECT_EQ(true_count.load(), N) << "insert() did not report exactly one winner per key, rep " << rep;
         for (int k = 0; k < N; ++k) {
-            EXPECT_TRUE(set.contains(scramble(k))) << "missing key " << k << " in rep " << rep;
+            EXPECT_TRUE(set.contains(h, scramble(k))) << "missing key " << k << " in rep " << rep;
         }
     } // repetitions
 } // ConcurrentSameKeyMembership
@@ -486,23 +497,25 @@ struct ModHash {
 
 TEST(ConcurrentHashSetRcuTest, CollisionHeavyChains) {
     ConcurrentResizableHashSetRCU<int, false, ModHash> set(4);
+    const ConcurrentResizableHashSetRCU<int, false, ModHash>::handle h = set.new_handle();
     const int N = 5000;
-    for (int i = 0; i < N; ++i) EXPECT_TRUE(set.insert(i));
-    for (int i = 0; i < N; ++i) EXPECT_TRUE(set.contains(i));
-    EXPECT_FALSE(set.contains(N + 1));
+    for (int i = 0; i < N; ++i) EXPECT_TRUE(set.insert(h, i));
+    for (int i = 0; i < N; ++i) EXPECT_TRUE(set.contains(h, i));
+    EXPECT_FALSE(set.contains(h, N + 1));
 } // CollisionHeavyChains
 
 // Non-trivial key type to confirm the container is not hard-wired to integers.
 TEST(ConcurrentHashSetRcuTest, StringKeys) {
     ConcurrentResizableHashSetRCU<std::string> set(4);
+    const ConcurrentResizableHashSetRCU<std::string>::handle h = set.new_handle();
     for (int i = 0; i < 1000; ++i) {
-        EXPECT_TRUE(set.insert("key_" + std::to_string(i)));
+        EXPECT_TRUE(set.insert(h, "key_" + std::to_string(i)));
     }
-    EXPECT_FALSE(set.insert("key_500"));
+    EXPECT_FALSE(set.insert(h, "key_500"));
     for (int i = 0; i < 1000; ++i) {
-        EXPECT_TRUE(set.contains("key_" + std::to_string(i)));
+        EXPECT_TRUE(set.contains(h, "key_" + std::to_string(i)));
     }
-    EXPECT_FALSE(set.contains("absent"));
+    EXPECT_FALSE(set.contains(h, "absent"));
 } // StringKeys
 
 // A writer continuously inserts a known range while readers poll; any key the writer
@@ -516,8 +529,9 @@ TEST(ConcurrentHashSetRcuTest, ConcurrentReadersWriters) {
     std::atomic<int> progress{0};
 
     std::thread writer([&]() {
+        const ConcurrentResizableHashSetRCU<int>::handle h = set.new_handle();
         for (int i = 0; i < N; ++i) {
-            set.insert(scramble(i));
+            set.insert(h, scramble(i));
             progress.store(i, std::memory_order_release);
         }
         done.store(true, std::memory_order_release);
@@ -526,20 +540,22 @@ TEST(ConcurrentHashSetRcuTest, ConcurrentReadersWriters) {
     std::vector<std::thread> readers;
     for (int r = 0; r < 4; ++r) {
         readers.emplace_back([&]() {
+            const ConcurrentResizableHashSetRCU<int>::handle h = set.new_handle();
             while (!done.load(std::memory_order_acquire)) {
                 int p = progress.load(std::memory_order_acquire);
                 if (p > 0) {
                     // A key strictly below the writer's progress was fully inserted.
-                    EXPECT_TRUE(set.contains(scramble(p - 1)));
+                    EXPECT_TRUE(set.contains(h, scramble(p - 1)));
                 }
-                EXPECT_FALSE(set.contains(scramble(N + 12345)));  // never inserted
+                EXPECT_FALSE(set.contains(h, scramble(N + 12345)));  // never inserted
             } // poll until the writer is done
         });
     } // spawn readers
 
     writer.join();
     for (std::thread& t : readers) t.join();
-    for (int i = 0; i < N; ++i) EXPECT_TRUE(set.contains(scramble(i)));
+    const ConcurrentResizableHashSetRCU<int>::handle h = set.new_handle();
+    for (int i = 0; i < N; ++i) EXPECT_TRUE(set.contains(h, scramble(i)));
 } // ConcurrentReadersWriters
 
 // Stresses the cooperative lazy split: many threads simultaneously touch the
@@ -565,33 +581,34 @@ TEST(ConcurrentHashSetRcuTest, SplitContention) {
         // ...) before the threads start. Key 100 is in bucket 0 at size 4 and in
         // bucket 4 at size 8, so the split of bucket 4 has a node to copy.
         ConcurrentResizableHashSetRCU<int, false, CollisionHash> set(4);
-        set.insert(100);
+        const ConcurrentResizableHashSetRCU<int, false, CollisionHash>::handle h = set.new_handle();
+        set.insert(h, 100);
 
         // 8 threads aggressively inserting elements that hash to 4, 5, 6, 7. Every
         // thread's first key (k = 0) maps to bucket 4 (i*10000 is a multiple of
         // 16), so all eight start in the split of the same bucket; their own
         // inserts keep doubling the table from there (rule 1, then the shards they
         // touch).
-        run_threads(8, [&set](int i) {
+        run_threads(8, set, [&set](const ConcurrentResizableHashSetRCU<int, false, CollisionHash>::handle& h, int i) {
             for (int k = 0; k < 500; ++k) {
                 // Keys that map to bucket 4, 5, 6, 7 when the table size is 8.
-                set.insert(4 + 8*k + i*10000);
-                set.insert(5 + 8*k + i*10000);
-                set.insert(6 + 8*k + i*10000);
-                set.insert(7 + 8*k + i*10000);
+                set.insert(h, 4 + 8*k + i*10000);
+                set.insert(h, 5 + 8*k + i*10000);
+                set.insert(h, 6 + 8*k + i*10000);
+                set.insert(h, 7 + 8*k + i*10000);
             } // key loop
         });
 
         // Verify
         for (int i = 0; i < 8; ++i) {
             for (int k = 0; k < 500; ++k) {
-                EXPECT_TRUE(set.contains(4 + 8*k + i*10000)) << "rep " << rep;
-                EXPECT_TRUE(set.contains(5 + 8*k + i*10000)) << "rep " << rep;
-                EXPECT_TRUE(set.contains(6 + 8*k + i*10000)) << "rep " << rep;
-                EXPECT_TRUE(set.contains(7 + 8*k + i*10000)) << "rep " << rep;
+                EXPECT_TRUE(set.contains(h, 4 + 8*k + i*10000)) << "rep " << rep;
+                EXPECT_TRUE(set.contains(h, 5 + 8*k + i*10000)) << "rep " << rep;
+                EXPECT_TRUE(set.contains(h, 6 + 8*k + i*10000)) << "rep " << rep;
+                EXPECT_TRUE(set.contains(h, 7 + 8*k + i*10000)) << "rep " << rep;
             } // key loop
         } // membership sweep
-        EXPECT_TRUE(set.contains(100)) << "the key the first split copied was lost, rep " << rep;
+        EXPECT_TRUE(set.contains(h, 100)) << "the key the first split copied was lost, rep " << rep;
     } // repetitions
 } // SplitContention
 
@@ -608,34 +625,35 @@ TEST(ConcurrentHashSetRcuTest, SplitContention) {
 // test; ExactlyOneEraseWinnerPerKeyDuringGrowth below covers erase under resize.
 TEST(ConcurrentHashSetRcuTest, TombstoneErase) {
     ConcurrentResizableHashSetRCU<int, true> set(4);
+    const ConcurrentResizableHashSetRCU<int, true>::handle h = set.new_handle();
 
     // Basic erase
-    EXPECT_TRUE(set.insert(10));
-    EXPECT_TRUE(set.insert(20));
-    EXPECT_TRUE(set.contains(10));
-    EXPECT_TRUE(set.erase(10));
-    EXPECT_FALSE(set.contains(10));
-    EXPECT_FALSE(set.erase(10)); // Already erased
-    EXPECT_TRUE(set.contains(20));
+    EXPECT_TRUE(set.insert(h, 10));
+    EXPECT_TRUE(set.insert(h, 20));
+    EXPECT_TRUE(set.contains(h, 10));
+    EXPECT_TRUE(set.erase(h, 10));
+    EXPECT_FALSE(set.contains(h, 10));
+    EXPECT_FALSE(set.erase(h, 10)); // Already erased
+    EXPECT_TRUE(set.contains(h, 20));
 
     // Erase and insert again
-    EXPECT_TRUE(set.insert(10));
-    EXPECT_TRUE(set.contains(10));
+    EXPECT_TRUE(set.insert(h, 10));
+    EXPECT_TRUE(set.contains(h, 10));
 
     // Concurrent erase of disjoint, pre-populated ranges.
     for (int i = 0; i < 8; ++i) {
         for (int k = 0; k < 1000; ++k) {
-            set.insert(scramble(i*10000 + k));
+            set.insert(h, scramble(i*10000 + k));
         }
     } // pre-population
 
     std::vector<size_t> not_erased(8, 0);
-    run_threads(8, [&set, &not_erased](int i) {
+    run_threads(8, set, [&set, &not_erased](const ConcurrentResizableHashSetRCU<int, true>::handle& h, int i) {
         size_t bad = 0;
         for (int k = 0; k < 1000; ++k) {
             // The key is present and private to this thread: the contract makes
             // this call the present->absent transition, so it must return true.
-            bad += !set.erase(scramble(i*10000 + k));
+            bad += !set.erase(h, scramble(i*10000 + k));
         }
         not_erased[i] = bad;
     });
@@ -643,7 +661,7 @@ TEST(ConcurrentHashSetRcuTest, TombstoneErase) {
     for (int i = 0; i < 8; ++i) {
         EXPECT_EQ(not_erased[i], 0u) << "erase() of a present, uncontended key returned false, thread " << i;
         for (int k = 0; k < 1000; ++k) {
-            EXPECT_FALSE(set.contains(scramble(i*10000 + k)));
+            EXPECT_FALSE(set.contains(h, scramble(i*10000 + k)));
         }
     } // membership sweep
 } // TombstoneErase
@@ -669,28 +687,29 @@ TEST(ConcurrentHashSetRcuTest, TombstoneErase) {
 // are 5, so at size 8 every key is in bucket 5.
 TEST(ConcurrentHashSetRcuTest, CooperativeSplitTSAN) {
     ConcurrentResizableHashSetRCU<int, false, CollisionHash> set(4);
+    const ConcurrentResizableHashSetRCU<int, false, CollisionHash>::handle h = set.new_handle();
 
     // Exactly one resize (N=4 -> N=8) before the threads start: by rule 1 of "WHEN
     // THE TABLE DOUBLES" the set's first insert doubles it, and a second one would
     // double it again. Key 0 stays in bucket 0, so buckets 4..7 are UNINITIALIZED
     // when the threads are released.
-    set.insert(0);
+    set.insert(h, 0);
 
     constexpr int NUM_THREADS = 8;
     constexpr int INSERTS_PER_THREAD = 1000;
     // The i-th key of thread t (see above); distinct for every (t, i).
     auto key_of = [](int t, int i) { return 5 + 8*i + (t << 16); };
 
-    run_threads(NUM_THREADS, [&set, &key_of](int t) {
+    run_threads(NUM_THREADS, set, [&set, &key_of](const ConcurrentResizableHashSetRCU<int, false, CollisionHash>::handle& h, int t) {
         for (int i = 0; i < INSERTS_PER_THREAD; ++i) {
-            set.insert(key_of(t, i));
+            set.insert(h, key_of(t, i));
         } // insert loop
     });
 
     int success_count = 0;
     for (int t = 0; t < NUM_THREADS; ++t) {
         for (int i = 0; i < INSERTS_PER_THREAD; ++i) {
-            if (set.contains(key_of(t, i))) {
+            if (set.contains(h, key_of(t, i))) {
                 success_count++;
             }
         }
@@ -706,26 +725,27 @@ TEST(ConcurrentHashSetRcuTest, CooperativeSplitTSAN) {
 // consecutive key range, after which unscrambled keys would stop moving.
 TEST(ConcurrentHashSetRcuTest, EraseStressTSAN) {
     ConcurrentResizableHashSetRCU<int, true> set(4);
+    const ConcurrentResizableHashSetRCU<int, true>::handle h = set.new_handle();
     constexpr int NUM_THREADS = 8;
     constexpr int OPERATIONS_PER_THREAD = 2000;
 
     // First, populate the set heavily so we force resizes and splits.
     for (int i = 0; i < NUM_THREADS*OPERATIONS_PER_THREAD; ++i) {
-        set.insert(scramble(i));
+        set.insert(h, scramble(i));
     }
 
     // Concurrently read, insert, and erase to stress the MARK_BIT CAS, the freeze
     // CAS a concurrent split performs on the same link word, and the DCLP resize.
     std::vector<size_t> bad(NUM_THREADS, 0);
-    run_threads(NUM_THREADS, [&set, &bad](int t) {
+    run_threads(NUM_THREADS, set, [&set, &bad](const ConcurrentResizableHashSetRCU<int, true>::handle& h, int t) {
         size_t b = 0;
         for (int i = 0; i < OPERATIONS_PER_THREAD; ++i) {
             int key = scramble(t*OPERATIONS_PER_THREAD + i);
 
-            b += !set.erase(key);      // present -> absent: exactly this call
-            b += set.contains(key);    // its own eraser must not still see it
-            b += !set.insert(key);     // absent -> present: exactly this call
-            b += !set.erase(key);      // present -> absent again
+            b += !set.erase(h, key);      // present -> absent: exactly this call
+            b += set.contains(h, key);    // its own eraser must not still see it
+            b += !set.insert(h, key);     // absent -> present: exactly this call
+            b += !set.erase(h, key);      // present -> absent again
         } // operation loop
         bad[t] = b;
     });
@@ -736,7 +756,7 @@ TEST(ConcurrentHashSetRcuTest, EraseStressTSAN) {
 
     // At the end, all keys should be erased
     for (int i = 0; i < NUM_THREADS*OPERATIONS_PER_THREAD; ++i) {
-        EXPECT_FALSE(set.contains(scramble(i)));
+        EXPECT_FALSE(set.contains(h, scramble(i)));
     }
 } // EraseStressTSAN
 
@@ -771,23 +791,26 @@ TEST(ConcurrentHashSetRcuTest, LostUpdateOnResize) {
         bool t1_inserted = false;
 
         std::thread t1([&]() {
+            const ConcurrentResizableHashSetRCU<int, false, CollisionHash>::handle h = set.new_handle();
             while (!start.load(std::memory_order_acquire)) {}
             // Insert 4 which hashes to 0 initially (4 & 3 == 0)
-            t1_inserted = set.insert(4);
+            t1_inserted = set.insert(h, 4);
         });
 
         std::thread t2([&]() {
+            const ConcurrentResizableHashSetRCU<int, false, CollisionHash>::handle h = set.new_handle();
             while (!start.load(std::memory_order_acquire)) {}
-            set.insert(1);      // the set's first insert, as a rule: doubles 4 -> 8
-            set.contains(12);   // splits bucket 4 from bucket 0's chain
+            set.insert(h, 1);      // the set's first insert, as a rule: doubles 4 -> 8
+            set.contains(h, 12);   // splits bucket 4 from bucket 0's chain
         });
 
         start.store(true, std::memory_order_release);
         t1.join();
         t2.join();
+        const ConcurrentResizableHashSetRCU<int, false, CollisionHash>::handle h = set.new_handle();
 
         ASSERT_TRUE(t1_inserted) << "insert(4) of an absent, uncontended key returned false in rep " << rep;
-        ASSERT_TRUE(set.contains(4)) << "Lost update in rep " << rep;
+        ASSERT_TRUE(set.contains(h, 4)) << "Lost update in rep " << rep;
     } // repetitions
 } // LostUpdateOnResize
 
@@ -805,9 +828,9 @@ TEST(ConcurrentHashSetRcuTest, InsertContention_NoMemoryLeak) {
     const int T = 8;
     const int N = 1000;
 
-    run_threads(T, [&set](int t) {
+    run_threads(T, set, [&set](const ConcurrentResizableHashSetRCU<int, false, ConstantHash>::handle& h, int t) {
         for (int i = 0; i < N; ++i) {
-            set.insert(t*N + i);
+            set.insert(h, t*N + i);
         }
     });
 
@@ -876,16 +899,17 @@ TEST(ConcurrentHashSetRcuTest, InsertContention_NoMemoryLeak) {
 template <typename SetT>
 static void one_winner_per_key_body(int T, int N, int rep, const char* flavor, size_t& limbo, size_t shards = 0, int prefill = 0, size_t min_free = 0) {
     SetT set(4, shards);
+    const typename SetT::handle h = set.new_handle();
     size_t prefilled = 0;   // prefill keys still in the set when the race starts
     std::vector<int> prefill_keys;
     for (int i = 0; i < prefill; ++i) {
         prefill_keys.push_back(scramble(N + i));
-        set.insert(prefill_keys.back());
+        set.insert(h, prefill_keys.back());
     }
     if (prefill > 0) {
-        EXPECT_EQ(membership_errors(set, prefill_keys, std::vector<int>{}), 0) << "prefill, rep " << rep;   // settles the splits
-        if constexpr (requires { set.erase(0); }) {
-            for (int i = 0; i < prefill; ++i) set.erase(scramble(N + i));
+        EXPECT_EQ(membership_errors(set, h, prefill_keys, std::vector<int>{}), 0) << "prefill, rep " << rep;   // settles the splits
+        if constexpr (requires { set.erase(h, 0); }) {
+            for (int i = 0; i < prefill; ++i) set.erase(h, scramble(N + i));
         } else {
             prefilled = static_cast<size_t>(prefill);
         }
@@ -895,9 +919,9 @@ static void one_winner_per_key_body(int T, int N, int rep, const char* flavor, s
     } // start with non-empty free lists
     const size_t expected = static_cast<size_t>(N) + prefilled;
     std::vector<std::vector<unsigned char>> won(T, std::vector<unsigned char>(N, 0));
-    run_threads(T, [&set, &won, N](int t) {
+    run_threads(T, set, [&set, &won, N](const typename SetT::handle& h, int t) {
         for (int k = 0; k < N; ++k) {
-            if (set.insert(scramble(k))) won[t][k] = 1;
+            if (set.insert(h, scramble(k))) won[t][k] = 1;
         }
     });
     const std::string where = std::string("rep ") + std::to_string(rep) + " (" + flavor + ")";
@@ -909,7 +933,7 @@ static void one_winner_per_key_body(int T, int N, int rep, const char* flavor, s
         for (int t = 0; t < T; ++t) c += won[t][k];
         if (c > 1) ++over;
         if (c < 1) ++under;
-        if (!set.contains(scramble(k))) ++missing;
+        if (!set.contains(h, scramble(k))) ++missing;
     } // per-key check
     EXPECT_EQ(over, 0) << over << " key(s) had MORE than one successful insert(), " << where;
     EXPECT_EQ(under, 0) << under << " key(s) had NO successful insert(), " << where;
@@ -960,17 +984,32 @@ TEST(ConcurrentHashSetRcuTest, NoDoubleWinnerAcrossResize) {
     const int KEY = 4;
     const int ATTEMPTS = 20000;
     std::unique_ptr<Set> set;
+    // The handles of each attempt's set: handles[role] is worker `role`'s and
+    // handles[3] this thread's. This thread joins them all to the new set before
+    // the attempt's first barrier, so no join runs inside the race; a worker uses
+    // its own only after that barrier (the happens-before edge a handle needs to
+    // be used on another thread); and this thread releases them all after the
+    // second barrier, before the next attempt's set replaces this one, since a
+    // handle must not outlive its set. Declared after `set`, so destroyed first.
+    // Each on its own 128-byte block: with assert() live every operation counts
+    // itself in its handle (an RMW at entry and at exit), and handles packed
+    // into one line would put that line between the racing workers.
+    struct alignas(128) PaddedHandle {
+        Set::handle h;   // one thread's handle of the attempt's set
+    }; // struct PaddedHandle
+    std::vector<PaddedHandle> handles(4);
     std::atomic<int> winners{0};
     std::barrier round(4);   // three workers plus this thread
 
     std::vector<std::thread> workers;
     for (int role = 0; role < 3; ++role) {
-        workers.emplace_back([&set, &winners, &round, KEY, role]() {
+        workers.emplace_back([&set, &handles, &winners, &round, KEY, role]() {
             for (int a = 0; a < ATTEMPTS; ++a) {
                 round.arrive_and_wait();     // the set for this attempt is built
+                const Set::handle& h = handles[role].h;
                 if (role == 1) {
-                    set->insert(1);          // the set's first insert, as a rule: doubles 4 -> 8
-                } else if (set->insert(KEY)) {
+                    set->insert(h, 1);       // the set's first insert, as a rule: doubles 4 -> 8
+                } else if (set->insert(h, KEY)) {
                     winners.fetch_add(1, std::memory_order_relaxed);
                 }
                 round.arrive_and_wait();     // results are safe to read
@@ -981,6 +1020,7 @@ TEST(ConcurrentHashSetRcuTest, NoDoubleWinnerAcrossResize) {
     int bad = 0, first_bad = -1, missing = 0;
     for (int a = 0; a < ATTEMPTS; ++a) {
         set = std::make_unique<Set>(4);   // empty: see "Geometry" above
+        for (PaddedHandle& p : handles) p.h = set->new_handle();
         winners.store(0, std::memory_order_relaxed);
         round.arrive_and_wait();
         round.arrive_and_wait();
@@ -988,7 +1028,8 @@ TEST(ConcurrentHashSetRcuTest, NoDoubleWinnerAcrossResize) {
             ++bad;
             if (first_bad < 0) first_bad = a;
         }
-        if (!set->contains(KEY)) ++missing;
+        if (!set->contains(handles[3].h, KEY)) ++missing;
+        for (PaddedHandle& p : handles) p.h = {};   // before the next attempt's set replaces this one
     } // attempt loop
     for (std::thread& th : workers) th.join();
 
@@ -1087,14 +1128,15 @@ TEST(ConcurrentHashSetRcuTest, ExactlyOneEraseWinnerPerKeyDuringGrowth) {
 
     for (int r = 0; r < ROUNDS; ++r) {
         Set set(4, 2*T);
-        for (int k = 0; k < K; ++k) set.insert(scramble(k));
+        const Set::handle h = set.new_handle();
+        for (int k = 0; k < K; ++k) set.insert(h, scramble(k));
 
         std::vector<std::vector<unsigned char>> won(T, std::vector<unsigned char>(K, 0));
         std::vector<int> dup(T, 0);
-        run_threads(T, [&set, &won, &dup](int t) {
+        run_threads(T, set, [&set, &won, &dup](const Set::handle& h, int t) {
             for (int i = 0; i < K; ++i) {
                 const int k = (i + t*K/T)%K;     // staggered start per thread
-                if (set.erase(scramble(k))) ++won[t][k];
+                if (set.erase(h, scramble(k))) ++won[t][k];
                 // Filler inserts, spread evenly through the erases from step s0 on
                 // (see "Shape" above): these are what grow the arena and double the
                 // table mid-flight. Each key belongs to one thread, so a false
@@ -1103,7 +1145,7 @@ TEST(ConcurrentHashSetRcuTest, ExactlyOneEraseWinnerPerKeyDuringGrowth) {
                 const int steps = K - s0;  // steps its fillers are spread over
                 if (i >= s0) {
                     for (int f = (i - s0)*FILL/steps; f < (i - s0 + 1)*FILL/steps; ++f) {
-                        if (!set.insert(scramble(K + t*FILL + f))) ++dup[t];
+                        if (!set.insert(h, scramble(K + t*FILL + f))) ++dup[t];
                     }
                 } // if this thread's fillers have started
             } // key loop
@@ -1114,12 +1156,12 @@ TEST(ConcurrentHashSetRcuTest, ExactlyOneEraseWinnerPerKeyDuringGrowth) {
             for (int t = 0; t < T; ++t) c += won[t][k];
             if (c > 1) ++over;
             if (c < 1) ++under;
-            if (set.contains(scramble(k))) ++still_present;
+            if (set.contains(h, scramble(k))) ++still_present;
         } // per-key check
         for (int t = 0; t < T; ++t) {
             filler_dup += dup[t];
             for (int f = 0; f < FILL; ++f) {
-                if (!set.contains(scramble(K + t*FILL + f))) ++filler_missing;
+                if (!set.contains(h, scramble(K + t*FILL + f))) ++filler_missing;
             }
         } // filler check
     } // rounds
@@ -1164,10 +1206,11 @@ TEST(ConcurrentHashSetRcuTest, InsertEraseChurnPerKeyAccounting) {
 
     for (int rep = 0; rep < REPS; ++rep) {
         Set set(4, 2*T);
+        const Set::handle h = set.new_handle();
         std::vector<std::vector<int>> ins(T, std::vector<int>(R, 0));
         std::vector<std::vector<int>> ers(T, std::vector<int>(R, 0));
 
-        run_threads(T, [&set, &ins, &ers, rep](int t) {
+        run_threads(T, set, [&set, &ins, &ers, rep](const Set::handle& h, int t) {
             std::minstd_rand rng(static_cast<unsigned>(rep*977 + t + 1));
             for (int op = 0; op < OPS; ++op) {
                 const unsigned x = rng();
@@ -1180,13 +1223,13 @@ TEST(ConcurrentHashSetRcuTest, InsertEraseChurnPerKeyAccounting) {
                 switch (kind) {
                     case 0:
                     case 1:  // insert twice as often as erase, so the set stays populated
-                        if (set.insert(k)) ++ins[t][i];
+                        if (set.insert(h, k)) ++ins[t][i];
                         break;
                     case 2:
-                        if (set.erase(k)) ++ers[t][i];
+                        if (set.erase(h, k)) ++ers[t][i];
                         break;
                     default:
-                        set.contains(k);
+                        set.contains(h, k);
                         break;
                 } // operation kind
             } // operation loop
@@ -1200,7 +1243,7 @@ TEST(ConcurrentHashSetRcuTest, InsertEraseChurnPerKeyAccounting) {
             EXPECT_LE(d, 1) << "key index " << i << ": " << d << " more successful inserts than erases (rep "
                             << rep << "); the transitions must alternate, so at most one";
             EXPECT_GE(d, 0) << "key index " << i << ": more successful erases than inserts (rep " << rep << ")";
-            EXPECT_EQ(set.contains(scramble(i + 1)), d == 1)
+            EXPECT_EQ(set.contains(h, scramble(i + 1)), d == 1)
                 << "key index " << i << ": final membership disagrees with the insert/erase tally " << d
                 << " (rep " << rep << ")";
         } // per-key check
@@ -1257,14 +1300,15 @@ TEST(ConcurrentHashSetRcuTest, EraseNotUndoneByResize) {
 
     for (int rep = 0; rep < REPS; ++rep) {
         Set set(4);
+        const Set::handle h = set.new_handle();
 
         // Phase 1: contended inserts of the shared keys during growth.
         std::vector<std::vector<unsigned char>> won(T, std::vector<unsigned char>(K, 0));
-        run_threads(T, [&set, &won](int t) {
+        run_threads(T, set, [&set, &won](const Set::handle& h, int t) {
             for (int i = 0; i < K; ++i) {
                 const int k = (i + t*K/T)%K;
-                if (set.insert(scramble(k))) won[t][k] = 1;
-                for (int f = i*FILL/K; f < (i + 1)*FILL/K; ++f) set.insert(scramble(K + t*FILL + f));
+                if (set.insert(h, scramble(k))) won[t][k] = 1;
+                for (int f = i*FILL/K; f < (i + 1)*FILL/K; ++f) set.insert(h, scramble(K + t*FILL + f));
             } // key loop
         });
         for (int k = 0; k < K; ++k) {
@@ -1276,30 +1320,31 @@ TEST(ConcurrentHashSetRcuTest, EraseNotUndoneByResize) {
 
         // Phase 2: erase them all, single-threaded, with fully determined results.
         for (int k = 0; k < K; ++k) {
-            erase_wrong += !set.erase(scramble(k));   // present -> absent
-            erase_wrong += set.erase(scramble(k));    // already absent
-            erase_wrong += set.contains(scramble(k));
+            erase_wrong += !set.erase(h, scramble(k));   // present -> absent
+            erase_wrong += set.erase(h, scramble(k));    // already absent
+            erase_wrong += set.contains(h, scramble(k));
         } // erase sweep
 
         // Phase 3: growth of OTHER keys, with the erased keys under observation.
         std::atomic<bool> stop{false};
         std::atomic<size_t> seen{0};
         std::thread watcher([&set, &stop, &seen]() {
+            const Set::handle h = set.new_handle();
             while (!stop.load(std::memory_order_acquire)) {
                 for (int k = 0; k < K; ++k) {
-                    if (set.contains(scramble(k))) seen.fetch_add(1, std::memory_order_relaxed);
+                    if (set.contains(h, scramble(k))) seen.fetch_add(1, std::memory_order_relaxed);
                 }
             } // poll until the hammers are done
         });
-        run_threads(T, [&set](int t) {
-            for (int h = 0; h < HAMMER; ++h) set.insert(scramble(K + T*FILL + t*HAMMER + h));
+        run_threads(T, set, [&set](const Set::handle& own, int t) {   // `own`: `h` is the loop index here
+            for (int h = 0; h < HAMMER; ++h) set.insert(own, scramble(K + T*FILL + t*HAMMER + h));
         });
         stop.store(true, std::memory_order_release);
         watcher.join();
         resurrected_live += seen.load();
 
         for (int k = 0; k < K; ++k) {
-            if (set.contains(scramble(k))) ++resurrected_final;
+            if (set.contains(h, scramble(k))) ++resurrected_final;
         }
     } // repetitions
 
@@ -1328,20 +1373,21 @@ TEST(ConcurrentHashSetRcuTest, ThreadPrivateKeySequenceDuringGrowth) {
     using Set = ConcurrentResizableHashSetRCU<int, true>;
     const int T = 8, PER = 1500;
     Set set(4);
+    const Set::handle h = set.new_handle();
     std::vector<size_t> bad(T, 0);
 
-    run_threads(T, [&set, &bad](int t) {
+    run_threads(T, set, [&set, &bad](const Set::handle& h, int t) {
         size_t b = 0;
         for (int i = 0; i < PER; ++i) {
             const int k = scramble(t*PER + i);
-            b += !set.insert(k);     // absent -> present
-            b += !set.contains(k);   // visible to its own inserter, immediately
-            b += set.insert(k);      // already present
-            b += !set.erase(k);      // present -> absent
-            b += set.contains(k);    // invisible to its own eraser, immediately
-            b += set.erase(k);       // already absent
-            b += !set.insert(k);     // absent -> present again
-            b += !set.contains(k);
+            b += !set.insert(h, k);     // absent -> present
+            b += !set.contains(h, k);   // visible to its own inserter, immediately
+            b += set.insert(h, k);      // already present
+            b += !set.erase(h, k);      // present -> absent
+            b += set.contains(h, k);    // invisible to its own eraser, immediately
+            b += set.erase(h, k);       // already absent
+            b += !set.insert(h, k);     // absent -> present again
+            b += !set.contains(h, k);
         } // key loop
         bad[t] = b;
     });
@@ -1353,7 +1399,7 @@ TEST(ConcurrentHashSetRcuTest, ThreadPrivateKeySequenceDuringGrowth) {
     }
     for (int t = 0; t < T; ++t) {
         for (int i = 0; i < PER; ++i) {
-            EXPECT_TRUE(set.contains(scramble(t*PER + i))) << "key lost, thread " << t << " index " << i;
+            EXPECT_TRUE(set.contains(h, scramble(t*PER + i))) << "key lost, thread " << t << " index " << i;
         }
     } // membership sweep
 } // ThreadPrivateKeySequenceDuringGrowth
@@ -1401,14 +1447,15 @@ TEST(ConcurrentHashSetRcuTest, ReclaimExactPreSized) {
     const int N = 1000, K = 250;
     {   // AllowDelete == true: the erased nodes are the only dead nodes
         ConcurrentResizableHashSetRCU<int, true> set(1024, 1);
+        const ConcurrentResizableHashSetRCU<int, true>::handle h = set.new_handle();
         std::vector<int> kept, erased, fresh;
-        for (int i = 0; i < N; ++i) EXPECT_TRUE(set.insert(scramble(i)));
+        for (int i = 0; i < N; ++i) EXPECT_TRUE(set.insert(h, scramble(i)));
         const ConcurrentResizableHashSetRCU<int, true>::InternalAccounting filled = expect_consistent(set, "after the fill");
         EXPECT_EQ(filled.slots, size_t(N));
         EXPECT_EQ(filled.reachable, size_t(N));
         for (int i = 0; i < N; ++i) {
             if (i%4 == 1) {   // every 4th key: the erased nodes sit anywhere in their chains
-                EXPECT_TRUE(set.erase(scramble(i)));
+                EXPECT_TRUE(set.erase(h, scramble(i)));
                 erased.push_back(scramble(i));
             } else {
                 kept.push_back(scramble(i));
@@ -1419,7 +1466,7 @@ TEST(ConcurrentHashSetRcuTest, ReclaimExactPreSized) {
         EXPECT_EQ(before.retired + before.reachable_dead, size_t(K)) << "an erased node is neither retired nor dead in its chain";
         ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, N - K, "first reclaim()"));
         EXPECT_EQ(set.get_internal_free_count(), size_t(K)) << "every erased node, and nothing else, is freed";
-        EXPECT_EQ(membership_errors(set, kept, erased), 0);
+        EXPECT_EQ(membership_errors(set, h, kept, erased), 0);
 
         // Idempotence: nothing died since, so nothing more is freed.
         ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, N - K, "second reclaim()"));
@@ -1428,30 +1475,31 @@ TEST(ConcurrentHashSetRcuTest, ReclaimExactPreSized) {
         // Reinsert K new keys: every one must be served from the free list.
         for (int i = 0; i < K; ++i) {
             fresh.push_back(scramble(N + i));
-            EXPECT_TRUE(set.insert(fresh.back()));
+            EXPECT_TRUE(set.insert(h, fresh.back()));
         }
         EXPECT_EQ(set.get_internal_node_count(), size_t(N)) << "the arena grew although the free list held a node for every insert";
         EXPECT_EQ(set.get_internal_free_count(), 0u);
         expect_consistent(set, "after the reinsertion");
         ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, N, "third reclaim()"));
         EXPECT_EQ(set.get_internal_free_count(), 0u);
-        EXPECT_EQ(membership_errors(set, kept, erased), 0);
-        EXPECT_EQ(membership_errors(set, fresh, std::vector<int>{}), 0);
+        EXPECT_EQ(membership_errors(set, h, kept, erased), 0);
+        EXPECT_EQ(membership_errors(set, h, fresh, std::vector<int>{}), 0);
     } // AllowDelete == true
     {   // AllowDelete == false: pre-sized, so nothing is ever dead
         ConcurrentResizableHashSetRCU<int, false> set(1024, 1);
+        const ConcurrentResizableHashSetRCU<int, false>::handle h = set.new_handle();
         std::vector<int> keys, absent;
         for (int i = 0; i < N; ++i) {
             keys.push_back(scramble(i));
-            EXPECT_TRUE(set.insert(keys.back()));
+            EXPECT_TRUE(set.insert(h, keys.back()));
             absent.push_back(scramble(N + i));
         }
         ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, N, "AllowDelete=false, first reclaim()"));
         EXPECT_EQ(set.get_internal_free_count(), 0u) << "reclaim() freed a live node";
-        for (int k : keys) EXPECT_FALSE(set.insert(k));   // duplicates: no allocation, no change
+        for (int k : keys) EXPECT_FALSE(set.insert(h, k));   // duplicates: no allocation, no change
         EXPECT_EQ(set.get_internal_node_count(), size_t(N));
         ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, N, "AllowDelete=false, second reclaim()"));
-        EXPECT_EQ(membership_errors(set, keys, absent), 0);
+        EXPECT_EQ(membership_errors(set, h, keys, absent), 0);
     } // AllowDelete == false
 } // ReclaimExactPreSized
 
@@ -1487,12 +1535,13 @@ static void reclaim_with_pending_splits_body() {
     for (int n : sizes) {
         const std::string where = std::string(AllowDelete ? "AllowDelete=true" : "AllowDelete=false") + ", n = " + std::to_string(n);
         Set set(4, 1);
+        const typename Set::handle h = set.new_handle();
         std::vector<int> in, out;
-        for (int i = 0; i < n; ++i) EXPECT_TRUE(set.insert(scramble(i))) << where;
+        for (int i = 0; i < n; ++i) EXPECT_TRUE(set.insert(h, scramble(i))) << where;
         for (int i = 0; i < n; ++i) {
             if constexpr (AllowDelete) {
                 if (i%3 == 0) {
-                    EXPECT_TRUE(set.erase(scramble(i))) << where;
+                    EXPECT_TRUE(set.erase(h, scramble(i))) << where;
                     out.push_back(scramble(i));
                     continue;
                 }
@@ -1503,7 +1552,7 @@ static void reclaim_with_pending_splits_body() {
         const size_t free1 = set.get_internal_free_count();
         ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, in.size(), where + ", second reclaim()"));
         EXPECT_EQ(set.get_internal_free_count(), free1) << where << ": the second reclaim() freed something new";
-        EXPECT_EQ(membership_errors(set, in, out), 0) << where << ": reclaim() changed membership";
+        EXPECT_EQ(membership_errors(set, h, in, out), 0) << where << ": reclaim() changed membership";
 
         // Reuse, with the baseline taken after the contains() sweep just done. That
         // sweep's splits popped the free list (with AllowDelete == false it is
@@ -1514,7 +1563,7 @@ static void reclaim_with_pending_splits_body() {
         const size_t free0 = set.get_internal_free_count();
         for (size_t i = 0; i < free0/2; ++i) {
             in.push_back(scramble(1000000 + n + static_cast<int>(i)));
-            EXPECT_TRUE(set.insert(in.back())) << where;
+            EXPECT_TRUE(set.insert(h, in.back())) << where;
         }
         const size_t free2 = set.get_internal_free_count();
         EXPECT_TRUE(free2 == 0 || set.get_internal_node_count() == slots0)
@@ -1522,7 +1571,7 @@ static void reclaim_with_pending_splits_body() {
             << " while the free list still held " << free2 << " node(s)";
         if (free0 > 0 && free2 > 0) ++reuse_exercised;
         ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, in.size(), where + ", reclaim() after the reuse"));
-        EXPECT_EQ(membership_errors(set, in, out), 0) << where << ": membership after the reuse";
+        EXPECT_EQ(membership_errors(set, h, in, out), 0) << where << ": membership after the reuse";
     } // for each burst size
     // Not an oracle on the header: a guard that the reuse check above is not vacuous.
     EXPECT_GT(reuse_exercised, 0) << "no size exercised reuse with free nodes left over";
@@ -1554,16 +1603,17 @@ TEST(ConcurrentHashSetRcuTest, ReclaimStaleSplitCopiesNoDelete) {
     for (int rep = 0; rep < REPS; ++rep) {
         const std::string where = "rep " + std::to_string(rep);
         Set set(4, T);
+        const Set::handle h = set.new_handle();
         std::vector<size_t> bad(T, 0);
-        run_threads(T, [&set, &bad, rep](int t) {
-            for (int i = 0; i < PER; ++i) bad[t] += !set.insert(scramble((rep*T + t)*PER + i));
+        run_threads(T, set, [&set, &bad, rep](const Set::handle& h, int t) {
+            for (int i = 0; i < PER; ++i) bad[t] += !set.insert(h, scramble((rep*T + t)*PER + i));
         });
         for (int t = 0; t < T; ++t) EXPECT_EQ(bad[t], 0u) << where << ": insert() of a new, uncontended key returned false";
         std::vector<int> in, out;
         for (int i = 0; i < T*PER; ++i) in.push_back(scramble(rep*T*PER + i));
         for (int i = 0; i < 100; ++i) out.push_back(scramble(1000000 + i));
         ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, T*PER, where + ", phase 1"));
-        EXPECT_EQ(membership_errors(set, in, out), 0) << where << ": reclaim() with pending splits changed membership";
+        EXPECT_EQ(membership_errors(set, h, in, out), 0) << where << ": reclaim() with pending splits changed membership";
         const Set::InternalAccounting swept = expect_consistent(set, where + ", after the settling sweep");
         EXPECT_EQ(swept.reachable, size_t(T*PER)) << where << ": an uncontended split left a superseded parent copy reachable";
         EXPECT_EQ(swept.reachable_dead, 0u) << where << ": a dead node is reachable after single-threaded splits";
@@ -1572,8 +1622,8 @@ TEST(ConcurrentHashSetRcuTest, ReclaimStaleSplitCopiesNoDelete) {
         // nothing forces it.
         ASSERT_GT(swept.retired, 0u) << where << ": test precondition: the sweep's splits superseded no parent copy";
         ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, T*PER, where + ", phase 2"));
-        EXPECT_EQ(membership_errors(set, in, out), 0) << where << ": reclaim() of superseded copies changed membership";
-        for (int k : in) EXPECT_FALSE(set.insert(k)) << where << ": a duplicate insert() returned true after reclaim()";
+        EXPECT_EQ(membership_errors(set, h, in, out), 0) << where << ": reclaim() of superseded copies changed membership";
+        for (int k : in) EXPECT_FALSE(set.insert(h, k)) << where << ": a duplicate insert() returned true after reclaim()";
     } // repetitions
 } // ReclaimStaleSplitCopiesNoDelete
 
@@ -1616,13 +1666,14 @@ TEST(ConcurrentHashSetRcuTest, ReclaimReuseAcrossShards) {
         const int per = K/static_cast<int>(std::max<size_t>(shape.shards, T));
         const std::string where = std::to_string(T) + " threads, " + std::to_string(shape.shards) + " shards";
         Set set(16384, shape.shards);
+        const Set::handle h = set.new_handle();
         std::vector<int> in, out;
-        for (int i = 0; i < N; ++i) EXPECT_TRUE(set.insert(scramble(i)));
+        for (int i = 0; i < N; ++i) EXPECT_TRUE(set.insert(h, scramble(i)));
         for (int i = 0; i < N; ++i) {
             if (i & 1) {
                 in.push_back(scramble(i));
             } else {
-                EXPECT_TRUE(set.erase(scramble(i)));
+                EXPECT_TRUE(set.erase(h, scramble(i)));
                 out.push_back(scramble(i));
             }
         } // erase the even-indexed keys
@@ -1634,15 +1685,15 @@ TEST(ConcurrentHashSetRcuTest, ReclaimReuseAcrossShards) {
         const size_t slots = set.get_internal_node_count();
 
         std::vector<size_t> bad(T, 0);
-        run_threads(T, [&set, &bad, per](int t) {
-            for (int i = 0; i < per; ++i) bad[t] += !set.insert(scramble(N + t*per + i));
+        run_threads(T, set, [&set, &bad, per](const Set::handle& h, int t) {
+            for (int i = 0; i < per; ++i) bad[t] += !set.insert(h, scramble(N + t*per + i));
         });
         for (int t = 0; t < T; ++t) EXPECT_EQ(bad[t], 0u) << where << ": insert() of a new, uncontended key returned false";
         for (int i = 0; i < T*per; ++i) in.push_back(scramble(N + i));
         EXPECT_EQ(set.get_internal_node_count(), slots) << where << ": the arena grew although every thread's shard held a free slot for each of its inserts";
         EXPECT_EQ(set.get_internal_free_count(), size_t(K - T*per)) << where;
         ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, in.size(), where + ", after the reuse"));
-        EXPECT_EQ(membership_errors(set, in, out), 0) << where;
+        EXPECT_EQ(membership_errors(set, h, in, out), 0) << where;
     } // for each shape
 } // ReclaimReuseAcrossShards
 
@@ -1678,12 +1729,13 @@ TEST(ConcurrentHashSetRcuTest, ReclaimThenConcurrentEraseAndGrowth) {
     int next = 0;   // next unused key index; keys are scramble(index), all distinct
     for (int rep = 0; rep < REPS; ++rep) {
         Set set(4, 2);
+        const Set::handle h = set.new_handle();
         std::vector<int> present, absent;
         for (int i = 0; i < A; ++i) {   // phase A, single-threaded: half the keys become tombstones
             const int k = scramble(next++);
-            EXPECT_TRUE(set.insert(k));
+            EXPECT_TRUE(set.insert(h, k));
             if (i & 1) {
-                EXPECT_TRUE(set.erase(k));
+                EXPECT_TRUE(set.erase(h, k));
                 absent.push_back(k);
             } else {
                 present.push_back(k);
@@ -1700,25 +1752,25 @@ TEST(ConcurrentHashSetRcuTest, ReclaimThenConcurrentEraseAndGrowth) {
                 for (int i = 0; i < F; ++i) fresh[t].push_back(scramble(next++));
             }
             std::vector<size_t> bad(T, 0);
-            run_threads(T, [&set, &old, &fresh, &bad](int t) {
+            run_threads(T, set, [&set, &old, &fresh, &bad](const Set::handle& h, int t) {
                 const std::vector<int>& mine = old[t];
                 const std::vector<int>& fr = fresh[t];
                 size_t b = 0;
                 for (size_t i = 0; i < std::max(mine.size(), fr.size()); ++i) {
                     if (i < fr.size()) {
-                        b += !set.insert(fr[i]);        // absent -> present (a reused slot, early on)
-                        b += !set.contains(fr[i]);
+                        b += !set.insert(h, fr[i]);        // absent -> present (a reused slot, early on)
+                        b += !set.contains(h, fr[i]);
                         if (i & 1) {
-                            b += !set.erase(fr[i - 1]);  // present -> absent
-                            b += set.contains(fr[i - 1]);
-                            b += set.erase(fr[i - 1]);   // already absent
+                            b += !set.erase(h, fr[i - 1]);  // present -> absent
+                            b += set.contains(h, fr[i - 1]);
+                            b += set.erase(h, fr[i - 1]);   // already absent
                         }
                     } // fresh key
                     if (i < mine.size()) {
-                        b += !set.erase(mine[i]);       // a kept node, or one reused in an earlier round
-                        b += set.contains(mine[i]);
-                        b += !set.insert(mine[i]);
-                        b += !set.contains(mine[i]);
+                        b += !set.erase(h, mine[i]);       // a kept node, or one reused in an earlier round
+                        b += set.contains(h, mine[i]);
+                        b += !set.insert(h, mine[i]);
+                        b += !set.contains(h, mine[i]);
                     } // surviving key
                 } // key loop
                 bad[t] = b;
@@ -1728,7 +1780,7 @@ TEST(ConcurrentHashSetRcuTest, ReclaimThenConcurrentEraseAndGrowth) {
                 for (int i = 0; i < F; ++i) ((i & 1) ? present : absent).push_back(fresh[t][i]);
             }
             ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, present.size(), where));
-            EXPECT_EQ(membership_errors(set, present, absent), 0) << where;
+            EXPECT_EQ(membership_errors(set, h, present, absent), 0) << where;
         } // rounds
     } // repetitions
 } // ReclaimThenConcurrentEraseAndGrowth
@@ -1765,6 +1817,11 @@ TEST(ConcurrentHashSetRcuTest, ReclaimThenConcurrentEraseAndGrowth) {
 //     node's value: equal_hook selects the comparison against one node). N is
 //     derived at each test from the operation's sequence of Hash{} and
 //     operator== calls; an action may arm the next hook (chained arming).
+//   - A nested operation in an action runs under the OUTER thread's handle, the
+//     one the outer operation is in flight under: that is the thread's handle
+//     at that instant, operations may share a handle, and a handle of its own
+//     would add a join inside the window the hook opens. (The same holds for
+//     on_assign's action, which runs inside an outer insert() too.)
 //   - hook_depth separates the outer operation's calls from the nested ones:
 //     while an action runs, no call counts toward a hook or toward the outer
 //     tally, so the nested operations' own hashing (and that of any accounting
@@ -1920,11 +1977,12 @@ TEST(ConcurrentHashSetRcuTest, ReclaimThrowingAssignment) {
     ProbeKey::reset_counters();
     {
         Set set(1024, 1);
+        const Set::handle h = set.new_handle();
         std::vector<int> in, out;
-        for (int i = 0; i < N; ++i) EXPECT_TRUE(set.insert(scramble(i)));
+        for (int i = 0; i < N; ++i) EXPECT_TRUE(set.insert(h, scramble(i)));
         for (int i = 0; i < N; ++i) {
             if (i < E) {
-                EXPECT_TRUE(set.erase(scramble(i)));
+                EXPECT_TRUE(set.erase(h, scramble(i)));
                 out.push_back(scramble(i));
             } else {
                 in.push_back(scramble(i));
@@ -1936,16 +1994,16 @@ TEST(ConcurrentHashSetRcuTest, ReclaimThrowingAssignment) {
 
         ProbeKey::copy_assignments = 0;
         ProbeKey::throw_countdown = 1;   // the next assignment throws
-        EXPECT_THROW(set.insert(scramble(N)), std::runtime_error);
+        EXPECT_THROW(set.insert(h, scramble(N)), std::runtime_error);
         ProbeKey::throw_countdown = 0;
-        EXPECT_FALSE(set.contains(scramble(N))) << "the key whose insert() threw is in the set";
+        EXPECT_FALSE(set.contains(h, scramble(N))) << "the key whose insert() threw is in the set";
         EXPECT_EQ(set.get_internal_limbo_count(), 1u) << "the popped slot must go to limbo";
         EXPECT_EQ(set.get_internal_free_count(), size_t(E - 1));
         EXPECT_EQ(set.get_internal_node_count(), slots);
         expect_consistent(set, "after the throwing insert()");
         EXPECT_EQ(ProbeKey::copy_assignments.load(), 0);
 
-        EXPECT_TRUE(set.insert(scramble(N)));   // the retry pops the next free slot
+        EXPECT_TRUE(set.insert(h, scramble(N)));   // the retry pops the next free slot
         in.push_back(scramble(N));
         EXPECT_EQ(set.get_internal_free_count(), size_t(E - 2));
         EXPECT_EQ(set.get_internal_limbo_count(), 1u);
@@ -1960,14 +2018,14 @@ TEST(ConcurrentHashSetRcuTest, ReclaimThrowingAssignment) {
         ProbeKey::copy_constructions = 0;
         for (size_t i = 0; i < free_slots; ++i) {
             in.push_back(scramble(N + 1 + static_cast<int>(i)));
-            EXPECT_TRUE(set.insert(in.back()));
+            EXPECT_TRUE(set.insert(h, in.back()));
         }
         EXPECT_EQ(set.get_internal_node_count(), slots) << "the arena grew although the free list (with the limbo slot) held a slot per insert";
         EXPECT_EQ(set.get_internal_free_count(), 0u);
         EXPECT_EQ(ProbeKey::copy_assignments.load(), static_cast<int>(free_slots)) << "a reused slot takes its value by copy assignment";
         EXPECT_EQ(ProbeKey::copy_constructions.load(), 0) << "reuse constructed a value";
         ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, in.size(), "after the reuse"));
-        EXPECT_EQ(membership_errors(set, in, out), 0);
+        EXPECT_EQ(membership_errors(set, h, in, out), 0);
     } // the set's lifetime
     EXPECT_EQ(ProbeKey::corrupt.load(), 0) << "an operation met a destroyed or never-constructed value";
 } // ReclaimThrowingAssignment
@@ -1989,8 +2047,8 @@ static constexpr int PROBE_E = 5 | (7 << 10);     // bucket 5 at every size up t
 // Fills a set built as SetT(256, 1) with the keys of `first`, in order, then with
 // fill_key(0), fill_key(1), ... until the arena holds exactly 512 slots; erases
 // fill_key(0 .. erase-1); reclaims, checking the result. `next` receives the
-// index of the first fill key not yet used. Callers wrap it in
-// ASSERT_NO_FATAL_FAILURE.
+// index of the first fill key not yet used. `h`: the calling thread's handle of
+// `set`. Callers wrap it in ASSERT_NO_FATAL_FAILURE.
 // The arithmetic, from the header's documented batching of node_count_ (the
 // resize hint; a doubling happens after a successful insert that sees it above
 // 2*table_size, i.e. above 512 here): the appends at indices 0 and 256 add 256
@@ -1999,11 +2057,11 @@ static constexpr int PROBE_E = 5 | (7 << 10);     // bucket 5 at every size up t
 // 512 is a multiple of 256. From then on the first pop after each reclaim() adds
 // 256, so it doubles the table iff live + 256 > 512, i.e. iff live > 256.
 template <typename SetT>
-static void fill_to_512_and_reclaim(SetT& set, const std::vector<int>& first, int erase, int& next) {
-    for (int k : first) EXPECT_TRUE(set.insert(k));
+static void fill_to_512_and_reclaim(SetT& set, const typename SetT::handle& h, const std::vector<int>& first, int erase, int& next) {
+    for (int k : first) EXPECT_TRUE(set.insert(h, k));
     const int fills = 512 - static_cast<int>(first.size());
-    for (int i = 0; i < fills; ++i) EXPECT_TRUE(set.insert(fill_key(i)));
-    for (int i = 0; i < erase; ++i) EXPECT_TRUE(set.erase(fill_key(i)));
+    for (int i = 0; i < fills; ++i) EXPECT_TRUE(set.insert(h, fill_key(i)));
+    for (int i = 0; i < erase; ++i) EXPECT_TRUE(set.erase(h, fill_key(i)));
     ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, 512 - erase, "fill_to_512_and_reclaim()"));
     EXPECT_EQ(set.get_internal_free_count(), size_t(erase));
     ASSERT_EQ(set.get_internal_table_size(), 256u) << "test precondition: the fill doubled the table";
@@ -2034,22 +2092,23 @@ static void fill_to_512_and_reclaim(SetT& set, const std::vector<int>& first, in
 TEST(ConcurrentHashSetRcuTest, ReclaimRestartsPopBatching) {
     using Set = ConcurrentResizableHashSetRCU<int, true, CollisionHash>;
     Set set(256, 1);
+    const Set::handle h = set.new_handle();
     int next = 0;
-    ASSERT_NO_FATAL_FAILURE(fill_to_512_and_reclaim(set, {PROBE_X1}, 300, next));
+    ASSERT_NO_FATAL_FAILURE(fill_to_512_and_reclaim(set, h, {PROBE_X1}, 300, next));
     size_t live = 212;
 
-    for (int i = 0; i < 100; ++i) EXPECT_TRUE(set.insert(fill_key(next++)));   // cycle 1
+    for (int i = 0; i < 100; ++i) EXPECT_TRUE(set.insert(h, fill_key(next++)));   // cycle 1
     live += 100;
     ASSERT_EQ(set.get_internal_table_size(), 256u)
         << "test precondition: the table doubled during cycle 1, so the arithmetic above does not hold";
     ASSERT_EQ(set.get_internal_node_count(), 512u) << "test precondition: cycle 1 must be served from the free list";
     ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, live, "after cycle 1"));
 
-    EXPECT_TRUE(set.insert(fill_key(next++)));   // cycle 2: the first pop after reclaim()
+    EXPECT_TRUE(set.insert(h, fill_key(next++)));   // cycle 2: the first pop after reclaim()
     ++live;
     EXPECT_EQ(set.get_internal_table_size(), 512u)
         << "the first pop after reclaim() did not add its batch to the resize hint: the table did not double";
-    EXPECT_TRUE(set.contains(PROBE_X1));   // at size 512 this splits bucket 261
+    EXPECT_TRUE(set.contains(h, PROBE_X1));   // at size 512 this splits bucket 261
     ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, live, "after cycle 2"));
 } // ReclaimRestartsPopBatching
 
@@ -2065,18 +2124,19 @@ TEST(ConcurrentHashSetRcuTest, ReclaimRestartsPopBatching) {
 //     1029 -> PROBE_X2 (FROZEN, child 261 UNINITIALIZED) -> rest of `first`
 // reversed (PROBE_X1, still live, last), and limbo holds the throwing slot.
 // fill_key(5), the other fill key of bucket 5, was among the erased ones.
-// `next` receives the first unused fill index and `live` the key count. Callers
-// wrap it in ASSERT_NO_FATAL_FAILURE; it ASSERTs its own steps.
+// `next` receives the first unused fill index and `live` the key count; `h` is
+// the calling thread's handle of `set`. Callers wrap it in
+// ASSERT_NO_FATAL_FAILURE; it ASSERTs its own steps.
 template <typename SetT>
-static void build_unfinished_split(SetT& set, const std::vector<int>& first, int& next, size_t& live) {
+static void build_unfinished_split(SetT& set, const typename SetT::handle& h, const std::vector<int>& first, int& next, size_t& live) {
     ASSERT_EQ(first.back(), PROBE_X2);
-    ASSERT_NO_FATAL_FAILURE(fill_to_512_and_reclaim(set, first, 200, next));
+    ASSERT_NO_FATAL_FAILURE(fill_to_512_and_reclaim(set, h, first, 200, next));
     live = 312;
-    ASSERT_TRUE(set.insert(fill_key(next++)));   // the first pop: doubles the table to 512
+    ASSERT_TRUE(set.insert(h, fill_key(next++)));   // the first pop: doubles the table to 512
     ++live;
     ASSERT_EQ(set.get_internal_table_size(), 512u) << "test precondition: the first pop after reclaim() did not double the table";
     ProbeKey::throw_countdown = 1;   // the split's first copy throws
-    EXPECT_THROW(set.contains(PROBE_X1), std::runtime_error);
+    EXPECT_THROW(set.contains(h, PROBE_X1), std::runtime_error);
     ProbeKey::throw_countdown = 0;
     const typename SetT::InternalAccounting acc = expect_consistent(set, "after the split threw");
     ASSERT_EQ(acc.limbo, 1u) << "the slot whose assignment threw must be on limbo";
@@ -2113,22 +2173,23 @@ TEST(ConcurrentHashSetRcuTest, ReclaimKeepsFrozenNodeOfUnfinishedSplit) {
     ProbeKey::reset_counters();
     {
         Set set(256, 1);
+        const Set::handle h = set.new_handle();
         int next = 0;
         size_t live = 0;
-        ASSERT_NO_FATAL_FAILURE(build_unfinished_split(set, {PROBE_X1, PROBE_E, PROBE_X2}, next, live));
+        ASSERT_NO_FATAL_FAILURE(build_unfinished_split(set, h, {PROBE_X1, PROBE_E, PROBE_X2}, next, live));
         const size_t reachable = set.get_internal_accounting().reachable;
 
-        EXPECT_TRUE(set.erase(PROBE_E));   // the dead node behind the FROZEN one
+        EXPECT_TRUE(set.erase(h, PROBE_E));   // the dead node behind the FROZEN one
         --live;
         const Set::InternalAccounting erased = expect_consistent(set, "after the erase");
         EXPECT_EQ(erased.retired, 0u) << "erase() unlinked its node through a tagged predecessor, or unlinked the FROZEN node of an unfinished split";
         EXPECT_EQ(erased.reachable, reachable) << "PROBE_E, or PROBE_X2, left the chain";
         EXPECT_EQ(erased.reachable_dead, 1u) << "PROBE_E must stay in its chain, dead";
         ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, live, "after the erase"));
-        EXPECT_TRUE(set.contains(PROBE_X1));
-        EXPECT_TRUE(set.contains(PROBE_X2));
-        EXPECT_FALSE(set.contains(PROBE_E));
-        EXPECT_FALSE(set.insert(PROBE_X2)) << "a key kept only by its FROZEN node was lost";
+        EXPECT_TRUE(set.contains(h, PROBE_X1));
+        EXPECT_TRUE(set.contains(h, PROBE_X2));
+        EXPECT_FALSE(set.contains(h, PROBE_E));
+        EXPECT_FALSE(set.insert(h, PROBE_X2)) << "a key kept only by its FROZEN node was lost";
         ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, live, "after the split finished"));
     } // the set's lifetime
     EXPECT_EQ(ProbeKey::corrupt.load(), 0);
@@ -2169,19 +2230,20 @@ TEST(ConcurrentHashSetRcuTest, EraseGivesUpAfterTwoLostUnlinks) {
     ProbeKey::reset_counters();
     {
         Set set(256, 1);
+        const Set::handle h = set.new_handle();
         int next = 0;
         size_t live = 0;
-        ASSERT_NO_FATAL_FAILURE(build_unfinished_split(set, {PROBE_X1, PROBE_E, PROBE_X2}, next, live));
+        ASSERT_NO_FATAL_FAILURE(build_unfinished_split(set, h, {PROBE_X1, PROBE_E, PROBE_X2}, next, live));
         const Set::InternalCounters before = set.get_internal_counters();
 
         bool y1_inserted = false, y2_inserted = false;
-        ProbeKey::arm(ProbeKey::equal_hook, HEAD, 1, [&set, &y1_inserted, &y2_inserted, Y1, Y2]() {   // (1)
-            y1_inserted = set.insert(Y1);
-            ProbeKey::arm(ProbeKey::hash_hook, PROBE_X2, 2, [&set, &y2_inserted, Y2]() {   // (2)
-                y2_inserted = set.insert(Y2);
+        ProbeKey::arm(ProbeKey::equal_hook, HEAD, 1, [&set, &h, &y1_inserted, &y2_inserted, Y1, Y2]() {   // (1)
+            y1_inserted = set.insert(h, Y1);
+            ProbeKey::arm(ProbeKey::hash_hook, PROBE_X2, 2, [&set, &h, &y2_inserted, Y2]() {   // (2)
+                y2_inserted = set.insert(h, Y2);
             });
         });
-        const bool erased = set.erase(HEAD);
+        const bool erased = set.erase(h, HEAD);
         ProbeKey::disarm_hooks();
         ASSERT_TRUE(y1_inserted) << "test precondition: hook (1) did not insert Y1 inside erase()'s compare-to-mark window";
         ASSERT_TRUE(y2_inserted) << "test precondition: hook (2) did not insert Y2 inside erase()'s second unlink attempt";
@@ -2194,12 +2256,12 @@ TEST(ConcurrentHashSetRcuTest, EraseGivesUpAfterTwoLostUnlinks) {
         EXPECT_EQ(acc.reachable_dead, 0u) << "1029 is still in its chain";
         const Set::InternalCounters after = set.get_internal_counters();
         EXPECT_EQ(after.retire_runs - before.retire_runs, 1u);
-        EXPECT_FALSE(set.contains(HEAD));
-        EXPECT_TRUE(set.contains(Y1));
-        EXPECT_TRUE(set.contains(Y2));
+        EXPECT_FALSE(set.contains(h, HEAD));
+        EXPECT_TRUE(set.contains(h, Y1));
+        EXPECT_TRUE(set.contains(h, Y2));
         ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, live, "after erase(1029)"));
-        EXPECT_TRUE(set.contains(PROBE_X2));
-        EXPECT_TRUE(set.contains(PROBE_E));
+        EXPECT_TRUE(set.contains(h, PROBE_X2));
+        EXPECT_TRUE(set.contains(h, PROBE_E));
     } // the set's lifetime
     EXPECT_EQ(ProbeKey::corrupt.load(), 0);
 } // EraseGivesUpAfterTwoLostUnlinks
@@ -2231,11 +2293,12 @@ TEST(ConcurrentHashSetRcuTest, ReclaimRelinksWhatEraseLeftBehind) {
     ProbeKey::reset_counters();
     {
         Set set(256, 1);
+        const Set::handle h = set.new_handle();
         int next = 0;
         size_t live = 0;
-        ASSERT_NO_FATAL_FAILURE(build_unfinished_split(set, {PROBE_X1, E3, E2, PROBE_E, PROBE_X2}, next, live));
+        ASSERT_NO_FATAL_FAILURE(build_unfinished_split(set, h, {PROBE_X1, E3, E2, PROBE_E, PROBE_X2}, next, live));
         for (int k : {PROBE_E, E2, E3}) {
-            EXPECT_TRUE(set.erase(k));
+            EXPECT_TRUE(set.erase(h, k));
             --live;
         }
         const Set::InternalAccounting run = expect_consistent(set, "after the erases behind PROBE_X2");
@@ -2243,17 +2306,17 @@ TEST(ConcurrentHashSetRcuTest, ReclaimRelinksWhatEraseLeftBehind) {
         EXPECT_EQ(run.reachable_dead, 3u);
 
         ProbeKey::arm(ProbeKey::hash_hook, PROBE_X2, 1, []() { throw std::runtime_error("Hash{} armed to throw"); });
-        EXPECT_THROW(set.erase(HEAD), std::runtime_error);
+        EXPECT_THROW(set.erase(h, HEAD), std::runtime_error);
         ProbeKey::disarm_hooks();
         --live;   // the mark landed: 1029 is deleted although the caller saw an exception
         const Set::InternalAccounting left = expect_consistent(set, "after erase(1029) threw");
         EXPECT_EQ(left.retired, 0u);
         ASSERT_EQ(left.reachable_dead, 4u) << "test precondition: erase(1029) did not leave its tombstone at the head";
-        EXPECT_FALSE(set.contains(HEAD));
+        EXPECT_FALSE(set.contains(h, HEAD));
 
         ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, live, "after the erases"));
-        for (int k : {PROBE_X1, PROBE_X2}) EXPECT_TRUE(set.contains(k));
-        for (int k : {HEAD, PROBE_E, E2, E3}) EXPECT_FALSE(set.contains(k));
+        for (int k : {PROBE_X1, PROBE_X2}) EXPECT_TRUE(set.contains(h, k));
+        for (int k : {HEAD, PROBE_E, E2, E3}) EXPECT_FALSE(set.contains(h, k));
         ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, live, "after the split finished"));
     } // the set's lifetime
     EXPECT_EQ(ProbeKey::corrupt.load(), 0);
@@ -2280,19 +2343,20 @@ TEST(ConcurrentHashSetRcuTest, ReclaimAccountsForSplitCopiesWhenAssignmentThrows
     ProbeKey::reset_counters();
     {
         Set set(256, 1);
+        const Set::handle h = set.new_handle();
         int next = 0;
-        ASSERT_NO_FATAL_FAILURE(fill_to_512_and_reclaim(set, {PROBE_X1, PROBE_X2}, 200, next));
+        ASSERT_NO_FATAL_FAILURE(fill_to_512_and_reclaim(set, h, {PROBE_X1, PROBE_X2}, 200, next));
         size_t live = 312;
-        EXPECT_TRUE(set.insert(fill_key(next++)));   // the first pop: doubles the table to 512
+        EXPECT_TRUE(set.insert(h, fill_key(next++)));   // the first pop: doubles the table to 512
         ++live;
 
         ProbeKey::throw_countdown = 2;   // the split's second copy throws
-        EXPECT_THROW(set.contains(PROBE_X1), std::runtime_error);
+        EXPECT_THROW(set.contains(h, PROBE_X1), std::runtime_error);
         ProbeKey::throw_countdown = 0;
         expect_consistent(set, "after the split threw on its second copy");
         EXPECT_EQ(set.get_internal_limbo_count(), 2u) << "the throwing slot and the one-node partial subchain must both be on limbo";
-        EXPECT_TRUE(set.contains(PROBE_X1));
-        EXPECT_TRUE(set.contains(PROBE_X2));
+        EXPECT_TRUE(set.contains(h, PROBE_X1));
+        EXPECT_TRUE(set.contains(h, PROBE_X2));
         ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, live, "after the split finished"));
     } // the set's lifetime
     EXPECT_EQ(ProbeKey::corrupt.load(), 0);
@@ -2333,27 +2397,28 @@ TEST(ConcurrentHashSetRcuTest, ReclaimRecoversPendingInsertNodeWhenRetryThrows) 
     ProbeKey::reset_counters();
     {
         Set set(256, 1);
+        const Set::handle h = set.new_handle();
         int next = 0;   // not used: the keys below are chosen by hand
-        ASSERT_NO_FATAL_FAILURE(fill_to_512_and_reclaim(set, {PROBE_X1}, 200, next));
+        ASSERT_NO_FATAL_FAILURE(fill_to_512_and_reclaim(set, h, {PROBE_X1}, 200, next));
         size_t live = 312;
 
         bool nested_inserted = false;
-        ProbeKey::on_assign = [&set, &nested_inserted, NESTED]() {
-            nested_inserted = set.insert(NESTED);
+        ProbeKey::on_assign = [&set, &h, &nested_inserted, NESTED]() {
+            nested_inserted = set.insert(h, NESTED);
             ProbeKey::throw_countdown = 1;   // the next assignment (the retry's split copy) throws
         };
-        EXPECT_THROW(set.insert(PROBE_K), std::runtime_error);
+        EXPECT_THROW(set.insert(h, PROBE_K), std::runtime_error);
         ProbeKey::on_assign = nullptr;
         ProbeKey::throw_countdown = 0;
         ASSERT_TRUE(nested_inserted) << "test precondition: the nested insert did not run inside the outer one's window";
         ++live;
         expect_consistent(set, "after the retry threw");
         EXPECT_EQ(set.get_internal_limbo_count(), 2u) << "the throwing slot and the insert's pending node must both be on limbo";
-        EXPECT_FALSE(set.contains(PROBE_K)) << "the insert that threw before publishing made its key a member";
-        EXPECT_TRUE(set.contains(NESTED));
-        EXPECT_TRUE(set.contains(PROBE_X1));
+        EXPECT_FALSE(set.contains(h, PROBE_K)) << "the insert that threw before publishing made its key a member";
+        EXPECT_TRUE(set.contains(h, NESTED));
+        EXPECT_TRUE(set.contains(h, PROBE_X1));
         ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, live, "after the retry threw"));
-        EXPECT_TRUE(set.insert(PROBE_K));
+        EXPECT_TRUE(set.insert(h, PROBE_K));
         ++live;
         ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, live, "after PROBE_K was inserted"));
     } // the set's lifetime
@@ -2470,19 +2535,20 @@ TEST(ConcurrentHashSetRcuTest, ReclaimBoundsTheArena) {
     for (const bool with_reclaim : {true, false}) {
         const std::string flavor = with_reclaim ? "with reclaim()" : "without reclaim()";
         Set set(4, T);
+        const Set::handle h = set.new_handle();
         // Key of thread t, round r, index i: distinct for every (t, r, i).
         auto key = [](int t, int r, int i) { return scramble((r*T + t)*W + i); };
         std::vector<size_t> bad(T, 0);
-        run_threads(T, [&set, &bad, &key](int t) {
-            for (int i = 0; i < W; ++i) bad[t] += !set.insert(key(t, 0, i));
+        run_threads(T, set, [&set, &bad, &key](const Set::handle& h, int t) {
+            for (int i = 0; i < W; ++i) bad[t] += !set.insert(h, key(t, 0, i));
         });
         for (int r = 0; r <= R; ++r) {   // round 0 is the fill above; rounds 1..R churn
             const std::string where = flavor + ", round " + std::to_string(r);
             if (r > 0) {
-                run_threads(T, [&set, &bad, &key, r](int t) {
+                run_threads(T, set, [&set, &bad, &key, r](const Set::handle& h, int t) {
                     for (int i = 0; i < W; ++i) {
-                        bad[t] += !set.erase(key(t, r - 1, i));
-                        bad[t] += !set.insert(key(t, r, i));
+                        bad[t] += !set.erase(h, key(t, r - 1, i));
+                        bad[t] += !set.insert(h, key(t, r, i));
                     }
                 });
             } // churn
@@ -2505,7 +2571,7 @@ TEST(ConcurrentHashSetRcuTest, ReclaimBoundsTheArena) {
                 out.push_back(key(t, R - 1, i));
             }
         } // last two rounds' keys
-        EXPECT_EQ(membership_errors(set, in, out), 0) << flavor;
+        EXPECT_EQ(membership_errors(set, h, in, out), 0) << flavor;
     } // with and without reclaim()
 } // ReclaimBoundsTheArena
 
@@ -2538,12 +2604,12 @@ TEST(ConcurrentHashSetRcuTest, ReclaimBoundsTheArena) {
 // Each test names what it kills: the protocol step it exists for, removed.
 // ===========================================================================
 
-// Inserts `keys` in order into `set` (each must be new), then checks that the
-// table has `expected_ts` buckets: the geometry the calling test derived. Callers
-// wrap it in ASSERT_NO_FATAL_FAILURE.
+// Inserts `keys` in order into `set` (each must be new), under the calling
+// thread's handle `h`, then checks that the table has `expected_ts` buckets: the
+// geometry the calling test derived. Callers wrap it in ASSERT_NO_FATAL_FAILURE.
 template <typename SetT>
-static void insert_in_order(SetT& set, const std::vector<int>& keys, size_t expected_ts) {
-    for (int k : keys) ASSERT_TRUE(set.insert(k)) << "insert(" << k << ") of a new key returned false";
+static void insert_in_order(SetT& set, const typename SetT::handle& h, const std::vector<int>& keys, size_t expected_ts) {
+    for (int k : keys) ASSERT_TRUE(set.insert(h, k)) << "insert(" << k << ") of a new key returned false";
     ASSERT_EQ(set.get_internal_table_size(), expected_ts) << "test precondition: the set-up did not reach the derived table size";
 } // insert_in_order()
 
@@ -2564,15 +2630,16 @@ TEST(ConcurrentHashSetRcuTest, EraseAllUnlinksEveryNode) {
     using Set = ConcurrentResizableHashSetRCU<int, true, CollisionHash>;
     const int B = 8, PER = 16, C = 1024;
     Set set(C, 1);
+    const Set::handle h = set.new_handle();
     for (int i = 0; i < PER; ++i) {
-        for (int b = 0; b < B; ++b) EXPECT_TRUE(set.insert(b + C*i));
+        for (int b = 0; b < B; ++b) EXPECT_TRUE(set.insert(h, b + C*i));
     }
     ASSERT_EQ(set.get_internal_table_size(), size_t(C)) << "test precondition: the table doubled";
     const Set::InternalCounters before = set.get_internal_counters();
     for (int i = 0; i < PER; ++i) {   // oldest first: each target is its chain's tail
         for (int b = 0; b < B; ++b) {
-            EXPECT_TRUE(set.erase(b + C*i));
-            EXPECT_FALSE(set.contains(b + C*i));
+            EXPECT_TRUE(set.erase(h, b + C*i));
+            EXPECT_FALSE(set.contains(h, b + C*i));
         }
     } // erase every key
     ASSERT_EQ(set.get_internal_table_size(), size_t(C)) << "test precondition: the table doubled";
@@ -2608,12 +2675,13 @@ static void growth_leaves_no_dead_node_body() {
     const int N = 5000;
     const std::string where = AllowDelete ? "AllowDelete=true" : "AllowDelete=false";
     Set set(4, 1);
+    const typename Set::handle h = set.new_handle();
     std::vector<int> keys;
     for (int i = 0; i < N; ++i) {
         keys.push_back(scramble(i));
-        EXPECT_TRUE(set.insert(keys.back())) << where;
+        EXPECT_TRUE(set.insert(h, keys.back())) << where;
     }
-    EXPECT_EQ(membership_errors(set, keys, std::vector<int>{}), 0) << where;
+    EXPECT_EQ(membership_errors(set, h, keys, std::vector<int>{}), 0) << where;
     const typename Set::InternalAccounting acc = expect_consistent(set, where + ", after the sweep");
     EXPECT_EQ(acc.reachable, size_t(N)) << where << ": a superseded parent copy is still reachable";
     EXPECT_EQ(acc.reachable_dead, 0u) << where;
@@ -2660,22 +2728,23 @@ TEST(ConcurrentHashSetRcuTest, EraseRetriesMarkAfterLiveLinkChange) {
     ProbeKey::reset_counters();
     {
         Set set(4, 1);
-        ASSERT_NO_FATAL_FAILURE(insert_in_order(set, {S, K}, 16));
+        const Set::handle h = set.new_handle();
+        ASSERT_NO_FATAL_FAILURE(insert_in_order(set, h, {S, K}, 16));
         bool hook_ran = false, nested_found = false;
         size_t retired_in_window = 0;
         ProbeKey::arm(ProbeKey::equal_hook, K, 1, [&]() {
             hook_ran = true;
-            nested_found = set.contains(S);
+            nested_found = set.contains(h, S);
             retired_in_window = set.get_internal_accounting().retired;
         });
-        const bool erased = set.erase(K);
+        const bool erased = set.erase(h, K);
         ProbeKey::disarm_hooks();
         ASSERT_TRUE(hook_ran) << "test precondition: the hook on erase(1)'s comparison did not fire";
         ASSERT_TRUE(nested_found);
         ASSERT_EQ(retired_in_window, 1u) << "test precondition: the split's cleanup did not unlink 9's parent copy through 1's link";
         EXPECT_TRUE(erased) << "erase() of a present key returned false after a live change of its link";
-        EXPECT_FALSE(set.contains(K));
-        EXPECT_TRUE(set.contains(S));
+        EXPECT_FALSE(set.contains(h, K));
+        EXPECT_TRUE(set.contains(h, S));
         const Set::InternalAccounting acc = expect_consistent(set, "after erase(1)");
         EXPECT_EQ(acc.retired, 2u) << "9's parent copy and 1's node must both be retired";
         EXPECT_EQ(acc.reachable, 1u);
@@ -2718,13 +2787,14 @@ static void miss_after_unlink_body(bool erase, bool at_compare) {
     ProbeKey::reset_counters();
     {
         Set set(4, 1);
-        ASSERT_NO_FATAL_FAILURE(insert_in_order(set, {K, 65, W}, 32));
+        const Set::handle h = set.new_handle();
+        ASSERT_NO_FATAL_FAILURE(insert_in_order(set, h, {K, 65, W}, 32));
         bool hook_ran = false, doubled = false, nested_found = false;
         size_t retired_in_window = 0;
         std::function<void()> window = [&]() {
             hook_ran = true;
-            doubled = set.insert(2) && set.get_internal_table_size() == 64;
-            nested_found = set.contains(K);
+            doubled = set.insert(h, 2) && set.get_internal_table_size() == 64;
+            nested_found = set.contains(h, K);
             retired_in_window = set.get_internal_accounting().retired;
         };
         if (at_compare) {
@@ -2734,7 +2804,7 @@ static void miss_after_unlink_body(bool erase, bool at_compare) {
         }
         ProbeKey::tally_value = K;
         ProbeKey::tally = 0;
-        const bool result = erase ? set.erase(K) : set.contains(K);
+        const bool result = erase ? set.erase(h, K) : set.contains(h, K);
         const int outer_hashes = ProbeKey::tally;
         ProbeKey::disarm_hooks();
         ASSERT_TRUE(hook_ran) << "test precondition: the hook did not fire";
@@ -2743,7 +2813,7 @@ static void miss_after_unlink_body(bool erase, bool at_compare) {
         ASSERT_EQ(retired_in_window, 1u) << "test precondition: the split's cleanup did not unlink 33's parent copy";
         EXPECT_TRUE(result) << (erase ? "erase" : "contains") << "(33) missed a present key whose FROZEN copy was unlinked";
         EXPECT_EQ(outer_hashes, 2) << "the outer operation must hash 33 once per pass: once in bucket 1, once after the reload";
-        EXPECT_EQ(set.contains(K), !erase);
+        EXPECT_EQ(set.contains(h, K), !erase);
         const Set::InternalAccounting acc = expect_consistent(set, "after the outer operation");
         EXPECT_EQ(acc.retired, erase ? 2u : 1u);
         EXPECT_EQ(acc.reachable_dead, 0u);
@@ -2792,15 +2862,16 @@ TEST(ConcurrentHashSetRcuTest, SplitRetriesFreezeAfterLiveLinkChange) {
     ProbeKey::reset_counters();
     {
         Set set(4, 1);
-        ASSERT_NO_FATAL_FAILURE(insert_in_order(set, {STAYER, VICTIM, MOVER, 2}, 64));
+        const Set::handle h = set.new_handle();
+        ASSERT_NO_FATAL_FAILURE(insert_in_order(set, h, {STAYER, VICTIM, MOVER, 2}, 64));
         bool hook_ran = false, nested_erased = false;
         size_t retired_in_window = 0;
         ProbeKey::arm(ProbeKey::hash_hook, MOVER, 2, [&]() {
             hook_ran = true;
-            nested_erased = set.erase(VICTIM);
+            nested_erased = set.erase(h, VICTIM);
             retired_in_window = set.get_internal_accounting().retired;
         });
-        const bool found = set.contains(MOVER);
+        const bool found = set.contains(h, MOVER);
         ProbeKey::disarm_hooks();
         ASSERT_TRUE(hook_ran) << "test precondition: the hook on the split's Hash{}(33) did not fire";
         ASSERT_TRUE(nested_erased);
@@ -2810,12 +2881,12 @@ TEST(ConcurrentHashSetRcuTest, SplitRetriesFreezeAfterLiveLinkChange) {
         EXPECT_EQ(acc.reachable, 3u) << "a key has two reachable nodes: the split copied a node it did not freeze";
         EXPECT_EQ(acc.reachable_dead, 0u);
         EXPECT_EQ(acc.retired, 2u);
-        EXPECT_TRUE(set.contains(MOVER));
-        EXPECT_TRUE(set.contains(STAYER));
-        EXPECT_FALSE(set.contains(VICTIM));
-        EXPECT_FALSE(set.erase(VICTIM));
-        EXPECT_TRUE(set.erase(MOVER));
-        EXPECT_FALSE(set.contains(MOVER)) << "erase(33) returned true and the key is still present";
+        EXPECT_TRUE(set.contains(h, MOVER));
+        EXPECT_TRUE(set.contains(h, STAYER));
+        EXPECT_FALSE(set.contains(h, VICTIM));
+        EXPECT_FALSE(set.erase(h, VICTIM));
+        EXPECT_TRUE(set.erase(h, MOVER));
+        EXPECT_FALSE(set.contains(h, MOVER)) << "erase(33) returned true and the key is still present";
     } // the set's lifetime
     EXPECT_EQ(ProbeKey::corrupt.load(), 0);
 } // SplitRetriesFreezeAfterLiveLinkChange
@@ -2846,18 +2917,19 @@ TEST(ConcurrentHashSetRcuTest, HeadUnlinkKeepsSealLevel) {
     ProbeKey::reset_counters();
     {
         Set set(4, 1);
-        ASSERT_NO_FATAL_FAILURE(insert_in_order(set, {1, MOVER}, 16));
+        const Set::handle h = set.new_handle();
+        ASSERT_NO_FATAL_FAILURE(insert_in_order(set, h, {1, MOVER}, 16));
         bool hook_ran = false, doubled = false, nested_found = false;
         size_t retired_in_window = 0;
         ProbeKey::arm(ProbeKey::hash_hook, STALE, 1, [&]() {
             hook_ran = true;
-            doubled = set.insert(2) && set.get_internal_table_size() == 32;
-            nested_found = set.contains(MOVER);
+            doubled = set.insert(h, 2) && set.get_internal_table_size() == 32;
+            nested_found = set.contains(h, MOVER);
             retired_in_window = set.get_internal_accounting().retired;
         });
         ProbeKey::tally_value = STALE;
         ProbeKey::tally = 0;
-        const bool inserted = set.insert(STALE);
+        const bool inserted = set.insert(h, STALE);
         const int outer_hashes = ProbeKey::tally;
         ProbeKey::disarm_hooks();
         ASSERT_TRUE(hook_ran) << "test precondition: the hook on insert(49)'s Hash{} did not fire";
@@ -2866,8 +2938,8 @@ TEST(ConcurrentHashSetRcuTest, HeadUnlinkKeepsSealLevel) {
         ASSERT_EQ(retired_in_window, 1u) << "test precondition: the split's cleanup did not unlink 17's parent copy at the head";
         EXPECT_TRUE(inserted);
         EXPECT_EQ(outer_hashes, 2) << "insert(49) did not retry after meeting the raised seal level";
-        EXPECT_TRUE(set.contains(STALE)) << "the stale insert published its key into the sealed parent: the key is lost";
-        EXPECT_FALSE(set.insert(STALE)) << "a second insert of the key succeeded";
+        EXPECT_TRUE(set.contains(h, STALE)) << "the stale insert published its key into the sealed parent: the key is lost";
+        EXPECT_FALSE(set.insert(h, STALE)) << "a second insert of the key succeeded";
         const Set::InternalAccounting acc = expect_consistent(set, "after insert(49)");
         EXPECT_EQ(acc.reachable - acc.reachable_dead, 4u);
     } // the set's lifetime
@@ -2899,7 +2971,8 @@ TEST(ConcurrentHashSetRcuTest, RetiredNodeStaysExitable) {
     ProbeKey::reset_counters();
     {
         Set set(1024, 1);
-        ASSERT_NO_FATAL_FAILURE(insert_in_order(set, {K, X, W}, 1024));
+        const Set::handle h = set.new_handle();
+        ASSERT_NO_FATAL_FAILURE(insert_in_order(set, h, {K, X, W}, 1024));
         const Set::InternalAccounting empty = expect_consistent(set, "before");
         ASSERT_EQ(empty.limbo, 0u);
         ASSERT_EQ(empty.retired, 0u);
@@ -2907,17 +2980,17 @@ TEST(ConcurrentHashSetRcuTest, RetiredNodeStaysExitable) {
         size_t reachable_in_window = 0;
         ProbeKey::arm(ProbeKey::equal_hook, W, 1, [&]() {
             hook_ran = true;
-            nested_erased = set.erase(X);
+            nested_erased = set.erase(h, X);
             reachable_in_window = set.get_internal_accounting().reachable;
         });
-        const bool found = set.contains(K);
+        const bool found = set.contains(h, K);
         ProbeKey::disarm_hooks();
         ASSERT_TRUE(hook_ran) << "test precondition: the hook on contains(5)'s first comparison did not fire";
         ASSERT_TRUE(nested_erased);
         ASSERT_EQ(reachable_in_window, 2u) << "test precondition: erase(1029) did not unlink its node";
         EXPECT_TRUE(found) << "a walk that reached a node before its unlink could not walk out of it";
-        EXPECT_FALSE(set.contains(X));
-        EXPECT_TRUE(set.contains(W));
+        EXPECT_FALSE(set.contains(h, X));
+        EXPECT_TRUE(set.contains(h, W));
         const Set::InternalAccounting acc = expect_consistent(set, "after contains(5)");
         EXPECT_EQ(acc.reachable, 2u);
         EXPECT_EQ(acc.retired, 1u);
@@ -2981,16 +3054,17 @@ TEST(ConcurrentHashSetRcuTest, CleanupLosingItsCasRetiresNothing) {
     ProbeKey::reset_counters();
     {
         Set set(4, 1);
-        ASSERT_NO_FATAL_FAILURE(insert_in_order(set, {1, 33, 65, 2}, 64));
+        const Set::handle h = set.new_handle();
+        ASSERT_NO_FATAL_FAILURE(insert_in_order(set, h, {1, 33, 65, 2}, 64));
         const Set::InternalCounters before = set.get_internal_counters();
         CleanupWindow w;
         bool nested_inserted = false;
         size_t retired_in_window = 0;
-        arm_cleanup_window(set, w, 33, [&set, &nested_inserted, &retired_in_window]() {
-            nested_inserted = set.insert(129);
+        arm_cleanup_window(set, w, 33, [&set, &h, &nested_inserted, &retired_in_window]() {
+            nested_inserted = set.insert(h, 129);
             retired_in_window = set.get_internal_accounting().retired;
         });
-        const bool found = set.contains(33);
+        const bool found = set.contains(h, 33);
         ProbeKey::disarm_hooks();
         ASSERT_TRUE(w.before_publish) << "test precondition: the hook on the split's Hash{}(33) did not fire";
         ASSERT_TRUE(w.after_publish) << "test precondition: the hook on the cleanup's Hash{}(33) did not fire right after the publication";
@@ -3003,7 +3077,7 @@ TEST(ConcurrentHashSetRcuTest, CleanupLosingItsCasRetiresNothing) {
         const Set::InternalCounters after = set.get_internal_counters();
         EXPECT_EQ(after.cleanup_cas_failures - before.cleanup_cas_failures, 1u) << "the cleanup's CAS on 65's link must have lost";
         EXPECT_EQ(after.retire_runs - before.retire_runs, 1u);
-        for (int k : {1, 2, 33, 65, 129}) EXPECT_TRUE(set.contains(k)) << k;
+        for (int k : {1, 2, 33, 65, 129}) EXPECT_TRUE(set.contains(h, k)) << k;
     } // the set's lifetime
     EXPECT_EQ(ProbeKey::corrupt.load(), 0);
 } // CleanupLosingItsCasRetiresNothing
@@ -3023,20 +3097,21 @@ TEST(ConcurrentHashSetRcuTest, WriterWalkCollectsCleanupStraggler) {
     ProbeKey::reset_counters();
     {
         Set set(4, 1);
-        ASSERT_NO_FATAL_FAILURE(insert_in_order(set, {1, 33, 65, 2}, 64));
+        const Set::handle h = set.new_handle();
+        ASSERT_NO_FATAL_FAILURE(insert_in_order(set, h, {1, 33, 65, 2}, 64));
         CleanupWindow w;
         arm_cleanup_window(set, w, 33, []() { throw std::runtime_error("Hash{} armed to throw in the cleanup"); });
-        EXPECT_THROW(set.contains(33), std::runtime_error);
+        EXPECT_THROW(set.contains(h, 33), std::runtime_error);
         ProbeKey::disarm_hooks();
         ASSERT_TRUE(w.before_publish) << "test precondition: the hook on the split's Hash{}(33) did not fire";
         ASSERT_TRUE(w.after_publish) << "test precondition: the hook on the cleanup's Hash{}(33) did not fire right after the publication";
         const Set::InternalAccounting left = expect_consistent(set, "after the cleanup threw");
         ASSERT_EQ(left.reachable_dead, 1u) << "test precondition: the throw did not leave 33's parent copy in its chain";
-        EXPECT_TRUE(set.insert(129));
+        EXPECT_TRUE(set.insert(h, 129));
         const Set::InternalAccounting acc = expect_consistent(set, "after insert(129)");
         EXPECT_EQ(acc.reachable_dead, 0u) << "insert()'s walk passed a dead node behind a live predecessor and left it";
         EXPECT_EQ(acc.retired, left.retired + 1);
-        for (int k : {1, 2, 33, 65, 129}) EXPECT_TRUE(set.contains(k)) << k;
+        for (int k : {1, 2, 33, 65, 129}) EXPECT_TRUE(set.contains(h, k)) << k;
     } // the set's lifetime
     EXPECT_EQ(ProbeKey::corrupt.load(), 0);
 } // WriterWalkCollectsCleanupStraggler
@@ -3063,25 +3138,26 @@ TEST(ConcurrentHashSetRcuTest, EraseWalkCollectsCleanupStraggler) {
         ProbeKey::reset_counters();
         {
             Set set(4, 1);
-            ASSERT_NO_FATAL_FAILURE(insert_in_order(set, {1, 33, 65, 2}, 64));
+            const Set::handle h = set.new_handle();
+            ASSERT_NO_FATAL_FAILURE(insert_in_order(set, h, {1, 33, 65, 2}, 64));
             CleanupWindow w;
             arm_cleanup_window(set, w, 33, []() { throw std::runtime_error("Hash{} armed to throw in the cleanup"); });
-            EXPECT_THROW(set.contains(33), std::runtime_error);
+            EXPECT_THROW(set.contains(h, 33), std::runtime_error);
             ProbeKey::disarm_hooks();
             ASSERT_TRUE(w.before_publish && w.after_publish) << where << ": test precondition: the cleanup window did not open";
             const Set::InternalAccounting left = expect_consistent(set, where + ", after the cleanup threw");
             ASSERT_EQ(left.reachable_dead, 1u) << where << ": test precondition: no straggler behind 65";
             if (hit) {
-                EXPECT_TRUE(set.erase(1));
+                EXPECT_TRUE(set.erase(h, 1));
             } else {
-                EXPECT_FALSE(set.erase(129));
+                EXPECT_FALSE(set.erase(h, 129));
             }
             const Set::InternalAccounting acc = expect_consistent(set, where + ", after the erase");
             EXPECT_EQ(acc.reachable_dead, 0u) << where << ": erase()'s walk passed a dead node behind a live predecessor and left it";
             EXPECT_EQ(acc.retired, left.retired + (hit ? 2u : 1u)) << where;
-            EXPECT_TRUE(set.contains(33)) << where;
-            EXPECT_TRUE(set.contains(65)) << where;
-            EXPECT_EQ(set.contains(1), !hit) << where;
+            EXPECT_TRUE(set.contains(h, 33)) << where;
+            EXPECT_TRUE(set.contains(h, 65)) << where;
+            EXPECT_EQ(set.contains(h, 1), !hit) << where;
         } // the set's lifetime
         EXPECT_EQ(ProbeKey::corrupt.load(), 0) << where;
     } // miss, then hit
@@ -3106,24 +3182,25 @@ TEST(ConcurrentHashSetRcuTest, InsertPublishAfterOwnHeadUnlink) {
     ProbeKey::reset_counters();
     {
         Set set(4, 1);
-        ASSERT_NO_FATAL_FAILURE(insert_in_order(set, {1, 65, 33, 2}, 64));
+        const Set::handle h = set.new_handle();
+        ASSERT_NO_FATAL_FAILURE(insert_in_order(set, h, {1, 65, 33, 2}, 64));
         CleanupWindow w;
         arm_cleanup_window(set, w, 33, []() { throw std::runtime_error("Hash{} armed to throw in the cleanup"); });
-        EXPECT_THROW(set.contains(33), std::runtime_error);
+        EXPECT_THROW(set.contains(h, 33), std::runtime_error);
         ProbeKey::disarm_hooks();
         ASSERT_TRUE(w.before_publish && w.after_publish) << "test precondition: the cleanup window did not open";
         const Set::InternalAccounting left = expect_consistent(set, "after the cleanup threw");
         ASSERT_EQ(left.reachable_dead, 1u) << "test precondition: no dead node at the head of bucket 1";
         ProbeKey::tally_value = 129;
         ProbeKey::tally = 0;
-        EXPECT_TRUE(set.insert(129));
+        EXPECT_TRUE(set.insert(h, 129));
         const int outer_hashes = ProbeKey::tally;
         ProbeKey::disarm_hooks();
         EXPECT_EQ(outer_hashes, 1) << "the publish after the insert's own head unlink did not expect the head it installed";
         const Set::InternalAccounting acc = expect_consistent(set, "after insert(129)");
         EXPECT_EQ(acc.reachable_dead, 0u);
         EXPECT_EQ(acc.retired, left.retired + 1);
-        for (int k : {1, 2, 33, 65, 129}) EXPECT_TRUE(set.contains(k)) << k;
+        for (int k : {1, 2, 33, 65, 129}) EXPECT_TRUE(set.contains(h, k)) << k;
     } // the set's lifetime
     EXPECT_EQ(ProbeKey::corrupt.load(), 0);
 } // InsertPublishAfterOwnHeadUnlink
@@ -3179,7 +3256,8 @@ TEST(ConcurrentHashSetRcuTest, UnlinkLossClassification) {
         ProbeKey::reset_counters();
         {
             Set set(4, 1);
-            ASSERT_NO_FATAL_FAILURE(insert_in_order(set, c.peer ? std::vector<int>{1, 33, 65, 2} : std::vector<int>{1, 65, 33, 2}, 64));
+            const Set::handle h = set.new_handle();
+            ASSERT_NO_FATAL_FAILURE(insert_in_order(set, h, c.peer ? std::vector<int>{1, 33, 65, 2} : std::vector<int>{1, 65, 33, 2}, 64));
             bool nested_inserted = false;
             Set::InternalCounters before = set.get_internal_counters();
             size_t retired_before = set.get_internal_accounting().retired;
@@ -3188,14 +3266,14 @@ TEST(ConcurrentHashSetRcuTest, UnlinkLossClassification) {
             // cases the cleanup throws there instead, leaving 33's parent copy in
             // bucket 1, dead, for insert(129)'s walk below.
             const std::function<void()> in_cleanup = c.cleanup
-                ? std::function<void()>([&set, &nested_inserted]() { nested_inserted = set.insert(129); })
+                ? std::function<void()>([&set, &h, &nested_inserted]() { nested_inserted = set.insert(h, 129); })
                 : std::function<void()>([]() { throw std::runtime_error("Hash{} armed to throw in the cleanup"); });
             CleanupWindow w;
             arm_cleanup_window(set, w, 33, in_cleanup);
             if (c.cleanup) {
-                EXPECT_TRUE(set.contains(33)) << where;
+                EXPECT_TRUE(set.contains(h, 33)) << where;
             } else {
-                EXPECT_THROW(set.contains(33), std::runtime_error) << where;
+                EXPECT_THROW(set.contains(h, 33), std::runtime_error) << where;
             }
             ProbeKey::disarm_hooks();
             ASSERT_TRUE(w.before_publish && w.after_publish) << where << ": test precondition: the cleanup window did not open";
@@ -3203,8 +3281,8 @@ TEST(ConcurrentHashSetRcuTest, UnlinkLossClassification) {
                 ASSERT_EQ(set.get_internal_accounting().reachable_dead, 1u) << where << ": test precondition: no straggler in bucket 1";
                 before = set.get_internal_counters();
                 retired_before = set.get_internal_accounting().retired;
-                ProbeKey::arm(ProbeKey::hash_hook, 33, 1, [&set, &nested_inserted]() { nested_inserted = set.insert(193); });
-                EXPECT_TRUE(set.insert(129)) << where;
+                ProbeKey::arm(ProbeKey::hash_hook, 33, 1, [&set, &h, &nested_inserted]() { nested_inserted = set.insert(h, 193); });
+                EXPECT_TRUE(set.insert(h, 129)) << where;
                 ProbeKey::disarm_hooks();
             } // if the walk is the hooked unlink
             ASSERT_TRUE(nested_inserted) << where << ": test precondition: the nested insert did not run in the unlink's window";
@@ -3216,9 +3294,9 @@ TEST(ConcurrentHashSetRcuTest, UnlinkLossClassification) {
             const Set::InternalAccounting acc = expect_consistent(set, where + ", after the lost CAS");
             EXPECT_EQ(acc.retired, retired_before + 1) << where << ": 33's parent copy must be retired once, by the nested insert";
             EXPECT_EQ(acc.reachable_dead, 0u) << where;
-            for (int k : {1, 2, 33, 65, 129}) EXPECT_TRUE(set.contains(k)) << where << ", key " << k;
+            for (int k : {1, 2, 33, 65, 129}) EXPECT_TRUE(set.contains(h, k)) << where << ", key " << k;
             if (!c.cleanup) {
-                EXPECT_TRUE(set.contains(193)) << where;
+                EXPECT_TRUE(set.contains(h, 193)) << where;
             }
         } // the set's lifetime
         EXPECT_EQ(ProbeKey::corrupt.load(), 0) << where;
@@ -3264,17 +3342,18 @@ TEST(ConcurrentHashSetRcuTest, SettleWritersCollectsStragglers) {
     ProbeKey::reset_counters();
     {
         Set set(4, 1);
-        ASSERT_NO_FATAL_FAILURE(insert_in_order(set, {0, 256, 512, 768, 1024,   // to 128 buckets
+        const Set::handle h = set.new_handle();
+        ASSERT_NO_FATAL_FAILURE(insert_in_order(set, h, {0, 256, 512, 768, 1024,   // to 128 buckets
                                                       257, 129, 385, 258, 130, 514, 131, 259, 387, 515}, 128));
         for (int i = 0; set.get_internal_table_size() == 128; ++i) {   // fillers, until the doubling to 256
             ASSERT_LT(i, 300) << "test precondition: the fillers did not double the table";
-            ASSERT_TRUE(set.insert(256*(64 + i)));
+            ASSERT_TRUE(set.insert(h, 256*(64 + i)));
         }
         ASSERT_EQ(set.get_internal_table_size(), 256u);
         for (const Split split : {Split{1, 385}, Split{2, 130}, Split{3, 387}}) {
             CleanupWindow w;
             arm_cleanup_window(set, w, split.key, []() { throw std::runtime_error("Hash{} armed to throw in the cleanup"); });
-            EXPECT_THROW(set.contains(split.key), std::runtime_error) << "bucket " << split.bucket;
+            EXPECT_THROW(set.contains(h, split.key), std::runtime_error) << "bucket " << split.bucket;
             ProbeKey::disarm_hooks();
             ASSERT_TRUE(w.before_publish && w.after_publish) << "test precondition: the cleanup window of bucket " << split.bucket << "'s split did not open";
         } // leave the stragglers
@@ -3283,7 +3362,7 @@ TEST(ConcurrentHashSetRcuTest, SettleWritersCollectsStragglers) {
         for (size_t j : {5, 6, 7}) ASSERT_FALSE(set.get_internal_bucket_published(j)) << "test precondition: bucket " << j << " is published";
         const Set::InternalCounters before = set.get_internal_counters();
 
-        ASSERT_NO_FATAL_FAILURE(settle_writers(set));
+        ASSERT_NO_FATAL_FAILURE(settle_writers(set, h));
         const Set::InternalAccounting settled = expect_consistent(set, "after settle_writers()");
         EXPECT_EQ(settled.reachable_dead, 0u) << "a straggler survived a writer miss walk over its chain";
         EXPECT_EQ(settled.reachable, left.reachable - 5);
@@ -3292,7 +3371,7 @@ TEST(ConcurrentHashSetRcuTest, SettleWritersCollectsStragglers) {
         EXPECT_EQ(after.retire_runs - before.retire_runs, 4u) << "one run at the head of bucket 1, one in bucket 2, two in bucket 3";
         EXPECT_EQ(after.split_attempts, before.split_attempts) << "settle_writers() split a bucket";
         for (size_t j : {5, 6, 7}) EXPECT_FALSE(set.get_internal_bucket_published(j)) << "settle_writers() published bucket " << j;
-        for (int k : {257, 129, 385, 258, 130, 514, 131, 259, 387, 515}) EXPECT_TRUE(set.contains(k)) << k;
+        for (int k : {257, 129, 385, 258, 130, 514, 131, 259, 387, 515}) EXPECT_TRUE(set.contains(h, k)) << k;
     } // the set's lifetime
     EXPECT_EQ(ProbeKey::corrupt.load(), 0);
 } // SettleWritersCollectsStragglers
@@ -3339,9 +3418,10 @@ TEST(ConcurrentHashSetRcuTest, HotGrowthResidue) {
     using Set = ConcurrentResizableHashSetRCU<int, true>;
     const int T = 8;
     Set set(4, T);
+    const Set::handle h = set.new_handle();
     std::vector<size_t> bad(T, 0);
-    run_threads(T, [&set, &bad](int t) {
-        for (int i = t; i < kHotKeys; i += T) bad[t] += !set.insert(hot_growth_key(i));
+    run_threads(T, set, [&set, &bad](const Set::handle& h, int t) {
+        for (int i = t; i < kHotKeys; i += T) bad[t] += !set.insert(h, hot_growth_key(i));
     });
     for (int t = 0; t < T; ++t) EXPECT_EQ(bad[t], 0u) << "insert() of a new, uncontended key returned false, thread " << t;
     const Set::InternalAccounting joined = expect_consistent(set, "after the join");
@@ -3351,14 +3431,14 @@ TEST(ConcurrentHashSetRcuTest, HotGrowthResidue) {
                 "retired %zu nodes in %zu runs, reachable dead before settling %zu, limbo %zu, slots %zu\n",
                 set.get_internal_table_size(), c.splits_published, c.split_attempts, c.cleanup_cas_failures,
                 joined.retired, c.retire_runs, joined.reachable_dead, joined.limbo, joined.slots);
-    ASSERT_NO_FATAL_FAILURE(settle_writers(set));
+    ASSERT_NO_FATAL_FAILURE(settle_writers(set, h));
     const Set::InternalAccounting settled = expect_consistent(set, "after settle_writers()");
     EXPECT_EQ(settled.reachable, size_t(kHotKeys));
     EXPECT_EQ(settled.reachable_dead, 0u) << "a dead node survived a writer walk over its chain";
     EXPECT_EQ(settled.free_nodes, 0u);
     EXPECT_EQ(settled.retired + settled.limbo, settled.slots - kHotKeys);
     int missing = 0;
-    for (int i = 0; i < kHotKeys; ++i) missing += !set.contains(hot_growth_key(i));
+    for (int i = 0; i < kHotKeys; ++i) missing += !set.contains(h, hot_growth_key(i));
     EXPECT_EQ(missing, 0) << "keys lost";
 } // HotGrowthResidue
 
@@ -3395,11 +3475,12 @@ static void churn_accounting_body(ChurnCheck check, int T, int R, int REPS, int 
     std::vector<size_t> dead_sum(ROUNDS, 0), dead_max(ROUNDS, 0);   // kSettle: reachable dead before settling
     for (int rep = 0; rep < REPS; ++rep) {
         Set set(4, 2*T);
+        const typename Set::handle h = set.new_handle();
         std::vector<std::vector<int>> ins(T, std::vector<int>(R, 0));
         std::vector<std::vector<int>> ers(T, std::vector<int>(R, 0));
         for (int round = 0; round < ROUNDS; ++round) {
             const std::string where = "rep " + std::to_string(rep) + ", round " + std::to_string(round);
-            run_threads(T, [&set, &ins, &ers, rep, round, R, OPS](int t) {
+            run_threads(T, set, [&set, &ins, &ers, rep, round, R, OPS](const typename Set::handle& h, int t) {
                 std::minstd_rand rng(static_cast<unsigned>((rep*31 + round)*977 + t + 1));
                 for (int op = 0; op < OPS; ++op) {
                     const unsigned x = rng();
@@ -3407,13 +3488,13 @@ static void churn_accounting_body(ChurnCheck check, int T, int R, int REPS, int 
                     switch (x & 3u) {
                         case 0:
                         case 1:   // insert twice as often as erase, so the set stays populated
-                            if (set.insert(scramble(i + 1))) ++ins[t][i];
+                            if (set.insert(h, scramble(i + 1))) ++ins[t][i];
                             break;
                         case 2:
-                            if (set.erase(scramble(i + 1))) ++ers[t][i];
+                            if (set.erase(h, scramble(i + 1))) ++ers[t][i];
                             break;
                         default:
-                            set.contains(scramble(i + 1));
+                            set.contains(h, scramble(i + 1));
                             break;
                     } // operation kind
                 } // operation loop
@@ -3425,7 +3506,7 @@ static void churn_accounting_body(ChurnCheck check, int T, int R, int REPS, int 
                 long d = 0;
                 for (int t = 0; t < T; ++t) d += ins[t][i] - ers[t][i];
                 EXPECT_TRUE(d == 0 || d == 1) << where << ", key index " << i << ": insert/erase tally " << d;
-                EXPECT_EQ(set.contains(scramble(i + 1)), d == 1) << where << ", key index " << i << ": membership disagrees with the tally " << d;
+                EXPECT_EQ(set.contains(h, scramble(i + 1)), d == 1) << where << ", key index " << i << ": membership disagrees with the tally " << d;
                 live += d == 1;
             } // per-key check
             EXPECT_EQ(acc.reachable - acc.reachable_dead, live) << where << ": not exactly one non-dead reachable node per key";
@@ -3433,7 +3514,7 @@ static void churn_accounting_body(ChurnCheck check, int T, int R, int REPS, int 
                 dead_sum[round] += acc.reachable_dead;
                 dead_max[round] = std::max(dead_max[round], acc.reachable_dead);
                 if constexpr (std::is_same_v<Hash, std::hash<int>>) {
-                    ASSERT_NO_FATAL_FAILURE(settle_writers(set));
+                    ASSERT_NO_FATAL_FAILURE(settle_writers(set, h));
                 }
                 const typename Set::InternalAccounting settled = expect_consistent(set, where + ", after settle_writers()");
                 EXPECT_EQ(settled.reachable_dead, 0u) << where << ": a dead node survived a writer walk over its chain";

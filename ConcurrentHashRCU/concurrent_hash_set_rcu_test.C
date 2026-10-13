@@ -1743,18 +1743,19 @@ TEST(ConcurrentHashSetRcuTest, ReclaimStaleSplitCopiesNoDelete) {
 // counts, so each shard gets exactly K/shards), threads started together get
 // consecutive thread numbers and so spread evenly over the shards (header,
 // concurrent_hash_rcu_detail), and each thread inserts exactly K/max(threads, shards)
-// new keys: exactly what its shard's list can serve, shared with its shard mates.
+// new keys: exactly what its shard's list can serve, shared with its shard mates,
+// so no thread's own list runs dry and no allocation needs another shard's.
 // So the arena must not grow at all, and the free count must drop by exactly the
-// number of inserts. Dealing everything to one shard, or popping another
-// thread's shard, both show as arena growth.
+// number of inserts. (An allocation whose own list is empty takes a node from
+// another shard's list before it appends, so an uneven deal shows here as no
+// arena growth at all; the deal's evenness is checked per shard by
+// FreedNodesDoNotStrandOnUnusedShards.)
 // The K erases run on the main thread, uncontended, so each unlinks its own node
 // and retires it onto the MAIN thread's shard's retired list (contract clause 5):
 // before the first advance() all K are retired and none is left dead in a chain
 // (both checked), the walk finds nothing, and the K slots reach the free lists
-// only through the bag (one shard's retired sublist). The free pass must deal
-// them round-robin like every other source: handing each shard's sublist to its
-// own shard would put all K on one shard, and the threads of the other shard
-// would grow the arena.
+// only through the bag (one shard's retired sublist), which the free pass deals
+// round-robin like every other source.
 // Pre-sizing: 16384 buckets, doubling threshold 32768; the resize hint peaks at
 // 4096 appended - 2048 freed + 8 first pops of 256, far below it.
 TEST(ConcurrentHashSetRcuTest, ReclaimReuseAcrossShards) {
@@ -2702,10 +2703,10 @@ TEST(ConcurrentHashSetRcuTest, ReclaimLimboPushesRaceFreeListPops) {
 //     reused, so the arena holds at least (R + 1)*T*W slots, which is more than
 //     BOUND*T*W: this half proves the bound above is not vacuous.
 // One arena shard per thread: T threads started together get T consecutive thread
-// numbers, one per shard, whatever round they run in; with fewer shards than
-// threads the bound would hold as well, but with MORE shards some rounds' threads
-// would find their shards' lists short and append (dealing is even over all
-// shards), which would be correct behavior and a looser bound.
+// numbers, one per shard, whatever round they run in; with fewer or more shards
+// than threads the bound would hold as well (a thread whose own list runs dry
+// takes nodes from other shards' lists before it appends), but each thread's
+// allocations would then mix its own and other shards' nodes.
 TEST(ConcurrentHashSetRcuTest, ReclaimBoundsTheArena) {
     using Set = ConcurrentResizableHashSetRCU<int, true>;
     const int T = 8, W = 256, R = 8;
@@ -3788,8 +3789,8 @@ TEST(ConcurrentHashSetRcuTest, ChurnAccountingLongChains) {
 //     a join between its increment and its re-verify, or an advance() between
 //     its publish and its free pass, and run other steps right there; and
 //     ProbeKey's call hooks suspend a reader inside contains(), or advance()'s
-//     walk at its Hash{} of a FROZEN node. Each script states which mutant of
-//     the protocol it kills and what makes the kill non-vacuous;
+//     walk at its Hash{} of a FROZEN node. Each script states which protocol
+//     defect it catches and what keeps the check from passing vacuously;
 //   - stress tests, one second each, with witness counters that prove the
 //     races they exist for happened, and an exact end state.
 // Handle discipline: before a hooked new_handle() or advance(), a script
@@ -4107,7 +4108,7 @@ TEST(ConcurrentHashSetRcuTest, AdvanceLatencyReleasedAndRefreshedHandle) {
             const Set::handle h = set.new_handle();
             ASSERT_TRUE(set.insert(h, 1));
             ASSERT_TRUE(set.erase(h, 1));
-        }
+        } // h's scope
         EXPECT_EQ(set.advance(), (AdvanceResult{1, 1, 0, 256, 0, Advance::advanced}));
         expect_tuple(set, "released", 0, 0, 0, 0, 1, 0, 0);
         EXPECT_EQ(set.get_internal_generation(), 1u);
@@ -4177,7 +4178,7 @@ TEST(ConcurrentHashSetRcuTest, LimboNodesTravelThroughTheBag) {
             const Set::handle hs = set.new_handle();
             for (int k : {1, 2}) ASSERT_TRUE(set.insert(hs, k));
             for (int k : {1, 2}) ASSERT_TRUE(set.erase(hs, k));
-        }
+        } // hs's scope
         expect_advance(set.advance(), 2, 1, 0, Advance::advanced, "two free nodes");
         Set::handle h = set.new_handle();
         ProbeKey::throw_countdown = 1;   // the popped slot's assignment throws
@@ -4270,12 +4271,70 @@ TEST(ConcurrentHashSetRcuTest, ChurnWithAdvanceKeepsTableBounded) {
     ASSERT_NO_FATAL_FAILURE(reclaim_and_check(set, h, W, "after the churn"));
 } // ChurnWithAdvanceKeepsTableBounded
 
+// Freed nodes do not strand on the free lists of shards no allocating thread
+// uses: an allocation whose own shard's free list is empty takes a free node
+// from another shard's list before it grows the arena.
+//
+// Weak spot: the free pass deals freed nodes round-robin over EVERY shard's
+// free list, and a thread pops only its own shard's list. With more shards than
+// allocating threads, the nodes dealt to the other shards would never be
+// reused, and under churn with a bounded live set the arena would grow without
+// bound although every freed node is free. Kills: an append path that grows
+// the arena while another shard's free list still holds a node.
+// Shape: one allocating thread (this one) on a set of 16 shards, pre-sized to
+// 4096 buckets so that nothing doubles or splits (identity hash; every key
+// below 4096 has a bucket of its own; the resize hint stays far below 8192):
+// L = 256 live keys, then ROUNDS rounds of R = 512 steps "erase the oldest
+// live key, insert a new one" (a sliding window of keys 0, 1, 2, ...), each
+// round ended by releasing the handle and one advance(). Every erase is
+// uncontended, so it retires its own node and nothing is left in a chain:
+// each advance() frees exactly that round's R nodes, dealt R/16 = 32 to each
+// shard (R is a multiple of 16, so wherever the dealing cursor starts).
+// The bound, derived: round 0 allocates its R nodes by appending (no free node
+// exists yet), so the arena holds L + R slots after it. From round 1 on, the
+// free lists hold exactly R nodes when the round starts and the round needs R
+// allocations, so if every allocation takes a free node before appending, the
+// arena stays at exactly L + R slots and every free list is empty when the
+// round ends (each other shard's count falls from 32 to 0). Stranded, only
+// this thread's shard would serve: 32 pops, 480 appends in round 1, and more
+// every round after.
+TEST(ConcurrentHashSetRcuTest, FreedNodesDoNotStrandOnUnusedShards) {
+    using Set = ConcurrentResizableHashSetRCU<int, true>;
+    const int L = 256, R = 512, ROUNDS = 6;
+    const size_t SHARDS = 16;
+    Set set(4096, SHARDS);
+    int oldest = 0;   // the live keys are oldest .. oldest + L - 1
+    {
+        const Set::handle h = set.new_handle();
+        for (int k = 0; k < L; ++k) ASSERT_TRUE(set.insert(h, k));
+    }
+    for (int round = 0; round < ROUNDS; ++round) {
+        const std::string where = "round " + std::to_string(round);
+        {
+            const Set::handle h = set.new_handle();
+            for (int i = 0; i < R; ++i, ++oldest) {
+                ASSERT_TRUE(set.erase(h, oldest)) << where;
+                ASSERT_TRUE(set.insert(h, oldest + L)) << where;
+            } // the round's churn
+        } // h's scope: the round's handle
+        const Set::InternalAccounting churned = expect_consistent(set, where + ", after the churn");
+        EXPECT_EQ(churned.slots, size_t(L + R)) << where << ": the arena grew while freed nodes waited on other shards' free lists";
+        EXPECT_EQ(churned.free_nodes, 0u) << where << ": freed nodes were left unused on a free list while the round allocated";
+        EXPECT_EQ(churned.retired, size_t(R)) << where << ": test precondition: every erase retires its own node";
+        expect_advance(set.advance(), R, 1, 0, Advance::advanced, where + ": the round's nodes, in one bag");
+        const Set::InternalAccounting freed = expect_consistent(set, where + ", after advance()");
+        ASSERT_EQ(freed.free_per_shard.size(), SHARDS);
+        for (size_t s = 0; s < SHARDS; ++s) EXPECT_EQ(freed.free_per_shard[s], size_t(R)/SHARDS) << where << ", shard " << s << ": a free list holds more than this round's even share: earlier rounds' nodes stranded there, or the deal is uneven";
+    } // rounds
+    EXPECT_EQ(set.get_internal_table_size(), 4096u) << "test precondition: the table doubled";
+} // FreedNodesDoNotStrandOnUnusedShards
+
 // ---------------------------------------------------------------------------
 // The hook scripts. Each runs on HookSet<K> for K = 2, 3 and 64 generations: K =
 // 2 is the minimum ring (every bump wraps), 3 the smallest ring with a slot
 // between the oldest and the current one, 64 the default. One test per K, each
-// calling the script's body template (a typed test would not do: the mutant
-// runner attributes a failure to a test by its plain name).
+// calling the script's body template, so that every instance has a plain test
+// name of its own.
 // Every set is pre-sized and one-shard, Set(256, 1): no doubling, split or
 // limbo node in any script (fewer than 256 slots are appended, and a doubling
 // needs the hint above 512), and every freed node lands on the one free list the
@@ -4328,7 +4387,7 @@ static void hook_join_race_retries_body() {
             EXPECT_TRUE(set.erase(h2, X));
         }
         rh = set.advance();
-    });
+    }); // the in_join action
     typename Set::handle J = set.new_handle();
     const HookCounts c1 = hook_counts(set);
     ASSERT_EQ(ran, 1) << "test precondition: the in_join action did not run";
@@ -4511,7 +4570,7 @@ static void hook_stale_increment_survives_recycle_body() {
             ++ran2;
             for (int j = 0; j < static_cast<int>(K) - 1; ++j) rb.push_back(cycle(set, j + 2));
         });
-    });
+    }); // the in_join action
     typename Set::handle J = set.new_handle();
     const HookCounts c1 = hook_counts(set);
     ASSERT_EQ(ran1, 1) << "test precondition: the in_join action did not run";
@@ -4574,7 +4633,7 @@ static void hook_stale_increment_on_resealed_slot_body() {
             ++ran2;
             for (int j = 0; j < static_cast<int>(K); ++j) rb.push_back(cycle(set, j + 2));
         });
-    });
+    }); // the in_join action
     typename Set::handle J = set.new_handle();
     const HookCounts c1 = hook_counts(set);
     ASSERT_EQ(ran1, 1) << "test precondition: the in_join action did not run";
@@ -4634,7 +4693,7 @@ static void hook_late_push_after_publish_body() {
         ASSERT_TRUE(set.insert(hs, A));
         ASSERT_TRUE(set.insert(hs, L));
         ASSERT_TRUE(set.erase(hs, A));
-    }
+    } // hs's scope
     expect_tuple(set, "step 0", 1, 0, 1, 0, 0, 0, 0);
     const HookCounts c0 = hook_counts(set);
     int ran = 0;
@@ -4646,9 +4705,9 @@ static void hook_late_push_after_publish_body() {
             const typename Set::handle h2 = set.new_handle();
             gen_in_hook = Set::get_internal_handle_generation(h2);
             EXPECT_TRUE(set.erase(h2, L));
-        }
+        } // h2's scope
         nested = set.advance();
-    });
+    }); // the in_advance_after_publish action
     const AdvanceResult r1 = set.advance();
     const HookCounts c1 = hook_counts(set);
     ASSERT_EQ(ran, 1) << "test precondition: the in_advance_after_publish action did not run";
@@ -4689,7 +4748,7 @@ static void hook_late_push_after_publish_every_shard_body() {
         ASSERT_TRUE(set.insert(hs, A));
         for (int s = 0; s < S; ++s) ASSERT_TRUE(set.insert(hs, s + 1));
         ASSERT_TRUE(set.erase(hs, A));
-    }
+    } // hs's scope
     expect_tuple(set, "step 0", S, 0, 1, 0, 0, 0, 0);
     int ran = 0;
     std::vector<unsigned> shard_of(S, 0);
@@ -4700,10 +4759,10 @@ static void hook_late_push_after_publish_every_shard_body() {
                 shard_of[s] = concurrent_hash_rcu_detail::thread_number() & (S - 1);
                 const typename Set::handle h = set.new_handle();
                 EXPECT_TRUE(set.erase(h, s + 1));
-            });
+            }); // thread helper
             helper.join();
         } // one helper at a time
-    });
+    }); // the in_advance_after_publish action
     const AdvanceResult r1 = set.advance();
     ASSERT_EQ(ran, 1) << "test precondition: the in_advance_after_publish action did not run";
     std::vector<unsigned> sorted = shard_of;
@@ -4794,7 +4853,7 @@ static void suspended_reader_pins_its_generation_body() {
             }
             r2 = set.advance();
             ProbeKey::arm(ProbeKey::equal_hook, S, 1, [&]() { ++stepped_on_s; });
-        });
+        }); // the equal_hook action on X
         const bool found = set.contains(h, KEY);
         ProbeKey::disarm_hooks();
         ASSERT_EQ(ran, 1) << "test precondition: the hook on the reader's comparison against X did not fire";
@@ -4880,7 +4939,7 @@ TEST_F(HashRcuHookTest, AdvanceWalkHoldsTheFlag) {
 // released on a throw (handle refs 1, and the destructor's live-handle assert).
 // The hook is armed outside any TestHooks action (this set has NoHooks): a
 // throw from a TestHooks action would terminate. `ran == 1` proves the throw
-// came from INSIDE the walk, which a black-box test cannot.
+// came from INSIDE the walk, which a test without the hook cannot.
 TEST_F(HashRcuHookTest, AdvanceWalkThrowReleasesFlagAndHandle) {
     using Set = ConcurrentResizableHashSetRCU<ProbeKey, true, ProbeKeyHash>;
     {
@@ -4924,7 +4983,7 @@ TEST_F(HashRcuHookTest, DestructorUnpoisonsFreeNodes) {
             const Set::handle h = set.new_handle();
             ASSERT_TRUE(set.insert(h, 1));
             ASSERT_TRUE(set.erase(h, 1));
-        }
+        } // h's scope
         expect_advance(set.advance(), 1, 1, 0, Advance::advanced, "one node freed");
         ASSERT_EQ(set.get_internal_free_count(), 1u) << "test precondition: the free list is empty at destruction";
     } // the set's destruction
@@ -4949,7 +5008,7 @@ TEST(ConcurrentHashSetRcuTest, FreeNodesArePoisonedAfterAdvance) {
         const Set::handle h = set.new_handle();
         for (int k : {1, 2}) ASSERT_TRUE(set.insert(h, k));
         for (int k : {1, 2}) ASSERT_TRUE(set.erase(h, k));
-    }
+    } // h's scope
     expect_advance(set.advance(), 2, 1, 0, Advance::advanced, "both nodes in one bag");
     ASSERT_EQ(set.get_internal_free_count(), 2u) << "test precondition: the free list does not hold both nodes";
     EXPECT_TRUE(expect_consistent(set, "two free nodes").consistent) << "a free node's value bytes are not poisoned (under ASan)";
@@ -5043,7 +5102,7 @@ static void advance_stress_body(const StressShape& shape, const std::string& whe
             return op(own);
         }
         return op(h);
-    };
+    }; // under()
     for (int t = 0; t < shape.writers; ++t) {
         threads.emplace_back([&, t]() {
             typename SetT::handle h = shape.per_op_handles ? typename SetT::handle{} : set.new_handle();
@@ -5061,7 +5120,7 @@ static void advance_stress_body(const StressShape& shape, const std::string& whe
                 } // the window's oldest key leaves
             } // writer loop
             written[t] = i;
-        });
+        }); // writer thread t
     } // writers
     for (int r = 0; r < shape.readers; ++r) {
         const int t = shape.writers + r;
@@ -5079,7 +5138,7 @@ static void advance_stress_body(const StressShape& shape, const std::string& whe
                 bad[t] += under(h, [&](const typename SetT::handle& y) { return set.contains(y, never); });
                 (void)under(h, [&](const typename SetT::handle& y) { return set.contains(y, any); });
             } // reader loop
-        });
+        }); // reader thread r
     } // readers
     for (int a = 0; a < shape.advancers; ++a) {
         threads.emplace_back([&, a]() {
@@ -5090,7 +5149,7 @@ static void advance_stress_body(const StressShape& shape, const std::string& whe
                 tally.bags_freed += r.freed_bags;
                 ++tally.outcomes[static_cast<size_t>(r.advance)];
             } // advancer loop
-        });
+        }); // advancer thread a
     } // advancers
     start.arrive_and_wait();
     std::this_thread::sleep_for(shape.run_for);
@@ -5180,6 +5239,29 @@ TEST_F(HashRcuHookTest, StressAdvanceYieldInWindows) {
     EXPECT_GT(w.contended, 0u) << "witness: the two advancers never met at the flag";
 } // StressAdvanceYieldInWindows
 
+// Per-operation handles UNDER the TestHooks instantiation with
+// yield_in_windows: every operation joins and leaves, and every join yields
+// between its load and its increment and between its increment and its
+// re-verify, so a joiner's stale increment meets the free pass's check of a
+// generation's count, and the slot's recycling, far more often than in either
+// of the two tests it combines. It is the stress that catches a free pass
+// storing 0 into the count of a slot it makes EMPTY (the wiped stale
+// increment's undo drives the count negative, which the header asserts).
+// Witnesses: join retries, join-hook calls, after-publish calls, bags freed,
+// the advancers met at the flag.
+TEST_F(HashRcuHookTest, StressAdvancePerOperationHandlesYieldInWindows) {
+    using Set = ConcurrentResizableHashSetRCU<int, true, std::hash<int>, 64, TestHooks>;
+    const StressShape shape{4, 2, 2, true, 2, 1024, 64, 256, std::chrono::milliseconds(1000), true};
+    TestHooks::yield_in_windows.store(true);
+    StressWitness w;
+    ASSERT_NO_FATAL_FAILURE(advance_stress_body<Set>(shape, "per-operation handles, yield in windows", w));
+    EXPECT_GT(w.join_retries, 0u) << "witness: no join ever retried";
+    EXPECT_GT(TestHooks::join.calls.load(), 0) << "witness: no join entered its windows";
+    EXPECT_GT(TestHooks::after_publish.calls.load(), 0) << "witness: no advance() entered its publish-to-free-pass window";
+    EXPECT_GT(w.bags_freed, 0u) << "witness: no bag was freed during the run";
+    EXPECT_GT(w.contended, 0u) << "witness: the two advancers never met at the flag";
+} // StressAdvancePerOperationHandlesYieldInWindows
+
 // Per-operation handles: every operation joins and leaves, so joins run all the
 // time against the advancers' publishes.
 // Witness: a join's re-verify failed (an advance() published between a joiner's
@@ -5216,16 +5298,15 @@ TEST(ConcurrentHashSetRcuTest, StressAdvanceLongChainsManyTinySets) {
 } // StressAdvanceLongChainsManyTinySets
 
 // ===========================================================================
-// CONTRACT TESTS OF STEP 2a (handles, generations, advance()).
+// CONTRACT TESTS: handles, generations and advance() through the public
+// interface.
 //
-// Black-box tests written from the set's public contract ALONE: every test
-// names, in words, the promises it checks (the handle's special members and
-// thread rules, new_handle() and refresh(), the operations under a handle,
-// advance()'s outcomes and counts, the pin and latency guarantees, the
-// template parameters, value lifetime, the destructor, and the diagnostics).
-// Every expected value below is derived from those promises, never from the
-// implementation. The get_internal_* accessors are used only as diagnostic
-// instruments, at quiescent points where they are valid.
+// Every test names, in words, the promises it checks: the handle's special
+// members and thread rules, new_handle() and refresh(), the operations under a
+// handle, advance()'s outcomes and counts, the pin and latency guarantees, the
+// template parameters, value lifetime, the destructor, and the diagnostics.
+// The get_internal_* accessors are used only as diagnostic instruments, at
+// quiescent points where they are valid.
 //
 // THE MODEL the exact AdvanceResult oracles follow (advance()'s outcomes and
 // counts, and the pin, latency and ring guarantees):
@@ -5243,15 +5324,15 @@ TEST(ConcurrentHashSetRcuTest, StressAdvanceLongChainsManyTinySets) {
 //     the walk visits every published bucket (v), except after `ring_full` or
 //     `contended`.
 //   - THE ONE-NODE SETTING: the exact-count tests construct
-//     their set with ContractB = 4096 buckets and ONE arena shard, at least
+//     their set with kContractBuckets = 4096 buckets and ONE arena shard, at least
 //     128 times the shards their threads touch, and check the setting with
 //     ContractOneNode (splits_published and the table size unchanged, nothing
-//     in limbo, every one of the ContractB buckets published). In it,
-//     ContractRetire() (an uncontended insert and erase of one key) retires
+//     in limbo, every one of the kContractBuckets buckets published). In it,
+//     contract_retire() (an uncontended insert and erase of one key) retires
 //     exactly one node and leaves nothing for the walk (the uncontended
 //     operations' unlinking POSTCONDITIONS), so a bag holds exactly the nodes
 //     retired into it.
-//   - buckets_walked is B = the published buckets: ContractB in the
+//   - buckets_walked is B = the published buckets: kContractBuckets in the
 //     setting (nothing was ever published beyond the constructor's 4096, which
 //     ContractOneNode checks). nodes_passed is n = `reachable` before the call
 //     when no dead node is reachable; with no key present it is 0.
@@ -5265,8 +5346,8 @@ TEST(ConcurrentHashSetRcuTest, StressAdvanceLongChainsManyTinySets) {
 // FROZEN node at a usable predecessor, which only an unfinished split leaves.
 // The contract names "a Hash that throws inside a split" as one way to leave
 // one, and an operation's exception clauses make that a legal Hash (an insert
-// that throws in a split it met). So the tests build it black-box
-// (ContractLeaveUnfinishedSplit()): after the set has doubled, inserts of
+// that throws in a split it met). So the tests build it through the public
+// interface (contract_leave_unfinished_split()): after the set has doubled, inserts of
 // fresh keys whose Hash{} throws at its 2nd..6th call, until an advance()
 // afterwards calls Hash{} at all, which the contract says happens only in
 // that construction; a construction that is never reached fails the test with
@@ -5277,14 +5358,8 @@ TEST(ConcurrentHashSetRcuTest, StressAdvanceLongChainsManyTinySets) {
 
 // The capacity of every one-node-setting set (a power of two, at least 128 x
 // the one arena shard those sets use), and that shard count.
-static constexpr size_t ContractB = 4096;
-static constexpr size_t ContractShards = 1;
-
-// The four outcomes, by short names.
-static constexpr AdvanceResult::Advance ContractNothingRetired = AdvanceResult::Advance::nothing_retired;
-static constexpr AdvanceResult::Advance ContractAdvanced = AdvanceResult::Advance::advanced;
-static constexpr AdvanceResult::Advance ContractRingFull = AdvanceResult::Advance::ring_full;
-static constexpr AdvanceResult::Advance ContractContended = AdvanceResult::Advance::contended;
+static constexpr size_t kContractBuckets = 4096;
+static constexpr size_t kContractShards = 1;
 
 // The instantiations: the default ring (64), a ring of K slots, and the
 // no-delete flavor (advance() works for both AllowDelete values).
@@ -5295,12 +5370,12 @@ using ContractSetNoDel = ConcurrentResizableHashSetRCU<int, false>;
 
 // A 64-bit mixer (splitmix64's finalizer), so that keys spread over the
 // buckets and every doubling splits many of them.
-static size_t ContractMix(int k) {
+static size_t contract_mix(int k) {
     uint64_t x = static_cast<uint64_t>(static_cast<uint32_t>(k)) + 0x9e3779b97f4a7c15ull;
     x = (x ^ (x >> 30))*0xbf58476d1ce4e5b9ull;
     x = (x ^ (x >> 27))*0x94d049bb133111ebull;
     return static_cast<size_t>(x ^ (x >> 31));
-}
+} // contract_mix()
 
 // ---------------------------------------------------------------------------
 // ContractHashControl: the per-thread switches of the hooked Hash{} types
@@ -5325,12 +5400,12 @@ struct ContractHashControl {
     static void reset() {
         parked.store(false, std::memory_order_relaxed);
         resume.store(false, std::memory_order_relaxed);
-    }
+    } // ContractHashControl::reset()
     // Waits (spinning) until `resume` is set; publishes `parked` first.
     static void park_here() {
         parked.store(true, std::memory_order_release);
         while (!resume.load(std::memory_order_acquire)) std::this_thread::yield();
-    }
+    } // ContractHashControl::park_here()
     // Called at the top of every hooked Hash{}: runs the nested action once,
     // then the countdown throw, then the mode (count, park once, or throw
     // once, after which it falls back to counting).
@@ -5339,7 +5414,7 @@ struct ContractHashControl {
             std::function<void()> action = std::move(nested);
             nested = nullptr;
             action();
-        }
+        } // if a nested action is set
         if (throw_countdown > 0 && --throw_countdown == 0) throw ContractHashThrow{};
         switch (mode) {
             case ContractHashMode::plain:
@@ -5356,7 +5431,7 @@ struct ContractHashControl {
                 ++calls;
                 mode = ContractHashMode::count;
                 throw ContractHashThrow{};
-        }
+        } // switch on the mode
     } // on_hash()
 }; // struct ContractHashControl
 
@@ -5364,9 +5439,9 @@ struct ContractHashControl {
 struct ContractHookHash {
     size_t operator()(int k) const {
         ContractHashControl::on_hash();
-        return ContractMix(k);
+        return contract_mix(k);
     }
-};
+}; // struct ContractHookHash
 
 // ---------------------------------------------------------------------------
 // ContractCountedKey: an instrumented T (copy-constructible, copy-assignable,
@@ -5410,7 +5485,7 @@ struct ContractCountedKey {
         }
         value = other.value;
         return *this;
-    }
+    } // ContractCountedKey::operator=()
     // Reads its own bytes (serial): under ASan a destruction of a poisoned
     // value would be reported (the destructor unpoisons free nodes first).
     ~ContractCountedKey() {
@@ -5424,25 +5499,25 @@ struct ContractCountedKey {
             ContractHashControl::park_here();
         }
         return value == other.value;
-    }
+    } // ContractCountedKey::operator==()
 }; // struct ContractCountedKey
 
 // Hash{} of ContractCountedKey with the same hook as ContractHookHash.
 struct ContractCountedKeyHash {
     size_t operator()(const ContractCountedKey& k) const {
         ContractHashControl::on_hash();
-        return ContractMix(k.value);
+        return contract_mix(k.value);
     }
-};
+}; // struct ContractCountedKeyHash
 
 // Number of serials in [first, last) not destroyed exactly once.
-static int ContractDestructionErrors(unsigned first, unsigned last) {
+static int contract_destruction_errors(unsigned first, unsigned last) {
     int errors = 0;
     for (unsigned s = first; s < last && s < ContractCountedKey::kMaxSerials; ++s) {
         if (ContractCountedKey::destroyed[s].load(std::memory_order_relaxed) != 1) ++errors;
     }
     return errors;
-}
+} // contract_destruction_errors()
 
 // ---------------------------------------------------------------------------
 // Helpers.
@@ -5455,27 +5530,16 @@ static int ContractDestructionErrors(unsigned first, unsigned last) {
 // handle of this helper pins anything. In the one-node setting: exactly one
 // node.
 template <typename SetT, typename K>
-static void ContractRetire(SetT& set, const K& key) {
+static void contract_retire(SetT& set, const K& key) {
     typename SetT::handle h = set.new_handle();
     EXPECT_TRUE(set.insert(h, key));
     EXPECT_TRUE(set.erase(h, key));
-}
-
-// The number of published buckets (a quiescent-only diagnostic): the walk's B.
-template <typename SetT>
-static size_t ContractPublished(const SetT& set) {
-    size_t published = 0;
-    const size_t size = set.get_internal_table_size();
-    for (size_t j = 0; j < size; ++j) {
-        if (set.get_internal_bucket_published(j)) ++published;
-    }
-    return published;
-}
+} // contract_retire()
 
 // ContractOneNode: the testable form of the ONE-NODE SETTING. Taken at
-// the start of a test on a set constructed with (ContractB, ContractShards);
+// the start of a test on a set constructed with (kContractBuckets, kContractShards);
 // holds() checks that no split published, the table did not grow, all
-// ContractB buckets are published (the walk's B) and, unless told otherwise,
+// kContractBuckets buckets are published (the walk's B) and, unless told otherwise,
 // nothing is in limbo. Quiescent use only.
 template <typename SetT>
 class ContractOneNode {
@@ -5485,12 +5549,12 @@ public:
     testing::AssertionResult holds(bool check_limbo = true) const {
         const size_t splits = set_.get_internal_counters().splits_published;
         const size_t table_size = set_.get_internal_table_size();
-        const size_t published = ContractPublished(set_);
+        const size_t published = published_buckets(set_);
         const size_t limbo = check_limbo ? set_.get_internal_limbo_count() : 0;
-        if (splits == splits_ && table_size == table_size_ && published == ContractB && limbo == 0) return testing::AssertionSuccess();
+        if (splits == splits_ && table_size == table_size_ && published == kContractBuckets && limbo == 0) return testing::AssertionSuccess();
         return testing::AssertionFailure() << "one-node setting broken: splits_published " << splits_ << " -> " << splits << ", table size "
                                            << table_size_ << " -> " << table_size << ", published " << published << ", limbo " << limbo;
-    }
+    } // ContractOneNode::holds()
 
 private:
     const SetT& set_;       // the set under test
@@ -5500,18 +5564,18 @@ private:
 
 // Calls set.advance() (single-threaded, nothing else running, one-node
 // setting, no key present) and checks it against {freed_nodes, freed_bags, 0,
-// B, 0, outcome}, B = ContractB for the outcomes that walk and 0 for
+// B, 0, outcome}, B = kContractBuckets for the outcomes that walk and 0 for
 // `ring_full` (a ring_full call does not walk). Returns an AssertionResult so that
 // EXPECT_TRUE() reports the caller's line.
 template <typename SetT>
-static testing::AssertionResult ContractAdvanceIs(SetT& set, size_t freed_nodes, size_t freed_bags, AdvanceResult::Advance outcome) {
-    const bool walks = outcome == ContractAdvanced || outcome == ContractNothingRetired;
-    const AdvanceResult want{freed_nodes, freed_bags, 0, walks ? ContractB : 0, 0, outcome};
+static testing::AssertionResult contract_advance_is(SetT& set, size_t freed_nodes, size_t freed_bags, AdvanceResult::Advance outcome) {
+    const bool walks = outcome == Advance::advanced || outcome == Advance::nothing_retired;
+    const AdvanceResult want{freed_nodes, freed_bags, 0, walks ? kContractBuckets : 0, 0, outcome};
     const AdvanceResult got = set.advance();
     if (got == want) return testing::AssertionSuccess();
     return testing::AssertionFailure() << "advance() returned " << testing::PrintToString(got)
                                        << ", expected " << testing::PrintToString(want);
-} // ContractAdvanceIs()
+} // contract_advance_is()
 
 // The ring invariant (generation numbers), through the ring-state view: K
 // slots in slot order; the CURRENT slot carries the current number; the
@@ -5520,7 +5584,7 @@ static testing::AssertionResult ContractAdvanceIs(SetT& set, size_t freed_nodes,
 // minus one; every other slot is EMPTY with nothing bagged. No advance() in
 // progress.
 template <typename SetT>
-static testing::AssertionResult ContractRingInvariant(const SetT& set, size_t K) {
+static testing::AssertionResult contract_ring_invariant(const SetT& set, size_t K) {
     const typename SetT::InternalRingState ring = set.get_internal_ring_state();
     const uint64_t current = set.get_internal_generation();
     const size_t n = ring.slots.size();
@@ -5542,46 +5606,47 @@ static testing::AssertionResult ContractRingInvariant(const SetT& set, size_t K)
             if (slot.state != SetT::GenerationState::EMPTY || slot.bagged != 0) {
                 return testing::AssertionFailure() << "slot " << index << " should be EMPTY with nothing bagged";
             }
-        }
+        } // the SEALED run, then the EMPTY slots
     } // loop over the slots, oldest first
     return testing::AssertionSuccess();
-} // ContractRingInvariant()
+} // contract_ring_invariant()
 
 // The number of SEALED slots (bags pending), from the ring-state view.
 template <typename SetT>
-static size_t ContractPendingBags(const SetT& set) {
+static size_t contract_pending_bags(const SetT& set) {
     const typename SetT::InternalRingState ring = set.get_internal_ring_state();
     size_t sealed = 0;
     for (const typename SetT::InternalRingSlot& slot : ring.slots) {
         if (slot.state == SetT::GenerationState::SEALED) ++sealed;
     }
     return sealed;
-}
+} // contract_pending_bags()
 
 // The live-handle count of generation `gen` in the ring (the ring-state
 // view), or -1 if no non-EMPTY slot has that generation.
 template <typename SetT>
-static long ContractRefsOf(const SetT& set, uint64_t gen) {
+static long contract_refs_of(const SetT& set, uint64_t gen) {
     const typename SetT::InternalRingState ring = set.get_internal_ring_state();
     for (const typename SetT::InternalRingSlot& slot : ring.slots) {
         if (slot.state != SetT::GenerationState::EMPTY && slot.gen == gen) return slot.refs;
     }
     return -1;
-}
+} // contract_refs_of()
 
 // Inserts keys K(next_key), K(next_key + 1), ... under one handle until the
 // table doubles once (get_internal_table_size(), exact single-threaded), or
 // 64 times the old size keys were inserted. Single-threaded use only.
 template <typename K, typename SetT>
-static void ContractGrowOnce(SetT& set, int& next_key) {
+static void contract_grow_once(SetT& set, int& next_key) {
     const size_t size0 = set.get_internal_table_size();
     typename SetT::handle h = set.new_handle();
     for (size_t i = 0; i < 64*size0 && set.get_internal_table_size() == size0; ++i) {
         EXPECT_TRUE(set.insert(h, K(next_key++)));
     }
-}
+} // contract_grow_once()
 
-// The unfinished-split construction, built black-box: fills the set with 300 keys
+// The unfinished-split construction, through the public interface: fills the
+// set with 300 keys
 // K(next_key++) (so that it has doubled and has UNINITIALIZED buckets), then
 // inserts fresh keys with this thread's Hash{} armed to throw at its nth call
 // (n = 2..6: after the key's own hash, i.e. inside a split the insert met,
@@ -5595,7 +5660,7 @@ static void ContractGrowOnce(SetT& set, int& next_key) {
 // depending on where the throw fell); every other key below next_key was
 // inserted. Single-threaded use only.
 template <typename K, typename SetT>
-static bool ContractLeaveUnfinishedSplit(SetT& set, int& next_key, std::vector<int>& thrown) {
+static bool contract_leave_unfinished_split(SetT& set, int& next_key, std::vector<int>& thrown) {
     {
         typename SetT::handle h = set.new_handle();
         for (int i = 0; i < 300; ++i) EXPECT_TRUE(set.insert(h, K(next_key++)));
@@ -5613,7 +5678,7 @@ static bool ContractLeaveUnfinishedSplit(SetT& set, int& next_key, std::vector<i
                     threw = true;
                 }
                 ContractHashControl::throw_countdown = 0;
-            }
+            } // the insert's handle
             if (!threw) continue;
             thrown.push_back(key);
             ContractHashControl::mode = ContractHashMode::count;
@@ -5624,7 +5689,7 @@ static bool ContractLeaveUnfinishedSplit(SetT& set, int& next_key, std::vector<i
         } // loop over attempts
     } // loop over the throwing call's index
     return false;
-} // ContractLeaveUnfinishedSplit()
+} // contract_leave_unfinished_split()
 
 // The throwing-walk construction: the unfinished-split construction, then
 // one advance() with this thread's Hash{} armed to throw once; returns true
@@ -5633,8 +5698,8 @@ static bool ContractLeaveUnfinishedSplit(SetT& set, int& next_key, std::vector<i
 // at compile time that advance() is not [[nodiscard]], or -Werror rejects
 // this line.
 template <typename K, typename SetT>
-static bool ContractThrowInWalk(SetT& set, int& next_key, std::vector<int>& thrown) {
-    if (!ContractLeaveUnfinishedSplit<K>(set, next_key, thrown)) return false;
+static bool contract_throw_in_walk(SetT& set, int& next_key, std::vector<int>& thrown) {
+    if (!contract_leave_unfinished_split<K>(set, next_key, thrown)) return false;
     bool threw = false;
     ContractHashControl::mode = ContractHashMode::throw_once;
     try {
@@ -5644,7 +5709,7 @@ static bool ContractThrowInWalk(SetT& set, int& next_key, std::vector<int>& thro
     }
     ContractHashControl::mode = ContractHashMode::plain;
     return threw;
-} // ContractThrowInWalk()
+} // contract_throw_in_walk()
 
 // ContractParkedAdvance: an advance() parked inside its walk's Hash{} on a
 // thread of its own (the construction behind the single-advancer, never-wait
@@ -5654,19 +5719,19 @@ static bool ContractThrowInWalk(SetT& set, int& next_key, std::vector<int>& thro
 // then in progress until resume()). resume() lets the parked call finish,
 // joins and returns its result; detach() abandons the parked thread
 // (death-test children only). The destructor resumes. `thrown` as in
-// ContractLeaveUnfinishedSplit().
+// contract_leave_unfinished_split().
 template <typename SetT, typename K>
 class ContractParkedAdvance {
 public:
     ContractParkedAdvance(SetT& set, int& next_key, std::vector<int>& thrown) : set_(set) {
-        if (!ContractLeaveUnfinishedSplit<K>(set, next_key, thrown)) return;
+        if (!contract_leave_unfinished_split<K>(set, next_key, thrown)) return;
         ContractHashControl::reset();
         thread_ = std::thread([this] {
             ContractHashControl::mode = ContractHashMode::park;
             result_ = set_.advance();
             ContractHashControl::mode = ContractHashMode::plain;
             done_.store(true, std::memory_order_release);
-        });
+        }); // the parked advancer thread
         while (!ContractHashControl::parked.load(std::memory_order_acquire) && !done_.load(std::memory_order_acquire)) {
             std::this_thread::yield();
         }
@@ -5683,7 +5748,7 @@ public:
             thread_.join();
         }
         return result_;
-    }
+    } // ContractParkedAdvance::resume()
     void detach() {
         if (thread_.joinable()) thread_.detach();
     }
@@ -5703,7 +5768,7 @@ private:
 // depends on where the throw fell and is not checked). Returns the number of
 // errors.
 template <typename K, typename SetT>
-static int ContractMembershipErrors(SetT& set, int next_key, const std::vector<int>& thrown) {
+static int contract_membership_errors(SetT& set, int next_key, const std::vector<int>& thrown) {
     typename SetT::handle h = set.new_handle();
     int errors = 0;
     for (int k = 0; k < next_key; ++k) {
@@ -5714,7 +5779,7 @@ static int ContractMembershipErrors(SetT& set, int next_key, const std::vector<i
         if (set.contains(h, K(k))) ++errors;
     }
     return errors;
-} // ContractMembershipErrors()
+} // contract_membership_errors()
 
 // ===========================================================================
 // The handle type and its special members, new_handle(), and the set's
@@ -5769,7 +5834,7 @@ TEST(ConcurrentHashSetRcuTest, ContractEmptyHandleMayOutliveSet) {
     ContractSet::handle outer;
     EXPECT_FALSE(outer);
     {
-        ContractSet set(ContractB, ContractShards);
+        ContractSet set(kContractBuckets, kContractShards);
         outer = set.new_handle();
         EXPECT_TRUE(outer);
         ContractSet::handle sink(std::move(outer));
@@ -5785,7 +5850,7 @@ TEST(ConcurrentHashSetRcuTest, ContractEmptyHandleMayOutliveSet) {
 // one `advanced` call. handle_refs (the sweep allows and counts live idle
 // handles) equals the number of live handles.
 TEST(ConcurrentHashSetRcuTest, ContractNewHandleJoinsCurrentGeneration) {
-    ContractSet set(ContractB, ContractShards);
+    ContractSet set(kContractBuckets, kContractShards);
     const ContractOneNode<ContractSet> setting(set);
     const ContractSet& cset = set;
     EXPECT_EQ(set.get_internal_generation(), 0u);
@@ -5793,15 +5858,15 @@ TEST(ConcurrentHashSetRcuTest, ContractNewHandleJoinsCurrentGeneration) {
     EXPECT_TRUE(h);
     EXPECT_EQ(ContractSet::get_internal_handle_generation(h), 0u);
     EXPECT_EQ(set.get_internal_accounting().handle_refs, 1);
-    ContractRetire(set, 1);
-    EXPECT_TRUE(ContractAdvanceIs(set, 0, 0, ContractAdvanced));
+    contract_retire(set, 1);
+    EXPECT_TRUE(contract_advance_is(set, 0, 0, Advance::advanced));
     EXPECT_EQ(set.get_internal_generation(), 1u);
     ContractSet::handle h2 = cset.new_handle();
     EXPECT_TRUE(h2);
     EXPECT_EQ(ContractSet::get_internal_handle_generation(h2), 1u);
     EXPECT_EQ(ContractSet::get_internal_handle_generation(h), 0u);
     EXPECT_EQ(set.get_internal_accounting().handle_refs, 2);
-    EXPECT_TRUE(ContractRingInvariant(set, 64));
+    EXPECT_TRUE(contract_ring_invariant(set, 64));
     EXPECT_TRUE(setting.holds());
 } // ContractNewHandleJoinsCurrentGeneration
 
@@ -5812,7 +5877,7 @@ TEST(ConcurrentHashSetRcuTest, ContractNewHandleJoinsCurrentGeneration) {
 // one, contains is exact; a prvalue handle leaves at the end of its full
 // expression (handle_refs counts only `h` afterwards).
 TEST(ConcurrentHashSetRcuTest, ContractOperationsUnderHandle) {
-    ContractSet set(ContractB, ContractShards);
+    ContractSet set(kContractBuckets, kContractShards);
     ContractSet::handle h = set.new_handle();
     EXPECT_FALSE(set.contains(h, 7));
     EXPECT_TRUE(set.insert(h, 7));
@@ -5827,7 +5892,7 @@ TEST(ConcurrentHashSetRcuTest, ContractOperationsUnderHandle) {
     EXPECT_FALSE(set.contains(set.new_handle(), 8));
     EXPECT_EQ(set.get_internal_accounting().handle_refs, 1);
 
-    ContractSetNoDel nodel(ContractB, ContractShards);
+    ContractSetNoDel nodel(kContractBuckets, kContractShards);
     ContractSetNoDel::handle hn = nodel.new_handle();
     EXPECT_TRUE(nodel.insert(hn, 3));
     EXPECT_FALSE(nodel.insert(nodel.new_handle(), 3));
@@ -5843,23 +5908,23 @@ TEST(ConcurrentHashSetRcuTest, ContractOperationsUnderHandle) {
 // cumulative), and the first call after its release frees both bags, by the
 // free pass of a `nothing_retired` call (which still runs its free pass).
 TEST(ConcurrentHashSetRcuTest, ContractMoveConstructionKeepsMembershipAndPin) {
-    ContractSet set(ContractB, ContractShards);
+    ContractSet set(kContractBuckets, kContractShards);
     const ContractOneNode<ContractSet> setting(set);
     ContractSet::handle a = set.new_handle();
     const uint64_t g0 = ContractSet::get_internal_handle_generation(a);
-    ContractRetire(set, 1);
-    EXPECT_TRUE(ContractAdvanceIs(set, 0, 0, ContractAdvanced));
+    contract_retire(set, 1);
+    EXPECT_TRUE(contract_advance_is(set, 0, 0, Advance::advanced));
     std::unique_ptr<ContractSet::handle> b = std::make_unique<ContractSet::handle>(std::move(a));
     EXPECT_FALSE(a);
     EXPECT_TRUE(*b);
     EXPECT_EQ(ContractSet::get_internal_handle_generation(*b), g0);
-    EXPECT_EQ(ContractRefsOf(set, g0), 1);
+    EXPECT_EQ(contract_refs_of(set, g0), 1);
     EXPECT_EQ(set.get_internal_accounting().handle_refs, 1);
-    ContractRetire(set, 2);
-    EXPECT_TRUE(ContractAdvanceIs(set, 0, 0, ContractAdvanced));
+    contract_retire(set, 2);
+    EXPECT_TRUE(contract_advance_is(set, 0, 0, Advance::advanced));
     b.reset();
     EXPECT_EQ(set.get_internal_accounting().handle_refs, 0);
-    EXPECT_TRUE(ContractAdvanceIs(set, 2, 2, ContractNothingRetired));
+    EXPECT_TRUE(contract_advance_is(set, 2, 2, Advance::nothing_retired));
     EXPECT_TRUE(setting.holds());
 } // ContractMoveConstructionKeepsMembershipAndPin
 
@@ -5872,31 +5937,31 @@ TEST(ConcurrentHashSetRcuTest, ContractMoveConstructionKeepsMembershipAndPin) {
 // assigning an empty handle over a live one leaves (the target becomes empty,
 // its pin ends), and assigning a live handle into an empty one only takes.
 TEST(ConcurrentHashSetRcuTest, ContractMoveAssignOverLiveHandleReleasesTarget) {
-    ContractSet set(ContractB, ContractShards);
+    ContractSet set(kContractBuckets, kContractShards);
     const ContractOneNode<ContractSet> setting(set);
     std::unique_ptr<ContractSet::handle> a = std::make_unique<ContractSet::handle>(set.new_handle());
-    ContractRetire(set, 1);
-    EXPECT_TRUE(ContractAdvanceIs(set, 0, 0, ContractAdvanced));
+    contract_retire(set, 1);
+    EXPECT_TRUE(contract_advance_is(set, 0, 0, Advance::advanced));
     ContractSet::handle b = set.new_handle();
     const uint64_t g1 = ContractSet::get_internal_handle_generation(b);
-    ContractRetire(set, 2);
+    contract_retire(set, 2);
     *a = std::move(b);
     EXPECT_TRUE(*a);
     EXPECT_FALSE(b);
     EXPECT_EQ(ContractSet::get_internal_handle_generation(*a), g1);
     EXPECT_EQ(set.get_internal_accounting().handle_refs, 1);
-    EXPECT_TRUE(ContractAdvanceIs(set, 1, 1, ContractAdvanced));
+    EXPECT_TRUE(contract_advance_is(set, 1, 1, Advance::advanced));
     a.reset();
-    EXPECT_TRUE(ContractAdvanceIs(set, 1, 1, ContractNothingRetired));
+    EXPECT_TRUE(contract_advance_is(set, 1, 1, Advance::nothing_retired));
 
     // An empty handle assigned over a live one: the target leaves and is empty.
     ContractSet::handle c = set.new_handle();
-    ContractRetire(set, 3);
-    EXPECT_TRUE(ContractAdvanceIs(set, 0, 0, ContractAdvanced));
+    contract_retire(set, 3);
+    EXPECT_TRUE(contract_advance_is(set, 0, 0, Advance::advanced));
     c = ContractSet::handle();
     EXPECT_FALSE(c);
     EXPECT_EQ(set.get_internal_accounting().handle_refs, 0);
-    EXPECT_TRUE(ContractAdvanceIs(set, 1, 1, ContractNothingRetired));
+    EXPECT_TRUE(contract_advance_is(set, 1, 1, Advance::nothing_retired));
 
     // A live handle assigned into an empty one: it takes the membership.
     ContractSet::handle d;
@@ -5912,7 +5977,7 @@ TEST(ConcurrentHashSetRcuTest, ContractMoveAssignOverLiveHandleReleasesTarget) {
 // `h = std::move(h)` under -Werror=self-move, so the source is reached
 // through a reference, which is exactly the aliasing case the promise covers.
 TEST(ConcurrentHashSetRcuTest, ContractSelfMoveAssignIsNoOp) {
-    ContractSet set(ContractB, ContractShards);
+    ContractSet set(kContractBuckets, kContractShards);
     const ContractOneNode<ContractSet> setting(set);
     std::unique_ptr<ContractSet::handle> h = std::make_unique<ContractSet::handle>(set.new_handle());
     const uint64_t g0 = ContractSet::get_internal_handle_generation(*h);
@@ -5921,13 +5986,13 @@ TEST(ConcurrentHashSetRcuTest, ContractSelfMoveAssignIsNoOp) {
     EXPECT_TRUE(*h);
     EXPECT_EQ(ContractSet::get_internal_handle_generation(*h), g0);
     EXPECT_EQ(set.get_internal_accounting().handle_refs, 1);
-    ContractRetire(set, 1);
-    EXPECT_TRUE(ContractAdvanceIs(set, 0, 0, ContractAdvanced));
+    contract_retire(set, 1);
+    EXPECT_TRUE(contract_advance_is(set, 0, 0, Advance::advanced));
     *h = std::move(alias);
-    ContractRetire(set, 2);
-    EXPECT_TRUE(ContractAdvanceIs(set, 0, 0, ContractAdvanced));
+    contract_retire(set, 2);
+    EXPECT_TRUE(contract_advance_is(set, 0, 0, Advance::advanced));
     h.reset();
-    EXPECT_TRUE(ContractAdvanceIs(set, 2, 2, ContractNothingRetired));
+    EXPECT_TRUE(contract_advance_is(set, 2, 2, Advance::nothing_retired));
 
     ContractSet::handle empty;
     ContractSet::handle& empty_alias = empty;
@@ -5943,12 +6008,12 @@ TEST(ConcurrentHashSetRcuTest, ContractSelfMoveAssignIsNoOp) {
 // releasing the g1 holder frees nothing (g0 is pinned and older), releasing
 // `e` frees both bags.
 TEST(ConcurrentHashSetRcuTest, ContractSwapExchangesMemberships) {
-    ContractSet set(ContractB, ContractShards);
+    ContractSet set(kContractBuckets, kContractShards);
     const ContractOneNode<ContractSet> setting(set);
     ContractSet::handle a = set.new_handle();
     const uint64_t g0 = ContractSet::get_internal_handle_generation(a);
-    ContractRetire(set, 1);
-    EXPECT_TRUE(ContractAdvanceIs(set, 0, 0, ContractAdvanced));
+    contract_retire(set, 1);
+    EXPECT_TRUE(contract_advance_is(set, 0, 0, Advance::advanced));
     std::unique_ptr<ContractSet::handle> b = std::make_unique<ContractSet::handle>(set.new_handle());
     const uint64_t g1 = ContractSet::get_internal_handle_generation(*b);
     ASSERT_EQ(g1, g0 + 1);
@@ -5965,14 +6030,14 @@ TEST(ConcurrentHashSetRcuTest, ContractSwapExchangesMemberships) {
     swap(a, a);
     EXPECT_TRUE(a);
     EXPECT_EQ(ContractSet::get_internal_handle_generation(a), g0);
-    EXPECT_EQ(ContractRefsOf(set, g0), 1);
+    EXPECT_EQ(contract_refs_of(set, g0), 1);
     std::unique_ptr<ContractSet::handle> e = std::make_unique<ContractSet::handle>();
     swap(a, *e);
     EXPECT_FALSE(a);
     EXPECT_TRUE(*e);
     EXPECT_EQ(ContractSet::get_internal_handle_generation(*e), g0);
-    EXPECT_EQ(ContractRefsOf(set, g0), 1);
-    EXPECT_EQ(ContractRefsOf(set, g1), 1);
+    EXPECT_EQ(contract_refs_of(set, g0), 1);
+    EXPECT_EQ(contract_refs_of(set, g1), 1);
     EXPECT_EQ(set.get_internal_accounting().handle_refs, 2);
     ContractSet::handle empty2;
     a.swap(empty2);  // both empty
@@ -5982,10 +6047,10 @@ TEST(ConcurrentHashSetRcuTest, ContractSwapExchangesMemberships) {
     EXPECT_FALSE(a);
 
     b.reset();
-    ContractRetire(set, 2);
-    EXPECT_TRUE(ContractAdvanceIs(set, 0, 0, ContractAdvanced));
+    contract_retire(set, 2);
+    EXPECT_TRUE(contract_advance_is(set, 0, 0, Advance::advanced));
     e.reset();
-    EXPECT_TRUE(ContractAdvanceIs(set, 2, 2, ContractNothingRetired));
+    EXPECT_TRUE(contract_advance_is(set, 2, 2, Advance::nothing_retired));
     EXPECT_TRUE(setting.holds());
 } // ContractSwapExchangesMemberships
 
@@ -6003,28 +6068,28 @@ TEST(ConcurrentHashSetRcuTest, ContractSwapExchangesMemberships) {
 // happens-before edge through a join: an `advanced` call on another thread,
 // joined, makes refresh() true (generation 2).
 TEST(ConcurrentHashSetRcuTest, ContractRefreshFastAndSlowPath) {
-    ContractSet set(ContractB, ContractShards);
+    ContractSet set(kContractBuckets, kContractShards);
     const ContractOneNode<ContractSet> setting(set);
     ContractSet::handle h = set.new_handle();
     EXPECT_EQ(ContractSet::get_internal_handle_generation(h), 0u);
     EXPECT_FALSE(h.refresh());
     EXPECT_EQ(ContractSet::get_internal_handle_generation(h), 0u);
-    EXPECT_TRUE(ContractAdvanceIs(set, 0, 0, ContractNothingRetired));
+    EXPECT_TRUE(contract_advance_is(set, 0, 0, Advance::nothing_retired));
     EXPECT_FALSE(h.refresh());
-    ContractRetire(set, 1);
-    EXPECT_TRUE(ContractAdvanceIs(set, 0, 0, ContractAdvanced));
+    contract_retire(set, 1);
+    EXPECT_TRUE(contract_advance_is(set, 0, 0, Advance::advanced));
     EXPECT_TRUE(h.refresh());
     EXPECT_EQ(ContractSet::get_internal_handle_generation(h), 1u);
     EXPECT_FALSE(h.refresh());
     EXPECT_TRUE(h);
     EXPECT_EQ(set.get_internal_accounting().handle_refs, 1);
-    EXPECT_TRUE(ContractAdvanceIs(set, 1, 1, ContractNothingRetired));
+    EXPECT_TRUE(contract_advance_is(set, 1, 1, Advance::nothing_retired));
 
-    ContractRetire(set, 2);
+    contract_retire(set, 2);
     AdvanceResult remote{};
     std::thread advancer([&] { remote = set.advance(); });
     advancer.join();
-    EXPECT_EQ(remote.advance, ContractAdvanced);
+    EXPECT_EQ(remote.advance, Advance::advanced);
     EXPECT_TRUE(h.refresh());
     EXPECT_EQ(ContractSet::get_internal_handle_generation(h), 2u);
     EXPECT_FALSE(h.refresh());
@@ -6036,16 +6101,16 @@ TEST(ConcurrentHashSetRcuTest, ContractRefreshFastAndSlowPath) {
 // frees nothing (the other still pins g0); refreshing the second frees g0's
 // bag at the next call.
 TEST(ConcurrentHashSetRcuTest, ContractRefreshReleasesWhenNoOtherHandlePins) {
-    ContractSet set(ContractB, ContractShards);
+    ContractSet set(kContractBuckets, kContractShards);
     const ContractOneNode<ContractSet> setting(set);
     ContractSet::handle a = set.new_handle();
     ContractSet::handle b = set.new_handle();
-    ContractRetire(set, 1);
-    EXPECT_TRUE(ContractAdvanceIs(set, 0, 0, ContractAdvanced));
+    contract_retire(set, 1);
+    EXPECT_TRUE(contract_advance_is(set, 0, 0, Advance::advanced));
     EXPECT_TRUE(a.refresh());
-    EXPECT_TRUE(ContractAdvanceIs(set, 0, 0, ContractNothingRetired));
+    EXPECT_TRUE(contract_advance_is(set, 0, 0, Advance::nothing_retired));
     EXPECT_TRUE(b.refresh());
-    EXPECT_TRUE(ContractAdvanceIs(set, 1, 1, ContractNothingRetired));
+    EXPECT_TRUE(contract_advance_is(set, 1, 1, Advance::nothing_retired));
     EXPECT_TRUE(setting.holds());
 } // ContractRefreshReleasesWhenNoOtherHandlePins
 
@@ -6059,7 +6124,7 @@ TEST(ConcurrentHashSetRcuTest, ContractRefreshReleasesWhenNoOtherHandlePins) {
 // threads touch one shard and 4096 buckets keep the one-node setting.
 TEST(ConcurrentHashSetRcuTest, ContractHandleUsedAndDestroyedOnOtherThreads) {
     constexpr int kKeys = 100;
-    ContractSet set(ContractB, ContractShards);
+    ContractSet set(kContractBuckets, kContractShards);
     const ContractOneNode<ContractSet> setting(set);
     std::unique_ptr<ContractSet::handle> h = std::make_unique<ContractSet::handle>(set.new_handle());
     int errors = 0;
@@ -6068,15 +6133,15 @@ TEST(ConcurrentHashSetRcuTest, ContractHandleUsedAndDestroyedOnOtherThreads) {
             if (!set.insert(*h, k)) ++errors;
             if (!set.contains(*h, k)) ++errors;
             if (!set.erase(*h, k)) ++errors;
-        }
-    });
+        } // loop over the keys
+    }); // thread user
     user.join();
     EXPECT_EQ(errors, 0);
-    EXPECT_TRUE(ContractAdvanceIs(set, 0, 0, ContractAdvanced));
+    EXPECT_TRUE(contract_advance_is(set, 0, 0, Advance::advanced));
     std::thread destroyer([&] { h.reset(); });
     destroyer.join();
     EXPECT_EQ(set.get_internal_accounting().handle_refs, 0);
-    EXPECT_TRUE(ContractAdvanceIs(set, kKeys, 1, ContractNothingRetired));
+    EXPECT_TRUE(contract_advance_is(set, kKeys, 1, Advance::nothing_retired));
     EXPECT_TRUE(setting.holds());
 } // ContractHandleUsedAndDestroyedOnOtherThreads
 
@@ -6102,7 +6167,7 @@ TEST(ConcurrentHashSetRcuTest, ContractSharedHandleConcurrentOperations) {
                 if (!set.contains(h, k)) errors.fetch_add(1, std::memory_order_relaxed);
                 if (set.contains(h, -1 - k)) errors.fetch_add(1, std::memory_order_relaxed);
             }
-        });
+        }); // thread t
     } // loop over threads
     for (std::thread& t : threads) t.join();
     EXPECT_EQ(errors.load(), 0);
@@ -6121,7 +6186,7 @@ TEST(ConcurrentHashSetRcuTest, ContractSharedHandleConcurrentOperations) {
 // key's own hash, which precedes any publishing CAS or mark.
 TEST(ConcurrentHashSetRcuTest, ContractThrowingOperationLeavesHandleUsable) {
     using SetT = ConcurrentResizableHashSetRCU<int, true, ContractHookHash>;
-    SetT set(ContractB, ContractShards);
+    SetT set(kContractBuckets, kContractShards);
     SetT::handle h = set.new_handle();
     ContractHashControl::throw_countdown = 1;
     EXPECT_THROW(set.insert(h, 5), ContractHashThrow);
@@ -6140,7 +6205,7 @@ TEST(ConcurrentHashSetRcuTest, ContractThrowingOperationLeavesHandleUsable) {
     SetT::handle moved(std::move(h));
     EXPECT_TRUE(moved);
     EXPECT_TRUE(set.erase(moved, 6));
-    EXPECT_NE(set.advance().advance, ContractContended);
+    EXPECT_NE(set.advance().advance, Advance::contended);
     EXPECT_TRUE(set.get_internal_accounting().consistent);
 } // ContractThrowingOperationLeavesHandleUsable
 
@@ -6155,21 +6220,21 @@ TEST(ConcurrentHashSetRcuTest, ContractThrowingOperationLeavesHandleUsable) {
 // generation (0, unchanged by `nothing_retired`), with or without a held
 // handle, for both AllowDelete values.
 TEST(ConcurrentHashSetRcuTest, ContractAdvanceFreshSetIsNothingRetired) {
-    for (const std::pair<size_t, size_t>& capacity_b : {std::pair<size_t, size_t>{64, 64}, {5, 8}, {1, 4}, {ContractB, ContractB}}) {
-        ContractSet set(capacity_b.first, ContractShards);
+    for (const std::pair<size_t, size_t>& capacity_b : {std::pair<size_t, size_t>{64, 64}, {5, 8}, {1, 4}, {kContractBuckets, kContractBuckets}}) {
+        ContractSet set(capacity_b.first, kContractShards);
         const size_t b = capacity_b.second;
         EXPECT_EQ(set.get_internal_generation(), 0u);
-        EXPECT_EQ(set.advance(), (AdvanceResult{0, 0, 0, b, 0, ContractNothingRetired})) << "capacity " << capacity_b.first;
-        EXPECT_EQ(set.advance(), (AdvanceResult{0, 0, 0, b, 0, ContractNothingRetired})) << "capacity " << capacity_b.first;
+        EXPECT_EQ(set.advance(), (AdvanceResult{0, 0, 0, b, 0, Advance::nothing_retired})) << "capacity " << capacity_b.first;
+        EXPECT_EQ(set.advance(), (AdvanceResult{0, 0, 0, b, 0, Advance::nothing_retired})) << "capacity " << capacity_b.first;
         {
             ContractSet::handle h = set.new_handle();
-            EXPECT_EQ(set.advance(), (AdvanceResult{0, 0, 0, b, 0, ContractNothingRetired})) << "capacity " << capacity_b.first;
+            EXPECT_EQ(set.advance(), (AdvanceResult{0, 0, 0, b, 0, Advance::nothing_retired})) << "capacity " << capacity_b.first;
         }
         EXPECT_EQ(set.get_internal_generation(), 0u);
-        EXPECT_TRUE(ContractRingInvariant(set, 64));
+        EXPECT_TRUE(contract_ring_invariant(set, 64));
 
-        ContractSetNoDel nodel(capacity_b.first, ContractShards);
-        EXPECT_EQ(nodel.advance(), (AdvanceResult{0, 0, 0, b, 0, ContractNothingRetired})) << "capacity " << capacity_b.first;
+        ContractSetNoDel nodel(capacity_b.first, kContractShards);
+        EXPECT_EQ(nodel.advance(), (AdvanceResult{0, 0, 0, b, 0, Advance::nothing_retired})) << "capacity " << capacity_b.first;
         EXPECT_EQ(nodel.get_internal_generation(), 0u);
     } // loop over capacities
 } // ContractAdvanceFreshSetIsNothingRetired
@@ -6182,17 +6247,17 @@ TEST(ConcurrentHashSetRcuTest, ContractAdvanceFreshSetIsNothingRetired) {
 // ONE bag: {3, 1, ...}. With five live keys present (no dead node reachable)
 // the call passes exactly the `reachable` nodes: {1, 1, 0, B, 5, advanced}.
 TEST(ConcurrentHashSetRcuTest, ContractAdvanceReleasedHandlesFreeInSameCall) {
-    ContractSet set(ContractB, ContractShards);
+    ContractSet set(kContractBuckets, kContractShards);
     const ContractOneNode<ContractSet> setting(set);
-    ContractRetire(set, 1);
-    EXPECT_TRUE(ContractAdvanceIs(set, 1, 1, ContractAdvanced));
+    contract_retire(set, 1);
+    EXPECT_TRUE(contract_advance_is(set, 1, 1, Advance::advanced));
     EXPECT_EQ(set.get_internal_generation(), 1u);
-    EXPECT_TRUE(ContractAdvanceIs(set, 0, 0, ContractNothingRetired));
+    EXPECT_TRUE(contract_advance_is(set, 0, 0, Advance::nothing_retired));
     EXPECT_EQ(set.get_internal_generation(), 1u);
-    ContractRetire(set, 2);
-    ContractRetire(set, 3);
-    ContractRetire(set, 4);
-    EXPECT_TRUE(ContractAdvanceIs(set, 3, 1, ContractAdvanced));
+    contract_retire(set, 2);
+    contract_retire(set, 3);
+    contract_retire(set, 4);
+    EXPECT_TRUE(contract_advance_is(set, 3, 1, Advance::advanced));
     EXPECT_EQ(set.get_internal_generation(), 2u);
 
     constexpr size_t kLive = 5;
@@ -6200,11 +6265,11 @@ TEST(ConcurrentHashSetRcuTest, ContractAdvanceReleasedHandlesFreeInSameCall) {
         ContractSet::handle h = set.new_handle();
         for (int k = 100; k < 100 + static_cast<int>(kLive); ++k) EXPECT_TRUE(set.insert(h, k));
     }
-    ContractRetire(set, 5);
+    contract_retire(set, 5);
     const ContractSet::InternalAccounting before = set.get_internal_accounting();
     ASSERT_EQ(before.reachable_dead, 0u);
     EXPECT_EQ(before.reachable, kLive);
-    EXPECT_EQ(set.advance(), (AdvanceResult{1, 1, 0, ContractB, kLive, ContractAdvanced}));
+    EXPECT_EQ(set.advance(), (AdvanceResult{1, 1, 0, kContractBuckets, kLive, Advance::advanced}));
     ContractSet::handle h = set.new_handle();
     for (int k = 100; k < 100 + static_cast<int>(kLive); ++k) EXPECT_TRUE(set.contains(h, k));
     EXPECT_TRUE(setting.holds());
@@ -6217,15 +6282,15 @@ TEST(ConcurrentHashSetRcuTest, ContractAdvanceReleasedHandlesFreeInSameCall) {
 // bag ({1, 1, 0, B, 0, nothing_retired}: nothing retired between the calls).
 // Five rounds: the steady state, not just the first.
 TEST(ConcurrentHashSetRcuTest, ContractAdvanceRefreshBeforeEachCallTwoCallLatency) {
-    ContractSet set(ContractB, ContractShards);
+    ContractSet set(kContractBuckets, kContractShards);
     const ContractOneNode<ContractSet> setting(set);
     ContractSet::handle h = set.new_handle();
     for (int round = 0; round < 5; ++round) {
-        ContractRetire(set, round);
+        contract_retire(set, round);
         EXPECT_FALSE(h.refresh()) << "round " << round;
-        EXPECT_TRUE(ContractAdvanceIs(set, 0, 0, ContractAdvanced)) << "round " << round;
+        EXPECT_TRUE(contract_advance_is(set, 0, 0, Advance::advanced)) << "round " << round;
         EXPECT_TRUE(h.refresh()) << "round " << round;
-        EXPECT_TRUE(ContractAdvanceIs(set, 1, 1, ContractNothingRetired)) << "round " << round;
+        EXPECT_TRUE(contract_advance_is(set, 1, 1, Advance::nothing_retired)) << "round " << round;
     } // loop over rounds
     EXPECT_TRUE(setting.holds());
 } // ContractAdvanceRefreshBeforeEachCallTwoCallLatency
@@ -6236,21 +6301,21 @@ TEST(ConcurrentHashSetRcuTest, ContractAdvanceRefreshBeforeEachCallTwoCallLatenc
 // g2 have no member, yet nothing is freed (no bag of a generation >= g0) until
 // the handle leaves; then one call frees all three bags.
 TEST(ConcurrentHashSetRcuTest, ContractAdvancePinIsCumulative) {
-    ContractSet set(ContractB, ContractShards);
+    ContractSet set(kContractBuckets, kContractShards);
     const ContractOneNode<ContractSet> setting(set);
     std::unique_ptr<ContractSet::handle> h = std::make_unique<ContractSet::handle>(set.new_handle());
     for (int call = 0; call < 3; ++call) {
-        ContractRetire(set, call);
-        EXPECT_TRUE(ContractAdvanceIs(set, 0, 0, ContractAdvanced)) << "call " << call;
+        contract_retire(set, call);
+        EXPECT_TRUE(contract_advance_is(set, 0, 0, Advance::advanced)) << "call " << call;
     }
     EXPECT_EQ(set.get_internal_accounting().bagged, 3u);
     for (uint64_t g = 0; g < 3; ++g) EXPECT_EQ(set.get_internal_bag_count(g), 1u) << "generation " << g;
-    EXPECT_EQ(ContractPendingBags(set), 3u);
-    EXPECT_TRUE(ContractRingInvariant(set, 64));
+    EXPECT_EQ(contract_pending_bags(set), 3u);
+    EXPECT_TRUE(contract_ring_invariant(set, 64));
     h.reset();
-    EXPECT_TRUE(ContractAdvanceIs(set, 3, 3, ContractNothingRetired));
+    EXPECT_TRUE(contract_advance_is(set, 3, 3, Advance::nothing_retired));
     EXPECT_EQ(set.get_internal_accounting().bagged, 0u);
-    EXPECT_TRUE(ContractRingInvariant(set, 64));
+    EXPECT_TRUE(contract_ring_invariant(set, 64));
     EXPECT_TRUE(setting.holds());
 } // ContractAdvancePinIsCumulative
 
@@ -6271,66 +6336,66 @@ TEST(ConcurrentHashSetRcuTest, ContractAdvancePinIsCumulative) {
 // K-1 waiting bags AND the one it closes: {K, K, 0, B, 0, advanced}. The ring
 // invariant holds after every call.
 template <size_t K>
-static void ContractRingFullThenRecover(bool through_ring_full, bool by_refresh) {
+static void contract_ring_full_then_recover(bool through_ring_full, bool by_refresh) {
     using SetT = ContractSetK<K>;
     SCOPED_TRACE(testing::Message() << "kGenerations " << K << (through_ring_full ? ", through ring_full" : ", no ring_full call")
                                     << (by_refresh ? ", recovery by refresh" : ", recovery by release"));
-    SetT set(ContractB, ContractShards);
+    SetT set(kContractBuckets, kContractShards);
     const ContractOneNode<SetT> setting(set);
     std::unique_ptr<typename SetT::handle> pin = std::make_unique<typename SetT::handle>(set.new_handle());
     int key = 0;
     for (size_t call = 1; call < K; ++call) {
-        ContractRetire(set, key++);
-        EXPECT_TRUE(ContractAdvanceIs(set, 0, 0, ContractAdvanced)) << "call " << call;
-        EXPECT_TRUE(ContractRingInvariant(set, K)) << "call " << call;
-    }
-    ContractRetire(set, key++);
+        contract_retire(set, key++);
+        EXPECT_TRUE(contract_advance_is(set, 0, 0, Advance::advanced)) << "call " << call;
+        EXPECT_TRUE(contract_ring_invariant(set, K)) << "call " << call;
+    } // calls 1 .. K-1
+    contract_retire(set, key++);
     if (through_ring_full) {
         const uint64_t g = set.get_internal_generation();
         EXPECT_EQ(g, K - 1);
-        EXPECT_TRUE(ContractAdvanceIs(set, 0, 0, ContractRingFull)) << "call " << K;
-        EXPECT_TRUE(ContractAdvanceIs(set, 0, 0, ContractRingFull)) << "call " << K + 1;
+        EXPECT_TRUE(contract_advance_is(set, 0, 0, Advance::ring_full)) << "call " << K;
+        EXPECT_TRUE(contract_advance_is(set, 0, 0, Advance::ring_full)) << "call " << K + 1;
         EXPECT_EQ(set.get_internal_generation(), g);
-        EXPECT_TRUE(ContractRingInvariant(set, K));
+        EXPECT_TRUE(contract_ring_invariant(set, K));
         const typename SetT::InternalAccounting acc = set.get_internal_accounting();
         EXPECT_EQ(acc.retired, 1u);
         EXPECT_EQ(acc.bagged, K - 1);
-        EXPECT_EQ(ContractPendingBags(set), K - 1);
-    }
+        EXPECT_EQ(contract_pending_bags(set), K - 1);
+    } // if through ring_full
     if (by_refresh) {
         EXPECT_TRUE(pin->refresh());
-        EXPECT_TRUE(ContractAdvanceIs(set, K - 1, K - 1, ContractAdvanced));
-        EXPECT_TRUE(ContractRingInvariant(set, K));
+        EXPECT_TRUE(contract_advance_is(set, K - 1, K - 1, Advance::advanced));
+        EXPECT_TRUE(contract_ring_invariant(set, K));
         pin.reset();
-        EXPECT_TRUE(ContractAdvanceIs(set, 1, 1, ContractNothingRetired));
+        EXPECT_TRUE(contract_advance_is(set, 1, 1, Advance::nothing_retired));
     } else {
         pin.reset();
-        EXPECT_TRUE(ContractAdvanceIs(set, K, K, ContractAdvanced));
+        EXPECT_TRUE(contract_advance_is(set, K, K, Advance::advanced));
     }
-    EXPECT_TRUE(ContractRingInvariant(set, K));
+    EXPECT_TRUE(contract_ring_invariant(set, K));
     EXPECT_EQ(set.get_internal_generation(), K);
     const typename SetT::InternalAccounting acc = set.get_internal_accounting();
     EXPECT_TRUE(acc.consistent);
     EXPECT_EQ(acc.bagged, 0u);
     EXPECT_EQ(acc.retired, 0u);
     EXPECT_TRUE(setting.holds());
-} // ContractRingFullThenRecover()
+} // contract_ring_full_then_recover()
 
 // ring_full after kGenerations - 1 advances
 // under one pinned handle and recovery after its refresh, at the minimum ring
 // (2), a small one (4) and the default (64).
 TEST(ConcurrentHashSetRcuTest, ContractAdvanceRingFullAndRecoveryByRefresh) {
-    ContractRingFullThenRecover<2>(true, true);
-    ContractRingFullThenRecover<4>(true, true);
-    ContractRingFullThenRecover<64>(true, true);
+    contract_ring_full_then_recover<2>(true, true);
+    contract_ring_full_then_recover<4>(true, true);
+    contract_ring_full_then_recover<64>(true, true);
 } // ContractAdvanceRingFullAndRecoveryByRefresh
 
 // Recovery after that handle leaves (the release frees kGenerations nodes in
 // kGenerations bags), same rings.
 TEST(ConcurrentHashSetRcuTest, ContractAdvanceRingFullAndRecoveryByRelease) {
-    ContractRingFullThenRecover<2>(true, false);
-    ContractRingFullThenRecover<4>(true, false);
-    ContractRingFullThenRecover<64>(true, false);
+    contract_ring_full_then_recover<2>(true, false);
+    contract_ring_full_then_recover<4>(true, false);
+    contract_ring_full_then_recover<64>(true, false);
 } // ContractAdvanceRingFullAndRecoveryByRelease
 
 // The two arithmetic facts of the counts, without the `ring_full` call: after
@@ -6339,12 +6404,12 @@ TEST(ConcurrentHashSetRcuTest, ContractAdvanceRingFullAndRecoveryByRelease) {
 // advanced}; with the handle released instead, {K, K, ..., advanced}. A
 // full ring with a freeable oldest slot is cleared in the call and the call
 // advances.
-TEST(ConcurrentHashSetRcuTest, ContractAdvanceA4CountsAfterFullRing) {
-    ContractRingFullThenRecover<3>(false, true);
-    ContractRingFullThenRecover<3>(false, false);
-    ContractRingFullThenRecover<64>(false, true);
-    ContractRingFullThenRecover<64>(false, false);
-} // ContractAdvanceA4CountsAfterFullRing
+TEST(ConcurrentHashSetRcuTest, ContractAdvanceCountsAfterFullRing) {
+    contract_ring_full_then_recover<3>(false, true);
+    contract_ring_full_then_recover<3>(false, false);
+    contract_ring_full_then_recover<64>(false, true);
+    contract_ring_full_then_recover<64>(false, false);
+} // ContractAdvanceCountsAfterFullRing
 
 // `nothing_retired` is decided before `ring_full`: with every slot in use
 // (kGenerations = 3, two advances under a pinned handle) and nothing retired,
@@ -6354,20 +6419,20 @@ TEST(ConcurrentHashSetRcuTest, ContractAdvanceA4CountsAfterFullRing) {
 // state gives `ring_full`.
 TEST(ConcurrentHashSetRcuTest, ContractAdvanceNothingRetiredWinsOverFullRing) {
     using SetT = ContractSetK<3>;
-    SetT set(ContractB, ContractShards);
+    SetT set(kContractBuckets, kContractShards);
     const ContractOneNode<SetT> setting(set);
     SetT::handle pin = set.new_handle();
     for (int call = 0; call < 2; ++call) {
-        ContractRetire(set, call);
-        EXPECT_TRUE(ContractAdvanceIs(set, 0, 0, ContractAdvanced)) << "call " << call;
+        contract_retire(set, call);
+        EXPECT_TRUE(contract_advance_is(set, 0, 0, Advance::advanced)) << "call " << call;
     }
     EXPECT_EQ(set.get_internal_generation(), 2u);
-    EXPECT_TRUE(ContractAdvanceIs(set, 0, 0, ContractNothingRetired));
+    EXPECT_TRUE(contract_advance_is(set, 0, 0, Advance::nothing_retired));
     EXPECT_EQ(set.get_internal_generation(), 2u);
-    ContractRetire(set, 10);
-    EXPECT_TRUE(ContractAdvanceIs(set, 0, 0, ContractRingFull));
+    contract_retire(set, 10);
+    EXPECT_TRUE(contract_advance_is(set, 0, 0, Advance::ring_full));
     EXPECT_EQ(set.get_internal_generation(), 2u);
-    EXPECT_TRUE(ContractRingInvariant(set, 3));
+    EXPECT_TRUE(contract_ring_invariant(set, 3));
     EXPECT_TRUE(setting.holds());
 } // ContractAdvanceNothingRetiredWinsOverFullRing
 
@@ -6382,22 +6447,22 @@ TEST(ConcurrentHashSetRcuTest, ContractAdvanceNothingRetiredWinsOverFullRing) {
 // frees g1's and g2's bags at the next call.
 TEST(ConcurrentHashSetRcuTest, ContractAdvanceRingFullWithFreeableOldestAdvances) {
     using SetT = ContractSetK<3>;
-    SetT set(ContractB, ContractShards);
+    SetT set(kContractBuckets, kContractShards);
     const ContractOneNode<SetT> setting(set);
     std::unique_ptr<SetT::handle> pin0 = std::make_unique<SetT::handle>(set.new_handle());
-    ContractRetire(set, 1);
-    EXPECT_TRUE(ContractAdvanceIs(set, 0, 0, ContractAdvanced));
+    contract_retire(set, 1);
+    EXPECT_TRUE(contract_advance_is(set, 0, 0, Advance::advanced));
     std::unique_ptr<SetT::handle> pin1 = std::make_unique<SetT::handle>(set.new_handle());
-    ContractRetire(set, 2);
-    EXPECT_TRUE(ContractAdvanceIs(set, 0, 0, ContractAdvanced));
+    contract_retire(set, 2);
+    EXPECT_TRUE(contract_advance_is(set, 0, 0, Advance::advanced));
     pin0.reset();
-    ContractRetire(set, 3);
-    EXPECT_TRUE(ContractAdvanceIs(set, 1, 1, ContractAdvanced));
+    contract_retire(set, 3);
+    EXPECT_TRUE(contract_advance_is(set, 1, 1, Advance::advanced));
     EXPECT_EQ(set.get_internal_generation(), 3u);
-    EXPECT_TRUE(ContractRingInvariant(set, 3));
+    EXPECT_TRUE(contract_ring_invariant(set, 3));
     pin1.reset();
-    EXPECT_TRUE(ContractAdvanceIs(set, 2, 2, ContractNothingRetired));
-    EXPECT_TRUE(ContractRingInvariant(set, 3));
+    EXPECT_TRUE(contract_advance_is(set, 2, 2, Advance::nothing_retired));
+    EXPECT_TRUE(contract_ring_invariant(set, 3));
     EXPECT_TRUE(setting.holds());
 } // ContractAdvanceRingFullWithFreeableOldestAdvances
 
@@ -6407,29 +6472,29 @@ TEST(ConcurrentHashSetRcuTest, ContractAdvanceRingFullWithFreeableOldestAdvances
 // call pattern, whose bags occupy two slots at most;
 // the ring invariant after every call.
 template <size_t K>
-static void ContractRingWrap() {
+static void contract_ring_wrap() {
     using SetT = ContractSetK<K>;
     SCOPED_TRACE(testing::Message() << "kGenerations " << K);
-    SetT set(ContractB, ContractShards);
+    SetT set(kContractBuckets, kContractShards);
     const ContractOneNode<SetT> setting(set);
     for (int call = 0; call < 12; ++call) {
-        ContractRetire(set, call);
-        EXPECT_TRUE(ContractAdvanceIs(set, 1, 1, ContractAdvanced)) << "call " << call;
+        contract_retire(set, call);
+        EXPECT_TRUE(contract_advance_is(set, 1, 1, Advance::advanced)) << "call " << call;
         EXPECT_EQ(set.get_internal_generation(), static_cast<uint64_t>(call + 1)) << "call " << call;
-        EXPECT_TRUE(ContractRingInvariant(set, K)) << "call " << call;
-    }
+        EXPECT_TRUE(contract_ring_invariant(set, K)) << "call " << call;
+    } // twelve calls
     typename SetT::handle h = set.new_handle();
     for (int round = 0; round < 10; ++round) {
-        ContractRetire(set, 100 + round);
+        contract_retire(set, 100 + round);
         EXPECT_FALSE(h.refresh()) << "round " << round;
-        EXPECT_TRUE(ContractAdvanceIs(set, 0, 0, ContractAdvanced)) << "round " << round;
-        EXPECT_TRUE(ContractRingInvariant(set, K)) << "round " << round;
+        EXPECT_TRUE(contract_advance_is(set, 0, 0, Advance::advanced)) << "round " << round;
+        EXPECT_TRUE(contract_ring_invariant(set, K)) << "round " << round;
         EXPECT_TRUE(h.refresh()) << "round " << round;
-        EXPECT_TRUE(ContractAdvanceIs(set, 1, 1, ContractNothingRetired)) << "round " << round;
-        EXPECT_TRUE(ContractRingInvariant(set, K)) << "round " << round;
+        EXPECT_TRUE(contract_advance_is(set, 1, 1, Advance::nothing_retired)) << "round " << round;
+        EXPECT_TRUE(contract_ring_invariant(set, K)) << "round " << round;
     } // loop over rounds
     EXPECT_TRUE(setting.holds());
-} // ContractRingWrap()
+} // contract_ring_wrap()
 
 // kGenerations = 2 compiles and works: the minimum ring (under one pinned
 // handle the SECOND call with something retired is already `ring_full`; after
@@ -6437,22 +6502,22 @@ static void ContractRingWrap() {
 // release counts at K = 2), and the wrap at 2.
 TEST(ConcurrentHashSetRcuTest, ContractAdvanceMinimumRing) {
     using SetT = ContractSetK<2>;
-    SetT set(ContractB, ContractShards);
+    SetT set(kContractBuckets, kContractShards);
     const ContractOneNode<SetT> setting(set);
     std::unique_ptr<SetT::handle> pin = std::make_unique<SetT::handle>(set.new_handle());
-    ContractRetire(set, 1);
-    EXPECT_TRUE(ContractAdvanceIs(set, 0, 0, ContractAdvanced));
-    ContractRetire(set, 2);
-    EXPECT_TRUE(ContractAdvanceIs(set, 0, 0, ContractRingFull));
+    contract_retire(set, 1);
+    EXPECT_TRUE(contract_advance_is(set, 0, 0, Advance::advanced));
+    contract_retire(set, 2);
+    EXPECT_TRUE(contract_advance_is(set, 0, 0, Advance::ring_full));
     pin.reset();
-    EXPECT_TRUE(ContractAdvanceIs(set, 2, 2, ContractAdvanced));
+    EXPECT_TRUE(contract_advance_is(set, 2, 2, Advance::advanced));
     EXPECT_TRUE(setting.holds());
-    ContractRingWrap<2>();
+    contract_ring_wrap<2>();
 } // ContractAdvanceMinimumRing
 
 // The ring wrap at kGenerations = 3.
 TEST(ConcurrentHashSetRcuTest, ContractAdvanceRingWrapThreeGenerations) {
-    ContractRingWrap<3>();
+    contract_ring_wrap<3>();
 } // ContractAdvanceRingWrapThreeGenerations
 
 // Nothing is freed unless advance() is called: no operation frees, no
@@ -6467,12 +6532,12 @@ TEST(ConcurrentHashSetRcuTest, ContractAdvanceRingWrapThreeGenerations) {
 // and that handle's release frees nothing: bagged stays 5; the next call frees
 // them: {5, 1, 0, B, n = 5 live keys, nothing_retired}.
 TEST(ConcurrentHashSetRcuTest, ContractAdvanceFreesNothingWithoutACall) {
-    ContractSet set(ContractB, ContractShards);
+    ContractSet set(kContractBuckets, kContractShards);
     const ContractOneNode<ContractSet> setting(set);
-    ContractRetire(set, 1);
-    ContractRetire(set, 2);
-    ContractRetire(set, 3);
-    EXPECT_TRUE(ContractAdvanceIs(set, 3, 1, ContractAdvanced));
+    contract_retire(set, 1);
+    contract_retire(set, 2);
+    contract_retire(set, 3);
+    EXPECT_TRUE(contract_advance_is(set, 3, 1, Advance::advanced));
     const ContractSet::InternalCounters c0 = set.get_internal_counters();
     const ContractSet::InternalAccounting a0 = set.get_internal_accounting();
     EXPECT_EQ(a0.free_nodes, 3u);
@@ -6499,13 +6564,13 @@ TEST(ConcurrentHashSetRcuTest, ContractAdvanceFreesNothingWithoutACall) {
     {
         ContractSet::handle h = set.new_handle();
         ASSERT_EQ(a1.reachable_dead, 0u);
-        EXPECT_EQ(set.advance(), (AdvanceResult{0, 0, 0, ContractB, a1.reachable, ContractAdvanced}));
-    }
+        EXPECT_EQ(set.advance(), (AdvanceResult{0, 0, 0, kContractBuckets, a1.reachable, Advance::advanced}));
+    } // h's scope
     const ContractSet::InternalAccounting a2 = set.get_internal_accounting();
     EXPECT_EQ(a2.bagged, 5u);
     EXPECT_EQ(a2.free_nodes, 0u);
     EXPECT_EQ(set.get_internal_counters().nodes_freed, c0.nodes_freed);
-    EXPECT_EQ(set.advance(), (AdvanceResult{5, 1, 0, ContractB, 5, ContractNothingRetired}));
+    EXPECT_EQ(set.advance(), (AdvanceResult{5, 1, 0, kContractBuckets, 5, Advance::nothing_retired}));
     EXPECT_TRUE(setting.holds());
 } // ContractAdvanceFreesNothingWithoutACall
 
@@ -6513,10 +6578,10 @@ TEST(ConcurrentHashSetRcuTest, ContractAdvanceFreesNothingWithoutACall) {
 // advance() that freed f nodes the next f allocations take free nodes:
 // get_internal_node_count() unchanged, free_nodes down by f).
 TEST(ConcurrentHashSetRcuTest, ContractReuseBeforeGrowth) {
-    ContractSet set(ContractB, ContractShards);
+    ContractSet set(kContractBuckets, kContractShards);
     const ContractOneNode<ContractSet> setting(set);
-    for (int k = 1; k <= 3; ++k) ContractRetire(set, k);
-    EXPECT_TRUE(ContractAdvanceIs(set, 3, 1, ContractAdvanced));
+    for (int k = 1; k <= 3; ++k) contract_retire(set, k);
+    EXPECT_TRUE(contract_advance_is(set, 3, 1, Advance::advanced));
     const size_t nodes0 = set.get_internal_node_count();
     const size_t free0 = set.get_internal_accounting().free_nodes;
     EXPECT_EQ(free0, 3u);
@@ -6526,7 +6591,7 @@ TEST(ConcurrentHashSetRcuTest, ContractReuseBeforeGrowth) {
             EXPECT_TRUE(set.insert(h, k));
             EXPECT_EQ(set.get_internal_node_count(), nodes0) << "key " << k;
         }
-    }
+    } // h's scope
     EXPECT_EQ(set.get_internal_accounting().free_nodes, free0 - 3);
     EXPECT_TRUE(setting.holds());
 } // ContractReuseBeforeGrowth
@@ -6546,10 +6611,10 @@ TEST(ConcurrentHashSetRcuTest, ContractReuseBeforeGrowth) {
 // `nothing_retired`: {1, 1, 0, B, 0, advanced}.
 TEST(ConcurrentHashSetRcuTest, ContractAdvanceLimboOnlyIsNotNothingRetired) {
     using SetT = ConcurrentResizableHashSetRCU<ContractCountedKey, true, ContractCountedKeyHash>;
-    SetT set(ContractB, ContractShards);
+    SetT set(kContractBuckets, kContractShards);
     const ContractOneNode<SetT> setting(set);
-    ContractRetire(set, ContractCountedKey(1));
-    EXPECT_TRUE(ContractAdvanceIs(set, 1, 1, ContractAdvanced));
+    contract_retire(set, ContractCountedKey(1));
+    EXPECT_TRUE(contract_advance_is(set, 1, 1, Advance::advanced));
     ASSERT_EQ(set.get_internal_accounting().free_nodes, 1u);
     {
         SetT::handle h = set.new_handle();
@@ -6572,7 +6637,7 @@ TEST(ConcurrentHashSetRcuTest, ContractAdvanceLimboOnlyIsNotNothingRetired) {
         EXPECT_EQ(set.get_internal_limbo_count(), 1u);
         EXPECT_TRUE(set.erase(h, ContractCountedKey(4)));
     } // the handle's scope
-    EXPECT_TRUE(ContractAdvanceIs(set, 2, 1, ContractAdvanced));
+    EXPECT_TRUE(contract_advance_is(set, 2, 1, Advance::advanced));
     EXPECT_EQ(set.get_internal_limbo_count(), 0u);
     EXPECT_EQ(set.get_internal_accounting().free_nodes, 2u);
 
@@ -6585,7 +6650,7 @@ TEST(ConcurrentHashSetRcuTest, ContractAdvanceLimboOnlyIsNotNothingRetired) {
     const SetT::InternalAccounting before = set.get_internal_accounting();
     ASSERT_EQ(before.limbo, 1u);
     ASSERT_EQ(before.retired, 0u);
-    EXPECT_TRUE(ContractAdvanceIs(set, 1, 1, ContractAdvanced));
+    EXPECT_TRUE(contract_advance_is(set, 1, 1, Advance::advanced));
     const SetT::InternalAccounting after = set.get_internal_accounting();
     EXPECT_EQ(after.limbo, 0u);
     EXPECT_EQ(after.free_nodes, before.free_nodes + 1);
@@ -6599,14 +6664,14 @@ TEST(ConcurrentHashSetRcuTest, ContractAdvanceLimboOnlyIsNotNothingRetired) {
 // `ring_full` under its own pin): every operation under it returns what items
 // 1-3 say, before and after each call.
 TEST(ConcurrentHashSetRcuTest, ContractOldHandleKeepsFullContractAcrossAdvances) {
-    ContractSet set(ContractB, ContractShards);
+    ContractSet set(kContractBuckets, kContractShards);
     const ContractSet::handle old = set.new_handle();
     for (int k = 1000; k < 1010; ++k) EXPECT_TRUE(set.insert(old, k));
     for (int round = 0; round < 100; ++round) {
         EXPECT_TRUE(set.insert(old, round)) << "round " << round;
         EXPECT_TRUE(set.erase(old, round)) << "round " << round;
         const AdvanceResult r = set.advance();
-        EXPECT_EQ(r.advance, round < 63 ? ContractAdvanced : ContractRingFull) << "round " << round;
+        EXPECT_EQ(r.advance, round < 63 ? Advance::advanced : Advance::ring_full) << "round " << round;
         EXPECT_FALSE(set.contains(old, round)) << "round " << round;
         for (int k = 1000; k < 1010; ++k) EXPECT_TRUE(set.contains(old, k)) << "round " << round;
         EXPECT_FALSE(set.insert(old, 1000 + round%10)) << "round " << round;
@@ -6697,7 +6762,7 @@ TEST(ConcurrentHashSetRcuTest, ContractMembershipExactAcrossConcurrentAdvances) 
                 if (set.contains(h, kAbsentBase + i)) errors.fetch_add(1, std::memory_order_relaxed);
             }
             (void)h.refresh();
-        }
+        } // while the writers run
     }; // reader
 
     auto advancer = [&](int a) {
@@ -6708,13 +6773,13 @@ TEST(ConcurrentHashSetRcuTest, ContractMembershipExactAcrossConcurrentAdvances) 
             if (mine) (void)mine->refresh();
             const AdvanceResult r = set.advance();
             ++local[static_cast<int>(r.advance)];
-            if (r.advance == ContractContended && r != AdvanceResult{0, 0, 0, 0, 0, ContractContended}) {
+            if (r.advance == Advance::contended && r != kContended) {
                 bad_results.fetch_add(1, std::memory_order_relaxed);
             }
-            if (r.advance == ContractRingFull && (r.walk_retired != 0 || r.buckets_walked != 0 || r.nodes_passed != 0)) {
+            if (r.advance == Advance::ring_full && (r.walk_retired != 0 || r.buckets_walked != 0 || r.nodes_passed != 0)) {
                 bad_results.fetch_add(1, std::memory_order_relaxed);
             }
-            if ((r.advance == ContractAdvanced || r.advance == ContractNothingRetired) && r.buckets_walked == 0) {
+            if ((r.advance == Advance::advanced || r.advance == Advance::nothing_retired) && r.buckets_walked == 0) {
                 bad_results.fetch_add(1, std::memory_order_relaxed);
             }
         } // loop until the writers finish
@@ -6730,18 +6795,18 @@ TEST(ConcurrentHashSetRcuTest, ContractMembershipExactAcrossConcurrentAdvances) 
     shared.reset();
 
     std::printf("[   INFO   ] advance() outcomes: nothing_retired %zu, advanced %zu, ring_full %zu, contended %zu\n",
-                outcomes[static_cast<int>(ContractNothingRetired)].load(), outcomes[static_cast<int>(ContractAdvanced)].load(),
-                outcomes[static_cast<int>(ContractRingFull)].load(), outcomes[static_cast<int>(ContractContended)].load());
+                outcomes[static_cast<int>(Advance::nothing_retired)].load(), outcomes[static_cast<int>(Advance::advanced)].load(),
+                outcomes[static_cast<int>(Advance::ring_full)].load(), outcomes[static_cast<int>(Advance::contended)].load());
     EXPECT_EQ(errors.load(), 0);
     EXPECT_EQ(bad_results.load(), 0);
-    EXPECT_GT(outcomes[static_cast<int>(ContractAdvanced)].load(), 0u) << "test sanity: no call ever advanced";
+    EXPECT_GT(outcomes[static_cast<int>(Advance::advanced)].load(), 0u) << "test sanity: no call ever advanced";
     {
         SetT::handle h = set.new_handle();
         for (int t = 0; t < kWriters; ++t) {
             for (int i = 0; i < kKeysPerWriter; ++i) {
                 EXPECT_EQ(set.contains(h, t + kWriters*i), static_cast<bool>(final_present[t][i])) << "writer " << t << " key index " << i;
             }
-        }
+        } // loop over the writers
         for (int i = 0; i < kStable; ++i) {
             EXPECT_TRUE(set.contains(h, -1 - i));
             EXPECT_FALSE(set.contains(h, kAbsentBase + i));
@@ -6749,8 +6814,8 @@ TEST(ConcurrentHashSetRcuTest, ContractMembershipExactAcrossConcurrentAdvances) 
     } // the checking handle's scope
     EXPECT_EQ(set.get_internal_accounting().handle_refs, 0);
     const AdvanceResult c1 = set.advance();
-    EXPECT_NE(c1.advance, ContractContended);
-    EXPECT_NE(c1.advance, ContractRingFull);
+    EXPECT_NE(c1.advance, Advance::contended);
+    EXPECT_NE(c1.advance, Advance::ring_full);
     const AdvanceResult c2 = set.advance();
     EXPECT_EQ(c2.walk_retired, 0u) << "an uncontended call left a dead run its successor's walk could retire";
     const SetT::InternalAccounting acc = set.get_internal_accounting();
@@ -6760,7 +6825,7 @@ TEST(ConcurrentHashSetRcuTest, ContractMembershipExactAcrossConcurrentAdvances) 
     EXPECT_EQ(acc.bagged, 0u);
     EXPECT_EQ(acc.handle_refs, 0);
     const AdvanceResult c3 = set.advance();
-    EXPECT_EQ(c3.advance, ContractNothingRetired);
+    EXPECT_EQ(c3.advance, Advance::nothing_retired);
     EXPECT_EQ(c3.freed_nodes, 0u);
     EXPECT_EQ(c3.freed_bags, 0u);
     EXPECT_EQ(c3.walk_retired, 0u);
@@ -6785,12 +6850,12 @@ TEST(ConcurrentHashSetRcuTest, ContractAdvanceOnMerelyDoubledSetCallsNoHash) {
     const size_t size0 = set.get_internal_table_size();
     int next_key = 0;
     for (int round = 0; round < 5; ++round) {
-        ContractGrowOnce<ContractCountedKey>(set, next_key);
+        contract_grow_once<ContractCountedKey>(set, next_key);
         {
             SetT::handle h = set.new_handle();
             for (int k = round; k < next_key; k += 7) EXPECT_TRUE(set.erase(h, ContractCountedKey(k)));
             for (int k = round; k < next_key; k += 7) EXPECT_TRUE(set.insert(h, ContractCountedKey(k)));
-        }
+        } // h's scope
         const size_t d0 = ContractCountedKey::destructor_calls.load();
         const size_t e0 = ContractCountedKey::equality_calls.load();
         const size_t a0 = ContractCountedKey::assign_calls.load();
@@ -6804,14 +6869,15 @@ TEST(ConcurrentHashSetRcuTest, ContractAdvanceOnMerelyDoubledSetCallsNoHash) {
         EXPECT_EQ(ContractCountedKey::equality_calls.load(), e0) << "round " << round;
         EXPECT_EQ(ContractCountedKey::assign_calls.load(), a0) << "round " << round;
         EXPECT_EQ(ContractCountedKey::copy_calls.load(), c0) << "round " << round;
-        EXPECT_NE(r.advance, ContractContended);
+        EXPECT_NE(r.advance, Advance::contended);
     } // loop over doublings
     EXPECT_GE(set.get_internal_table_size(), 32*size0) << "test sanity: the set did not double five times";
 } // ContractAdvanceOnMerelyDoubledSetCallsNoHash
 
 // The one read of a stored value by advance() is Hash{} on a FROZEN node at
 // a usable pred (no ==, copy, assignment or destruction), and the walk does
-// hash in the unfinished-split construction, built black-box: an advance() on a
+// hash in the unfinished-split construction, built through the public
+// interface: an advance() on a
 // set holding an unfinished split calls Hash{} at least once and touches no
 // value otherwise.
 TEST(ConcurrentHashSetRcuTest, ContractAdvanceWalkReadsValuesOnlyThroughHash) {
@@ -6819,7 +6885,7 @@ TEST(ConcurrentHashSetRcuTest, ContractAdvanceWalkReadsValuesOnlyThroughHash) {
     SetT set(64, 1);
     int next_key = 0;
     std::vector<int> thrown;
-    ASSERT_TRUE(ContractLeaveUnfinishedSplit<ContractCountedKey>(set, next_key, thrown))
+    ASSERT_TRUE(contract_leave_unfinished_split<ContractCountedKey>(set, next_key, thrown))
         << "construction: no insert throwing inside a split left a state whose walk calls Hash{} (an unfinished split)";
     const size_t d0 = ContractCountedKey::destructor_calls.load();
     const size_t e0 = ContractCountedKey::equality_calls.load();
@@ -6834,8 +6900,8 @@ TEST(ConcurrentHashSetRcuTest, ContractAdvanceWalkReadsValuesOnlyThroughHash) {
     EXPECT_EQ(ContractCountedKey::equality_calls.load(), e0);
     EXPECT_EQ(ContractCountedKey::assign_calls.load(), a0);
     EXPECT_EQ(ContractCountedKey::copy_calls.load(), c0);
-    EXPECT_NE(r.advance, ContractContended);
-    EXPECT_EQ(ContractMembershipErrors<ContractCountedKey>(set, next_key, thrown), 0);
+    EXPECT_NE(r.advance, Advance::contended);
+    EXPECT_EQ(contract_membership_errors<ContractCountedKey>(set, next_key, thrown), 0);
 } // ContractAdvanceWalkReadsValuesOnlyThroughHash
 
 // One advancer at a time (`contended`: {0, 0, 0, 0, 0, contended}), and
@@ -6855,8 +6921,8 @@ TEST(ConcurrentHashSetRcuTest, ContractAdvanceContendedWhileAnotherIsParked) {
     SetT::handle old = set.new_handle();
     ContractParkedAdvance<SetT, int> parked(set, next_key, thrown);
     ASSERT_TRUE(parked.parked()) << "construction: no parked walk (the unfinished split was not reached or the walk did not hash)";
-    EXPECT_EQ(set.advance(), (AdvanceResult{0, 0, 0, 0, 0, ContractContended}));
-    EXPECT_EQ(set.advance(), (AdvanceResult{0, 0, 0, 0, 0, ContractContended}));
+    EXPECT_EQ(set.advance(), kContended);
+    EXPECT_EQ(set.advance(), kContended);
     SetT::handle h = set.new_handle();
     EXPECT_TRUE(h);
     (void)old.refresh();
@@ -6866,9 +6932,9 @@ TEST(ConcurrentHashSetRcuTest, ContractAdvanceContendedWhileAnotherIsParked) {
     EXPECT_TRUE(set.erase(old, -5));
     EXPECT_FALSE(set.contains(h, -5));
     const AdvanceResult r = parked.resume();
-    EXPECT_NE(r.advance, ContractContended);
-    EXPECT_NE(set.advance().advance, ContractContended);
-    EXPECT_EQ(ContractMembershipErrors<int>(set, next_key, thrown), 0);
+    EXPECT_NE(r.advance, Advance::contended);
+    EXPECT_NE(set.advance().advance, Advance::contended);
+    EXPECT_EQ(contract_membership_errors<int>(set, next_key, thrown), 0);
 } // ContractAdvanceContendedWhileAnotherIsParked
 
 // Nested calls: from inside Hash{} while advance()'s walk is calling it
@@ -6882,7 +6948,7 @@ TEST(ConcurrentHashSetRcuTest, ContractAdvanceNestedCalls) {
     SetT set(64, 1);
     int next_key = 0;
     std::vector<int> thrown;
-    ASSERT_TRUE(ContractLeaveUnfinishedSplit<int>(set, next_key, thrown))
+    ASSERT_TRUE(contract_leave_unfinished_split<int>(set, next_key, thrown))
         << "construction: no insert throwing inside a split left a state whose walk calls Hash{} (an unfinished split)";
     AdvanceResult nested{};
     bool ran = false;
@@ -6891,13 +6957,13 @@ TEST(ConcurrentHashSetRcuTest, ContractAdvanceNestedCalls) {
         nested = set.advance();
         nested_contains = set.contains(set.new_handle(), -77);
         ran = true;
-    };
+    }; // the nested action
     const AdvanceResult outer = set.advance();
     ContractHashControl::nested = nullptr;
     ASSERT_TRUE(ran) << "the walk did not call Hash{}";
-    EXPECT_EQ(nested, (AdvanceResult{0, 0, 0, 0, 0, ContractContended}));
+    EXPECT_EQ(nested, kContended);
     EXPECT_FALSE(nested_contains);
-    EXPECT_NE(outer.advance, ContractContended);
+    EXPECT_NE(outer.advance, Advance::contended);
 
     AdvanceResult from_operation{};
     ran = false;
@@ -6911,7 +6977,7 @@ TEST(ConcurrentHashSetRcuTest, ContractAdvanceNestedCalls) {
     }
     ContractHashControl::nested = nullptr;
     ASSERT_TRUE(ran);
-    EXPECT_NE(from_operation.advance, ContractContended);
+    EXPECT_NE(from_operation.advance, Advance::contended);
     EXPECT_TRUE(set.contains(set.new_handle(), -78));
 } // ContractAdvanceNestedCalls
 
@@ -6927,15 +6993,15 @@ TEST(ConcurrentHashSetRcuTest, ContractAdvanceWalkThrowLeavesSetUsable) {
     SetT set(64, 1);
     int next_key = 0;
     std::vector<int> thrown;
-    ASSERT_TRUE(ContractThrowInWalk<int>(set, next_key, thrown)) << "construction: the walk did not call the throwing Hash{} (no unfinished split)";
+    ASSERT_TRUE(contract_throw_in_walk<int>(set, next_key, thrown)) << "construction: the walk did not call the throwing Hash{} (no unfinished split)";
     (void)set.get_internal_generation();
     const SetT::InternalAccounting acc = set.get_internal_accounting();
     EXPECT_EQ(acc.handle_refs, 0);
     EXPECT_TRUE(acc.consistent);
     const AdvanceResult next = set.advance();
-    EXPECT_TRUE(next.advance == ContractAdvanced || next.advance == ContractNothingRetired) << testing::PrintToString(next);
-    EXPECT_NE(set.advance().advance, ContractContended);
-    EXPECT_EQ(ContractMembershipErrors<int>(set, next_key, thrown), 0);
+    EXPECT_TRUE(next.advance == Advance::advanced || next.advance == Advance::nothing_retired) << testing::PrintToString(next);
+    EXPECT_NE(set.advance().advance, Advance::contended);
+    EXPECT_EQ(contract_membership_errors<int>(set, next_key, thrown), 0);
     EXPECT_TRUE(set.get_internal_accounting().consistent);
 } // ContractAdvanceWalkThrowLeavesSetUsable
 
@@ -6957,24 +7023,24 @@ TEST(ConcurrentHashSetRcuTest, ContractDestroySetWithPendingBags) {
     using SetT = ConcurrentResizableHashSetRCU<ContractCountedKey, true, ContractCountedKeyHash>;
     const unsigned first = ContractCountedKey::next_serial.load();
     {
-        std::unique_ptr<SetT> set = std::make_unique<SetT>(ContractB, ContractShards);
+        std::unique_ptr<SetT> set = std::make_unique<SetT>(kContractBuckets, kContractShards);
         const ContractOneNode<SetT> setting(*set);
         {
             SetT::handle h = set->new_handle();
             for (int k = 0; k < 10; ++k) EXPECT_TRUE(set->insert(h, ContractCountedKey(k)));
             for (int k = 0; k < 3; ++k) EXPECT_TRUE(set->erase(h, ContractCountedKey(k)));
-        }
+        } // h's scope
         size_t d0 = ContractCountedKey::destructor_calls.load();
         const AdvanceResult r1 = set->advance();
         EXPECT_EQ(ContractCountedKey::destructor_calls.load(), d0);
-        EXPECT_EQ(r1, (AdvanceResult{3, 1, 0, ContractB, 7, ContractAdvanced}));
+        EXPECT_EQ(r1, (AdvanceResult{3, 1, 0, kContractBuckets, 7, Advance::advanced}));
         {
             SetT::handle h = set->new_handle();
             for (int k = 3; k < 8; ++k) EXPECT_TRUE(set->erase(h, ContractCountedKey(k)));
             d0 = ContractCountedKey::destructor_calls.load();
             const AdvanceResult r2 = set->advance();
             EXPECT_EQ(ContractCountedKey::destructor_calls.load(), d0);
-            EXPECT_EQ(r2, (AdvanceResult{0, 0, 0, ContractB, 2, ContractAdvanced}));
+            EXPECT_EQ(r2, (AdvanceResult{0, 0, 0, kContractBuckets, 2, Advance::advanced}));
             EXPECT_EQ(set->get_internal_bag_count(SetT::get_internal_handle_generation(h)), 5u)
                 << "ring view: the pending bag is h's generation's";
             EXPECT_TRUE(set->erase(h, ContractCountedKey(8)));
@@ -6996,7 +7062,7 @@ TEST(ConcurrentHashSetRcuTest, ContractDestroySetWithPendingBags) {
     } // the set's scope
     const unsigned last = ContractCountedKey::next_serial.load();
     ASSERT_LT(last, ContractCountedKey::kMaxSerials);
-    EXPECT_EQ(ContractDestructionErrors(first, last), 0);
+    EXPECT_EQ(contract_destruction_errors(first, last), 0);
 } // ContractDestroySetWithPendingBags
 
 // ===========================================================================
@@ -7011,13 +7077,13 @@ TEST(ConcurrentHashSetRcuTest, ContractDestroySetWithPendingBags) {
 TEST(ConcurrentHashSetRcuDeathTest, ContractDestroySetWithLiveHandleAborts) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     {
-        ContractSet* set = new ContractSet(ContractB, ContractShards);
+        ContractSet* set = new ContractSet(kContractBuckets, kContractShards);
         ContractSet::handle* h = new ContractSet::handle(set->new_handle());
         delete h;
         delete set;
-    }
+    } // the set's scope
     EXPECT_EXIT({
-        ContractSet* set = new ContractSet(ContractB, ContractShards);
+        ContractSet* set = new ContractSet(kContractBuckets, kContractShards);
         [[maybe_unused]] ContractSet::handle* leaked = new ContractSet::handle(set->new_handle());
         delete set;
     }, testing::KilledBySignal(SIGABRT), "Assertion");
@@ -7028,7 +7094,7 @@ TEST(ConcurrentHashSetRcuDeathTest, ContractDestroySetWithLiveHandleAborts) {
 // construction, the parked call released and joined before the destruction.
 // Returns whether the call parked (the construction's non-vacuity, checked in
 // the parent).
-static bool ContractDestroyDuringParkedAdvance(bool legal) {
+static bool contract_destroy_during_parked_advance(bool legal) {
     using SetT = ConcurrentResizableHashSetRCU<int, true, ContractHookHash>;
     SetT* set = new SetT(64, 1);
     int next_key = 0;
@@ -7040,16 +7106,16 @@ static bool ContractDestroyDuringParkedAdvance(bool legal) {
         delete parked;
         delete set;
         return was_parked;
-    }
+    } // if legal or not parked
     parked->detach();
     delete set;
     return was_parked;
-} // ContractDestroyDuringParkedAdvance()
+} // contract_destroy_during_parked_advance()
 
 TEST(ConcurrentHashSetRcuDeathTest, ContractDestroySetDuringAdvanceAborts) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
-    ASSERT_TRUE(ContractDestroyDuringParkedAdvance(true)) << "construction: no parked walk (no unfinished split)";
-    EXPECT_EXIT(ContractDestroyDuringParkedAdvance(false), testing::KilledBySignal(SIGABRT), "Assertion");
+    ASSERT_TRUE(contract_destroy_during_parked_advance(true)) << "construction: no parked walk (no unfinished split)";
+    EXPECT_EXIT(contract_destroy_during_parked_advance(false), testing::KilledBySignal(SIGABRT), "Assertion");
 } // ContractDestroySetDuringAdvanceAborts
 
 // An operation with a live handle of ANOTHER set of the same
@@ -7057,30 +7123,30 @@ TEST(ConcurrentHashSetRcuDeathTest, ContractDestroySetDuringAdvanceAborts) {
 TEST(ConcurrentHashSetRcuDeathTest, ContractForeignHandleAborts) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     {
-        ContractSet a(ContractB, ContractShards);
-        ContractSet b(ContractB, ContractShards);
+        ContractSet a(kContractBuckets, kContractShards);
+        ContractSet b(kContractBuckets, kContractShards);
         const ContractSet::handle ha = a.new_handle();
         const ContractSet::handle hb = b.new_handle();
         EXPECT_TRUE(b.insert(hb, 1));
         EXPECT_TRUE(b.contains(hb, 1));
         EXPECT_TRUE(b.erase(hb, 1));
         EXPECT_FALSE(a.contains(ha, 1));
-    }
+    } // the sets' scope
     EXPECT_EXIT({
-        ContractSet a(ContractB, ContractShards);
-        ContractSet b(ContractB, ContractShards);
+        ContractSet a(kContractBuckets, kContractShards);
+        ContractSet b(kContractBuckets, kContractShards);
         const ContractSet::handle ha = a.new_handle();
         (void)b.contains(ha, 1);
     }, testing::KilledBySignal(SIGABRT), "Assertion");
     EXPECT_EXIT({
-        ContractSet a(ContractB, ContractShards);
-        ContractSet b(ContractB, ContractShards);
+        ContractSet a(kContractBuckets, kContractShards);
+        ContractSet b(kContractBuckets, kContractShards);
         const ContractSet::handle ha = a.new_handle();
         (void)b.insert(ha, 1);
     }, testing::KilledBySignal(SIGABRT), "Assertion");
     EXPECT_EXIT({
-        ContractSet a(ContractB, ContractShards);
-        ContractSet b(ContractB, ContractShards);
+        ContractSet a(kContractBuckets, kContractShards);
+        ContractSet b(kContractBuckets, kContractShards);
         const ContractSet::handle ha = a.new_handle();
         (void)b.erase(ha, 1);
     }, testing::KilledBySignal(SIGABRT), "Assertion");
@@ -7091,23 +7157,23 @@ TEST(ConcurrentHashSetRcuDeathTest, ContractForeignHandleAborts) {
 TEST(ConcurrentHashSetRcuDeathTest, ContractEmptyHandleUseAborts) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
     {
-        ContractSet set(ContractB, ContractShards);
+        ContractSet set(kContractBuckets, kContractShards);
         ContractSet::handle h = set.new_handle();
         EXPECT_TRUE(set.insert(h, 1));
         EXPECT_FALSE(h.refresh());
-    }
+    } // the set's scope
     EXPECT_EXIT({
-        ContractSet set(ContractB, ContractShards);
+        ContractSet set(kContractBuckets, kContractShards);
         const ContractSet::handle empty;
         (void)set.contains(empty, 1);
     }, testing::KilledBySignal(SIGABRT), "Assertion");
     EXPECT_EXIT({
-        ContractSet set(ContractB, ContractShards);
+        ContractSet set(kContractBuckets, kContractShards);
         const ContractSet::handle empty;
         (void)set.insert(empty, 1);
     }, testing::KilledBySignal(SIGABRT), "Assertion");
     EXPECT_EXIT({
-        ContractSet set(ContractB, ContractShards);
+        ContractSet set(kContractBuckets, kContractShards);
         const ContractSet::handle empty;
         (void)set.erase(empty, 1);
     }, testing::KilledBySignal(SIGABRT), "Assertion");
@@ -7116,7 +7182,7 @@ TEST(ConcurrentHashSetRcuDeathTest, ContractEmptyHandleUseAborts) {
         (void)empty.refresh();
     }, testing::KilledBySignal(SIGABRT), "Assertion");
     EXPECT_EXIT({
-        ContractSet set(ContractB, ContractShards);
+        ContractSet set(kContractBuckets, kContractShards);
         ContractSet::handle h = set.new_handle();
         ContractSet::handle sink(std::move(h));
         (void)set.contains(h, 1);
@@ -7128,9 +7194,9 @@ TEST(ConcurrentHashSetRcuDeathTest, ContractEmptyHandleUseAborts) {
 // `what` selects the violating use: 0 refresh(), 1 move construction from it;
 // legal == true: the parked operation is released and joined first. Returns
 // whether the operation parked (checked in the parent).
-static bool ContractUseHandleWithOperationInFlight(bool legal, int what) {
+static bool contract_use_handle_with_operation_in_flight(bool legal, int what) {
     using SetT = ConcurrentResizableHashSetRCU<ContractCountedKey, true, ContractCountedKeyHash>;
-    SetT set(ContractB, ContractShards);
+    SetT set(kContractBuckets, kContractShards);
     SetT::handle h = set.new_handle();
     EXPECT_TRUE(set.insert(h, ContractCountedKey(1)));
     const ContractCountedKey probe(1);
@@ -7141,7 +7207,7 @@ static bool ContractUseHandleWithOperationInFlight(bool legal, int what) {
         (void)set.contains(h, probe);
         ContractCountedKey::park_on_equality = false;
         done.store(true, std::memory_order_release);
-    });
+    }); // thread op
     while (!ContractHashControl::parked.load(std::memory_order_acquire) && !done.load(std::memory_order_acquire)) std::this_thread::yield();
     const bool was_parked = ContractHashControl::parked.load(std::memory_order_acquire);
     if (legal || !was_parked) {
@@ -7158,13 +7224,13 @@ static bool ContractUseHandleWithOperationInFlight(bool legal, int what) {
         op.join();
     }
     return was_parked;
-} // ContractUseHandleWithOperationInFlight()
+} // contract_use_handle_with_operation_in_flight()
 
 TEST(ConcurrentHashSetRcuDeathTest, ContractUseOfHandleWithOperationInFlightAborts) {
     GTEST_FLAG_SET(death_test_style, "threadsafe");
-    ASSERT_TRUE(ContractUseHandleWithOperationInFlight(true, 0)) << "construction: contains() never called operator==";
-    ASSERT_TRUE(ContractUseHandleWithOperationInFlight(true, 1));
-    EXPECT_EXIT(ContractUseHandleWithOperationInFlight(false, 0), testing::KilledBySignal(SIGABRT), "Assertion");
-    EXPECT_EXIT(ContractUseHandleWithOperationInFlight(false, 1), testing::KilledBySignal(SIGABRT), "Assertion");
+    ASSERT_TRUE(contract_use_handle_with_operation_in_flight(true, 0)) << "construction: contains() never called operator==";
+    ASSERT_TRUE(contract_use_handle_with_operation_in_flight(true, 1));
+    EXPECT_EXIT(contract_use_handle_with_operation_in_flight(false, 0), testing::KilledBySignal(SIGABRT), "Assertion");
+    EXPECT_EXIT(contract_use_handle_with_operation_in_flight(false, 1), testing::KilledBySignal(SIGABRT), "Assertion");
 } // ContractUseOfHandleWithOperationInFlightAborts
 #endif // NDEBUG

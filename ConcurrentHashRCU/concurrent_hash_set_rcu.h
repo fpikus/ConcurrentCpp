@@ -169,8 +169,10 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   shards_  : the node arena, SHARDED: an array of Shard, each an append-only
 //              deque of Node (ConcurrentAppendDeque) plus that shard's FREE
 //              LIST, LIMBO LIST and RETIRED LIST heads (see RECLAMATION
-//              below). A thread always allocates from the shard its thread
-//              number selects (see alloc_node()). A node is never moved and
+//              below). A thread appends to, and first pops from, the shard
+//              its thread number selects; when that shard's free list is
+//              empty it pops from another shard's before it appends (the
+//              steal: see alloc_node()). A node is never moved and
 //              never returned to the system; while a node is published its
 //              value is never written, its link changes only by the one CAS
 //              that tags it and by unlink CASes that bypass dead successors
@@ -187,16 +189,20 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //              accounting sweep (get_internal_accounting()) at a quiescent
 //              point; no read path ever goes through a deque.
 //              Sharding exists because one shared per-node atomic of any kind
-//              (a lock, a counter) is the insert ceiling; a shard's lock and
-//              free-list head are contended only by the threads whose numbers
-//              collide modulo the shard count.
+//              (a lock, a counter) is the insert ceiling; a shard's lock is
+//              contended only by the threads whose numbers collide modulo
+//              the shard count, and its free-list head by those threads, by
+//              the free pass's pushes and by threads of other shards whose
+//              own free lists are empty (the steal).
 //   node_count_ : the resize hint: arena occupancy, OVER-counted by up to 255
 //              per touched shard per allocation path (each shard adds 256
 //              when it appends a node whose index is a multiple of 256, index
-//              0 included, and 256 on every 256th free-list pop, the first
-//              pop included), minus every node the free pass of advance()
-//              has freed. One-sided always: the member's comment says why
-//              a concurrent free never takes it below the occupied slots.
+//              0 included, and 256 on every 256th pop from a free list, the
+//              first pop included), minus every node the free pass of
+//              advance() has freed. One-sided at every quiescent point;
+//              while operations run it may lag the occupied slots by the
+//              batches whose 256 is not yet added, and it never goes below
+//              zero (the member's comment says why).
 //   buckets_ : array of atomic bucket heads. buckets_[j] holds the address of
 //              the first node of bucket j's singly linked chain (or a
 //              sentinel), plus the bucket's SEAL LEVEL. buckets_ only ever grows.
@@ -375,8 +381,9 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //     assignment must leave the old object valid, as every standard type's
 //     does.
 //   - alloc_node(): if T's copy assignment throws on a free-list node, the
-//     node (still holding its old, valid value) goes to the shard's limbo
-//     list -- the limbo push writes the link the caller's `next` would have
+//     node (still holding its old, valid value) goes to the limbo list of
+//     the popping thread's own shard (for a node stolen from another
+//     shard's free list too) -- the limbo push writes the link the caller's `next` would have
 //     taken -- and the exception propagates. If the append throws, nothing
 //     observable in the arena has changed (the deque's own heap ownership on
 //     that path is its business, see above; a copy constructor that throws
@@ -475,9 +482,13 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //     free head, with ACQUIRE orders, concurrent with the free pass's pushes.
 //     The head word packs the top node's address with a 9-bit POP COUNTER
 //     (see the free-list constants), so the CAS that pops a node also counts
-//     it, and only the winner's count lands: every 256th pop of a shard, its
-//     first pop included, adds 256 to node_count_, mirroring the append
-//     path's batching. Empty list: append to the deque.
+//     it, and only the winner's count lands: every 256th pop from a free
+//     list, its first pop included, adds 256 to node_count_, mirroring the
+//     append path's batching. Own list empty: the same pop on every other
+//     shard's free list in turn (the STEAL: the free pass deals freed nodes
+//     over every shard, so a node dealt to a shard no allocating thread maps
+//     to would otherwise never be reused); every list empty: append to the
+//     deque.
 //   - PUSH onto a free list (push_free()) happens ONLY inside the free pass
 //     of advance(), one advancer at a time, with a RELEASE CAS that keeps the
 //     counter bits, and runs concurrently with the pops. ABA on the pop is
@@ -489,8 +500,9 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //     matter: WHY COPY above).
 //   - PUSH onto a limbo list is a Treiber push (release CAS) on the pushing
 //     thread's own shard; the list is push-only until the bump exchanges it,
-//     so it is ABA-free too, and nothing but the bump and the diagnostic
-//     accounting sweep ever read it. THE LIMBO LIST below says why limbo
+//     and the push is ABA-benign (the pusher only stores the head it read
+//     into its own tail's link: Shard::limbo_head); nothing but the bump and
+//     the diagnostic accounting sweep ever read it. THE LIMBO LIST below says why limbo
 //     goes through the bag and why the push is release.
 //   - PERIODS. What contains(), insert() and erase() can observe across an
 //     advance() is MEMBERSHIP only -- a value in the set before it is in the
@@ -583,8 +595,8 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   that has loaded `current_` but not yet incremented its count may
 //   increment a block that was closed in between: the block must still
 //   exist for that stale increment to land somewhere harmless. Footprint:
-//   kGenerations blocks of one 128-byte line each plus two words per shard
-//   per block.
+//   kGenerations blocks of 128 bytes each (a pair of 64-byte lines: see
+//   GenerationBlock) plus two words per shard per block.
 //
 //   THE JOIN (join(), from new_handle() and refresh()'s slow path): load
 //   `current_` -> B (relaxed); `B->refs.fetch_add(1, seq_cst)`; re-verify
@@ -624,11 +636,15 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   ONE ADVANCER. advance() runs under the global try-flag `reclaiming_`:
 //   `exchange(true, acquire)` at entry (a caller that finds it set returns
 //   `contended` at once, every count 0) and `store(false, release)` at
-//   exit, on every path, by an RAII guard. The flag's acquire/release pair
-//   is the ONLY synchronization on the plain fields `state`, `gen`, the bag
-//   slots, `oldest_` and the dealing cursor between successive advancers,
+//   exit, on every path, by an RAII guard. Between successive advancers the
+//   flag's acquire/release pair is the ONLY synchronization on the plain
+//   fields `state`, `gen`, the bag slots, `oldest_` and the dealing cursor,
 //   and it orders one holder's publish before a later holder's `refs` loads
-//   (the store-buffering argument across calls). Inside, sequentially:
+//   (the store-buffering argument across calls). `gen` is also read outside
+//   the flag, through the publish that made its block current: by a
+//   handle's own diagnostic (its successful re-verify read that publish)
+//   and by get_internal_generation() (an acquire load of `current_`).
+//   Inside, sequentially:
 //   (A0) load every shard's retired head and limbo head (relaxed; a push
 //        racing a load is seen by the next call): all EMPTY -> the result is
 //        `nothing_retired`, no exchange is made, no slot is consumed and
@@ -638,9 +654,14 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //        look again; still not EMPTY -> `ring_full`: the oldest generation
 //        is pinned, no slot is consumed, nothing is published, and the call
 //        returns after the free pass below (its second, which frees only
-//        what a leave since the first one unpinned) without walking
-//        (walking would add retirees to lists that cannot be bagged until
-//        the pin goes away).
+//        what a leave since the first one unpinned) without walking. The
+//        skipped walk is a cost choice, not an invariant: its retirees
+//        could not be bagged until the pin goes away, so a refused call
+//        does not pay a whole-table walk for nothing; a `nothing_retired`
+//        call on a wrapped, pinned ring decides at A0, before this check,
+//        and does walk, so retirees can wait on the retired lists of a
+//        full ring all the same, and are bagged by the first call after
+//        the pin leaves.
 //   (A3) for every shard, retired_head.exchange(EMPTY, acquire) into the
 //        closing block's retired slot for that shard, and, for every shard
 //        whose limbo head (A0) read as non-EMPTY, limbo_head.exchange(EMPTY,
@@ -737,34 +758,36 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //                   a mark, a freeze and a seal keep the address; a tagged
 //                   `link` is never written again until the node is freed;
 //                   a node is linked into a chain once and never moves.
-//       C3 (ORDERS) the pinned orders of the unlink layer: every walk's
-//                   head and link loads acquire, the mark, freeze and
-//                   unlink CAS successes release, the mark CAS's expected
-//                   value from an acquire read or its acquire failure.
+//       C3 (TAGS)   a tag is permanent for the node's life: once a link is
+//                   MARKED or FROZEN, every later value of it in its
+//                   modification order is tagged too, until the node is
+//                   freed; and an unlink CAS expects an UNTAGGED word.
 //       C4 (REUSE)  a node's address is reused only after its bag is freed
 //                   under the cumulative rule, so the only X-address a
 //                   handle can legitimately read is a NEW node at that
 //                   address, which the handle never held before.
-//       Let w_X be the word u_X wrote and R the run it bypassed (every node
-//       of R read as tagged by u_X's recorder, with acquire, so each mark or
-//       freeze of a node of R happens-before u_X). Suppose a handle H whose
-//       join u_X happens-before reads a word w and obtains the address of a
-//       node N of R; take the first such read. (1) w = w_X: u_X
-//       happens-before the read, so by write-read coherence the read
-//       returns u_X's value (the first node after R) or a later value of
-//       w_X, and by C2 every later value keeps or advances the address past
-//       R. (2) w is the link of a node Z before w_X's node L in chain order:
-//       for w to hold N, the CAS that installed N into w bypassed a run
-//       containing L (Z prepended with N as its successor is excluded by
-//       C2: L lies between them and chains prepend only at the head); that
-//       CAS's recorder read L's tagged link with acquire, and L's tag is a
-//       read-modify-write after u_X in L's link's modification order (u_X
-//       expected L's untagged link), so it is in u_X's release sequence,
-//       and independently of u_X's own order the recorder synchronizes with
-//       L's tagger, whose own acquire read of L's link (C3) read u_X's
-//       value; either way the recorder is ordered after u_X, hence after
-//       every tag of R, so it read every node of R as dead and installed
-//       the first node after it, not N. (3) w is the link of a node of R:
+//       Let w_X be the word u_X wrote and R the run it bypassed. Suppose a
+//       handle H whose join u_X happens-before reads a word w and obtains
+//       the address of a node N of R; take the first such read. (1) w =
+//       w_X: u_X happens-before the read, so by write-read coherence the
+//       read returns u_X's value (the first node after R) or a later value
+//       of w_X, and by C2 every later value keeps or advances the address
+//       past R. (2) w is the link of a node Z before w_X's node L in chain
+//       order: for w to hold N, the CAS that installed N into w bypassed a
+//       run containing L (Z prepended with N as its successor is excluded
+//       by C2: L lies between them and chains prepend only at the head);
+//       that CAS's recorder read L's link as TAGGED and continued from the
+//       address it held. u_X expected L's link untagged, so by C3 every
+//       tagged value of that link lies after u_X in its modification
+//       order; the read-modify-write that tagged it read the value just
+//       before it in that order, at or after u_X's, and kept its address,
+//       which by C2 is the first node after R or a node further on. So the
+//       recorder's run walk went from L to a node past R, and the node it
+//       installed lies past R as well, not N. The step uses only the
+//       modification order of L's link: no acquire of the recorder, no
+//       release of u_X, and no order of the tagging CAS (a freeze whose
+//       expected value came from a relaxed failure tags L the same way).
+//       (3) w is the link of a node of R:
 //       then H reached a node of R by an earlier read, contradicting "first
 //       such read". There is no other word: an address enters a published
 //       word only by a prepend, a split's publish or an unlink CAS (C2).
@@ -788,9 +811,11 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //       by g and does not care how late a node is bagged; the cumulative
 //       rule then keeps the late one, which is in a bag >= g too. The
 //       cross-word form of this case, where the word that could still lead
-//       H to X is not w_X, is case (2) above: under C1-C4 it reduces to the
-//       same-word form, so the acquire that carries it is the walk's own
-//       acquire of the tagged word, not the unlink CAS's release.
+//       H to X is not w_X, is case (2) above: under C1-C4 it reduces to
+//       the modification order of one word, L's link, and needs neither
+//       the unlink CAS's release nor any acquire of the walks. (The pinned
+//       orders of the unlink layer, channels 4 and 5, are for its own
+//       arguments: the miss argument and the seal.)
 //   (II) Contrapositive: a node in bag G is observable only by handles of
 //        generation <= G. This is what the CUMULATIVE RULE needs: a handle
 //        of generation g observes nodes whose unlink does not happen-before
@@ -901,9 +926,10 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   and the free pass's later rewrite of that same `link` (the free-list
 //   next pointer) are two writes to one word, which happens-before orders
 //   in modification order only if the push is release and the exchange
-//   acquire -- a mechanism that a model checker whose modification order is
-//   execution order can never exhibit, so its necessity rests on the
-//   standard, not on a kill. The retire push's release is already in place
+//   acquire (write-write coherence). The first reason has a known failing
+//   execution; the second is reasoned from the standard: a failure needs
+//   the two writes to one word to land in modification order against
+//   their execution order. The retire push's release is already in place
 //   for the same reason (Shard::retired_head).
 //
 //   WHAT THIS DOES AND DOES NOT GUARANTEE. MADE UNREACHABLE (the unlink
@@ -1198,9 +1224,9 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   HANDLES AND GENERATIONS: joiner "+1 refs, then load current_" against
 //   advancer "store current_, then load refs"), and it is closed by seq_cst
 //   on all four operations, not by acquire/release; no store-buffering
-//   regression test of this directory covers that pair, so its evidence on
-//   a weakly ordered machine is the standard's total order and model
-//   checking, not an observed execution.
+//   regression test of this directory covers that pair, so on a weakly
+//   ordered machine it rests on the standard's single total order of
+//   seq_cst operations, reasoned, not on an observed execution.
 //   What remains cross-variable is the read-side chain of channels 4 and 5
 //   (acquire word -> acquire table_size_). For a thread that meets a seal
 //   level above its own, or a FROZEN node for its key, it is used for
@@ -1228,7 +1254,8 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 // only an operation that allocates can reach either, so an operation that
 // allocates nothing is lock-free end to end:
 //   (1) alloc_node(): a lock-free pop from the calling thread's arena shard's
-//       free list when it has a node, else an append under that shard's
+//       free list when it has a node, else a lock-free pop from another
+//       shard's (the steal), else an append under the own shard's
 //       deque SpinLock; with one thread per shard that lock is uncontended,
 //       but it is a lock. An insert() whose walk misses its key allocates
 //       this way, and so does split_bucket() for its copies, so contains(),
@@ -1259,7 +1286,7 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 // never waits for an advance(); advance() is non-blocking by REFUSAL (a
 // try-flag: a caller that finds it set returns `contended` at once, and
 // nothing ever waits for the holder); the free pass's push loops are
-// lock-free (each failure a completed pop of the same shard); the free-list
+// lock-free (each failure a completed pop of the same list); the free-list
 // pop is the lock-free loop it always was, now against concurrent pushes
 // (each failure a completed pop or push).
 //
@@ -1478,7 +1505,8 @@ private:
     // their own, apart from the deque's members (which the deque's default
     // build pads onto lines of their own):
     //   - the FREE LINE: free_head and limbo_head. The free head is written by
-    //     every pop of the shard's threads and by the free pass's pushes, and
+    //     every pop of the shard's threads, by the pops of threads of other
+    //     shards stealing (steal_node()) and by the free pass's pushes, and
     //     with more threads than shards a pop CAS and the deque's lock
     //     exchange would otherwise fight over one line; the limbo head is
     //     written by lost splits (a whole subchain per lost publish, which
@@ -1486,8 +1514,8 @@ private:
     //     assignments, and is exchanged by the bump only when the bump's
     //     emptiness load found it non-EMPTY, so an idle limbo list costs the
     //     free line nothing.
-    //   - the RETIRED LINE: retired_head and the two retire and four loss
-    //     counters, which fill it. The retired head
+    //   - the RETIRED LINE: retired_head, one unused placeholder word, and
+    //     the two retire and four loss counters, which fill it. The retired head
     //     takes a release CAS from every operation that unlinks a dead run:
     //     the erase path, the writer walks of insert() and erase(), and the
     //     split winner's cleanup pass (which any operation may run,
@@ -1508,8 +1536,9 @@ private:
         // is destroyed; a slot's address is stable for the life of the set.
         ConcurrentAppendDeque<Node, ARENA_BLOCK> nodes;
         // Free list: the encoded top node address and pop counter (see the
-        // FREE-LIST HEAD encoding). Popped by alloc_node() with an acquire
-        // CAS, pushed by the free pass of advance() with a release CAS that
+        // FREE-LIST HEAD encoding). Popped with an acquire CAS by
+        // alloc_node() on the shard's own threads and by steal_node() on
+        // threads of other shards, pushed by the free pass of advance() with a release CAS that
         // keeps the counter bits (push_free()); the counter is never reset.
         // The two run concurrently: the orders are THE PER-NODE REUSE CHAIN
         // in the class overview.
@@ -1520,9 +1549,12 @@ private:
         // the bump of advance() when its emptiness load found the list
         // non-EMPTY (into the closing generation's bag, where the free pass
         // walks it through `link`), read by the accounting sweep. Push-only
-        // between two exchanges, so the push CAS is ABA-free: a head value a
-        // pusher read can only be restored by a push of the same node, and a
-        // node is pushed once per node life.
+        // between two exchanges. The push CAS is ABA-benign: a pusher never
+        // dereferences the head value it read, it only stores that value
+        // into the `link` of its own private tail, so a CAS that succeeds
+        // after the head changed and changed back (a node exchanged away,
+        // freed, reused and pushed again in a later life) links the tail to
+        // the node that IS the head at the CAS, which is all a push needs.
         std::atomic<word_t> limbo_head{EMPTY};
         // Retired list: the bare address of the top retired node, or EMPTY;
         // the nodes link through their `retire_link` words, never through
@@ -1531,8 +1563,9 @@ private:
         // RELEASE CAS on behalf of the thread that unlinked it (its own
         // shard, see there), the bump of advance() exchanges the head to
         // EMPTY with ACQUIRE into the closing generation's bag, and nothing
-        // pops. Push-only makes the CAS ABA-free for the same reason the
-        // limbo push is. The release on every push means the exchange's
+        // pops. The push CAS is ABA-benign for the same reason the limbo
+        // push is (the pusher stores the head it read into its own tail's
+        // `retire_link` and dereferences nothing through it). The release on every push means the exchange's
         // acquire is a happens-before boundary for the whole list below the
         // value it took: the push whose value was loaded is a
         // read-modify-write and so lies in the release sequence of every
@@ -1540,6 +1573,11 @@ private:
         // sees every unlink that preceded any of those pushes (the chain of
         // direction (I) of THE HANDLE INVARIANT in the class overview).
         alignas(64) std::atomic<word_t> retired_head{EMPTY};
+        // Unused: a placeholder word that keeps every counter below at its
+        // offset, so that the six counters fill the rest of the retired line
+        // and the split counters start the next line (the layout comment
+        // above). Removing it moves split_attempts onto the retired line.
+        word_t placeholder{EMPTY};
         // Diagnostic counters, each bumped with a relaxed fetch_add by the
         // thread whose operation took the counted step (so they are exact
         // when read at a quiescent point, and a snapshot otherwise); summed
@@ -1577,7 +1615,9 @@ private:
     }; // struct Shard
 
     // The node arena: arena_mask_ + 1 (a power of two) shards. A thread
-    // allocates from shards_[thread_number & arena_mask_]. Fixed at
+    // appends to, and first pops from, shards_[thread_number & arena_mask_];
+    // it pops from another shard's free list only when its own is empty
+    // (steal_node()). Fixed at
     // construction; the array itself is never resized.
     std::unique_ptr<Shard[]> shards_;
     size_t arena_mask_;
@@ -1592,48 +1632,63 @@ private:
     SpinLock resize_lock_;
 
     // The resize hint: arena occupancy, over-counted by up to 255 per touched
-    // shard and allocation path, minus every node the free pass of advance()
-    // has freed. A shard adds 256 when the index of a node it appends is a
-    // multiple of 256, index 0 included, so a shard's first node counts as
-    // 256; and 256 on every 256th free-list pop of the shard, the first pop
-    // ever included (see the FREE-LIST HEAD encoding: the counter is never
-    // reset); the free pass subtracts the exact number of nodes it moves to
-    // the free lists, one fetch_sub per bag. The error is one-sided on
-    // purpose: an over-count doubles the table early (memory: a set touched
-    // by k shards grows to at least 128k buckets, small next to the k node
-    // blocks the shards themselves hold), where an under-count would let
-    // chains grow long before a doubling. Why the subtraction keeps it
-    // one-sided AT QUIESCENCE (every pop's batch increment landed): per
-    // shard the appends added 256*ceil(appended/256) >= appended and the
-    // pops 256*ceil(popped/256) >= popped, the frees subtracted exactly
-    // freed, and the occupied slots number appended + popped - freed (a slot
-    // is appended once, and every later life of it is one pop after one
-    // free); so the count is at least the occupied slots (the accounting
-    // sweep asserts `node_count_ >= slots - free`). No exact live count
-    // exists: this class has no quiescent moment in which to take one.
-    // Without the subtraction appends plus pops would over-count without
-    // bound under churn and the table would double forever.
-    // WHY THE BOUND ALSO HOLDS WHILE OPERATIONS RUN, so that the count never
-    // dips below zero and an unsigned word is safe. A batch's +256 is added
-    // AFTER the batch-opening pop's CAS (alloc_node()) or append, so one
-    // might fear a node of that batch, taken by another thread, being
-    // published, erased, bagged and freed -- its -1 landing before the +256
-    // that covers it, and wrapping the count. It cannot: the opener holds a
-    // live handle of some generation g for the whole of its allocating
-    // operation, the +256 included, and every node of its batch is bagged
-    // in a generation >= g (a batch-mate's pop follows the opener's CAS in
-    // the free head's modification order, or its append follows the
-    // opener's under the shard's lock; were the batch-mate's node bagged in
-    // a generation below g, that bag's exchange would happen-before the
-    // publish of g, hence before the opener's join and its CAS, hence
-    // before the batch-mate's pop, which happens-before the exchange that
-    // bagged it -- a cycle). A bag of generation >= g is freed only after
-    // the opener's handle leaves (THE HANDLE INVARIANT, direction (II)),
-    // and that leave is sequenced after the +256 and acquired by the free
-    // pass's `refs` load: the +256 happens-before the -1, and coherence
-    // puts it first in the count's modification order. The accounting
-    // sweep's conjunct C5 checks the bound at every quiescent point, and a
-    // churn test under stress checks that the table stays bounded.
+    // shard's deque and per free list, minus every node the free pass of
+    // advance() has freed. A shard adds 256 when the index of a node it
+    // appends is a multiple of 256, index 0 included, so a shard's first
+    // node counts as 256; and 256 on every 256th pop from a free list, the
+    // list's first pop ever included (see the FREE-LIST HEAD encoding: the
+    // counter is never reset), whichever thread pops -- one of the shard's
+    // own or a stealer from another shard (alloc_node()): the batch belongs
+    // to the list's counter, and the popper that opens a batch adds its
+    // 256; the free pass subtracts the exact number of nodes it moves to the
+    // free lists, one fetch_sub per bag. The error is one-sided on purpose:
+    // an over-count doubles the table early (memory: a set touched by k
+    // shards grows to at least 128k buckets, small next to the k node blocks
+    // the shards themselves hold), where an under-count would let chains
+    // grow long before a doubling. Why the subtraction keeps it one-sided AT
+    // EVERY QUIESCENT POINT (every batch's increment landed): per deque the
+    // appends added 256*ceil(appended/256) >= appended, per free list the
+    // pops added 256*ceil(popped/256) >= popped, the frees subtracted exactly
+    // freed, and the occupied slots number appended + popped - freed summed
+    // over deques and lists (a slot is appended once, and every later life
+    // of it is one pop, from whatever list the free pass dealt it to, after
+    // one free); so the count is at least the occupied slots (the accounting
+    // sweep asserts `node_count_ >= slots - free`). WHILE OPERATIONS RUN the
+    // count can lag the occupied slots, by the batches whose opener has not
+    // yet added its 256 (at most 256 each), but it never dips below zero
+    // (below). No exact live count exists: this class has no quiescent
+    // moment in which to take one. Without the subtraction appends plus pops
+    // would over-count without bound under churn and the table would double
+    // forever.
+    // WHY IT NEVER DIPS BELOW ZERO, so that an unsigned word is safe. A
+    // batch's +256 is added AFTER the batch-opening pop's CAS (alloc_node())
+    // or append, so one might fear a node of that batch, taken by another
+    // thread, being published, erased, bagged and freed -- its -1 landing
+    // before the +256 that covers it, and wrapping the count. It cannot: the
+    // opener holds a live handle of some generation g for the whole of its
+    // allocating operation, the +256 included, and every node of its batch
+    // is bagged in a generation >= g. A batch-mate's pop follows the
+    // opener's CAS in that free head's modification order (or its append
+    // follows the opener's under the shard's lock). Were the batch-mate's
+    // node bagged in a generation below g, the batch-mate's pop (or append)
+    // would happen-before that bag's exchange (the node is popped,
+    // published, erased and retired before it is bagged), the exchange
+    // before the publish of g, the publish before the opener's join and so
+    // before the opener's CAS (or append); for the pop, write-write
+    // coherence then puts the batch-mate's pop before the opener's CAS in
+    // the free head's modification order, and for the append the lock's
+    // order would be a happens-before cycle: either way a contradiction.
+    // A bag of generation >= g is freed only after the opener's handle
+    // leaves (THE HANDLE INVARIANT, direction (II)), and that leave is
+    // sequenced after the +256 and acquired by the free pass's `refs` load:
+    // the +256 happens-before the -1, and coherence puts it first in the
+    // count's modification order. Every free is thus preceded in that order
+    // by the increment of the batch that covers its node's life, each batch
+    // covers at most 256 lives, and the count stays at or above zero. The
+    // argument never asks which shard the popper maps to, so a stolen pop
+    // is covered as an own-shard pop is. The accounting sweep's conjunct C5
+    // checks the quiescent bound, and a churn test under stress checks that
+    // the table stays bounded.
     // The exact slot count is the sum of the shards' sizes
     // (get_internal_node_count()), which is too many acquire loads of
     // frequently written lines to do per insert. On its own cache line: it
@@ -1664,29 +1719,31 @@ private:
     // whose address field is ignored).
     static constexpr word_t free_word(word_t addr, word_t count_bits) { return (addr >> 3) | (count_bits & FREE_COUNT_MASK); }
 
-    // The arena shard the calling thread allocates from and pushes limbo onto.
+    // The arena shard the calling thread appends to, pops from first and
+    // pushes limbo onto (a stolen pop takes a node from another shard's free
+    // list: steal_node()).
     Shard& my_shard() { return shards_[concurrent_hash_rcu_detail::thread_number() & arena_mask_]; }
 
     // Push the private chain first..last (linked through their link words,
     // nothing else references them) onto `shard`'s limbo list, where the
     // bump of advance() will find it (THE LIMBO LIST under HANDLES AND
-    // GENERATIONS in the class overview). Treiber push; the list is
-    // push-only between two bumps, so a CAS that finds the head unchanged
-    // is safe (no ABA: nothing pops). The head load and the failure order
+    // GENERATIONS in the class overview). Treiber push, ABA-benign: the
+    // pusher never dereferences the head value it read, it only stores it
+    // into `last->link`, so a CAS that finds the head value again links the
+    // tail to the node that is the head at the CAS. The head load and the failure order
     // are relaxed: the pushers exchange nothing but the head word itself
     // (each links its own private tail), and the failed value is only the
     // next expected value (EXPECTED-EQUIVALENT to acquire). Success is
     // RELEASE, REQUIRED for two reasons, neither of them a pusher: the
     // bump's acquire exchange synchronizes only with release pushes, and the
     // free pass then walks the sublist through `link` -- with a relaxed push
-    // it reads a node's `link` before the pusher's store of it is visible
-    // (demonstrated by model checking); and the pusher's store of
+    // it can read a node's `link` before the pusher's store of it is
+    // visible (an execution that fails exists); and the pusher's store of
     // `last->link` (the limbo next pointer) and the free pass's later
     // rewrite of that same word (the free-list next pointer) are two writes
     // to one atomic, which happens-before orders in modification order only
-    // through this release and the exchange's acquire -- a mechanism a
-    // model checker whose modification order is execution order cannot
-    // exhibit, so that half rests on the standard, not on a kill. Weak CAS:
+    // through this release and the exchange's acquire (write-write
+    // coherence; that half is reasoned from the standard). Weak CAS:
     // a retry loop anyway. Counted (limbo_pushes, one per subchain) on the
     // generation protocol's counter line: a lost split pushes a whole
     // subchain and a hot growth pushes many, so the count is the measure of
@@ -2060,16 +2117,87 @@ private:
         } // at most two rounds
     } // self_unlink()
 
+    // THE STEAL, alloc_node()'s slow path, taken only when the calling
+    // thread's own free list is empty: pop a node holding `val` with link
+    // `next` from ANOTHER shard's free list, trying shards own + 1, own + 2,
+    // ... (modulo the shard count) once each; nullptr when every other list
+    // is empty too, and the caller appends. Why it exists: the free pass
+    // deals freed nodes round-robin over EVERY shard's free list, while a
+    // thread pops only its own shard's, so without the steal the nodes
+    // dealt to shards no allocating thread maps to would never be reused,
+    // and under churn with fewer allocating threads than shards the arena
+    // would grow without bound.
+    // The pop on each list is alloc_node()'s own-shard pop, unchanged, on
+    // another head; the memory-model argument does not ask which shard the
+    // popper maps to. Several threads already pop one shard's list (thread
+    // numbers collide modulo the shard count), and a stealer is one more:
+    // the head load and the CAS failure ACQUIRE synchronize with the free
+    // pass's RELEASE push before the top's `link` is read and the value
+    // assigned (THE PER-NODE REUSE CHAIN), and the losing-popper and ABA
+    // argument (ABA WITHOUT VERSION TAGS) rests only on the popper's live
+    // handle for the whole pop loop, which the stealer holds as the caller
+    // of alloc_node() (insert() or split_bucket(), under the caller's
+    // handle). The batching of node_count_ belongs to the list: the
+    // stealer's CAS advances THAT list's pop counter, and if the counter it
+    // replaced opened a batch the stealer adds the 256, after its CAS, as
+    // an own-shard opener does (node_count_'s comment re-derives the
+    // quiescent bound and the no-underflow argument per list). The value
+    // bytes are unpoisoned by the stealing winner before the assignment,
+    // as by an own-shard winner. A throwing assignment sends the node to
+    // the stealer's OWN shard's limbo list (a limbo list is only a holding
+    // place until the next bump; which shard holds a node does not matter
+    // to the bag). Bounded: one pass over the other shards, and on each
+    // list only the pop loop's own retries, each after another thread's
+    // completed pop or push (or a spurious failure of the weak CAS): no
+    // lock, lock-free in the header's sense. Cost, on the append path only:
+    // one acquire load of each other shard's free head (its FREE LINE)
+    // when every list is empty, so an append costs up to shard-count - 1
+    // extra loads. The loop body is a copy of alloc_node()'s own-shard pop
+    // with the source shard varied, not a shared helper, and it is not
+    // inlined into alloc_node(), so that the own-shard pop -- the hot path --
+    // keeps its own code and gains only what a call on the slow path costs
+    // a caller (the arguments kept for after the call).
+    [[gnu::noinline]] Node* steal_node(const T& val, word_t next) {
+        const size_t own = concurrent_hash_rcu_detail::thread_number() & arena_mask_;
+        for (size_t i = 1; i <= arena_mask_; ++i) {   // one pass over the other shards
+            Shard& from = shards_[(own + i) & arena_mask_];
+            word_t head = from.free_head.load(std::memory_order_acquire);   // acquire: REQUIRED, as alloc_node()'s head load
+            while (free_addr_of(head) != FREE_EMPTY) {   // free-list pop on another shard's list
+                Node* node = node_of(free_addr_of(head));
+                word_t successor = node->link.load(std::memory_order_relaxed);
+                const word_t expected = head;
+                // (acquire, acquire): as alloc_node()'s own pop (failure
+                // REQUIRED, success EXPECTED-EQUIVALENT to relaxed).
+                if (from.free_head.compare_exchange_weak(head, free_word(successor, head + FREE_POP_ONE), std::memory_order_acquire, std::memory_order_acquire)) {
+                    if ((head & FREE_BATCH_MASK) == 0) node_count_.fetch_add(256, std::memory_order_relaxed);   // this list's batch, opened by this pop
+                    unpoison_node(node);
+                    try {
+                        node->value = val;
+                    } catch (...) {
+                        push_limbo(my_shard(), node, node);
+                        throw;
+                    }
+                    node->link.store(next, std::memory_order_relaxed);
+                    return node;
+                } // if this thread popped the node
+                if ((head & FREE_COUNT_MASK) == (expected & FREE_COUNT_MASK)) advance_counters_.pops_raced_push.fetch_add(1, std::memory_order_relaxed);   // see alloc_node()
+            } // free-list pop on another shard's list
+        } // one pass over the other shards
+        return nullptr;
+    } // steal_node()
+
     // Thread-safe node allocator: returns a node holding `val` with link
     // `next`, private to the caller until it publishes the node, at an
     // address that is stable for the life of the set. The node comes from
-    // the calling thread's shard: from its free list when the list has a
-    // node, else appended to its deque. Exceptions: see EXCEPTIONS in the
+    // the calling thread's shard's free list when the list has a node, else
+    // from another shard's free list (steal_node()), else it is appended to
+    // the calling thread's shard's deque. Exceptions: see EXCEPTIONS in the
     // class overview.
     //
     // The pop is a lock-free CAS on the free head, run CONCURRENTLY with the
     // free pass's pushes (push_free(), one advancer at a time) and with the
-    // other poppers of this shard. The orders are the last links of THE
+    // other poppers of this list (its shard's threads, and threads of other
+    // shards stealing: steal_node()). The orders are the last links of THE
     // PER-NODE REUSE CHAIN in the class overview: the free pass rewrote the
     // top node's `link` into the free list's next pointer, poisoned its
     // value bytes and pushed it with a RELEASE CAS, after it read the leaves
@@ -2084,9 +2212,9 @@ private:
     // `link`). CAS success ACQUIRE (EXPECTED-EQUIVALENT to relaxed: the
     // value consumed is the one the acquire load or the acquire failure
     // returned, so the success order re-acquires an edge this thread has;
-    // kept in the (acquire, acquire) pair form, which is what the model
-    // checking ran, since a failure order stronger than the success order
-    // is a form some checkers silently downgrade). The relaxed load of the
+    // kept in the (acquire, acquire) pair form: a failure order stronger
+    // than the success order buys nothing here and is a form some tools
+    // silently weaken). The relaxed load of the
     // top's `link` is carried by the head load's acquire (the pusher stored
     // the link before its release CAS). Why a losing popper is harmless:
     // a popper that read the head (X, c) and then X's link may lose to
@@ -2099,9 +2227,11 @@ private:
     // class overview: the counter bits play no part). A CAS that succeeds
     // therefore read X's link as the free pass left it, i.e. the true
     // successor. Weak CAS: we loop anyway. A failure whose counter bits are
-    // the expected ones lost to a PUSH (a pop would have advanced them) or
-    // was spurious; it is counted (pops_raced_push) as the witness that
-    // pops and pushes really meet.
+    // the expected ones lost to a PUSH (a pop would have advanced them), or
+    // was spurious, or -- the counter has nine bits -- lost to a multiple of
+    // 512 pops between this thread's read and its CAS; it is counted
+    // (pops_raced_push) as the witness that pops and pushes really meet, an
+    // approximate one.
     //
     // The successful CAS also increments the counter packed in the head word
     // (it replaces the whole word), and only the winner's increment lands, so
@@ -2145,6 +2275,7 @@ private:
             } // if this thread popped the node
             if ((head & FREE_COUNT_MASK) == (expected & FREE_COUNT_MASK)) advance_counters_.pops_raced_push.fetch_add(1, std::memory_order_relaxed);   // lost to a push (or a spurious failure): the witness that pops meet pushes
         } // free-list pop
+        if (Node* stolen = steal_node(val, next)) return stolen;   // the slow path: another shard's free list
         size_t idx = shard.nodes.emplace_back(val, next);
         if ((idx & 255) == 0) node_count_.fetch_add(256, std::memory_order_relaxed);
         Node* node = &shard.nodes[idx];   // the deque's index is used here, once, and by the accounting sweep
@@ -2901,7 +3032,7 @@ private:
     void push_free(Shard& shard, Node* node) {
         poison_node(node);
         word_t head = shard.free_head.load(std::memory_order_relaxed);
-        while (true) {   // the push loop: every failure is a completed pop of this shard, or spurious
+        while (true) {   // the push loop: every failure is a completed pop of this list, or spurious
             node->link.store(free_addr_of(head), std::memory_order_relaxed);   // published by the release CAS below
             if (shard.free_head.compare_exchange_weak(head, free_word(word_of(node), head), std::memory_order_release, std::memory_order_relaxed)) return;
             advance_counters_.free_push_cas_failures.fetch_add(1, std::memory_order_relaxed);
@@ -2952,7 +3083,7 @@ public:
 
     // DIAGNOSTICS. The get_internal_* accessors below, and the two structs
     // they return, show the arena and the counters to the tests and the
-    // benchmark. They come in two classes:
+    // benchmark. They come in three classes:
     //   - RACE-FREE, approximate while operations run:
     //     get_internal_node_count(), get_internal_arena_shards(),
     //     get_internal_table_size() and get_internal_counters() read only
@@ -2985,6 +3116,20 @@ public:
     //     get_internal_table_size() does not provide one, and the sweep
     //     itself indexes buckets_ up to a relaxed-loaded table_size_, the
     //     same hazard.
+    //   - RING VIEWS, no advance() in progress (a weaker precondition than
+    //     QUIESCENCE: operations, join attempts and live handles may run):
+    //     get_internal_generation(), get_internal_ring_state() and
+    //     get_internal_bag_count() read the ring's plain fields and walk the
+    //     bags, which only the advancer writes (asserted: the flag clear),
+    //     and the bagged nodes' `retire_link` and `link`, which no operation
+    //     writes. get_internal_generation() reads `current_` with acquire,
+    //     which reads the publish and so orders the advancer's write of
+    //     `gen` before the read; it needs nothing more. The other two also
+    //     read `state`, `oldest_` and the bag slots, which an advance() may
+    //     write without publishing (a `nothing_retired` or `ring_full` call
+    //     that frees bags), so they need every earlier advance() to
+    //     happen-before the call (the caller made it, or joined the thread
+    //     that did). get_internal_handle_generation(h) needs only a live h.
     //
     // Diagnostic accessor: total nodes ever appended to the arena (reachable,
     // free, limbo and retired alike): the sum of the shards' sizes, exact at
@@ -3242,8 +3387,8 @@ public:
     // ------------------------------------------------------------------------
     // HANDLES AND GENERATIONS (the class overview section of that name).
     // Every member from here to the end of the class belongs to the
-    // generation protocol; they are appended after the step-1 members so
-    // that no existing member moves (the data members at the very end
+    // generation protocol; they are appended after the members above so
+    // that no member above moves (the data members at the very end
     // follow node_count_ in the layout): the generation block and the
     // handle, the join and the leave, the flag's guard, the poison helpers,
     // the destructor, new_handle(), advance() with its bump, free pass and
@@ -3260,13 +3405,17 @@ private:
     // or moved). 128 bytes per block (a pair of 64-byte lines on x86, so
     // the adjacent-line prefetcher does not couple neighbours): adjacent
     // `refs` would otherwise share a line. `state`, `gen` and the bag slots
-    // are PLAIN fields written and read only by the holder of
-    // `reclaiming_`, by the destructor and by the quiescent accounting
-    // sweep; the flag's acquire/release is their only synchronization.
-    // Joiners read only `current_` and `refs`, so no join path reads `gen`;
-    // a `gen` read of a handle's own block is safe only AFTER a successful
-    // re-verify (the publish then happens-before it, and the block cannot
-    // be recycled while the handle's +1 is on it).
+    // are PLAIN fields written only by the holder of `reclaiming_` (and the
+    // constructor). They are read by the flag holder, whose synchronization
+    // with earlier holders is the flag's acquire/release; by the destructor
+    // and the quiescent accounting sweep, under their quiescence; and, for
+    // `gen` alone, through the publish that made the block current: by
+    // get_internal_handle_generation(), safe only AFTER the handle's
+    // successful re-verify (that publish then happens-before the read, and
+    // the block cannot be recycled while the handle's +1 is on it), and by
+    // get_internal_generation(), whose acquire load of `current_` reads
+    // that publish. Joiners read only `current_` and `refs`, so no join
+    // path reads `gen`.
     struct alignas(128) GenerationBlock {
         std::atomic<long> refs{0};                           // live handles joined to this generation, plus transient join attempts; RMW-only (J2): never stored after construction
         GenerationState state = GenerationState::EMPTY;      // EMPTY / CURRENT / SEALED (owned by the advancer)
@@ -3629,8 +3778,9 @@ private:
     // not hoard its own garbage, and splicing a sublist whole would save
     // nothing (finding its tail is the same walk). Then the slot goes EMPTY,
     // `oldest_` moves on, and the count is subtracted from node_count_ (the
-    // resize hint: its comment says why the subtraction is exact and why the
-    // count is signed). Checks (debug builds): every retired node is tagged
+    // resize hint: its comment says why the subtraction keeps it one-sided
+    // at quiescent points and why it never goes below zero). Checks (debug
+    // builds): every retired node is tagged
     // (only dead nodes are retired, and every dead node in a chain is
     // tagged: a live node here means a run walk overshot its run, or a node
     // was retired on a lost CAS), and a bag never holds more nodes than the
@@ -3700,8 +3850,9 @@ private:
     // node the walk passes with a usable pred (H5' through step_over(): a
     // FROZEN node right after a live predecessor, or at the head, is
     // hashed by is_dead_now() whether or not it turns out dead), and that
-    // is the one source of a throw here. No split, no allocation, no lock,
-    // no value read. C1 (ENTRY): every chain is entered through
+    // is the one source of a throw here. No split, no allocation, no lock;
+    // the only values read are those of the FROZEN nodes hashed, and no
+    // value is compared. C1 (ENTRY): every chain is entered through
     // `buckets_[j].load(acquire)` AFTER this handle's join and through
     // nothing else, and every further node is reached only through the
     // `link` of a node reached from that head in this pass over the chain;
@@ -3709,9 +3860,9 @@ private:
     // UNINITIALIZED buckets are skipped and not counted (nothing is
     // published in them). The loop body is a COPY of cleanup_parent()'s,
     // plus the counting, rather than a shared helper, so that the cleanup
-    // pass's text -- an anchor of the unlink layer's mutants -- is
-    // untouched; a mutant of either copy must say whether the other is
-    // mutated too. Counts: `buckets_walked`; `walk_retired` (the nodes of
+    // pass keeps exactly the code its correctness argument was made for;
+    // the two copies are the same writer walk and change together.
+    // Counts: `buckets_walked`; `walk_retired` (the nodes of
     // every run whose CAS this walk won; a won CAS is recognized after
     // step_over() by the pred word now leading to the run's successor,
     // which only this thread's own installed value can make it do, and the
@@ -3858,9 +4009,10 @@ public:
     //      a liveness detail that costs one state test and one seq_cst load
     //      when nothing has changed, and keeps the structure "the bump
     //      decides, then one unconditional free pass" uniform);
-    //   4. the WALK, for every outcome but `ring_full` (walking would add
-    //      retirees to lists that cannot be bagged until the pin goes away)
-    //      and `contended`.
+    //   4. the WALK, for every outcome but `ring_full` and `contended` (a
+    //      cost choice: on a full ring its retirees could not be bagged
+    //      until the pin goes away; ONE ADVANCER, A2, in the class overview
+    //      says why it is not an invariant).
     // Against the four steps a QUIESCENT collector of this structure would
     // take (clear the pop counters; drain the limbo and retired lists onto
     // the free lists; walk every chain unlinking the dead with plain
@@ -3907,12 +4059,18 @@ public:
 
     // --- Diagnostics of the generation protocol (see DIAGNOSTICS) --------
 
-    // Diagnostic accessor: the current generation number. Precondition: no
-    // advance() in progress (`gen` is a plain field the advancer writes;
-    // live handles and operations are fine). Exact under that precondition.
+    // Diagnostic accessor, a RING VIEW (DIAGNOSTICS): the current
+    // generation number. Precondition: no advance() in progress (`gen` is a
+    // plain field the advancer writes; live handles and operations are
+    // fine). Exact under that precondition.
+    // The load of `current_` is acquire: it reads the publish (a seq_cst
+    // store, sequenced after the advancer's write of the block's `gen`), so
+    // that write happens-before the read of `gen` even for a caller that
+    // never synchronized with the advancer otherwise; relaxed would race
+    // with that write.
     uint64_t get_internal_generation() const {
         assert(!reclaiming_.load(std::memory_order_relaxed) && "get_internal_generation() during advance()");
-        return current_.load(std::memory_order_relaxed)->gen;
+        return current_.load(std::memory_order_acquire)->gen;
     } // get_internal_generation()
     // Diagnostic accessor: the generation a live handle is joined to.
     // Race-free: the handle's block cannot be recycled, and so its `gen`
@@ -3923,7 +4081,9 @@ public:
         assert(h.block_ != nullptr && "generation of an empty handle");
         return h.block_->gen;
     } // get_internal_handle_generation()
-    // Diagnostic accessor, quiescent only: the number of nodes in the bag of
+    // Diagnostic accessor, a RING VIEW (DIAGNOSTICS: no advance() in
+    // progress, every earlier one happens-before the call; operations may
+    // run): the number of nodes in the bag of
     // generation `gen`, retired and limbo sublists over every shard, or 0 if
     // no SEALED slot represents that generation (it was freed, or never
     // closed). Walks the sublists without the sweep's cycle guard: a
@@ -3959,8 +4119,9 @@ public:
         size_t oldest_slot;                  // `oldest_`
         std::vector<InternalRingSlot> slots; // one per slot, index = ring index
     }; // struct InternalRingState
-    // Diagnostic accessor, quiescent only (no advance() in progress; live
-    // handles are fine): the ring-state view above.
+    // Diagnostic accessor, a RING VIEW (DIAGNOSTICS: no advance() in
+    // progress, every earlier one happens-before the call; operations and
+    // live handles may run): the ring-state view above.
     InternalRingState get_internal_ring_state() const {
         assert(!reclaiming_.load(std::memory_order_relaxed) && "get_internal_ring_state() during advance()");
         InternalRingState view{slot_index(current_.load(std::memory_order_relaxed)), oldest_, {}};
@@ -3979,8 +4140,10 @@ public:
     // attributing another advancer's call to itself. One set of
     // accumulators per thread per instantiation, shared by every set of
     // that type the thread advances; the caller resets them through the
-    // returned reference. Always compiled, as the counters are: four
-    // steady-clock reads per call that proceeds, two per `contended` call.
+    // returned reference. Always compiled, as the counters are: two
+    // steady-clock reads per timed scope, so eight per call that walks
+    // (`advanced` or `nothing_retired`), six per `ring_full` call (no walk)
+    // and two per `contended` call.
     // A call that throws from the walk still charges its time (StepTimer).
     struct InternalTimers {
         size_t advance_ns;  // the whole call, flag acquisition to return (`contended` calls included)

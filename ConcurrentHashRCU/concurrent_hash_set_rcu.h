@@ -171,8 +171,9 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //              LIST, LIMBO LIST and RETIRED LIST heads (see RECLAMATION
 //              below). A thread appends to, and first pops from, the shard
 //              its thread number selects; when that shard's free list is
-//              empty it pops from another shard's before it appends (the
-//              steal: see alloc_node()). A node is never moved and
+//              empty, and unless a set-wide hint says no free list has a
+//              node, it scans every shard's free list, its own first, before
+//              it appends (the steal: see alloc_node()). A node is never moved and
 //              never returned to the system; while a node is published its
 //              value is never written, its link changes only by the one CAS
 //              that tags it and by unlink CASes that bypass dead successors
@@ -192,8 +193,9 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //              (a lock, a counter) is the insert ceiling; a shard's lock is
 //              contended only by the threads whose numbers collide modulo
 //              the shard count, and its free-list head by those threads, by
-//              the free pass's pushes and by threads of other shards whose
-//              own free lists are empty (the steal).
+//              the free pass's pushes and by threads of other shards that
+//              scan it when their own free lists are empty and the steal's
+//              hint is not EMPTY (the steal).
 //   node_count_ : the resize hint: arena occupancy, OVER-counted by up to 255
 //              per touched shard per allocation path (each shard adds 256
 //              when it appends a node whose index is a multiple of 256, index
@@ -484,7 +486,8 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //     (see the free-list constants), so the CAS that pops a node also counts
 //     it, and only the winner's count lands: every 256th pop from a free
 //     list, its first pop included, adds 256 to node_count_, mirroring the
-//     append path's batching. Own list empty: the same pop on every other
+//     append path's batching. Own list empty: unless a set-wide hint says
+//     no free list has a node (one relaxed load), the same pop on every
 //     shard's free list in turn (the STEAL: the free pass deals freed nodes
 //     over every shard, so a node dealt to a shard no allocating thread maps
 //     to would otherwise never be reused); every list empty: append to the
@@ -638,9 +641,10 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   `contended` at once, every count 0) and `store(false, release)` at
 //   exit, on every path, by an RAII guard. Between successive advancers the
 //   flag's acquire/release pair is the ONLY synchronization on the plain
-//   fields `state`, `gen`, the bag slots, `oldest_` and the dealing cursor,
-//   and it orders one holder's publish before a later holder's `refs` loads
-//   (the store-buffering argument across calls). `gen` is also read outside
+//   fields `state`, `gen`, the bag slots, `oldest_`, the dealing cursor,
+//   the bump's scratch and the steal hint's stamp counter, and it orders
+//   one holder's publish before a later holder's `refs` loads (the
+//   store-buffering argument across calls). `gen` is also read outside
 //   the flag, through the publish that made its block current: by a
 //   handle's own diagnostic (its successful re-verify read that publish)
 //   and by get_internal_generation() (an acquire load of `current_`).
@@ -1254,9 +1258,10 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 // only an operation that allocates can reach either, so an operation that
 // allocates nothing is lock-free end to end:
 //   (1) alloc_node(): a lock-free pop from the calling thread's arena shard's
-//       free list when it has a node, else a lock-free pop from another
-//       shard's (the steal), else an append under the own shard's
-//       deque SpinLock; with one thread per shard that lock is uncontended,
+//       free list when it has a node, else, unless the steal's hint says no
+//       free list has a node, a lock-free pop from the first shard's list,
+//       own first, that has one (the steal), else an append under the own
+//       shard's deque SpinLock; with one thread per shard that lock is uncontended,
 //       but it is a lock. An insert() whose walk misses its key allocates
 //       this way, and so does split_bucket() for its copies, so contains(),
 //       insert() and erase() can all reach the lock by meeting an
@@ -1440,6 +1445,9 @@ private:
     static constexpr word_t FREE_COUNT_MASK = ~(FREE_POP_ONE - 1);       // bits 63..55
     static constexpr word_t FREE_BATCH_MASK = word_t{255} << FREE_COUNT_SHIFT;   // bits 62..55
     static constexpr word_t FREE_EMPTY = 0;
+    // Bit 0 of steal_hint_ (THE HINT at steal_scan()): set when a scan of
+    // the steal found every free list empty; the stamp is in bits 63..1.
+    static constexpr word_t STEAL_HINT_EMPTY = 1;
     static_assert((PTR_MASK >> 3) < FREE_POP_ONE, "an address >> 3 must fit below the pop counter");
 
 public:
@@ -2119,14 +2127,65 @@ private:
 
     // THE STEAL, alloc_node()'s slow path, taken only when the calling
     // thread's own free list is empty: pop a node holding `val` with link
-    // `next` from ANOTHER shard's free list, trying shards own + 1, own + 2,
-    // ... (modulo the shard count) once each; nullptr when every other list
-    // is empty too, and the caller appends. Why it exists: the free pass
-    // deals freed nodes round-robin over EVERY shard's free list, while a
-    // thread pops only its own shard's, so without the steal the nodes
-    // dealt to shards no allocating thread maps to would never be reused,
-    // and under churn with fewer allocating threads than shards the arena
-    // would grow without bound.
+    // `next` from any shard's free list; nullptr when the set-wide hint says
+    // no free list has a node, or when a scan finds every list empty, and
+    // the caller appends. Why it exists: the free pass deals freed nodes
+    // round-robin over EVERY shard's free list, while a thread pops first
+    // from its own shard's, so without the steal the nodes dealt to shards
+    // no allocating thread maps to would never be reused, and under churn
+    // with fewer allocating threads than shards the arena would grow
+    // without bound.
+    // Two parts. steal_node() is the CHEAP TEST, inlined into the append
+    // path: one relaxed load of the set-wide word steal_hint_ and a branch;
+    // when the word says "nothing free anywhere" (STEAL_HINT_EMPTY set) the
+    // call returns nullptr at once, so an append in a set where nothing has
+    // been freed since the last empty scan costs that load and nothing
+    // more. Otherwise steal_scan() (not inlined) scans the lists. The test
+    // reads a word on a line of its own that only the free pass and a
+    // failed scan write, and adds no read-modify-write to the own-shard pop
+    // or to the append. The hint is ONLY a hint: skipping a steal is always
+    // safe (the caller appends: memory, not correctness), and no
+    // correctness argument rests on the word or on its orders.
+    // Why a flag with a stamp and not a count of free nodes: an exact count
+    // would need a decrement per pop, a read-modify-write on one set-wide
+    // line for every allocation of every thread (the contention the shards
+    // exist to avoid); the steal needs only to know whether a scan could
+    // find anything, and that changes only when the free pass pushes
+    // (nodes enter a free list only there) or when the lists run dry.
+    Node* steal_node(const T& val, word_t next) {
+        const word_t hint = steal_hint_.load(std::memory_order_relaxed);   // relaxed: a hint (see steal_scan() for what the scan acquires)
+        if (hint & STEAL_HINT_EMPTY) return nullptr;
+        return steal_scan(val, next);
+    } // steal_node()
+
+    // THE SCAN of the steal: called by steal_node() when the hint it loaded
+    // was not EMPTY. Pops a node holding `val` with link `next` from the
+    // first shard's free list that has one, trying the calling thread's own
+    // shard and then own + 1, own + 2, ... (modulo the shard count), each
+    // once; if every list is empty, marks the hint EMPTY and returns
+    // nullptr (also at once, if the hint reloaded here is EMPTY already).
+    // THE HINT. steal_hint_ holds a STAMP (bits 63..1) and the EMPTY flag
+    // (bit 0). The free pass, after pushing a freed bag's nodes, stores a
+    // new stamp with EMPTY clear (RELEASE: sequenced after its pushes). A
+    // scan begins by reloading the hint with ACQUIRE, so if that load read
+    // a pass's store, every push of that pass and of every earlier one
+    // happens-before the scan's loads of the heads, which therefore see
+    // those nodes or their later pops. (A reload, not an acquire fence
+    // after steal_node()'s relaxed load: the ordering the scan needs is the
+    // same, the reload may read a later value and return early, and GCC's
+    // ThreadSanitizer does not support fences.) A scan that finds every
+    // list empty sets EMPTY with a CAS from the value it reloaded (relaxed:
+    // nothing acquires through it); a free pass that stored a new stamp in
+    // the meantime makes that CAS fail, and a store that comes after the
+    // CAS in the word's modification order clears EMPTY again. So EMPTY stays set only while every node pushed by every
+    // pass whose stamp store precedes it was seen popped. What the hint can
+    // miss, and the bound: nodes a pass has pushed but whose stamp store
+    // has not landed yet (a scan in that window may find them or not, and
+    // may set EMPTY), until that store, at the end of freeing that bag,
+    // clears EMPTY; and appends that load the hint before a store reaches
+    // them, which is ordinary staleness. No node is left unstealable past
+    // the stamp store of the bag that freed it. The acquire reload is on
+    // the scan path only; the test in steal_node() stays one relaxed load.
     // The pop on each list is alloc_node()'s own-shard pop, unchanged, on
     // another head; the memory-model argument does not ask which shard the
     // popper maps to. Several threads already pop one shard's list (thread
@@ -2146,23 +2205,35 @@ private:
     // as by an own-shard winner. A throwing assignment sends the node to
     // the stealer's OWN shard's limbo list (a limbo list is only a holding
     // place until the next bump; which shard holds a node does not matter
-    // to the bag). Bounded: one pass over the other shards, and on each
-    // list only the pop loop's own retries, each after another thread's
-    // completed pop or push (or a spurious failure of the weak CAS): no
-    // lock, lock-free in the header's sense. Cost, on the append path only:
-    // one acquire load of each other shard's free head (its FREE LINE)
-    // when every list is empty, so an append costs up to shard-count - 1
-    // extra loads. The loop body is a copy of alloc_node()'s own-shard pop
-    // with the source shard varied, not a shared helper, and it is not
-    // inlined into alloc_node(), so that the own-shard pop -- the hot path --
-    // keeps its own code and gains only what a call on the slow path costs
-    // a caller (the arguments kept for after the call).
-    [[gnu::noinline]] Node* steal_node(const T& val, word_t next) {
-        const size_t own = concurrent_hash_rcu_detail::thread_number() & arena_mask_;
-        for (size_t i = 1; i <= arena_mask_; ++i) {   // one pass over the other shards
-            Shard& from = shards_[(own + i) & arena_mask_];
+    // to the bag). The own shard is scanned again, first, because its
+    // emptiness was read before the hint, so without the acquire above it.
+    // Bounded: one pass over the shards, and on each list only the pop
+    // loop's own retries, each after another thread's completed pop or
+    // push (or a spurious failure of the weak CAS), and one CAS on the
+    // hint, never retried: no lock, lock-free in the header's sense. Cost,
+    // when the hint is not EMPTY: the acquire reload of steal_hint_, one
+    // acquire load of each shard's free head (its FREE LINE), the shard
+    // array's base and mask read once into locals (the atomic accesses in
+    // the loop would otherwise make the compiler reload them per shard),
+    // and, when every list is empty, the relaxed CAS that sets EMPTY: the
+    // only read-modify-write on the line every appender reads, attempted
+    // by every thread that finishes an empty scan on the same stamp (a
+    // failed CAS still takes the line). The loop body is a copy of
+    // alloc_node()'s own-shard pop with the source shard varied, not a
+    // shared helper, and it is not inlined into alloc_node(), so that the
+    // own-shard pop -- the hot path -- keeps its own code and gains only
+    // what a call on the slow path costs a caller (the arguments kept for
+    // after the call).
+    [[gnu::noinline]] Node* steal_scan(const T& val, word_t next) {
+        word_t hint = steal_hint_.load(std::memory_order_acquire);   // acquire: the free pass's pushes before the scan (THE HINT above)
+        if (hint & STEAL_HINT_EMPTY) return nullptr;
+        Shard* const shards = shards_.get();
+        const size_t mask = arena_mask_;
+        const size_t own = concurrent_hash_rcu_detail::thread_number() & mask;
+        for (size_t i = 0; i <= mask; ++i) {   // one pass over the shards, own first
+            Shard& from = shards[(own + i) & mask];
             word_t head = from.free_head.load(std::memory_order_acquire);   // acquire: REQUIRED, as alloc_node()'s head load
-            while (free_addr_of(head) != FREE_EMPTY) {   // free-list pop on another shard's list
+            while (free_addr_of(head) != FREE_EMPTY) {   // free-list pop on that shard's list
                 Node* node = node_of(free_addr_of(head));
                 word_t successor = node->link.load(std::memory_order_relaxed);
                 const word_t expected = head;
@@ -2181,17 +2252,24 @@ private:
                     return node;
                 } // if this thread popped the node
                 if ((head & FREE_COUNT_MASK) == (expected & FREE_COUNT_MASK)) advance_counters_.pops_raced_push.fetch_add(1, std::memory_order_relaxed);   // see alloc_node()
-            } // free-list pop on another shard's list
-        } // one pass over the other shards
+            } // free-list pop on that shard's list
+        } // one pass over the shards, own first
+        // Every list was empty: mark the hint EMPTY unless a free pass stored
+        // a new stamp since `hint` was reloaded. relaxed, and one attempt: a
+        // hint (a failure means a pass freed something, and EMPTY must stay
+        // clear).
+        steal_hint_.compare_exchange_strong(hint, hint | STEAL_HINT_EMPTY, std::memory_order_relaxed, std::memory_order_relaxed);
         return nullptr;
-    } // steal_node()
+    } // steal_scan()
 
     // Thread-safe node allocator: returns a node holding `val` with link
     // `next`, private to the caller until it publishes the node, at an
     // address that is stable for the life of the set. The node comes from
     // the calling thread's shard's free list when the list has a node, else
-    // from another shard's free list (steal_node()), else it is appended to
-    // the calling thread's shard's deque. Exceptions: see EXCEPTIONS in the
+    // -- unless the steal's hint is EMPTY, in which case no list is tried --
+    // from the first shard's free list, own first, that has one
+    // (steal_node()), else it is appended to the calling thread's shard's
+    // deque. Exceptions: see EXCEPTIONS in the
     // class overview.
     //
     // The pop is a lock-free CAS on the free head, run CONCURRENTLY with the
@@ -3668,8 +3746,8 @@ private:
 
     // --- The three steps of advance(): the bump, the free pass, the walk ---
     // All three run under the flag (ONE ADVANCER in the class overview):
-    // `state`, `gen`, the bag slots, `oldest_`, `deal_` and `limbo_loaded_`
-    // are plain fields of the flag holder, synchronized between holders by
+    // `state`, `gen`, the bag slots, `oldest_`, `deal_`, `limbo_loaded_`
+    // and `steal_stamp_` are plain fields of the flag holder, synchronized between holders by
     // the flag's acquire/release alone.
 
     // THE BUMP, steps A0-A5 of ONE ADVANCER: decide whether anything is
@@ -3824,6 +3902,11 @@ private:
             block.state = GenerationState::EMPTY;
             oldest_ = (oldest_ + 1) % kGenerations;
             node_count_.fetch_sub(count, std::memory_order_relaxed);   // relaxed: a hint, read relaxed by insert(); never below zero (see node_count_)
+            // The steal's hint: a new stamp, EMPTY clear, after this bag's
+            // pushes. release: a scan that reads it with its acquire reload
+            // sees every push above (THE HINT at steal_scan()). Only when
+            // the bag held a node: an empty bag changed no free list.
+            if (count != 0) steal_hint_.store(++steal_stamp_ << 1, std::memory_order_release);
             result.freed_nodes += count;
             ++result.freed_bags;
             advance_counters_.bags_freed.fetch_add(1, std::memory_order_relaxed);
@@ -4028,8 +4111,8 @@ public:
         const StepTimer whole(internal_advance_timers().advance_ns);
         // acquire: pairs with the previous holder's release store in
         // AdvanceGuard -- this is the ONLY synchronization on the plain
-        // fields `state`, `gen`, the bag slots, `oldest_`, `deal_` and
-        // `limbo_loaded_`, and it places the previous holder's publish
+        // fields `state`, `gen`, the bag slots, `oldest_`, `deal_`,
+        // `limbo_loaded_` and `steal_stamp_`, and it places the previous holder's publish
         // before this holder's `refs` loads (DESIGNATED: with relaxed orders
         // here two callers race on the plain fields).
         if (reclaiming_.exchange(true, std::memory_order_acquire)) {
@@ -4195,6 +4278,21 @@ private:
     // load that decides whether A3 exchanges that shard's limbo list. Owned
     // by the flag holder; meaningless outside a bump.
     std::unique_ptr<word_t[]> limbo_loaded_;
+    // The steal's set-wide hint (THE HINT at steal_scan()): a stamp in bits
+    // 63..1 and STEAL_HINT_EMPTY in bit 0, "a scan found every free list
+    // empty since the last stamp". Written by the free pass (a release
+    // store of a new stamp, EMPTY clear, after each bag it frees) and by a
+    // scan that found nothing (one relaxed CAS setting EMPTY); read with one
+    // relaxed load by every append that missed its own free list. EMPTY at
+    // construction: no free list has a node. A hint only: no correctness
+    // argument rests on it. A 128-byte block of its own (a pair of 64-byte
+    // lines, so the adjacent-line prefetcher does not couple it to its
+    // neighbours), like `current_` and `reclaiming_`: every append that
+    // misses its own list reads it, while the flag's block holds `deal_`,
+    // written once per freed node; the only other field in the block,
+    // `steal_stamp_`, is written with the hint, once per freed bag.
+    alignas(128) std::atomic<word_t> steal_hint_{STEAL_HINT_EMPTY};
+    word_t steal_stamp_ = 0;   // the last stamp the free pass stored into steal_hint_ (shifted left by one there); owned by the flag holder
 }; // class ConcurrentResizableHashSetRCU
 
 #endif // CONCURRENT_HASH_SET_RCU_H

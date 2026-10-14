@@ -347,18 +347,23 @@ using LockedSet     = LockedHashSet<int, std::hash<int>>;
 // released before the prep's advance(), and the threads' handles are created
 // after it, so that it runs with no handle alive -- and each thread uses its
 // own only INSIDE the state loop, whose start is a barrier: the happens-before
-// edge a handle created on one thread needs before another thread uses it
-// (see the CAUTION below). A thread refreshes its handle only in the rows
-// that call advance() at a cadence (at the top of every iteration:
-// Own::refresh()), and releases it on its own LAST iteration (Google
-// Benchmark runs every thread for exactly state.max_iterations iterations): a
-// thread that has finished and waits at the loop's end barrier then pins no
-// generation of the set for the threads still running. Thread 0 destroys the
-// empty handles in TearDown(), before it deletes the set: a live handle must
-// not outlive its set. Each handle sits on its own 128-byte block, since a
-// release writes its thread's handle and handles packed into one line would
-// false-share. For the baseline the handle is an empty type, the release does
-// nothing, and the compiler drops finish_iteration() from those bodies.
+// edge a handle created on one thread needs before another thread uses it (see
+// the CAUTION below). Only the rows that call advance() (the _Rcu rows) touch
+// a handle inside the timed loop beyond using it: a thread refreshes it at the
+// top of every iteration in the rows with a cadence (Own::refresh()), and
+// releases it on its own LAST iteration (Own::finish_iteration(); Google
+// Benchmark runs every thread for exactly state.max_iterations iterations), so
+// that a thread that has finished and waits at the loop's end barrier pins no
+// generation of the set for the threads still advancing. In every other row no
+// advance() runs while the handles are live (a *_Reclaimed prep runs its one
+// before they are made), so a live idle handle pins nothing anyone measures,
+// and the timed loop carries no handle bookkeeping: the handles stay live
+// until thread 0's TearDown() destroys them (the leave), before it deletes the
+// set -- a live handle must not outlive its set. Not released by each thread
+// after its loop: the code after the state loop runs concurrently with thread
+// 0's TearDown(), so a late release could reach a set already deleted. Each
+// handle sits on its own 128-byte block, since a release or a refresh writes
+// its thread's handle and handles packed into one line would false-share.
 // ---------------------------------------------------------------------------
 template <typename SetType>
 class ThreadHandles {
@@ -373,7 +378,9 @@ public:
     } // ThreadHandles::make()
 
     // Thread 0 only, in TearDown(), before the set is deleted: destroys every
-    // handle, each already released by its thread on its last iteration.
+    // handle; in the rows without advance() this is the leave of each thread's
+    // live handle, in the _Rcu rows each was released on its thread's last
+    // iteration.
     void clear() { recs_.clear(); }
 
     // One thread's use of its handle, a local of the body. Trivially
@@ -395,10 +402,10 @@ public:
         // no older one. Inside the state loop only, before
         // finish_iteration() has released the handle.
         void refresh() { (void)handles_.recs_[thread_].h.refresh(); }
-        // Called at the end of every iteration; on the thread's last
-        // iteration it releases the handle and returns true (false on every
-        // other iteration), so that a row can act after the release (see
-        // Erase_Presized_Del_Rcu).
+        // The _Rcu rows only, at the end of every iteration; on the thread's
+        // last iteration it releases the handle and returns true (false on
+        // every other iteration), so that a row can act after the release
+        // (see Erase_Presized_Del_Rcu).
         bool finish_iteration() {
             if (++done_ == last_) [[unlikely]] {
                 handles_.recs_[thread_].h = Handle{};
@@ -417,7 +424,7 @@ public:
 private:
     // One thread's handle on its own 128-byte block (see above).
     struct alignas(128) Rec {
-        Handle h;   // the thread's handle: joined by thread 0 in SetUp(), released on the thread's last iteration
+        Handle h;   // the thread's handle: joined by thread 0 in SetUp(); released on the thread's last iteration in the _Rcu rows, by thread 0's TearDown() otherwise
     }; // struct Rec
     std::vector<Rec> recs_;   // one per thread of the run; built by make(), destroyed by clear()
 }; // class ThreadHandles
@@ -673,10 +680,12 @@ template <typename SetType> ThreadHandles<SetType> MostlyOldFixture<SetType>::ha
 // per-thread SkipWithError() is called after the loop, never inside it. No
 // object with a destructor is live across the loop: its cleanup region can
 // change the loop's code. Each operation runs under the thread's own handle,
-// through the trivially destructible ThreadHandles::Own, whose
-// finish_iteration() ends every iteration (it releases the handle on the
-// last one), except in Lookup_MostlyOld_OpHandle, where each operation takes
-// a handle of its own (the thread's handle is still made and released).
+// through the trivially destructible ThreadHandles::Own, and these bodies do
+// nothing else with it (no row they define calls advance() while the
+// handles are live: ThreadHandles says why the handles then stay live until
+// TearDown()), except in Lookup_MostlyOld_OpHandle, where each operation
+// takes a handle of its own (the thread's handle is still made and
+// destroyed, unused).
 // ---------------------------------------------------------------------------
 
 /*
@@ -696,7 +705,6 @@ template <typename SetType> ThreadHandles<SetType> MostlyOldFixture<SetType>::ha
         records.allocate(state);                                              \
         for (auto _ : WallTimed(state, records)) {                            \
             ok += set->insert(own.get(), mix(base + next++));                 \
-            own.finish_iteration();                                           \
         }                                                                     \
         if (ok != state.iterations()) {                                       \
             state.SkipWithError("insert() returned false for a unique key "   \
@@ -755,7 +763,6 @@ template <typename SetType> ThreadHandles<SetType> MostlyOldFixture<SetType>::ha
                                     mix((int)(rng.next() & kLookupMask)));    \
                 benchmark::DoNotOptimize(hit);                                \
             }                                                                 \
-            own.finish_iteration();                                           \
         }                                                                     \
         if (ok != tries) {                                                    \
             state.SkipWithError("insert() returned false for a unique key "   \
@@ -1301,10 +1308,11 @@ template <typename SetType> typename SetType::InternalCounters WindowFixture<Set
 
 // The body of the window rows (see above), as a macro for the same reason as
 // DEFINE_ERASE: PRE declares what the regime needs before the loop, BEFORE
-// runs at the top of every iteration, AFTER_ERASE after every erase, POST
-// reports after the loop; all four are empty in _NoReclaim. Same accounting
-// contract as the other bodies.
-#define DEFINE_WINDOW(NAME, PRE, BEFORE, AFTER_ERASE, POST)                   \
+// runs at the top of every iteration, AFTER_ERASE after every erase, END at
+// the end of every iteration (the release on the last one), POST reports
+// after the loop; all five are empty in _NoReclaim. Same accounting contract
+// as the other bodies.
+#define DEFINE_WINDOW(NAME, PRE, BEFORE, AFTER_ERASE, END, POST)              \
     BENCHMARK_TEMPLATE_DEFINE_F(WindowFixture, NAME, ConcurrentSetDel)        \
     (benchmark::State& state) {                                               \
         static constinit WallRecords records;                                 \
@@ -1333,7 +1341,7 @@ template <typename SetType> typename SetType::InternalCounters WindowFixture<Set
                 benchmark::DoNotOptimize(hit);                                \
             }                                                                 \
             phase = (phase + 1) & 3;                                          \
-            own.finish_iteration();                                           \
+            END                                                               \
         }                                                                     \
         if (ok != tries) {                                                    \
             state.SkipWithError("erase() or insert() of a window key returned false: the keys are this thread's alone"); \
@@ -1500,7 +1508,6 @@ static void register_shared_total(int total) {
         for (auto _ : WallTimed(state, records)) {                            \
             ok += set->insert(own.get(), hot_growth_key(index));              \
             index += threads;                                                 \
-            own.finish_iteration();                                           \
         }                                                                     \
         if (ok != state.iterations()) {                                       \
             state.SkipWithError("insert() returned false for a unique key "   \
@@ -1744,7 +1751,7 @@ DEFINE_MOSTLY_OLD(Lookup_MostlyOld_RWLocked,   LockedSet)
 // decrement of the same count, so every thread's every operation writes the
 // one line that count is on; each join also increments the set's diagnostic
 // join counter (relaxed), one more line that every thread writes. The threads'
-// long-lived handles are still made and released as in every row, unused.
+// long-lived handles are still made and destroyed as in every row, unused.
 // Only on the AllowDelete == false set, against _Concurrent.
 DEFINE_MOSTLY_OLD_UNDER(MostlyOldFixture, Lookup_MostlyOld_OpHandle, ConcurrentSet, set->new_handle())
 
@@ -1771,8 +1778,7 @@ DEFINE_MOSTLY_OLD_ON(ChurnFixture, Lookup_MostlyOld_Del_Erased,    OldErased)
 DEFINE_ERASE(Erase_Presized_Del,
     /* PRE */,
     /* ITERATION */
-    ok += set->erase(own.get(), mix(base + next++));
-    own.finish_iteration();,
+    ok += set->erase(own.get(), mix(base + next++));,
     /* POST */,
     ConcurrentSetDel)
 BENCHMARK_REGISTER_F(EraseFixture, Erase_Presized_Del)
@@ -1793,8 +1799,7 @@ BENCHMARK_REGISTER_F(EraseFixture, Erase_Presized_Del_Rcu)
 DEFINE_ERASE(Erase_Small_Del,
     /* PRE */,
     /* ITERATION */
-    ok += set->erase(own.get(), mix(base + next++));
-    own.finish_iteration();,
+    ok += set->erase(own.get(), mix(base + next++));,
     /* POST */,
     ConcurrentSetDel, SmallErase)
 [[maybe_unused]] static const bool Erase_Small_Del_registered =
@@ -1816,7 +1821,7 @@ DEFINE_ERASE(Erase_Small_Del_Rcu,
 
 // The window rows (see Churn_Window_Del above).
 DEFINE_WINDOW(Churn_Window_Del_NoReclaim,
-    /* PRE */, /* BEFORE */, /* AFTER_ERASE */, /* POST */)
+    /* PRE */, /* BEFORE */, /* AFTER_ERASE */, /* END */, /* POST */)
 DEFINE_WINDOW(Churn_Window_Del_Rcu,
     /* PRE */
     Tally tally(advance_every_from_env("HASH_BM_WINDOW_ADVANCE_EVERY", kWindowAdvanceEvery), state);,
@@ -1824,6 +1829,8 @@ DEFINE_WINDOW(Churn_Window_Del_Rcu,
     own.refresh();,
     /* AFTER_ERASE */
     if (tally.due()) tally.add(set->advance());,
+    /* END */
+    own.finish_iteration();,
     /* POST */
     tally.report(state);)
 

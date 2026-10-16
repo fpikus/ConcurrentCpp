@@ -45,13 +45,22 @@
 
 // AddressSanitizer poisoning of free-list nodes (see ASAN POISONING under
 // HANDLES AND GENERATIONS in the class overview): the value bytes of a node
-// are poisoned while the node is on a free list, so that a read of a freed
-// value through a stale address is reported instead of returning a stale or
-// a reused value. The detection is in the NESTED form on purpose: GCC defines
+// are poisoned while the node is on a free list -- by advance()'s free pass,
+// before it pushes the node, and unpoisoned by the pop that wins the node,
+// before it assigns the new value, and by the destructor -- so that a read
+// of a freed value through a stale address is reported instead of returning
+// a stale or a reused value. A diagnostic: no contract of the class promises
+// it. The detection is in the NESTED form on purpose: GCC defines
 // __SANITIZE_ADDRESS__ and has no __has_feature, and `#if defined(X) &&
 // __has_feature(Y)` on one line is a GCC syntax error. Without ASan the
 // macros are no-ops. The prefix is this header's own, so that a translation
 // unit which includes another header with the same scheme sees no clash.
+//
+// ODR: the layout of the set's handle type depends on NDEBUG (a debug build
+// adds a per-handle count of the operations in flight: HANDLES in the class
+// overview), and a handle crosses translation units by value, so every
+// translation unit of one program that includes this header must agree on
+// NDEBUG.
 #if defined(__SANITIZE_ADDRESS__)
 #define CHS_RCU_HAVE_ASAN 1
 #elif defined(__has_feature)
@@ -339,8 +348,12 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   an untagged word (the bucket head or a live node's link); an insert() or
 //   erase() walk leaves no dead run reachable behind the bucket head or a
 //   live node it passed (a run at the head counts: the head is an untagged
-//   word); an erase() leaves its tombstone unreachable, unless a tagged,
-//   not-dead node lies between it and the last live word before it, which in
+//   word); an advance() whose walk runs leaves no dead run reachable behind
+//   an untagged word in any published bucket, except a run behind a FROZEN
+//   node whose child is not published (UNINITIALIZED buckets hold nothing
+//   and are not visited); an erase() leaves its tombstone unreachable,
+//   unless a tagged, not-dead node lies between it and the last live word
+//   before it, which in
 //   uncontended use arises only after an earlier split threw between its
 //   freeze and its publish (behind such a node nothing can be bypassed until
 //   its child is published and that child's split's cleanup pass, or a
@@ -369,7 +382,10 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   (in the constructor, before any handle exists), and the vectors of
 //   get_internal_accounting() and get_internal_ring_state(); nothing else
 //   in this class throws. new_handle(), refresh(), the handle's special
-//   members and the join and leave are noexcept. An arena address the word
+//   members and the join and leave are noexcept. An operation that throws
+//   leaves its handle live and usable: the handle's debug in-flight count is
+//   undone on the throwing path too (by RAII), and release builds touch
+//   nothing of the handle. An arena address the word
 //   encoding cannot represent is not an exception either: alloc_node()
 //   calls std::abort(), as the constructor does on an initial capacity
 //   above 2^63. A Hooks action that throws terminates (the hooks are
@@ -570,15 +586,28 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   since (the cumulative rule, below). A handle is therefore meant to be
 //   long-lived and refreshed regularly. Thread rules: any number of threads
 //   may run operations concurrently, each under its own handle or sharing
-//   one; refresh(), move assignment over a handle and destruction are
-//   exclusive with every other use of that handle (debug builds count the
-//   operations in flight on a handle and assert zero at each of the three);
-//   a handle may be created on one thread and used on another after a
-//   happens-before edge (the handle records no thread id). An operation on
-//   an empty handle, or on a handle of another set, is a precondition
-//   violation, diagnosed in debug builds; in release builds an operation
-//   touches nothing of its handle. Taking a handle never waits for an
-//   advance(): the join is lock-free and retries only after an advancer has
+//   one; refresh(), moving from a handle, move assignment over it, swap and
+//   destruction are exclusive with every other use of that handle (debug
+//   builds count the operations in flight on a handle and assert zero at
+//   each of these), and with nothing else: not with other handles, with
+//   new_handle() or with advance(); a handle may be created on one thread
+//   and used on another after a happens-before edge (the handle records no
+//   thread id). An operation runs under a handle of ANY live generation,
+//   the current one or one an advance() has closed since the join, with
+//   its full contract: the generation decides only which bags advance() may
+//   free while the handle lives, and only refresh() or a release changes
+//   it. A temporary is a handle too: `set.contains(set.new_handle(), k)`
+//   joins, and leaves at the end of the full expression. The precondition
+//   violations debug builds diagnose, by assertion: an operation with an
+//   empty handle or with a handle of another set; refresh() of an empty
+//   handle; refresh(), a move, swap or destruction of a handle while an
+//   operation runs under it; destruction of the set with a live handle or
+//   during an advance(); the accounting sweep or a ring view (DIAGNOSTICS)
+//   during an advance(). Release builds diagnose none of them, and there an
+//   operation touches nothing of its handle, so an operation's cost does
+//   not depend on its handle's age or on how many handles exist. Taking a
+//   handle never waits for an advance(): the join is lock-free and retries
+//   only after an advancer has
 //   published a new generation. ODR: the handle's layout depends on NDEBUG
 //   (the debug in-flight counter), so every translation unit of one program
 //   that names the handle type must agree on NDEBUG.
@@ -639,7 +668,14 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   ONE ADVANCER. advance() runs under the global try-flag `reclaiming_`:
 //   `exchange(true, acquire)` at entry (a caller that finds it set returns
 //   `contended` at once, every count 0) and `store(false, release)` at
-//   exit, on every path, by an RAII guard. Between successive advancers the
+//   exit, on every path, by an RAII guard. Reclamation is CALLER-DRIVEN:
+//   nothing is ever freed except by an advance() that some thread calls,
+//   with or without a handle of its own; no operation and no handle's
+//   leave frees anything. The flag is held for the whole call, so an
+//   advance() nested inside it -- from the hook, or from a Hash{} the walk
+//   calls -- returns `contended`; one nested in a Hash{} or operator== that
+//   an OPERATION calls is an ordinary call, and the operation's own handle
+//   pins the generation it closes. Between successive advancers the
 //   flag's acquire/release pair is the ONLY synchronization on the plain
 //   fields `state`, `gen`, the bag slots, `oldest_`, the dealing cursor,
 //   the bump's scratch and the steal hint's stamp counter, and it orders
@@ -693,10 +729,11 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   head load with acquire, one unlink attempt per dead run, never retried,
 //   UNINITIALIZED buckets skipped, no split and no allocation -- retiring
 //   what it bypasses onto the shard's retired lists of the generation that
-//   is current AFTER the publish. A walk retiree is therefore freed no
-//   earlier than the NEXT advance() (it is exchanged into a bag by the next
-//   call's A3 and freed by that call's free pass at the earliest): two
-//   clicks. A dead node still in a chain carries no generation and is
+//   is current AFTER the bump (after the publish, when there is one: a
+//   `nothing_retired` call publishes nothing). A walk retiree is therefore
+//   freed no earlier than the NEXT advance() (it is exchanged into a bag by
+//   the next call's A3 and freed by that call's free pass at the earliest):
+//   two clicks. A dead node still in a chain carries no generation and is
 //   visible to handles of EVERY live generation, which is why the walk can
 //   only make it unreachable with the one-shot unlink CAS every writer walk
 //   makes, never with a plain-store relink, and why the walk never touches
@@ -954,27 +991,39 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   long-lived handle refreshed before each advance(), a node retired
 //   between two calls is freed TWO calls after its retirement (the first
 //   closes its bag, which the refreshed handle still pins; the second frees
-//   it); with every handle released before each call, by the NEXT call; a
-//   straggler the walk of call k bypasses is freed by call k + 1.
+//   it); with every handle released before each call, by the NEXT call. A
+//   straggler the walk of call k bypasses is freed by call k + 1 with every
+//   handle released, and by call k + 2 under a handle refreshed before each
+//   call (call k + 1 bags it into the generation that handle pins).
 //
-//   TEST SEAMS. The `Hooks` template parameter names three static
-//   `noexcept` functions the set calls at fixed positions of the join and
-//   of advance() (see NoHooks for each): tests force the orderings the
-//   store-buffering argument depends on -- the join before its increment,
-//   the increment before its re-verify, operations between the publish and
-//   the free pass -- deterministically; the default NoHooks compiles to
-//   nothing, and no hook is on an operation path. A hook action may run
-//   complete operations and advance() on the same set (a nested advance()
-//   inside in_advance_after_publish() returns `contended`: the same thread
-//   holds the flag) but must not refresh, move or destroy the handle the
-//   interrupted join is creating or refreshing, nor throw, nor call the
-//   diagnostic sweep (get_internal_accounting() and everything derived from
-//   it), and inside in_advance_after_publish() -- or a join hook nested in
-//   it -- nor get_internal_generation(), get_internal_ring_state() or
-//   get_internal_bag_count(): each asserts the advancer flag clear and
-//   aborts (get_internal_handle_generation() of a live handle is fine
-//   anywhere). The get_internal_* accessors and the ASan poisoning are
-//   outside the operational contract as well.
+//   TEST SEAMS, outside the operational contract. Two kinds.
+//   The `Hooks` template parameter names three static `noexcept` functions
+//   the set calls at fixed positions of the join and of advance() (see
+//   NoHooks for each): tests force the interleavings the store-buffering
+//   argument depends on -- the join before its increment, the increment
+//   before its re-verify, operations between the publish and the free
+//   pass -- deterministically; the default NoHooks compiles to nothing, and
+//   no hook is on an operation path, in the destructor or in the sweep.
+//   The hooks are `noexcept`, so a hook action that throws terminates the
+//   program. A hook action may run complete operations and advance() on
+//   the same set (a nested advance() inside in_advance_after_publish()
+//   returns `contended`: the same thread holds the flag) but must not
+//   refresh, move or destroy the handle the interrupted join is creating or
+//   refreshing, nor call the diagnostic sweep (get_internal_accounting()
+//   and everything derived from it), and inside in_advance_after_publish()
+//   -- or a join hook nested in it -- nor get_internal_generation(),
+//   get_internal_ring_state() or get_internal_bag_count(): each asserts the
+//   advancer flag clear and aborts (get_internal_handle_generation() of a
+//   live handle is fine anywhere).
+//   The get_internal_* accessors (DIAGNOSTICS, before them) show the
+//   arena, the ring and the counters, each under its own precondition:
+//   RACE-FREE ones (counts, the table size, the counters) may run beside
+//   anything and are exact at a quiescent point; RING VIEWS need no
+//   advance() in progress; the QUIESCENT ones -- the accounting sweep and
+//   everything derived from it -- need no operation, no join attempt and no
+//   advance() in progress on any thread, every other call ordered against
+//   them by happens-before, live idle handles allowed.
+//
 //   ASAN POISONING. Under AddressSanitizer a node's VALUE bytes -- the
 //   extent [&value, &link) by address difference, never sizeof(T), which
 //   under ASan's 8-byte granularity would poison nothing for an int --
@@ -984,7 +1033,10 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   the slots. `link` and `retire_link` stay readable: the free list links
 //   through `link`, a losing popper reads it, and the sweep reads both. A
 //   read of a freed value through a stale address is then an ASan report
-//   instead of a silent wrong answer. A no-op without ASan.
+//   instead of a silent wrong answer, and the accounting sweep checks that
+//   every free node is poisoned exactly so (its C6). A no-op without ASan;
+//   a diagnostic that no contract promises. The header detects ASan itself
+//   (the nested test at the top of the file).
 //
 // STALE GEOMETRY: EVERY DECISION IS MADE ON ONE ATOMIC
 //   An operation picks its bucket from a table_size_ it loaded earlier; the
@@ -1216,7 +1268,7 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   before this call began" means the return happens-before the call (e.g. the
 //   caller synchronized), not wall-clock order.
 //
-// WEAK MEMORY (ARM, POWER): WHAT THIS DESIGN DOES AND DOES NOT RELY ON
+// WEAK MEMORY: WHAT THIS DESIGN DOES AND DOES NOT RELY ON
 //   The decisions above are atomic read-modify-writes of a single word, which
 //   are totally ordered with every other write of that word on every
 //   architecture. No correctness argument of the OPERATIONS has the
@@ -1227,10 +1279,16 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   shape is the handle join against the generation publish (THE JOIN under
 //   HANDLES AND GENERATIONS: joiner "+1 refs, then load current_" against
 //   advancer "store current_, then load refs"), and it is closed by seq_cst
-//   on all four operations, not by acquire/release; no store-buffering
-//   regression test of this directory covers that pair, so on a weakly
-//   ordered machine it rests on the standard's single total order of
-//   seq_cst operations, reasoned, not on an observed execution.
+//   on all four operations (the increment, the re-verify load, the publish
+//   store and the free pass's `refs` load), not by acquire/release. Store
+//   buffering is the one reordering x86 itself performs, so the pair needs
+//   its seq_cst on every architecture, x86 included. The directory's
+//   store-buffering regression test (concurrent_hash_set_rcu_tso_test.C)
+//   does NOT cover it: that test guards the operations' pair above (a
+//   bucket-head CAS against a resize), and the hook tests (TEST SEAMS)
+//   force interleavings of the join, never a reordering of its accesses.
+//   The pair rests on the standard's single total order of seq_cst
+//   operations, reasoned, not on an observed execution.
 //   What remains cross-variable is the read-side chain of channels 4 and 5
 //   (acquire word -> acquire table_size_). For a thread that meets a seal
 //   level above its own, or a FROZEN node for its key, it is used for
@@ -1291,17 +1349,22 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 // never waits for an advance(); advance() is non-blocking by REFUSAL (a
 // try-flag: a caller that finds it set returns `contended` at once, and
 // nothing ever waits for the holder); the free pass's push loops are
-// lock-free (each failure a completed pop of the same list); the free-list
-// pop is the lock-free loop it always was, now against concurrent pushes
-// (each failure a completed pop or push).
+// lock-free (each failure a completed pop of the same list, or a spurious
+// failure of the weak CAS); the free-list pop, the steal's included, is a
+// lock-free loop against concurrent pops and pushes (each failure a
+// completed pop or push of the same list, or a spurious failure).
 //
 // Template parameters:
 //   T           : element (key) type; must be copy-constructible (a new node
 //                 is constructed from the key), copy-assignable (a node
 //                 reused from a free list takes its new value by
 //                 assignment; see EXCEPTIONS for what a throwing assignment
-//                 must satisfy), and equality-comparable as `value == key`,
-//                 a stored T against a const T&, consistently with Hash:
+//                 must satisfy; no T is destroyed before the set's
+//                 destructor: LIFETIME OF VALUES), destructible without
+//                 throwing (the set's destructor, which is noexcept, destroys
+//                 every stored T), and
+//                 equality-comparable as `value == key`, a stored T against
+//                 a const T&, consistently with Hash:
 //                 keys that compare equal must hash equal, since an
 //                 operation looks for its key only in the bucket the key's
 //                 own hash selects.
@@ -2283,9 +2346,9 @@ private:
     // must synchronize with that push before it reads the top's `link` and
     // before it assigns the value. Head load ACQUIRE (REQUIRED: relaxed lets
     // this thread read the top's `link` before the pusher's store of it,
-    // and install a stale successor as the head -- the hazard the pop's
-    // old relaxed orders were immune to only because pushes were
-    // quiescent). CAS failure ACQUIRE (REQUIRED, same reason: the refreshed
+    // and install a stale successor as the head; relaxed would do only if
+    // no push could run concurrently with a pop, and the free pass's pushes
+    // do). CAS failure ACQUIRE (REQUIRED, same reason: the refreshed
     // head may be a later push's value, and the next pass reads that top's
     // `link`). CAS success ACQUIRE (EXPECTED-EQUIVALENT to relaxed: the
     // value consumed is the one the acquire load or the acquire failure
@@ -3210,8 +3273,8 @@ public:
     //     that did). get_internal_handle_generation(h) needs only a live h.
     //
     // Diagnostic accessor: total nodes ever appended to the arena (reachable,
-    // free, limbo and retired alike): the sum of the shards' sizes, exact at
-    // a quiescent point.
+    // free, limbo, retired and bagged alike): the sum of the shards' sizes,
+    // exact at a quiescent point.
     size_t get_internal_node_count() const {
         size_t n = 0;
         for (size_t i = 0; i <= arena_mask_; ++i) n += shards_[i].nodes.size();
@@ -3302,9 +3365,10 @@ public:
     // Diagnostic accounting sweep, quiescent only (see DIAGNOSTICS above):
     // where every arena slot is. `consistent` is true iff
     //   C1  every slot of every shard is reachable from a published bucket
-    //       head, on a free list, on a limbo list, or on a retired list,
-    //       exactly one of the four and exactly once, and no list or chain
-    //       contains an address that is not a slot;
+    //       head, on a free list, on a limbo list, on a retired list, or in
+    //       the bag of a SEALED generation, exactly one of the five and
+    //       exactly once, and no list, bag or chain contains an address that
+    //       is not a slot;
     //   C2  every reachable node that is dead by is_dead()'s quiescent rule
     //       is TAGGED (MARKED or FROZEN): a dead node with a live link would
     //       be a node a concurrent bypass can run through while another
@@ -3531,7 +3595,9 @@ public:
     // or references, so nothing obtained under a handle outlives a call:
     // a handle protects nothing between two calls. Thread rules: HANDLES
     // in the class overview (concurrent use in operations is fine;
-    // refresh, move-over and destruction are exclusive).
+    // refresh(), moving from the handle, move assignment over it, swap and
+    // destruction are exclusive with every other use of it, debug-asserted
+    // at each).
     class handle {
     public:
         // Postcondition: empty. nothrow.
@@ -3576,8 +3642,13 @@ public:
         // closed: safe, and merely conservative, it keeps that generation's
         // bag pinned until the next refresh). Returns true iff the handle
         // actually moved to a newer generation (false: it was already
-        // current and nothing changed). Releases the old generation for
-        // reclamation once no other handle pins it. Lock-free. nothrow.
+        // current and nothing changed). Conversely, after an advance() that
+        // returned `advanced` and happens-before the call, a handle of an
+        // older generation moves: the fast path's load then reads that
+        // publish or a later one (coherence), and the handle's own block
+        // cannot be CURRENT again while the handle pins it. Releases the
+        // old generation for reclamation once no other handle pins it.
+        // Allocates nothing. Lock-free. nothrow.
         //
         // The fast-path load is relaxed: it changes no membership, so it
         // has nothing to synchronize with. The only stale answer it can
@@ -3600,8 +3671,9 @@ public:
         } // handle::refresh()
 
         // Exchanges the sessions of two handles; either or both may be
-        // empty. Precondition: no operation in flight on either
-        // (debug-asserted). nothrow.
+        // empty, and a self-swap is a no-op (the handle keeps its session).
+        // Precondition: no operation in flight on either (debug-asserted).
+        // nothrow.
         void swap(handle& other) noexcept {
             assert(not_in_flight() && other.not_in_flight() && "handle swapped while an operation runs on it");
             std::swap(block_, other.block_);
@@ -3611,7 +3683,9 @@ public:
     private:
         friend class ConcurrentResizableHashSetRCU;
         // True iff no operation of the set is running under this handle;
-        // the precondition of refresh, move-over, swap and destruction. In
+        // the precondition of refresh(), of the source of a move
+        // construction, of either side of a move assignment or a swap, and
+        // of destruction. In
         // release builds nothing is counted, and the check is vacuous.
         bool not_in_flight() const noexcept {
 #ifndef NDEBUG
@@ -3863,7 +3937,12 @@ private:
     // tagged: a live node here means a run walk overshot its run, or a node
     // was retired on a lost CAS), and a bag never holds more nodes than the
     // arena has slots (a longer walk is a cycle from a double retirement,
-    // which would otherwise hang this loop). nothrow.
+    // which would otherwise hang this loop). Under ASan push_free() poisons
+    // each node's value bytes before it pushes the node (ASAN POISONING in
+    // the class overview), so every node a popper can win is poisoned until
+    // that popper unpoisons it; limbo nodes (never freed, or unpoisoned by
+    // the popper whose assignment threw) are poisoned here like retired
+    // ones, with no site of their own. nothrow.
     void free_oldest(AdvanceResult& result) noexcept {
         while (true) {   // free the oldest sealed bag while it is unpinned
             GenerationBlock& block = ring_[oldest_];
@@ -4051,8 +4130,11 @@ public:
     ConcurrentResizableHashSetRCU& operator=(const ConcurrentResizableHashSetRCU&) = delete;
 
     // Join the current generation and return a live handle for it. Const:
-    // a const set yields handles too. Postcondition: the handle is live and
-    // belongs to this set. Lock-free; never waits for an advance(). nothrow.
+    // a const set yields handles too. Precondition: the set is alive.
+    // Postcondition: the handle is live, belongs to this set, and its
+    // generation was current at some point during the call. Allocates
+    // nothing and touches no node, head or bag (J1). Lock-free; never waits
+    // for an advance(). nothrow.
     [[nodiscard]] handle new_handle() const noexcept {
         handle h;
         h.block_ = join();
@@ -4077,6 +4159,14 @@ public:
     // result is lost; the flag and the walk's handle are released on every
     // path. A thread that holds a handle should refresh or release it
     // before calling: its own handle pins the generation this call closes.
+    // Not [[nodiscard]]: calling on a cadence and ignoring the result is
+    // the normal use, and every refusal is retried by calling again. Cost,
+    // in kind, on the calling thread: the walk visits every published
+    // bucket and every node in it, for every outcome but `ring_full` and
+    // `contended` (a `nothing_retired` call walks the whole table too), and
+    // the free pass deals round-robin, so a bag of at least as many nodes as
+    // there are shards touches every shard's free line; the call is meant to be
+    // made rarely, on a cadence the caller chooses.
     //
     // FLOW (the steps are bump(), free_oldest() and walk(), each commented
     // at its definition; the per-thread timers of InternalTimers bracket

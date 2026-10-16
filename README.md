@@ -58,12 +58,14 @@ and documented on their own terms.
   list by a caller-driven `reclaim()`, and an iterator stays valid until the
   handle it was obtained under is destroyed, refreshed or move-assigned over.
 - **[ConcurrentHashRCU](ConcurrentHashRCU/)** — a copy of
-  `ConcurrentResizableHashSet` in which dead nodes (tombstones, superseded
-  split copies) are bypassed by the concurrent writers themselves, best
-  effort, one CAS per run (an erase tries its own tombstone at most twice),
-  instead of waiting in their chains for `reclaim()`; a lookup's own walk
-  still writes nothing, and memory still becomes reusable only through
-  `reclaim()`. The first step toward reclaiming it by generations.
+  `ConcurrentResizableHashSet` that reclaims memory by generations, without a
+  quiescent point: every operation runs under a handle; dead nodes
+  (tombstones, superseded split copies) are bypassed by the concurrent
+  writers themselves, best effort, one CAS per run (an erase tries its own
+  tombstone at most twice), while a lookup's own walk writes nothing;
+  and a caller-driven `advance()` recycles them through the free lists once
+  no handle can still see them, and walks the table for the dead nodes the
+  writers left behind.
 
 ## Building
 

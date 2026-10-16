@@ -178,6 +178,17 @@ static TsoResult run_tso_trials(long trials, int hammers) {
     };
 
     std::vector<std::unique_ptr<Set>> sets(BATCH);
+    // The handles of the batch's sets, handles[i] for sets[i], shared by every
+    // thread that operates on that set (R, A, the hammers and this thread:
+    // operations may share a handle). This thread creates them in the
+    // batch-build loop and releases each one there BEFORE sets[i] is replaced:
+    // in this NDEBUG build a live handle that outlived its set would corrupt
+    // memory silently. An NDEBUG operation touches nothing of its handle, so
+    // they add no memory access to a trial; nothing in the trial loop creates
+    // or refreshes one, since either is an RMW on a shared line and would drain
+    // the store buffer this test depends on. Declared after `sets`, so they are
+    // destroyed first.
+    std::vector<typename Set::handle> handles(BATCH);
     std::atomic<long> go{-1};      // index of the trial to run, -1 = none yet
     std::atomic<int> done{0};      // R and A each add 1 per trial
     std::atomic<bool> stop{false};
@@ -193,11 +204,11 @@ static TsoResult run_tso_trials(long trials, int hammers) {
             }
             seen = g;
             Set& set = *sets[g%BATCH];
-            set.insert(64);        // doubles 4 -> 8 (insert side) or 8 -> 16 (erase side)
+            set.insert(handles[g%BATCH], 64);        // doubles 4 -> 8 (insert side) or 8 -> 16 (erase side)
             if constexpr (EraseSide) {
-                set.contains(29);  // touches bucket 13, so R itself splits it from bucket 5
+                set.contains(handles[g%BATCH], 29);  // touches bucket 13, so R itself splits it from bucket 5
             } else {
-                set.contains(13);  // touches bucket 5, so R itself splits it from bucket 1
+                set.contains(handles[g%BATCH], 13);  // touches bucket 5, so R itself splits it from bucket 1
             }
             done.fetch_add(1);
         } // trial loop
@@ -220,9 +231,9 @@ static TsoResult run_tso_trials(long trials, int hammers) {
             for (volatile unsigned d = rng()%192u; d != 0; d = d - 1) {}
             bool won;
             if constexpr (EraseSide) {
-                won = set.erase(VICTIM);
+                won = set.erase(handles[g%BATCH], VICTIM);
             } else {
-                won = set.insert(VICTIM);
+                won = set.insert(handles[g%BATCH], VICTIM);
             }
             if (won) a_true.fetch_add(1, std::memory_order_relaxed);
             done.fetch_add(1);
@@ -232,7 +243,8 @@ static TsoResult run_tso_trials(long trials, int hammers) {
     // Quiescence handshake between the hammers and this thread (seq_cst on both
     // sides -- it IS a store-buffering pattern): a hammer clears idle[h] BEFORE
     // loading cur, and this thread stores cur = -1 and THEN waits for every
-    // idle[h], so no hammer is still holding a set that is about to be destroyed.
+    // idle[h], so no hammer is still holding a set (or its handle) that is about
+    // to be destroyed.
     std::atomic<long> cur{-1};
     std::vector<std::atomic<bool>> idle(hammers);
     for (std::atomic<bool>& f : idle) f.store(true);
@@ -248,7 +260,7 @@ static TsoResult run_tso_trials(long trials, int hammers) {
                 // that occurs here (4, 8, 16), which is never UNINITIALIZED, so a
                 // hammer splits nothing and touches no head the race involves: it
                 // only keeps the table_size_ line shared (a miss reads it twice).
-                if (g >= 0) sink += sets[g%BATCH]->contains(0) ? 1u : 0u;
+                if (g >= 0) sink += sets[g%BATCH]->contains(handles[g%BATCH], 0) ? 1u : 0u;
                 idle[h].store(true);
             } // hammer loop
             if (sink == ~size_t{0}) std::printf(" ");   // keep `sink` alive
@@ -261,10 +273,12 @@ static TsoResult run_tso_trials(long trials, int hammers) {
         cur.store(-1);
         for (int h = 0; h < hammers; ++h) { while (!idle[h].load()) {} }
         for (int i = 0; i < BATCH; ++i) {
+            handles[i] = {};                      // leave the previous batch's set before it is destroyed
             sets[i] = std::make_unique<Set>(4);   // insert side: left empty, R's insert doubles it
+            handles[i] = sets[i]->new_handle();
             if constexpr (EraseSide) {
-                sets[i]->insert(VICTIM);     // bucket 1; the set's first insert: doubles 4 -> 8
-                sets[i]->contains(VICTIM);   // publishes bucket 5, a copy of the victim in it
+                sets[i]->insert(handles[i], VICTIM);     // bucket 1; the set's first insert: doubles 4 -> 8
+                sets[i]->contains(handles[i], VICTIM);   // publishes bucket 5, a copy of the victim in it
             }
         } // build the batch
         for (int i = 0; i < BATCH; ++i) {
@@ -279,7 +293,7 @@ static TsoResult run_tso_trials(long trials, int hammers) {
         for (int i = 0; i < BATCH; ++i) {
             // Insert side: A's insert(5) returned true, so 5 must be a member.
             // Erase side: A's erase(13) returned true, so 13 must NOT be a member.
-            const bool present = sets[i]->contains(VICTIM);
+            const bool present = sets[i]->contains(handles[i], VICTIM);
             if (EraseSide ? present : !present) ++out.lost;
         } // score the batch
     } // batches

@@ -22,16 +22,20 @@
 // SOFTWARE.
 //
 #include <benchmark/benchmark.h>
+#include <algorithm>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <unistd.h>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <mutex>
 #include <shared_mutex>
+#include <type_traits>
 #include <unordered_set>
+#include <vector>
 #include "concurrent_hash_set_rcu.h"
 #include "gb_wall_clock.h"      // WallRecords, WallTimed, report_wall() (../Spinlock)
 
@@ -116,9 +120,24 @@
  * items_per_second overstates the throughput by more the less evenly the
  * threads progress; the wall rate is the throughput the run delivered.
  *
+ * RECLAMATION. Every operation of this container runs under a handle, and
+ * nodes that erases and splits retire are made reusable only by advance(),
+ * which the caller runs (the header's HANDLES AND GENERATIONS): it closes the
+ * current generation's retired nodes into a bag, frees every bag no live
+ * handle can observe onto the free lists, and walks every published chain,
+ * unlinking the dead nodes it passes. In every row but the ones named next,
+ * each thread has one long-lived handle, never refreshed, and nothing in the
+ * timed region calls advance() (see ThreadHandles). The rows whose names end
+ * in _Rcu run under the RECLAMATION REGIME: advance() is called from inside
+ * the timed loop -- once per thread at its end, or by one thread at a cadence
+ * while every thread refreshes its handle each iteration -- and the rows
+ * report what the calls did and what they cost (see AdvanceTally). The
+ * Advance_ rows measure advance() alone, one thread, nothing else running.
+ *
  * Table of contents: every registration, in the order of the file, each run
  * at the thread counts of ThreadRange(1, num_cpu) (one row per thread count,
- * all rows of a registration the same workload), with why it is measured. The
+ * all rows of a registration the same workload) except the Advance_ rows (one
+ * thread, one row per geometry), with why it is measured. The
  * details are at each definition; the churn states (Control, Reclaimed,
  * Erased) are described above the ChurnFixture. A bucket count chosen so that
  * a table does not resize holds only up to some thread count: the pre-sized
@@ -147,6 +166,10 @@
  *                                 readers pay for coexisting with writers.
  *  Lookup_MostlyOld_RWLocked      the same on the baseline: the RMW every
  *                                 reader pays to be visible to a rehash.
+ *  Lookup_MostlyOld_OpHandle      the lookup workload with a handle taken and
+ *                                 released around every operation, where
+ *                                 _Concurrent keeps one per thread: what a
+ *                                 handle costs when it is not long-lived.
  *  Insert_MostlyNew_Del           the growth inserts on an EMPTY AllowDelete
  *                                 set: against _Concurrent, whether compiling
  *                                 erase() in costs the insert path anything.
@@ -154,8 +177,8 @@
  *                                 and empty free lists: a resident population
  *                                 with every allocation an append.
  *  Insert_MostlyNew_Del_Reclaimed the same population reached by churn and
- *                                 reclaim(): inserts that pop freed slots in a
- *                                 table the larger prefill grew further --
+ *                                 one advance(): inserts that pop freed slots
+ *                                 in a table the larger prefill grew further --
  *                                 "churn, then growth", not an allocator cell.
  *  Insert_MostlyNew_Presized_Del  the pre-sized inserts on an EMPTY
  *                                 AllowDelete set: erase() compiled in, the
@@ -164,11 +187,12 @@
  *                                 prefilled, no churn, the same buckets as the
  *                                 next two: the control for the free lists.
  *  Insert_MostlyNew_Presized_Del_Reclaimed
- *                                 churn and reclaim() at fixed geometry: the
- *                                 free-list pop path and the locality of the
- *                                 popped slots, the controlled allocator cell.
+ *                                 churn and one advance() at fixed geometry:
+ *                                 the free-list pop path and the locality of
+ *                                 the popped slots, the controlled allocator
+ *                                 cell.
  *  Insert_MostlyNew_Presized_Del_Erased
- *                                 churn without reclaim(): inserts whose scans
+ *                                 churn without advance(): inserts whose scans
  *                                 walk chains the erases already unlinked
  *                                 from; what eager unlinking buys a writer.
  *  Lookup_MostlyOld_Del           the lookup workload on the AllowDelete set:
@@ -176,8 +200,9 @@
  *                                 the read path.
  *  Lookup_MostlyOld_Del_Control   the same prefill through the churn fixture:
  *                                 a check of the fixture against _Del.
- *  Lookup_MostlyOld_Del_Reclaimed the misses walk chains reclaim() relinked
- *                                 and the trickle inserts pop freed slots.
+ *  Lookup_MostlyOld_Del_Reclaimed the misses walk chains the victims were
+ *                                 unlinked from, and the trickle inserts pop
+ *                                 the slots advance() freed.
  *  Lookup_MostlyOld_Del_Erased    the misses walk chains the erases unlinked
  *                                 from, nothing reclaimed: what eager
  *                                 unlinking buys a reader.
@@ -185,12 +210,50 @@
  *                                 thread: what eager unlinking costs the
  *                                 eraser, and the share of erases that
  *                                 retired their own node.
+ *  Erase_Presized_Del_Rcu         the same erases, and each thread releases
+ *                                 its handle and calls advance() once, after
+ *                                 its last erase, inside the timed region:
+ *                                 against Erase_Presized_Del, one advance()
+ *                                 per thread at a geometry where one walk of
+ *                                 the table takes longer than the erases; at
+ *                                 one thread the call frees every erased
+ *                                 node, at more it bumps and walks and
+ *                                 usually frees nothing (see the row).
+ *  Erase_Small_Del                timed erase() on a small pre-sized table,
+ *                                 the same keys erased over the run whatever
+ *                                 the thread count (every prefilled key when
+ *                                 the thread count divides their number): the
+ *                                 control of the next row.
+ *  Erase_Small_Del_Rcu            the same erases under the reclamation
+ *                                 regime (one advance() per
+ *                                 kSmallAdvanceEvery erases of the run, four
+ *                                 per run at every thread count, every call
+ *                                 but the first freeing a bag): the erase
+ *                                 cost under reclamation, on a table whose
+ *                                 walk is short in absolute terms.
+ *  Churn_Window_Del_NoReclaim     steady churn: every thread slides a window
+ *                                 of live keys (erase the oldest, insert the
+ *                                 next, two lookups), nothing reclaimed, so
+ *                                 every insert appends and the table grows.
+ *  Churn_Window_Del_Rcu           the same under the reclamation regime: the
+ *                                 only row in which the free pass pushes
+ *                                 freed nodes while other threads pop them.
  *  InsertHotGrowth_Concurrent     growth on a few hot chains, split while the
  *                                 threads still prepend to them: the cleanup
  *                                 pass's lost CASes and the stragglers they
  *                                 leave, counted; the throughput is not the
  *                                 point.
  *  InsertHotGrowth_Del            the same probe with erase() compiled in.
+ *  Advance_FreePass_*             advance() alone: the bump and the free pass
+ *                                 per freed node, warm and cold, the nodes in
+ *                                 arena order and shuffled; the source of the
+ *                                 free pass's cost per node.
+ *  Advance_Walk_*                 advance() alone: the walk over pre-sized
+ *                                 tables whose prefill retired nothing (one
+ *                                 variant retires one key per call), per
+ *                                 bucket and per node passed; the source
+ *                                 of the walk's cost, from which the _Rcu
+ *                                 rows' cadences are chosen.
  */
 
 static const int num_cpu = sysconf(_SC_NPROCESSORS_CONF);
@@ -253,14 +316,20 @@ public:
     // The second parameter mirrors ConcurrentResizableHashSetRCU's arena_shards so
     // the fixtures can construct both containers the same way; it is ignored.
     explicit LockedHashSet(size_t initial_buckets = 1024, size_t /*arena_shards*/ = 0) : set_(initial_buckets) {}
+    // Mirrors the concurrent set's handle, the first argument of each of its
+    // operations, so that the fixtures and the bodies compile over both
+    // containers: the baseline needs none, so its handle is an empty type,
+    // new_handle() returns one, and the operations ignore it.
+    struct handle {};
+    handle new_handle() const noexcept { return {}; }
     // Mirrors the concurrent set's diagnostic accessor for the arena_nodes_per_key
     // counter: the baseline has one node per key, so this is the key count.
     size_t get_internal_node_count() const { return set_.size(); }
-    bool insert(const T& v) {
+    bool insert(const handle& /*h*/, const T& v) {
         std::unique_lock lock(mtx_);
         return set_.insert(v).second;
     }
-    bool contains(const T& v) const {
+    bool contains(const handle& /*h*/, const T& v) const {
         std::shared_lock lock(mtx_);              // <-- the RMW every reader pays
         return set_.find(v) != set_.end();
     }
@@ -270,6 +339,232 @@ using ConcurrentSet = ConcurrentResizableHashSetRCU<int, false, std::hash<int>>;
 using LockedSet     = LockedHashSet<int, std::hash<int>>;
 
 // ---------------------------------------------------------------------------
+// The benchmark threads' handles.
+//
+// Every operation of ConcurrentResizableHashSetRCU runs under a handle. Each
+// fixture keeps one per thread of a run: thread 0 creates them all at the END
+// of its SetUp(), after every prep step -- any handle the prep itself used is
+// released before the prep's advance(), and the threads' handles are created
+// after it, so that it runs with no handle alive -- and each thread uses its
+// own only INSIDE the state loop, whose start is a barrier: the happens-before
+// edge a handle created on one thread needs before another thread uses it (see
+// the CAUTION below). Only the rows that call advance() (the _Rcu rows) touch
+// a handle inside the timed loop beyond using it: a thread refreshes it at the
+// top of every iteration in the rows with a cadence (Own::refresh()), and
+// releases it on its own LAST iteration (Own::finish_iteration(); Google
+// Benchmark runs every thread for exactly state.max_iterations iterations), so
+// that a thread that has finished and waits at the loop's end barrier pins no
+// generation of the set for the threads still advancing. In every other row no
+// advance() runs while the handles are live (a *_Reclaimed prep runs its one
+// before they are made), so a live idle handle pins nothing anyone measures,
+// and the timed loop carries no handle bookkeeping: the handles stay live
+// until thread 0's TearDown() destroys them (the leave), before it deletes the
+// set -- a live handle must not outlive its set. Not released by each thread
+// after its loop: the code after the state loop runs concurrently with thread
+// 0's TearDown(), so a late release could reach a set already deleted. Each
+// handle sits on its own 128-byte block, since a release or a refresh writes
+// its thread's handle and handles packed into one line would false-share.
+// ---------------------------------------------------------------------------
+template <typename SetType>
+class ThreadHandles {
+public:
+    using Handle = typename SetType::handle;
+
+    // Thread 0 only, at the end of SetUp(): one handle of `set` per thread of
+    // the run, indexed by thread_index().
+    void make(const SetType& set, int threads) {
+        recs_ = std::vector<Rec>(threads);
+        for (Rec& rec : recs_) rec.h = set.new_handle();
+    } // ThreadHandles::make()
+
+    // Thread 0 only, in TearDown(), before the set is deleted: destroys every
+    // handle; in the rows without advance() this is the leave of each thread's
+    // live handle, in the _Rcu rows each was released on its thread's last
+    // iteration.
+    void clear() { recs_.clear(); }
+
+    // One thread's use of its handle, a local of the body. Trivially
+    // destructible (asserted below), so no destructor is live across the
+    // state loop (see the note above the benchmark bodies). Constructed
+    // before the loop, it reads nothing of the handles there.
+    class Own {
+    public:
+        Own(ThreadHandles& handles, const benchmark::State& state)
+            : handles_(handles), thread_(state.thread_index()), last_(state.max_iterations) {}
+        // The thread's handle. Inside the state loop only, and not after
+        // finish_iteration() has released it.
+        const Handle& get() const { return handles_.recs_[thread_].h; }
+        // The rows with an advance() cadence, at the top of every
+        // iteration: moves the handle to the set's current generation if an
+        // advance() has published a newer one since (handle::refresh(): a
+        // relaxed load and a compare when nothing changed), so that the
+        // handle pins the generation of the operation it is about to run and
+        // no older one. Inside the state loop only, before
+        // finish_iteration() has released the handle.
+        void refresh() { (void)handles_.recs_[thread_].h.refresh(); }
+        // The _Rcu rows only, at the end of every iteration; on the thread's
+        // last iteration it releases the handle and returns true (false on
+        // every other iteration), so that a row can act after the release
+        // (see Erase_Presized_Del_Rcu).
+        bool finish_iteration() {
+            if (++done_ == last_) [[unlikely]] {
+                handles_.recs_[thread_].h = Handle{};
+                return true;
+            }
+            return false;
+        } // ThreadHandles::Own::finish_iteration()
+    private:
+        ThreadHandles& handles_;                  // the fixture's handles
+        const int thread_;                        // this thread's index in the run
+        const benchmark::IterationCount last_;    // the iterations this thread runs (state.max_iterations)
+        benchmark::IterationCount done_ = 0;      // iterations finished so far
+    }; // class ThreadHandles::Own
+    static_assert(std::is_trivially_destructible_v<Own>, "a body local with a destructor would be live across the state loop");
+
+private:
+    // One thread's handle on its own 128-byte block (see above).
+    struct alignas(128) Rec {
+        Handle h;   // the thread's handle: joined by thread 0 in SetUp(); released on the thread's last iteration in the _Rcu rows, by thread 0's TearDown() otherwise
+    }; // struct Rec
+    std::vector<Rec> recs_;   // one per thread of the run; built by make(), destroyed by clear()
+}; // class ThreadHandles
+
+// ---------------------------------------------------------------------------
+// One thread's advance() calls in a timed row.
+//
+// The rows under the reclamation regime call advance() from inside their
+// timed loops. What a call did is in its AdvanceResult; what it cost is in
+// the CALLING thread's own timers (the set's internal_advance_timers(), one
+// set of accumulators per thread, so a thread is charged for its own calls
+// only). An AdvanceTally, a local of the body, zeroes this thread's timers
+// when it is constructed (before the loop: the timers accumulate over the
+// thread's life, and Google Benchmark's thread 0 is the main thread, which
+// ran the fixtures' prep and other rows), counts the results inside the loop
+// (add()) and sets the counters after it (report()). A row that calls
+// advance() at a cadence constructs it with that cadence and asks due() after
+// each erase: ONE thread of the row, thread 0, calls advance(), after every
+// `every` of its own erases, while every thread refreshes its handle. One
+// advancer, because advance() runs one call at a time: with every thread
+// calling at a cadence of its own erases, the calls collide (all but one find
+// the flag held and do nothing) and the number of walks per run changes with
+// the thread count; with one advancer it does not, for the same per-thread
+// work. Every counter is set by every thread and summed over the threads by
+// Google Benchmark, so each is a total for the row:
+//   advance_calls      calls made;
+//   advanced, nothing_retired, contended, ring_full
+//                      their outcomes (AdvanceResult::Advance): `contended`
+//                      did nothing (another thread's call held the flag, and
+//                      the call is not retried), `ring_full` freed what it
+//                      could and did not walk;
+//   freed_nodes, walk_retired, buckets_walked, nodes_passed
+//                      the AdvanceResult counts, summed;
+//   advance_ns, bump_ns, free_ns, walk_ns
+//                      the time spent in the calls, whole and by step (the
+//                      bump, the free pass after it, the walk), in ns;
+//   advance_share, walk_share
+//                      advance_ns and walk_ns over the summed loop time of the
+//                      threads (a per-thread time in seconds with
+//                      kAvgThreadsRate: Google Benchmark divides the sum over
+//                      the threads by the thread count and by the mean loop
+//                      time). With one advancer, walk_share is that thread's
+//                      walk time over every thread's loop time, and the
+//                      advancer finishes last (finish_spread). Ratios: the
+//                      console prints them with the "/s" it gives every rate
+//                      counter;
+//   advance_every      the cadence: thread 0's erases between two calls (rows
+//                      with a cadence only).
+// Trivially destructible, like ThreadHandles::Own.
+// ---------------------------------------------------------------------------
+template <typename SetType>
+class AdvanceTally {
+public:
+    // A row without a cadence (due() is never called).
+    AdvanceTally() : AdvanceTally(0, int64_t{0}) {}
+    // A row with a cadence, for the thread of `state`: thread 0, the row's
+    // one advancer, is due to call advance() after every `every` (> 0) of its
+    // own erases; on every other thread due() is never true.
+    AdvanceTally(int every, const benchmark::State& state)
+        : AdvanceTally(every, state.thread_index() == 0 ? int64_t{every} : std::numeric_limits<int64_t>::max()) {}
+
+    // Inside the loop, after each of the thread's erases, in a row with a
+    // cadence: true on every every-th call, when the thread is to call
+    // advance(). A countdown, so the test is a decrement and a compare.
+    bool due() {
+        if (--countdown_ != 0) return false;
+        countdown_ = every_;
+        return true;
+    } // AdvanceTally::due()
+
+    // Inside the loop: one call's result.
+    void add(const AdvanceResult& r) {
+        ++calls_;
+        switch (r.advance) {
+        case AdvanceResult::Advance::advanced:        ++advanced_; break;
+        case AdvanceResult::Advance::nothing_retired: ++nothing_retired_; break;
+        case AdvanceResult::Advance::contended:       ++contended_; break;
+        case AdvanceResult::Advance::ring_full:       ++ring_full_; break;
+        } // switch on the outcome
+        freed_nodes_ += r.freed_nodes;
+        walk_retired_ += r.walk_retired;
+        buckets_walked_ += r.buckets_walked;
+        nodes_passed_ += r.nodes_passed;
+    } // AdvanceTally::add()
+
+    // After the loop, on every thread: this thread's counts and timers as the
+    // counters listed above.
+    void report(benchmark::State& state) const {
+        const typename SetType::InternalTimers& t = SetType::internal_advance_timers();
+        state.counters["advance_calls"]   = benchmark::Counter(double(calls_));
+        state.counters["advanced"]        = benchmark::Counter(double(advanced_));
+        state.counters["nothing_retired"] = benchmark::Counter(double(nothing_retired_));
+        state.counters["contended"]       = benchmark::Counter(double(contended_));
+        state.counters["ring_full"]       = benchmark::Counter(double(ring_full_));
+        state.counters["freed_nodes"]     = benchmark::Counter(double(freed_nodes_));
+        state.counters["walk_retired"]    = benchmark::Counter(double(walk_retired_));
+        state.counters["buckets_walked"]  = benchmark::Counter(double(buckets_walked_));
+        state.counters["nodes_passed"]    = benchmark::Counter(double(nodes_passed_));
+        state.counters["advance_ns"]      = benchmark::Counter(double(t.advance_ns));
+        state.counters["bump_ns"]         = benchmark::Counter(double(t.bump_ns));
+        state.counters["free_ns"]         = benchmark::Counter(double(t.free_ns));
+        state.counters["walk_ns"]         = benchmark::Counter(double(t.walk_ns));
+        state.counters["advance_share"]   = benchmark::Counter(double(t.advance_ns)*1e-9, benchmark::Counter::kAvgThreadsRate);
+        state.counters["walk_share"]      = benchmark::Counter(double(t.walk_ns)*1e-9, benchmark::Counter::kAvgThreadsRate);
+        if (every_ != 0) state.counters["advance_every"] = benchmark::Counter(double(every_), benchmark::Counter::kAvgThreads);
+    } // AdvanceTally::report()
+
+private:
+    // The two public constructors' common part: the cadence, the erases until
+    // the first call, and this thread's timers zeroed.
+    AdvanceTally(int every, int64_t countdown) : every_(every), countdown_(countdown) {
+        SetType::internal_advance_timers() = {0, 0, 0, 0};
+    } // AdvanceTally::AdvanceTally(every, countdown)
+
+    const int every_;              // the cadence: thread 0 calls after every every_ of its erases; 0 = no cadence
+    int64_t countdown_;            // erases left until the next call (rows with a cadence; never reaches 0 off thread 0)
+    int64_t calls_ = 0;            // advance() calls
+    int64_t advanced_ = 0;         // of those, by outcome
+    int64_t nothing_retired_ = 0;
+    int64_t contended_ = 0;
+    int64_t ring_full_ = 0;
+    size_t freed_nodes_ = 0;       // AdvanceResult counts, summed over the calls
+    size_t walk_retired_ = 0;
+    size_t buckets_walked_ = 0;
+    size_t nodes_passed_ = 0;
+}; // class AdvanceTally
+
+// The cadence of advance() in a row that has one (each such row says what its
+// cadence counts): the row's value `registered`, unless the environment
+// variable `name` sets another (a positive integer; anything else means the
+// default). Exists so that one binary can be calibrated and re-run at other
+// cadences; every such row reports thread 0's cadence, the one it ran with,
+// as the counter advance_every.
+static int advance_every_from_env(const char* name, int registered) {
+    const char* s = getenv(name);
+    const long n = s ? atol(s) : 0;
+    return n > 0 && n <= (1L << 30) ? int(n) : registered;
+} // advance_every_from_env()
+
+// ---------------------------------------------------------------------------
 // Fixtures.
 //
 // CAUTION: Google Benchmark runs SetUp() per thread with NO implicit barrier
@@ -277,20 +572,27 @@ using LockedSet     = LockedHashSet<int, std::hash<int>>;
 // barrier is the benchmark loop itself. Therefore: thread 0
 // creates (and, for MostlyOld, prefills) the container in its SetUp(), and no
 // thread dereferences `set` anywhere except INSIDE the loop (or after it, once
-// the loop's end barrier has been crossed).
+// the loop's end barrier has been crossed). The same holds for the threads'
+// handles, `handles` (ThreadHandles above), which thread 0 creates last.
 // ---------------------------------------------------------------------------
 template <typename SetType>
 class MostlyNewFixture : public benchmark::Fixture {
 public:
     static SetType* set;
+    using Handles = ThreadHandles<SetType>;
+    static Handles handles;   // the threads' handles (ThreadHandles above)
     void SetUp(const ::benchmark::State& state) override {
-        if (state.thread_index() == 0) set = new SetType(1024, arena_shards_from_env());
+        if (state.thread_index() == 0) {
+            set = new SetType(1024, arena_shards_from_env());
+            handles.make(*set, state.threads());
+        }
     }
     void TearDown(const ::benchmark::State& state) override {
-        if (state.thread_index() == 0) { delete set; set = nullptr; }
+        if (state.thread_index() == 0) { handles.clear(); delete set; set = nullptr; }
     }
 }; // class MostlyNewFixture
 template <typename SetType> SetType* MostlyNewFixture<SetType>::set = nullptr;
+template <typename SetType> ThreadHandles<SetType> MostlyNewFixture<SetType>::handles;
 
 // The same insert workload into a table constructed with kPresizedBuckets
 // buckets, so that no doubling and no lazy split happens until the arena holds
@@ -305,19 +607,27 @@ template <typename SetType>
 class MostlyNewPresizedFixture : public benchmark::Fixture {
 public:
     static SetType* set;
+    using Handles = ThreadHandles<SetType>;
+    static Handles handles;   // the threads' handles (ThreadHandles above)
     void SetUp(const ::benchmark::State& state) override {
-        if (state.thread_index() == 0) set = new SetType(kPresizedBuckets, arena_shards_from_env());
+        if (state.thread_index() == 0) {
+            set = new SetType(kPresizedBuckets, arena_shards_from_env());
+            handles.make(*set, state.threads());
+        }
     }
     void TearDown(const ::benchmark::State& state) override {
-        if (state.thread_index() == 0) { delete set; set = nullptr; }
+        if (state.thread_index() == 0) { handles.clear(); delete set; set = nullptr; }
     }
 }; // class MostlyNewPresizedFixture
 template <typename SetType> SetType* MostlyNewPresizedFixture<SetType>::set = nullptr;
+template <typename SetType> ThreadHandles<SetType> MostlyNewPresizedFixture<SetType>::handles;
 
 template <typename SetType>
 class MostlyOldFixture : public benchmark::Fixture {
 public:
     static SetType* set;
+    using Handles = ThreadHandles<SetType>;
+    static Handles handles;   // the threads' handles (ThreadHandles above)
     void SetUp(const ::benchmark::State& state) override {
         if (state.thread_index() == 0) {
             /*
@@ -344,28 +654,38 @@ public:
              * its own benchmark; it has no business inside a mean.
              */
             set = new SetType(2*kPrefill, arena_shards_from_env());
-            for (int k = 0; k < kPrefill; ++k) set->insert(mix(k));   // untimed
+            {   // the prefill's own handle, released before the threads' handles are made
+                const typename SetType::handle h = set->new_handle();
+                for (int k = 0; k < kPrefill; ++k) set->insert(h, mix(k));   // untimed
+            }
+            handles.make(*set, state.threads());
         }
     }
     void TearDown(const ::benchmark::State& state) override {
-        if (state.thread_index() == 0) { delete set; set = nullptr; }
+        if (state.thread_index() == 0) { handles.clear(); delete set; set = nullptr; }
     }
 }; // class MostlyOldFixture
 template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
+template <typename SetType> ThreadHandles<SetType> MostlyOldFixture<SetType>::handles;
 
 // ---------------------------------------------------------------------------
 // Benchmark bodies (as macros, so each container gets an identical body).
 //
 // Each body keeps its own wall-clock records, a function-local static (one per
-// instantiation), rather than one per fixture: one placement then serves all
-// four fixture types (MostlyNewFixture, MostlyNewPresizedFixture,
-// MostlyOldFixture, ChurnFixture). The calls follow
+// instantiation), rather than one per fixture: one placement then serves
+// every fixture type the macro is used on. The calls follow
 // gb_wall_clock.h's contract: allocate() before the loop and, after it,
 // report_wall() then release(), each called on every thread and doing its work
 // on thread 0 alone; state.iterations() is read only after the loop, and the
 // per-thread SkipWithError() is called after the loop, never inside it. No
 // object with a destructor is live across the loop: its cleanup region can
-// change the loop's code.
+// change the loop's code. Each operation runs under the thread's own handle,
+// through the trivially destructible ThreadHandles::Own, and these bodies do
+// nothing else with it (no row they define calls advance() while the
+// handles are live: ThreadHandles says why the handles then stay live until
+// TearDown()), except in Lookup_MostlyOld_OpHandle, where each operation
+// takes a handle of its own (the thread's handle is still made and
+// destroyed, unused).
 // ---------------------------------------------------------------------------
 
 /*
@@ -381,9 +701,10 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
         const int base = state.thread_index()*kKeyStride;                     \
         int next = 0;                                                         \
         int64_t ok = 0;                                                       \
+        Handles::Own own(handles, state);                                     \
         records.allocate(state);                                              \
         for (auto _ : WallTimed(state, records)) {                            \
-            ok += set->insert(mix(base + next++));                            \
+            ok += set->insert(own.get(), mix(base + next++));                 \
         }                                                                     \
         if (ok != state.iterations()) {                                       \
             state.SkipWithError("insert() returned false for a unique key "   \
@@ -412,9 +733,15 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
  * brand-new keys on a deterministic schedule. New keys live above the lookup
  * range, so the workload composition is constant for the whole run.
  * Invariant checked per thread: every insert() returned true.
+ * HANDLE is the expression each operation is called with as its handle: the
+ * thread's own long-lived handle, own.get(), in every row but one;
+ * set->new_handle() in Lookup_MostlyOld_OpHandle, a temporary handle that
+ * joins the current generation before the operation and leaves it when the
+ * operation's full expression ends.
  */
 #define DEFINE_MOSTLY_OLD(NAME, SET_TYPE) DEFINE_MOSTLY_OLD_ON(MostlyOldFixture, NAME, SET_TYPE)
-#define DEFINE_MOSTLY_OLD_ON(FIXTURE, NAME, SET_TYPE)                         \
+#define DEFINE_MOSTLY_OLD_ON(FIXTURE, NAME, SET_TYPE) DEFINE_MOSTLY_OLD_UNDER(FIXTURE, NAME, SET_TYPE, own.get())
+#define DEFINE_MOSTLY_OLD_UNDER(FIXTURE, NAME, SET_TYPE, HANDLE)              \
     BENCHMARK_TEMPLATE_DEFINE_F(FIXTURE, NAME, SET_TYPE)                      \
     (benchmark::State& state) {                                               \
         static constinit WallRecords records;                                 \
@@ -424,14 +751,16 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
         int op = 0;                                                           \
         int64_t ok = 0, tries = 0;                                            \
         bool hit = false;                                                     \
+        Handles::Own own(handles, state);                                     \
         records.allocate(state);                                              \
         for (auto _ : WallTimed(state, records)) {                            \
             if (++op == kInsertEvery) {                                       \
                 op = 0;                                                       \
                 ++tries;                                                      \
-                ok += set->insert(mix(base + next++));                        \
+                ok += set->insert(HANDLE, mix(base + next++));                \
             } else {                                                          \
-                hit = set->contains(mix((int)(rng.next() & kLookupMask)));    \
+                hit = set->contains(HANDLE,                                   \
+                                    mix((int)(rng.next() & kLookupMask)));    \
                 benchmark::DoNotOptimize(hit);                                \
             }                                                                 \
         }                                                                     \
@@ -465,52 +794,61 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
 //                    erase() in costs nothing on those paths.
 //   *_Del_Control    the same workload on a set PREFILLED (untimed, by thread 0)
 //                    with a population of live keys and nothing else: no erase,
-//                    no reclaim(), every free list empty, so every allocation
+//                    no advance(), every free list empty, so every allocation
 //                    in the timed region APPENDS to a deque.
 //   *_Del_Reclaimed  the same workload on a set that reached the same live
 //                    population by CHURN: twice as many keys were inserted,
 //                    interleaved (survivor, victim, survivor, victim, ... in
-//                    arena order), every victim was erased, and reclaim() ran.
-//                    The live keys and the timed workload are those of the
-//                    Control; what differs is the state of the arena: the
-//                    victims' slots (and, in the growth fixture, the split
-//                    copies the prefill made) sit on the shards' free lists,
-//                    dealt round-robin, and the survivors occupy every other
-//                    slot of the deque blocks thread 0 filled. The timed
-//                    allocations POP from the calling thread's shard's list
-//                    until it is empty and then append -- the mixed regime.
+//                    arena order), every victim was erased, and then, with no
+//                    handle live, one advance() ran: it closed every retired
+//                    node into a bag and, since no handle pinned the bag,
+//                    freed it in the same call. The live keys and the timed
+//                    workload are those of the Control; what differs is the
+//                    state of the arena: the victims' slots (and, in the
+//                    growth fixture, the split copies the prefill superseded)
+//                    sit on the shards' free lists, dealt round-robin, and the
+//                    survivors occupy every other slot of the deque blocks
+//                    thread 0 filled. The timed allocations POP from the
+//                    calling thread's shard's list, then from the other
+//                    shards' lists, and append once every list is empty --
+//                    the mixed regime (see below).
 //   *_Del_Erased     (pre-sized insert and lookup only) the same churn without
-//                    the reclaim(): the victims are erased and the timed
+//                    the advance(): the victims are erased and the timed
 //                    workload starts right after. It is the only state of the
 //                    set that erases built: in this container each erase()
 //                    unlinked its own node at once and retired it, so the
 //                    timed walks find chains of live nodes only, where a
-//                    container that leaves tombstones in place until reclaim()
-//                    walks past every one of them. The free lists are empty, as
-//                    in the Control. Why measure: this is what eager unlinking
-//                    buys a reader and a writer; Erase_Presized_Del below
-//                    measures what it costs the eraser.
+//                    container that leaves tombstones in place until a
+//                    collector runs walks past every one of them. The free
+//                    lists are empty, as in the Control. Why measure: this is
+//                    what eager unlinking buys a reader and a writer;
+//                    Erase_Presized_Del below measures what it costs the
+//                    eraser.
 //
 // Control vs Del separates "a resident population" from "AllowDelete"; Reclaimed
 // vs Control is the free lists in use: the pop path in alloc_node() (one CAS on
-// the shard's free head instead of the deque's lock and cursor) and the locality
+// a shard's free head instead of the deque's lock and cursor) and the locality
 // of the popped slots; Erased vs Control is the dead nodes the erases left (or,
-// here, did not leave) in the chains. reclaim() deals the freed nodes
-// round-robin over the shards in the order it finds them -- the limbo lists
-// first, then the retired lists, then the dead nodes its walk over the buckets
-// unlinks -- and each free list is LIFO, so a shard pops them in reverse dealing
-// order. In this container the prefill's erases unlink and retire every victim
-// themselves, onto thread 0's retired list, which is LIFO too: reclaim() deals
-// the victims in reverse erase order, so each shard pops its share in erase
-// order, i.e. in arena order, every 2*shards-th slot in the pre-sized and lookup
-// fixtures (survivors and victims alternate in the arena; in the growth fixture
-// the split copies interleave with them, and the superseded copies are retired
-// in split order). Popped slots are therefore at least 2*shards*sizeof(Node)
-// bytes apart, a new cache line per popped node at any shard count above one,
-// where an append fills a line with two or three consecutive 24-byte nodes. Why
-// measure: the free lists are the point of reclaim(), and these are the only
-// cells that measure an insert that reuses a slot, or a lookup over chains that
-// reclaim() relinked.
+// here, did not leave) in the chains. advance()'s free pass deals the freed
+// nodes round-robin over the shards, from shard 0 on for a fresh set, in the
+// order it walks the bag: shard by shard, each shard's retired nodes (that
+// list is LIFO: latest retirement first) and then its limbo nodes; each free
+// list is LIFO too, so a shard pops its share in reverse dealing order. In
+// this container the prefill's erases unlink and retire every victim
+// themselves, onto thread 0's shard's retired list, and the single-threaded
+// prefill leaves no limbo: the free pass deals the victims in reverse erase
+// order, so each shard pops its share in erase order, i.e. in arena order,
+// every 2*shards-th slot in the pre-sized and lookup fixtures (survivors and
+// victims alternate in the arena; in the growth fixture the split copies
+// interleave with them, and the superseded copies were retired in split
+// order, before the victims). Popped slots are therefore at least
+// 2*shards*sizeof(Node) bytes apart, a new cache line per popped node at any
+// shard count above one, where an append fills a line with two or three
+// consecutive 24-byte nodes. The prep leaves no dead node in a chain, so the
+// walk of that advance() unlinks nothing. Why measure: the free lists are what
+// reclamation is for, and these are the only cells that measure an insert
+// that reuses a slot, or a lookup over chains whose erased nodes were
+// recycled.
 //
 // The pre-sized and lookup cells share their bucket count between Control and
 // Reclaimed (no doubling in either prefill), so there the free lists are the
@@ -518,30 +856,33 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
 // the keys through the same doublings, so its table is one doubling larger
 // (2^22 buckets against the Control's 2^21 with 16 shards), with a
 // different population of pending lazy splits, which the timed inserts then
-// perform and which allocate their copies from the same free lists; and its
-// node_count_ restarts from the live count, so its next doubling comes later.
+// perform and which allocate their copies from the same free lists; and the
+// free pass lowered its resize hint (node_count_) by the nodes it freed, to
+// about the live count, so its next doubling comes later.
 // The growth Reclaimed row is therefore "churn, then growth" as a workload,
 // not a controlled measurement of the allocator; read the pre-sized row for
 // that. Neither prefill can be made to end at the other's geometry with the
 // same live keys: the doubling threshold is a slot count and the prefills
 // differ by 2x in slots.
 //
-// WHEN THE TIMED REGION CROSSES FROM POPS TO APPENDS. reclaim() deals the freed
-// nodes over ALL shards (the shard count is the hardware concurrency rounded up
-// to a power of two, or HASH_ARENA_SHARDS), and a thread pops only from its own
-// shard, so every timed thread starts with free/shards nodes to pop regardless
-// of the thread count, and appends after that:
+// WHEN THE TIMED REGION CROSSES FROM POPS TO APPENDS. The free pass deals the
+// freed nodes over ALL shards (the shard count is the hardware concurrency
+// rounded up to a power of two, or HASH_ARENA_SHARDS); a thread pops from its
+// own shard's list, and when that is empty, from the other shards' lists (the
+// steal: alloc_node() tries each other shard's list once before it appends).
+// So the timed threads together pop every freed node before any of them
+// appends, whatever the shard count: at equal rates, about free/T pops per
+// thread, then appends.
 //   insert fixtures: kChurnPairs = 2^21 victims (plus the growth fixture's split
-//     copies, ~0.4 per prefilled key) over S shards, against kNewIters = 2^18
-//     inserts per thread: S = 16 -> 2^17 pops, half the run; S = 32 -> a quarter;
-//     S = 128 -> 6%; S = 256 -> 3%. On a machine whose default shard count is
-//     large, run the Del benchmarks again with HASH_ARENA_SHARDS=16 to get the
-//     half-and-half regime.
-//   lookup fixture: kPrefill = 2^20 victims over S shards, against
-//     kOldIters/kInsertEvery = 10485 inserts per thread: all pops for S <= 64,
-//     8192 pops then appends at S = 128, 4096 at S = 256.
+//     copies, ~0.4 per prefilled key) against T*kNewIters = T*2^18 inserts:
+//     the pre-sized cell pops throughout at T <= 8 and for half the run at
+//     T = 16; the growth cell's free lists (2^21 victims and its copies) also
+//     serve the copies its timed splits allocate.
+//   lookup fixture: kPrefill = 2^20 victims against T*kOldIters/kInsertEvery =
+//     T*10485 inserts: all pops up to about 100 threads.
 // The fixture prints one line per configuration and process, before the first
-// row that uses it, with the free-list total it measured (see report_prep()).
+// row that uses it, with the free-list total it measured and the smallest and
+// largest per-shard list (see report_prep()).
 //
 // The prep is deterministic (single-threaded, fixed keys), so the arena state
 // at the start of the timed region is the same for every repetition and thread
@@ -562,12 +903,14 @@ static_assert(sizeof(ConcurrentSetDel::Node) == 24, "the node layout changed: 24
 static_assert(offsetof(ConcurrentSetDel::Node, link) == 8, "the node layout changed: the link word at offset 8 expected");
 static_assert(offsetof(ConcurrentSetDel::Node, retire_link) == 16, "the node layout changed: retire_link last, at offset 16, expected");
 static_assert(sizeof(ConcurrentSet::Node) == sizeof(ConcurrentSetDel::Node), "the two instantiations' nodes differ in size");
+// AdvanceTally is a local of the bodies that use it, on this instantiation (see there).
+static_assert(std::is_trivially_destructible_v<AdvanceTally<ConcurrentSetDel>>, "a body local with a destructor would be live across the state loop");
 
 // What the fixture does to the set after the prefill: nothing (Control), erase
-// every victim and reclaim() (Reclaimed), or erase every victim and nothing more
-// (Erased). Every Reclaimed and Erased configuration has a Control with the same
-// live keys and the same initial bucket count (the growth cells' Reclaimed table
-// ends one doubling larger; see above).
+// every victim and run one advance() (Reclaimed), or erase every victim and
+// nothing more (Erased). Every Reclaimed and Erased configuration has a
+// Control with the same live keys and the same initial bucket count (the
+// growth cells' Reclaimed table ends one doubling larger; see above).
 enum class Churn { Control, Reclaimed, Erased };
 
 // The insert fixtures' churn population: kChurnPairs survivors, and as many
@@ -598,9 +941,9 @@ struct InsertChurn {
 // Lookup_MostlyOld_Del_Control is Lookup_MostlyOld_Del reached by another
 // fixture, a check on the fixture itself. The victims are the OTHER half of
 // the lookup range, [kPrefill, 2*kPrefill): the Reclaimed set once held every
-// key the lookups will miss, so the misses walk chains reclaim() relinked, and
-// the hit rate is the 50% of the workload above. 2*kPrefill prefilled nodes
-// stay below the doubling threshold of 4*kPrefill slots.
+// key the lookups will miss, so the misses walk chains those keys were
+// unlinked from, and the hit rate is the 50% of the workload above. 2*kPrefill
+// prefilled nodes stay below the doubling threshold of 4*kPrefill slots.
 template <Churn C>
 struct LookupChurn {
     using Set = ConcurrentSetDel;
@@ -631,6 +974,8 @@ class ChurnFixture : public benchmark::Fixture {
 public:
     using SetType = typename Cfg::Set;
     static SetType* set;
+    using Handles = ThreadHandles<SetType>;
+    static Handles handles;   // the threads' handles (ThreadHandles above)
     void SetUp(const ::benchmark::State& state) override {
         if (state.thread_index() != 0) return;
         set = new SetType(Cfg::buckets, arena_shards_from_env());
@@ -638,22 +983,33 @@ public:
         // victims are present when erased); a failure would silently change
         // the population, so it aborts the run instead.
         long failed = 0;
-        for (int k = 0; k < Cfg::pairs; ++k) {
-            failed += !set->insert(mix(Cfg::survivor(k)));
-            if constexpr (Cfg::churn != Churn::Control) failed += !set->insert(mix(Cfg::victim(k)));
-        } // prefill, survivors and victims alternating
-        if constexpr (Cfg::churn != Churn::Control) {
-            for (int k = 0; k < Cfg::pairs; ++k) failed += !set->erase(mix(Cfg::victim(k)));
-        } // erase every victim
-        if constexpr (Cfg::churn == Churn::Reclaimed) set->reclaim();
+        {   // the prep's own handle, released before the advance() below (see ThreadHandles)
+            const typename SetType::handle h = set->new_handle();
+            for (int k = 0; k < Cfg::pairs; ++k) {
+                failed += !set->insert(h, mix(Cfg::survivor(k)));
+                if constexpr (Cfg::churn != Churn::Control) failed += !set->insert(h, mix(Cfg::victim(k)));
+            } // prefill, survivors and victims alternating
+            if constexpr (Cfg::churn != Churn::Control) {
+                for (int k = 0; k < Cfg::pairs; ++k) failed += !set->erase(h, mix(Cfg::victim(k)));
+            } // erase every victim
+        } // the prep's handle
+        // With no handle live, one advance() bags every retired node and frees the bag in the
+        // same call; the prep leaves no dead node reachable, so its walk retires nothing. A
+        // call that did anything else did not build the state the rows describe: counted as
+        // a failed prep operation.
+        if constexpr (Cfg::churn == Churn::Reclaimed) {
+            const AdvanceResult r = set->advance();
+            failed += r.advance != AdvanceResult::Advance::advanced || r.freed_bags != 1 || r.walk_retired != 0;
+        } // the prep's one advance()
         if (failed != 0) {
             fprintf(stderr, "ChurnFixture: %ld prep operations failed in %s\n", failed, state.name().c_str());
             abort();
         } // if the prep did not build the population it describes
         report_prep(state);
+        handles.make(*set, state.threads());   // after the prep's advance() (see ThreadHandles)
     } // ChurnFixture::SetUp()
     void TearDown(const ::benchmark::State& state) override {
-        if (state.thread_index() == 0) { delete set; set = nullptr; }
+        if (state.thread_index() == 0) { handles.clear(); delete set; set = nullptr; }
     }
 private:
     // Prints the arena state the timed region starts from, once per
@@ -662,9 +1018,12 @@ private:
     // reachable from the buckets and how many of those are dead (erased or
     // superseded nodes still in their chains: what an erase or a split left
     // behind), free-list, limbo and retired-list totals (retired: dead nodes the
-    // prep's operations unlinked, which only a reclaim() recycles), the sweep's
-    // consistency verdict, the shard count and the free nodes a timed thread
-    // can pop before its shard's list is empty. To stdout, so the line lands in the benchmark output
+    // prep's operations unlinked, which only an advance() makes reusable), the
+    // sweep's consistency verdict, the shard count, the mean free-list length
+    // per shard (free_per_shard: the free total over the shard count), the
+    // shortest and the longest shard's list, the nodes in bags (closed by an
+    // advance() and not yet freed: 0 unless a handle pinned them) and the
+    // table size. To stdout, so the line lands in the benchmark output
     // before the first row that uses the configuration (Google Benchmark
     // writes its console report to stdout too). The accounting sweep sorts
     // every slot; a few hundred milliseconds, once, untimed.
@@ -674,21 +1033,24 @@ private:
         reported = true;
         const typename SetType::InternalAccounting a = set->get_internal_accounting();
         const size_t shards = set->get_internal_arena_shards();
-        printf("# prep %s: slots=%zu reachable=%zu reachable_dead=%zu free=%zu limbo=%zu retired=%zu consistent=%d shards=%zu free_per_shard=%zu\n",
+        const auto [free_min, free_max] = std::minmax_element(a.free_per_shard.begin(), a.free_per_shard.end());
+        printf("# prep %s: slots=%zu reachable=%zu reachable_dead=%zu free=%zu limbo=%zu retired=%zu consistent=%d shards=%zu free_per_shard=%zu"
+               " free_shard_min=%zu free_shard_max=%zu bagged=%zu table_size=%zu\n",
                state.name().c_str(), a.slots, a.reachable, a.reachable_dead, a.free_nodes, a.limbo, a.retired, int(a.consistent),
-               shards, a.free_nodes/shards);
+               shards, a.free_nodes/shards, *free_min, *free_max, a.bagged, set->get_internal_table_size());
         fflush(stdout);
     } // ChurnFixture::report_prep()
 }; // class ChurnFixture
 template <typename Cfg> typename Cfg::Set* ChurnFixture<Cfg>::set = nullptr;
+template <typename Cfg> ThreadHandles<typename Cfg::Set> ChurnFixture<Cfg>::handles;
 
 // ---------------------------------------------------------------------------
-// Erase_Presized_Del: timed erase() of present keys.
+// The erase rows: timed erase() of present keys.
 //
-// Why measure: in this container an uncontended erase() marks its node (one
-// CAS), unlinks it (one CAS on its predecessor's word) and retires it (one
-// release CAS on the retired head of the erasing thread's shard): three
-// CASes where an erase that only marks does one, plus a mark
+// Erase_Presized_Del. Why measure: in this container an uncontended erase()
+// marks its node (one CAS), unlinks it (one CAS on its predecessor's word) and
+// retires it (one release CAS on the retired head of the erasing thread's
+// shard): three CASes where an erase that only marks does one, plus a mark
 // retried when a concurrent unlink through the node's link changes it, and a
 // second walk from the bucket head when the first unlink attempt loses. The
 // Erased churn cells measure what that buys the later walks; this row measures
@@ -706,31 +1068,299 @@ template <typename Cfg> typename Cfg::Set* ChurnFixture<Cfg>::set = nullptr;
 //   retired_per_erase -- nodes retired during the timed loop per timed erase: 1
 //                        when every erase took its own node out of its chain,
 //                        less by the share left in place under contention (for
-//                        a later writer or reclaim() to collect).
+//                        a later writer or advance()'s walk to collect); in the
+//                        _Rcu rows it includes the nodes their walks retired
+//                        (the counter walk_retired).
+//
+// Erase_Presized_Del_Rcu. Why measure: what reclamation adds to the erases of
+// the row above, at its geometry and paired with it. The same fixture and the
+// same erases; after its last erase each thread releases its handle
+// (ThreadHandles::Own::finish_iteration()) and then calls advance() exactly
+// once, inside the timed region. With its own handle released first, the
+// call is not pinned by its caller. At one thread no other handle exists, so
+// the call bags every node the erases retired and frees the bag. At more than
+// one, the threads' handles were made in SetUp() and are never refreshed:
+// the first thread to finish bags the retired nodes into the generation the
+// still-running threads' handles hold, so its free pass frees nothing; its
+// call bumps and walks. A call that finds another thread's call in progress
+// returns `contended` and is not retried, so the row expects about one
+// effective walk, and only a last finisher's call that comes after that walk
+// could free the bag. freed_nodes reports what was freed. At this geometry one
+// walk of the table takes longer than one thread's erases (the Advance_Walk
+// rows give its cost), so the row is mostly walk at one thread and says so
+// through walk_share. No handle is refreshed: no advance() runs before the
+// last iteration, so a refresh would never move one. Counters: AdvanceTally's,
+// beside retired_per_erase.
+//
+// Erase_Small_Del and Erase_Small_Del_Rcu. Why measure: the cost of an erase
+// under reclamation, with the reclamation done at a fixed number of calls per
+// population erased, on a table small enough that its walk is short in
+// absolute terms (Erase_Presized_Del_Rcu's one walk is long). Thread 0's
+// SetUp() prefills kSmallPrefill mix()ed keys into kSmallBuckets buckets (the
+// pre-sized rows' load factor). Thread t of T erases mix(t*n + i) for
+// i < n = kSmallPrefill/T (the rows are registered one thread count at a
+// time, as InsertHotGrowth is): every prefilled key is erased exactly once
+// when T divides kSmallPrefill (every power of two does), and the last
+// kSmallPrefill mod T keys are left otherwise. The checks and
+// retired_per_erase as above.
+// Erase_Small_Del: the erases alone, the control.
+// Erase_Small_Del_Rcu: the reclamation regime. Every thread refreshes its
+// handle at the top of every iteration, and thread 0 calls advance() after
+// every kSmallAdvanceEvery/T of its own erases: at the threads' equal rates,
+// once per kSmallAdvanceEvery erases of the run, so every run makes
+// kSmallPrefill/kSmallAdvanceEvery calls whatever the thread count
+// (AdvanceTally says why one advancer). Thread 0 does every walk and finishes
+// last (finish_spread); the walks' share of the threads' summed loop time
+// falls as the thread count grows and the other threads' erases end sooner.
+// A call bags what the erases retired since the
+// previous call and frees the bags no handle pins any more: the advancer's
+// own handle, refreshed before its erase, still pins the generation the call
+// closes, so each bag is freed one call later. Counters: AdvanceTally's,
+// beside retired_per_erase.
 // ---------------------------------------------------------------------------
-static constexpr int kErasePrefill = 1 << 22;
-template <typename SetType>
+static constexpr int    kErasePrefill = 1 << 22;
+static constexpr size_t kSmallBuckets = size_t(1) << 17;
+static constexpr int    kSmallPrefill = 1 << 16;
+// Erase_Small_Del_Rcu's cadence: one advance() per kSmallAdvanceEvery erases
+// of the run, a quarter of the prefilled keys, so four calls per run (thread 0
+// calls after every kSmallAdvanceEvery/T of its own erases;
+// HASH_BM_SMALL_ADVANCE_EVERY overrides it: advance_every_from_env()). Every
+// call but the first frees the bag the one before it closed. A walk passes
+// every live node.
+static constexpr int    kSmallAdvanceEvery = kSmallPrefill/4;
+
+// The two erase geometries, EraseFixture's second parameter: the table's
+// buckets, the prefilled keys, and the keys each thread erases.
+struct PresizedErase {
+    static constexpr size_t buckets = kPresizedBuckets;
+    static constexpr int    prefill = kErasePrefill;
+    static int keys_per_thread(const benchmark::State& /*state*/) { return kErasePrefill/num_cpu; }
+}; // struct PresizedErase
+struct SmallErase {
+    static constexpr size_t buckets = kSmallBuckets;
+    static constexpr int    prefill = kSmallPrefill;
+    static int keys_per_thread(const benchmark::State& state) { return kSmallPrefill/state.threads(); }
+}; // struct SmallErase
+
+// Thread 0's prefill in the SetUp() of EraseFixture and WindowFixture: a new
+// set of `buckets` buckets (and the arena shards of arena_shards_from_env()),
+// into which `for_each_key(insert)` inserts its keys through `insert(key)`,
+// under a handle of the prefill's own, released before this returns (before
+// the threads' handles are made). The keys are distinct, so an insert that
+// fails means the set does not hold the population the rows describe: the run
+// aborts, naming `fixture` and the row.
+template <typename SetType, typename KeyVisitor>
+static SetType* make_prefilled(const ::benchmark::State& state, const char* fixture, size_t buckets, KeyVisitor for_each_key) {
+    SetType* set = new SetType(buckets, arena_shards_from_env());
+    long failed = 0;
+    {   // the prefill's own handle
+        const typename SetType::handle h = set->new_handle();
+        for_each_key([&](int key) { failed += !set->insert(h, key); });
+    } // the prefill's handle
+    if (failed != 0) {
+        fprintf(stderr, "%s: %ld prefill inserts failed in %s\n", fixture, failed, state.name().c_str());
+        abort();
+    } // if the prefill did not build the population it describes
+    return set;
+} // make_prefilled()
+
+template <typename SetType, typename Geom = PresizedErase>
 class EraseFixture : public benchmark::Fixture {
 public:
+    using Geometry = Geom;    // the bodies read the per-thread key count through it
     static SetType* set;
+    using Handles = ThreadHandles<SetType>;
+    static Handles handles;   // the threads' handles (ThreadHandles above)
+    using Tally = AdvanceTally<SetType>;   // one thread's advance() calls in the _Rcu bodies (AdvanceTally above)
     static size_t retired_before;   // the container's retired-node counter after the prefill
     void SetUp(const ::benchmark::State& state) override {
         if (state.thread_index() != 0) return;
-        set = new SetType(kPresizedBuckets, arena_shards_from_env());
-        long failed = 0;
-        for (int k = 0; k < kErasePrefill; ++k) failed += !set->insert(mix(k));
-        if (failed != 0) {
-            fprintf(stderr, "EraseFixture: %ld prefill inserts failed in %s\n", failed, state.name().c_str());
-            abort();
-        } // if the prefill did not build the population it describes
+        set = make_prefilled<SetType>(state, "EraseFixture", Geometry::buckets, [](auto insert) {
+            for (int k = 0; k < Geometry::prefill; ++k) insert(mix(k));
+        });
         retired_before = set->get_internal_counters().retire_nodes;
+        handles.make(*set, state.threads());
     } // EraseFixture::SetUp()
     void TearDown(const ::benchmark::State& state) override {
-        if (state.thread_index() == 0) { delete set; set = nullptr; }
+        if (state.thread_index() == 0) { handles.clear(); delete set; set = nullptr; }
     }
 }; // class EraseFixture
-template <typename SetType> SetType* EraseFixture<SetType>::set = nullptr;
-template <typename SetType> size_t EraseFixture<SetType>::retired_before = 0;
+template <typename SetType, typename Geom> SetType* EraseFixture<SetType, Geom>::set = nullptr;
+template <typename SetType, typename Geom> ThreadHandles<SetType> EraseFixture<SetType, Geom>::handles;
+template <typename SetType, typename Geom> size_t EraseFixture<SetType, Geom>::retired_before = 0;
+
+// The body of the erase rows (see above), as a macro like the bodies above, so
+// that every erase row runs the same code around its own regime. ITERATION is
+// the loop body: it erases the thread's next key into `ok` and does what the
+// row's regime adds; PRE declares what the regime needs before the loop and
+// POST reports it after; both are empty in the rows without reclamation. The
+// fixture's template arguments come last. Same accounting contract as the
+// macro bodies: allocate() before the loop; report_wall() then release()
+// after it; the per-thread SkipWithError() after the loop, never inside it.
+#define DEFINE_ERASE(NAME, PRE, ITERATION, POST, ...)                         \
+    BENCHMARK_TEMPLATE_DEFINE_F(EraseFixture, NAME, __VA_ARGS__)              \
+    (benchmark::State& state) {                                               \
+        static constinit WallRecords records;                                 \
+        const int base = state.thread_index()*Geometry::keys_per_thread(state); \
+        int next = 0;                                                         \
+        int64_t ok = 0;                                                       \
+        Handles::Own own(handles, state);                                     \
+        PRE                                                                   \
+        records.allocate(state);                                              \
+        for (auto _ : WallTimed(state, records)) {                            \
+            ITERATION                                                         \
+        }                                                                     \
+        if (ok != state.iterations()) {                                       \
+            state.SkipWithError("erase() returned false for a present key no other thread erases"); \
+        }                                                                     \
+        state.SetItemsProcessed(state.iterations());                          \
+        report_wall(state, records, double(state.iterations())*state.threads()); \
+        if (state.thread_index() == 0) {   /* the container's diagnostic counter (see the fixture) */ \
+            const double erased = double(state.iterations())*state.threads(); \
+            state.counters["retired_per_erase"] = benchmark::Counter(         \
+                double(set->get_internal_counters().retire_nodes - retired_before)/erased); \
+        }                                                                     \
+        POST                                                                  \
+        records.release(state);                                               \
+    }
+
+// ---------------------------------------------------------------------------
+// Churn_Window_Del: steady churn, without and with the reclamation regime.
+//
+// Why measure: the rows above make freed nodes available once, before the
+// timed region (the Reclaimed states), or call advance() in rows that do not
+// allocate (Erase_Presized_Del_Rcu, once per thread at its end;
+// Erase_Small_Del_Rcu, at a cadence); none frees nodes while other threads
+// allocate.
+// Here every thread keeps a fixed number of live keys and replaces them
+// continuously, so under the regime the free pass pushes the nodes it frees
+// onto the free lists while the threads pop them for their inserts -- the free
+// lists as a concurrent recycler, which is what reclamation beside the
+// operations is for -- and without it every insert appends, and the arena and
+// the table grow with the run. The pair says what the regime costs a churning
+// workload and what it saves it.
+// Shape: thread t owns the keys mix(t*kKeyStride + i), i = 0, 1, 2, ...; at
+// any moment the kWindow keys with i in [lo, lo + kWindow) are live. Thread
+// 0's SetUp() inserts every thread's first window (lo = 0), untimed, into a
+// table of kWindowBuckets buckets (one key per bucket at 16 threads). Every
+// thread then repeats a cycle of four iterations: erase the key at lo; insert
+// the key at lo + kWindow (the window slides by one); look up two keys drawn
+// at random from [lo - kWindow, lo + kWindow), of which half are live (those
+// below lo were erased, or never inserted). kWindowIters iterations per
+// thread: kWindowIters/(4*kWindow) passes over the window. Every erase and
+// every insert must return true (checked per thread, after the loop).
+// _NoReclaim: nothing else. Nothing is freed, so the retired lists and the
+//   arena grow by one node per insert, and the table doubles as the arena
+//   grows (the resize hint counts every slot that is not on a free list).
+// _Rcu: the reclamation regime. Every thread refreshes its handle at the top
+//   of every iteration, and thread 0 calls advance() after every
+//   kWindowAdvanceEvery of its own erases (AdvanceTally says why one
+//   advancer): the same number of calls per run at every thread count, each
+//   walking the threads*kWindow live keys. The nodes a call frees are popped
+//   by every thread's inserts: from the inserting thread's own shard's list
+//   first, then from the others' (the steal).
+// Counters, read by thread 0 after the loop (every thread has left it), untimed:
+//   table_size         -- the bucket count at the end;
+//   slots_per_live_key -- arena slots ever appended, over the live keys at the
+//                         end (threads*kWindow): the memory the run kept;
+//   pops_raced_push, free_push_cas_failures
+//                      -- the container's diagnostic counters over the timed
+//                         loop: free-list pops whose CAS lost to a push of the
+//                         free pass (or failed spuriously), and pushes whose
+//                         CAS lost to a pop (or failed spuriously): the
+//                         witnesses that frees and pops met;
+// and on _Rcu the AdvanceTally counters.
+// ---------------------------------------------------------------------------
+static constexpr int    kWindow        = 1 << 12;
+static constexpr size_t kWindowBuckets = size_t(1) << 16;
+static constexpr int    kWindowIters   = 1 << 20;
+// Churn_Window_Del_Rcu's cadence: thread 0 calls advance() after every
+// kWindowAdvanceEvery of its own erases, two passes over its window
+// (HASH_BM_WINDOW_ADVANCE_EVERY overrides it: advance_every_from_env()).
+static constexpr int    kWindowAdvanceEvery = 2*kWindow;
+
+template <typename SetType>
+class WindowFixture : public benchmark::Fixture {
+public:
+    static SetType* set;
+    using Handles = ThreadHandles<SetType>;
+    static Handles handles;   // the threads' handles (ThreadHandles above)
+    using Tally = AdvanceTally<SetType>;   // one thread's advance() calls in the _Rcu bodies (AdvanceTally above)
+    static typename SetType::InternalCounters counters_before;   // the container's diagnostic counters after the prefill
+    void SetUp(const ::benchmark::State& state) override {
+        if (state.thread_index() != 0) return;
+        const int threads = state.threads();
+        set = make_prefilled<SetType>(state, "WindowFixture", kWindowBuckets, [threads](auto insert) {
+            for (int t = 0; t < threads; ++t) {
+                for (int i = 0; i < kWindow; ++i) insert(mix(t*kKeyStride + i));
+            } // every thread's first window
+        });
+        counters_before = set->get_internal_counters();
+        handles.make(*set, state.threads());
+    } // WindowFixture::SetUp()
+    void TearDown(const ::benchmark::State& state) override {
+        if (state.thread_index() == 0) { handles.clear(); delete set; set = nullptr; }
+    }
+}; // class WindowFixture
+template <typename SetType> SetType* WindowFixture<SetType>::set = nullptr;
+template <typename SetType> ThreadHandles<SetType> WindowFixture<SetType>::handles;
+template <typename SetType> typename SetType::InternalCounters WindowFixture<SetType>::counters_before{};
+
+// The body of the window rows (see above), as a macro for the same reason as
+// DEFINE_ERASE: PRE declares what the regime needs before the loop, BEFORE
+// runs at the top of every iteration, AFTER_ERASE after every erase, END at
+// the end of every iteration (the release on the last one), POST reports
+// after the loop; all five are empty in _NoReclaim. Same accounting contract
+// as the other bodies.
+#define DEFINE_WINDOW(NAME, PRE, BEFORE, AFTER_ERASE, END, POST)              \
+    BENCHMARK_TEMPLATE_DEFINE_F(WindowFixture, NAME, ConcurrentSetDel)        \
+    (benchmark::State& state) {                                               \
+        static constinit WallRecords records;                                 \
+        XorShift32 rng(0x1234567u + 0x9e3779b9u*state.thread_index());        \
+        const int base = state.thread_index()*kKeyStride;                     \
+        int lo = 0;                                                           \
+        int phase = 0;                                                        \
+        int64_t ok = 0, tries = 0;                                            \
+        bool hit = false;                                                     \
+        Handles::Own own(handles, state);                                     \
+        PRE                                                                   \
+        records.allocate(state);                                              \
+        for (auto _ : WallTimed(state, records)) {                            \
+            BEFORE                                                            \
+            if (phase == 0) {                                                 \
+                ++tries;                                                      \
+                ok += set->erase(own.get(), mix(base + lo));                  \
+                AFTER_ERASE                                                   \
+            } else if (phase == 1) {                                          \
+                ++tries;                                                      \
+                ok += set->insert(own.get(), mix(base + lo + kWindow));       \
+                ++lo;                                                         \
+            } else {                                                          \
+                hit = set->contains(own.get(),                                \
+                    mix(base + lo - kWindow + int(rng.next() & (2*kWindow - 1)))); \
+                benchmark::DoNotOptimize(hit);                                \
+            }                                                                 \
+            phase = (phase + 1) & 3;                                          \
+            END                                                               \
+        }                                                                     \
+        if (ok != tries) {                                                    \
+            state.SkipWithError("erase() or insert() of a window key returned false: the keys are this thread's alone"); \
+        }                                                                     \
+        state.SetItemsProcessed(state.iterations());                          \
+        report_wall(state, records, double(state.iterations())*state.threads()); \
+        if (state.thread_index() == 0) {   /* the container's diagnostic counters (see the fixture) */ \
+            const ConcurrentSetDel::InternalCounters c = set->get_internal_counters(); \
+            state.counters["table_size"] = benchmark::Counter(double(set->get_internal_table_size())); \
+            state.counters["slots_per_live_key"] = benchmark::Counter(        \
+                double(set->get_internal_node_count())/(double(state.threads())*kWindow)); \
+            state.counters["pops_raced_push"] = benchmark::Counter(double(c.pops_raced_push - counters_before.pops_raced_push)); \
+            state.counters["free_push_cas_failures"] = benchmark::Counter(double(c.free_push_cas_failures - counters_before.free_push_cas_failures)); \
+        }                                                                     \
+        POST                                                                  \
+        records.release(state);                                               \
+    }                                                                         \
+    BENCHMARK_REGISTER_F(WindowFixture, NAME)                                 \
+        ->ThreadRange(1, num_cpu)->Iterations(kWindowIters)->UseRealTime();
 
 // ---------------------------------------------------------------------------
 // InsertHotGrowth: growth on hot chains, a probe of the split's cleanup pass.
@@ -743,7 +1373,8 @@ template <typename SetType> size_t EraseFixture<SetType>::retired_before = 0;
 // buckets) split chains of that length while the threads are still
 // prepending to them -- the one place where a cleanup pass's single unlink
 // CAS per dead run loses to a concurrent insert, and where a lost CAS can
-// leave a frozen node in its chain for a later walk or reclaim() to collect.
+// leave a frozen node in its chain for a later writer walk or advance()'s walk
+// to collect.
 // The counters, all read by thread 0 after the loop (the loop's end is a
 // barrier, so the container is quiescent and its diagnostic accessors are
 // exact), untimed, are what a decision to retry the cleanup CAS would rest
@@ -775,8 +1406,8 @@ template <typename SetType> size_t EraseFixture<SetType>::retired_before = 0;
 //   walk_cas_lost_per_moved, walk_cas_nonpeer_per_moved -- the same two for
 //                         the unlinks the inserts' walks attempt;
 //   reachable_dead     -- frozen nodes still in their chains after the join
-//                         (the stragglers; the residue a later walk or
-//                         reclaim() collects);
+//                         (the stragglers; the residue a later writer walk
+//                         or advance()'s walk collects);
 //   retired            -- frozen nodes the cleanup passes and the walks did
 //                         unlink and retire.
 // Keys: the key of index i is (m & 63) | (((m >> 6) & 7) << 12) | (i << 16)
@@ -788,7 +1419,7 @@ template <typename SetType> size_t EraseFixture<SetType>::retired_before = 0;
 // The same keys at every thread count: the run inserts kHotKeys keys in all,
 // kHotKeys/T per thread. ThreadRange() shares one Iterations() value among
 // its thread counts, so the rows are registered one thread count at a time
-// (register_hot_growth()), each with its own per-thread count; the row names
+// (register_shared_total()), each with its own per-thread count; the row names
 // carry it as /iterations:N. The initial bucket count is the growth
 // fixture's; the doublings before 4096 buckets split the 64 chains but move
 // nothing. The cell is registered on both instantiations, as the cells above
@@ -807,14 +1438,20 @@ template <typename SetType>
 class HotGrowthFixture : public benchmark::Fixture {
 public:
     static SetType* set;
+    using Handles = ThreadHandles<SetType>;
+    static Handles handles;   // the threads' handles (ThreadHandles above)
     void SetUp(const ::benchmark::State& state) override {
-        if (state.thread_index() == 0) set = new SetType(1024, arena_shards_from_env());
+        if (state.thread_index() == 0) {
+            set = new SetType(1024, arena_shards_from_env());
+            handles.make(*set, state.threads());
+        }
     }
     void TearDown(const ::benchmark::State& state) override {
-        if (state.thread_index() == 0) { delete set; set = nullptr; }
+        if (state.thread_index() == 0) { handles.clear(); delete set; set = nullptr; }
     }
 }; // class HotGrowthFixture
 template <typename SetType> SetType* HotGrowthFixture<SetType>::set = nullptr;
+template <typename SetType> ThreadHandles<SetType> HotGrowthFixture<SetType>::handles;
 
 // The counters of InsertHotGrowth that only this container's diagnostic
 // accessors provide (listed above), set on `state` by thread 0 after the loop;
@@ -841,17 +1478,19 @@ static void hot_growth_counters(benchmark::State& state, const SetType& set,
 
 // The thread counts ThreadRange(1, num_cpu) produces (1, the powers of two
 // below num_cpu, num_cpu), each registered as its own row of benchmark class
-// `Bench` with the per-thread count kHotKeys/threads. The registration call
-// is the one BENCHMARK_REGISTER_F() expands to.
+// `Bench` with the per-thread count total/threads: a row whose run does the
+// same `total` operations at every thread count, when the thread count
+// divides it (InsertHotGrowth, Erase_Small_Del, Erase_Small_Del_Rcu). The
+// registration call is the one BENCHMARK_REGISTER_F() expands to.
 template <typename Bench>
-static void register_hot_growth() {
+static void register_shared_total(int total) {
     for (int t = 1; ; t *= 2) {
         if (t >= num_cpu) t = num_cpu;
         benchmark::internal::RegisterBenchmarkInternal(std::make_unique<Bench>())
-            ->Threads(t)->Iterations(kHotKeys/t)->UseRealTime();
+            ->Threads(t)->Iterations(total/t)->UseRealTime();
         if (t == num_cpu) break;
     } // loop over the thread counts
-} // register_hot_growth()
+} // register_shared_total()
 
 // The body (see InsertHotGrowth above) and its registration, as a macro so
 // that each instantiation gets an identical body. Same accounting contract as
@@ -864,9 +1503,10 @@ static void register_hot_growth() {
         const int threads = state.threads();                                  \
         int index = state.thread_index();                                     \
         int64_t ok = 0;                                                       \
+        Handles::Own own(handles, state);                                     \
         records.allocate(state);                                              \
         for (auto _ : WallTimed(state, records)) {                            \
-            ok += set->insert(hot_growth_key(index));                         \
+            ok += set->insert(own.get(), hot_growth_key(index));              \
             index += threads;                                                 \
         }                                                                     \
         if (ok != state.iterations()) {                                       \
@@ -888,7 +1528,206 @@ static void register_hot_growth() {
         records.release(state);                                               \
     }                                                                         \
     [[maybe_unused]] static const bool NAME##_registered =                    \
-        (register_hot_growth<BENCHMARK_PRIVATE_CONCAT_NAME(HotGrowthFixture, NAME)>(), true);
+        (register_shared_total<BENCHMARK_PRIVATE_CONCAT_NAME(HotGrowthFixture, NAME)>(kHotKeys), true);
+
+// ---------------------------------------------------------------------------
+// The advance() geometry regression: advance() alone, one thread, nothing else
+// running.
+//
+// Why measure: advance() is the one call of this container whose cost grows
+// with the set rather than with the operation: its free pass pushes every node
+// of the bags it frees onto the free lists, and its walk passes every
+// published bucket and every node in its chain. Here it runs alone, so the
+// time is its own, split by the calling thread's timers into the bump, the
+// free pass and the walk; the rows under the reclamation regime are read
+// against these costs per node and per bucket, and their cadences are chosen
+// from them.
+//  Advance_FreePass_<Warm|Cold>_<ArenaOrder|Shuffled>/nodes:N
+//      A set of N buckets (so that the inserts below never double it), N keys
+//      inserted and then all erased, untimed, then one timed advance(): no
+//      handle is live, so the call bags the N retired nodes and frees the bag
+//      in the same call, and walks the N empty buckets. The order of the
+//      erases is the order in which the free pass visits the nodes (it
+//      follows the retired list, latest retirement first): ArenaOrder erases
+//      the keys in insertion order, which is the order of their slots in the
+//      arena, so the visits run through the arena backwards, one slot after
+//      the other; Shuffled erases them in a fixed pseudo-random order, so the
+//      visits jump. Warm: the call runs right after the erases, with whatever
+//      of the nodes the caches still hold; Cold: evict_caches() runs between
+//      the erases and the call. A fresh set every iteration, so that every
+//      call starts from the same arena layout.
+//      Counters (per call or per node, averaged over the iterations):
+//      freed_per_call, bump_ns_per_node, free_ns_per_node, and
+//      walk_ns_per_bucket (the walk over the N empty buckets).
+//  Advance_Walk_<NothingRetired|NothingRetired_Cold|Advanced>/buckets:B/live:L
+//      A set of B buckets holding L keys (untimed prefill; a pre-sized table
+//      never splits, so nothing is retired), then timed advance() calls on
+//      it. NothingRetired: each call finds nothing retired, consumes no
+//      generation and still walks the table (AdvanceResult's
+//      `nothing_retired`): what a call costs on a set where nothing was
+//      erased; NothingRetired_Cold: the same with evict_caches() before every
+//      call; Advanced: one key is erased (untimed) before every call and
+//      inserted again after it, so every call bumps the generation, frees one
+//      node and walks under the new generation: the same walk through the
+//      other branch of advance().
+//      Counters (per call): walk_ns, bump_ns, free_ns, buckets_walked,
+//      nodes_passed; and walk_ns_per_bucket, walk_ns over B. The walk's cost
+//      per bucket and per node passed is the fit of walk_ns over the rows of
+//      one B at L = 0, B/2 and B.
+// Every row's iteration time is the whole advance() call, from the calling
+// thread's own timers (manual time: the untimed setup of each iteration is
+// left out). A call that does not do what its row describes (outcome, counts)
+// marks the row as an error after the loop.
+// ---------------------------------------------------------------------------
+static constexpr size_t kEvictBytes = size_t(256) << 20;
+
+// Reads one word of every 64-byte line of a buffer of kEvictBytes, so that
+// afterwards no line a set used is in any cache: kEvictBytes must be several
+// times the last-level cache (256 MiB is four times a 64 MiB cache). The
+// buffer is allocated and written on the first call.
+static void evict_caches() {
+    static const std::vector<uint64_t> buffer(kEvictBytes/sizeof(uint64_t), 1);
+    uint64_t sum = 0;
+    for (size_t i = 0; i < buffer.size(); i += 64/sizeof(uint64_t)) sum += buffer[i];
+    benchmark::DoNotOptimize(sum);
+} // evict_caches()
+
+// One timed call of an Advance_ row: zeroes the calling thread's timers,
+// calls advance() on `set`, gives the whole call's time (advance_ns) to Google
+// Benchmark as this iteration's time, and adds the four timers into `sum`.
+// Returns the call's result.
+static AdvanceResult timed_advance(benchmark::State& state, ConcurrentSetDel& set, ConcurrentSetDel::InternalTimers& sum) {
+    ConcurrentSetDel::InternalTimers& timers = ConcurrentSetDel::internal_advance_timers();
+    timers = {0, 0, 0, 0};
+    const AdvanceResult r = set.advance();
+    state.SetIterationTime(double(timers.advance_ns)*1e-9);
+    sum.advance_ns += timers.advance_ns;
+    sum.bump_ns += timers.bump_ns;
+    sum.free_ns += timers.free_ns;
+    sum.walk_ns += timers.walk_ns;
+    return r;
+} // timed_advance()
+
+// One row of Advance_FreePass (see above): `nodes` keys retired and freed per
+// call, the caches evicted before the call if kCold, erased in a shuffled
+// order if kShuffled.
+template <bool kCold, bool kShuffled>
+static void advance_free_pass(benchmark::State& state, size_t nodes) {
+    std::vector<int> order(nodes);   // the erase order: indices of the inserted keys
+    for (size_t i = 0; i < nodes; ++i) order[i] = int(i);
+    if constexpr (kShuffled) {
+        XorShift32 rng(0x2545f491u);
+        for (size_t i = nodes - 1; i > 0; --i) std::swap(order[i], order[rng.next() % (i + 1)]);
+    } // Fisher-Yates, a fixed seed
+    ConcurrentSetDel::InternalTimers sum{0, 0, 0, 0};   // the timers summed over the calls
+    size_t freed = 0;                                   // nodes freed, summed over the calls
+    bool as_described = true;                           // every call did what the row describes
+    for (auto _ : state) {
+        ConcurrentSetDel set(nodes, arena_shards_from_env());
+        {   // the prep's handle, released before the call
+            const ConcurrentSetDel::handle h = set.new_handle();
+            for (size_t i = 0; i < nodes; ++i) as_described &= set.insert(h, mix(int(i)));
+            for (size_t i = 0; i < nodes; ++i) as_described &= set.erase(h, mix(order[i]));
+        } // the prep's handle
+        if constexpr (kCold) evict_caches();
+        const AdvanceResult r = timed_advance(state, set, sum);
+        as_described &= r.advance == AdvanceResult::Advance::advanced && r.freed_nodes == nodes && r.walk_retired == 0
+                        && set.get_internal_table_size() == nodes;
+        freed += r.freed_nodes;
+    } // loop over the calls, a fresh set each
+    if (!as_described) state.SkipWithError("a prep operation failed, or advance() did not free every node of the bag");
+    const double calls = double(state.iterations());
+    state.counters["freed_per_call"]     = benchmark::Counter(double(freed)/calls);
+    state.counters["bump_ns_per_node"]   = benchmark::Counter(double(sum.bump_ns)/double(freed));
+    state.counters["free_ns_per_node"]   = benchmark::Counter(double(sum.free_ns)/double(freed));
+    state.counters["walk_ns_per_bucket"] = benchmark::Counter(double(sum.walk_ns)/(calls*double(nodes)));
+} // advance_free_pass()
+
+// What the timed advance() calls of an Advance_Walk row find (see above).
+enum class WalkCall { NothingRetired, NothingRetiredCold, Advanced };
+
+// One row of Advance_Walk (see above): `buckets` buckets, `live` keys.
+template <WalkCall kCall>
+static void advance_walk(benchmark::State& state, size_t buckets, size_t live) {
+    ConcurrentSetDel set(buckets, arena_shards_from_env());
+    bool as_described = true;   // every prep operation succeeded and every call did what the row describes
+    {   // the prefill's handle, released before the calls
+        const ConcurrentSetDel::handle h = set.new_handle();
+        for (size_t k = 0; k < live; ++k) as_described &= set.insert(h, mix(int(k)));
+    } // the prefill's handle
+    constexpr bool kAdvanced = kCall == WalkCall::Advanced;
+    const AdvanceResult::Advance expected = kAdvanced ? AdvanceResult::Advance::advanced : AdvanceResult::Advance::nothing_retired;
+    ConcurrentSetDel::InternalTimers sum{0, 0, 0, 0};   // the timers summed over the calls
+    size_t walked = 0, passed = 0;                      // buckets_walked and nodes_passed, summed over the calls
+    for (auto _ : state) {
+        if constexpr (kAdvanced) {
+            const ConcurrentSetDel::handle h = set.new_handle();
+            as_described &= set.erase(h, mix(0));
+        } // one key retired before the call, its handle released
+        if constexpr (kCall == WalkCall::NothingRetiredCold) evict_caches();
+        const AdvanceResult r = timed_advance(state, set, sum);
+        if constexpr (kAdvanced) {
+            const ConcurrentSetDel::handle h = set.new_handle();
+            as_described &= set.insert(h, mix(0));
+        } // the key back, after the call
+        as_described &= r.advance == expected && r.freed_nodes == (kAdvanced ? 1u : 0u) && r.walk_retired == 0
+                        && r.buckets_walked == buckets && r.nodes_passed == live - (kAdvanced ? 1 : 0);
+        walked += r.buckets_walked;
+        passed += r.nodes_passed;
+    } // loop over the calls
+    if (!as_described) state.SkipWithError("a prep operation failed, or advance() did not do what the row describes");
+    const double calls = double(state.iterations());
+    state.counters["walk_ns"]            = benchmark::Counter(double(sum.walk_ns)/calls);
+    state.counters["bump_ns"]            = benchmark::Counter(double(sum.bump_ns)/calls);
+    state.counters["free_ns"]            = benchmark::Counter(double(sum.free_ns)/calls);
+    state.counters["buckets_walked"]     = benchmark::Counter(double(walked)/calls);
+    state.counters["nodes_passed"]       = benchmark::Counter(double(passed)/calls);
+    state.counters["walk_ns_per_bucket"] = benchmark::Counter(double(sum.walk_ns)/(calls*double(buckets)));
+} // advance_walk()
+
+// Registers the regression's rows, one registration per row, each with its
+// own iteration count (Google Benchmark shares one Iterations() value per
+// registration), sized so that a row takes about a second or less: the free
+// pass at N = 2^10 to 2^22 nodes in steps of 4x; the walk at B = 2^14 to 2^23
+// buckets, which include the bucket counts of the rows above (2^16: the window
+// rows; 2^17: the small erase rows; 2^21: the lookup rows; 2^23: the pre-sized
+// rows), at L = 0, B/2 and B live keys, and the Advanced variant at L = B/2.
+static void register_advance_regression() {
+    struct FreePassRow { const char* name; void (*fn)(benchmark::State&, size_t); };
+    static constexpr FreePassRow free_rows[] = {
+        {"Advance_FreePass_Warm_ArenaOrder", advance_free_pass<false, false>},
+        {"Advance_FreePass_Cold_ArenaOrder", advance_free_pass<true, false>},
+        {"Advance_FreePass_Warm_Shuffled",   advance_free_pass<false, true>},
+        {"Advance_FreePass_Cold_Shuffled",   advance_free_pass<true, true>},
+    };
+    for (const FreePassRow& row : free_rows) {
+        for (int lg = 10; lg <= 22; lg += 2) {
+            const size_t nodes = size_t(1) << lg;
+            const benchmark::IterationCount iters = std::clamp<benchmark::IterationCount>(benchmark::IterationCount(1 << 22)/benchmark::IterationCount(nodes), 3, 200);
+            benchmark::RegisterBenchmark(std::string(row.name) + "/nodes:" + std::to_string(nodes), row.fn, nodes)
+                ->Iterations(iters)->UseManualTime();
+        } // loop over the node counts
+    } // loop over the free-pass variants
+    struct WalkRow { const char* name; void (*fn)(benchmark::State&, size_t, size_t); bool half_only; };
+    static constexpr WalkRow walk_rows[] = {
+        {"Advance_Walk_NothingRetired",      advance_walk<WalkCall::NothingRetired>,     false},
+        {"Advance_Walk_NothingRetired_Cold", advance_walk<WalkCall::NothingRetiredCold>, false},
+        {"Advance_Walk_Advanced",            advance_walk<WalkCall::Advanced>,           true},
+    };
+    static constexpr int bucket_logs[] = {14, 16, 17, 18, 20, 21, 22, 23};
+    for (const WalkRow& row : walk_rows) {
+        for (int lg : bucket_logs) {
+            const size_t buckets = size_t(1) << lg;
+            for (size_t live : {size_t(0), buckets/2, buckets}) {
+                if (row.half_only && live != buckets/2) continue;
+                const benchmark::IterationCount iters = std::clamp<benchmark::IterationCount>(benchmark::IterationCount(1 << 25)/benchmark::IterationCount(buckets + live), 3, 100);
+                benchmark::RegisterBenchmark(std::string(row.name) + "/buckets:" + std::to_string(buckets) + "/live:" + std::to_string(live),
+                                             row.fn, buckets, live)
+                    ->Iterations(iters)->UseManualTime();
+            } // loop over the populations
+        } // loop over the bucket counts
+    } // loop over the walk variants
+} // register_advance_regression()
 
 // ---------------------------------------------------------------------------
 // Registrations: identical workloads, two containers.
@@ -901,6 +1740,20 @@ DEFINE_MOSTLY_NEW_ON(MostlyNewPresizedFixture, Insert_MostlyNew_Presized_RWLocke
 
 DEFINE_MOSTLY_OLD(Lookup_MostlyOld_Concurrent, ConcurrentSet)
 DEFINE_MOSTLY_OLD(Lookup_MostlyOld_RWLocked,   LockedSet)
+
+// Lookup_MostlyOld_OpHandle: Lookup_MostlyOld_Concurrent with every operation
+// under a handle of its own, taken just before it and released when it ends
+// (DEFINE_MOSTLY_OLD_UNDER's HANDLE). Why measure: the rows above keep one
+// long-lived handle per thread, whose join happens once, untimed; a caller
+// that cannot keep a handle pays a join and a leave per operation instead.
+// The join is a seq_cst increment of the current generation's handle count
+// and a seq_cst re-load of the current generation, the leave a release
+// decrement of the same count, so every thread's every operation writes the
+// one line that count is on; each join also increments the set's diagnostic
+// join counter (relaxed), one more line that every thread writes. The threads'
+// long-lived handles are still made and destroyed as in every row, unused.
+// Only on the AllowDelete == false set, against _Concurrent.
+DEFINE_MOSTLY_OLD_UNDER(MostlyOldFixture, Lookup_MostlyOld_OpHandle, ConcurrentSet, set->new_handle())
 
 // The reclamation cells (see the section above): the AllowDelete == true set
 // empty, prefilled, and prefilled by churn, for each of the three workloads.
@@ -919,36 +1772,74 @@ DEFINE_MOSTLY_OLD_ON(ChurnFixture, Lookup_MostlyOld_Del_Control,   OldControl)
 DEFINE_MOSTLY_OLD_ON(ChurnFixture, Lookup_MostlyOld_Del_Reclaimed, OldReclaimed)
 DEFINE_MOSTLY_OLD_ON(ChurnFixture, Lookup_MostlyOld_Del_Erased,    OldErased)
 
-// The erase cell (see Erase_Presized_Del above). Same accounting contract as the
-// macro bodies: allocate() before the loop; report_wall() then release() after
-// it; the per-thread SkipWithError() after the loop, never inside it.
-BENCHMARK_TEMPLATE_DEFINE_F(EraseFixture, Erase_Presized_Del, ConcurrentSetDel)(benchmark::State& state) {
-    static constinit WallRecords records;
-    const int base = state.thread_index()*(kErasePrefill/num_cpu);
-    int next = 0;
-    int64_t ok = 0;
-    records.allocate(state);
-    for (auto _ : WallTimed(state, records)) {
-        ok += set->erase(mix(base + next++));
-    }
-    if (ok != state.iterations()) {
-        state.SkipWithError("erase() returned false for a present key no other thread erases");
-    }
-    state.SetItemsProcessed(state.iterations());
-    report_wall(state, records, double(state.iterations())*state.threads());
-    if (state.thread_index() == 0) {   // the container's diagnostic counter (see the fixture)
-        const double erased = double(state.iterations())*state.threads();
-        state.counters["retired_per_erase"] = benchmark::Counter(
-            double(set->get_internal_counters().retire_nodes - retired_before)/erased);
-    }
-    records.release(state);
-} // Erase_Presized_Del
+// The erase rows (see Erase_Presized_Del above): the two pre-sized rows over
+// ThreadRange(1, num_cpu) with kErasePrefill/num_cpu erases per thread at
+// every thread count, the two small rows with kSmallPrefill erases per run.
+DEFINE_ERASE(Erase_Presized_Del,
+    /* PRE */,
+    /* ITERATION */
+    ok += set->erase(own.get(), mix(base + next++));,
+    /* POST */,
+    ConcurrentSetDel)
 BENCHMARK_REGISTER_F(EraseFixture, Erase_Presized_Del)
     ->ThreadRange(1, num_cpu)->Iterations(kErasePrefill/num_cpu)->UseRealTime();
+
+DEFINE_ERASE(Erase_Presized_Del_Rcu,
+    /* PRE */
+    Tally tally;,
+    /* ITERATION: after the last erase, the release, then the one advance() */
+    ok += set->erase(own.get(), mix(base + next++));
+    if (own.finish_iteration()) [[unlikely]] tally.add(set->advance());,
+    /* POST */
+    tally.report(state);,
+    ConcurrentSetDel)
+BENCHMARK_REGISTER_F(EraseFixture, Erase_Presized_Del_Rcu)
+    ->ThreadRange(1, num_cpu)->Iterations(kErasePrefill/num_cpu)->UseRealTime();
+
+DEFINE_ERASE(Erase_Small_Del,
+    /* PRE */,
+    /* ITERATION */
+    ok += set->erase(own.get(), mix(base + next++));,
+    /* POST */,
+    ConcurrentSetDel, SmallErase)
+[[maybe_unused]] static const bool Erase_Small_Del_registered =
+    (register_shared_total<BENCHMARK_PRIVATE_CONCAT_NAME(EraseFixture, Erase_Small_Del)>(kSmallPrefill), true);
+
+DEFINE_ERASE(Erase_Small_Del_Rcu,
+    /* PRE */
+    Tally tally(std::max(1, advance_every_from_env("HASH_BM_SMALL_ADVANCE_EVERY", kSmallAdvanceEvery)/state.threads()), state);,
+    /* ITERATION: refresh, erase, advance() at the cadence */
+    own.refresh();
+    ok += set->erase(own.get(), mix(base + next++));
+    if (tally.due()) tally.add(set->advance());
+    own.finish_iteration();,
+    /* POST */
+    tally.report(state);,
+    ConcurrentSetDel, SmallErase)
+[[maybe_unused]] static const bool Erase_Small_Del_Rcu_registered =
+    (register_shared_total<BENCHMARK_PRIVATE_CONCAT_NAME(EraseFixture, Erase_Small_Del_Rcu)>(kSmallPrefill), true);
+
+// The window rows (see Churn_Window_Del above).
+DEFINE_WINDOW(Churn_Window_Del_NoReclaim,
+    /* PRE */, /* BEFORE */, /* AFTER_ERASE */, /* END */, /* POST */)
+DEFINE_WINDOW(Churn_Window_Del_Rcu,
+    /* PRE */
+    Tally tally(advance_every_from_env("HASH_BM_WINDOW_ADVANCE_EVERY", kWindowAdvanceEvery), state);,
+    /* BEFORE */
+    own.refresh();,
+    /* AFTER_ERASE */
+    if (tally.due()) tally.add(set->advance());,
+    /* END */
+    own.finish_iteration();,
+    /* POST */
+    tally.report(state);)
 
 // The hot-growth probe (see InsertHotGrowth above), on both instantiations.
 DEFINE_HOT_GROWTH(InsertHotGrowth_Concurrent, ConcurrentSet)
 DEFINE_HOT_GROWTH(InsertHotGrowth_Del,        ConcurrentSetDel)
+
+// The advance() geometry regression (see above), last.
+[[maybe_unused]] static const bool advance_regression_registered = (register_advance_regression(), true);
 
 // BENCHMARK_MAIN()'s start-up, including its re-exec without ASLR, less its
 // guard against a null argv (argv is never null in a hosted program), plus

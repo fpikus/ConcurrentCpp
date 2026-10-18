@@ -5098,6 +5098,12 @@ struct StressShape {
     // shapes' initializers (which end at `report`) need neither.
     size_t cadence = 0;     // Options::auto_reclaim_every of the set: 0 = off; > 0 = the automatic cadence, and the run's end state goes through advance_and_check()
     size_t slot_limit = 0;  // runaway guard: the run STOPS early (it does not fail) when the arena exceeds this many slots; 0 = no guard
+    // The broad cadenced stress's variations (CadenceStressMixedHandlesAndCallers). Each
+    // defaults to what every shape above has, so no other shape changes.
+    int reclaimers = 0;           // threads calling reclaim() in a loop, beside the `advancers` (which call advance())
+    bool mixed_handles = false;   // true: even-numbered writers and readers take a handle per operation, odd-numbered ones a long-lived handle (per_op_handles is then ignored)
+    int refresh_every = 1;        // a long-lived handle is refreshed on every refresh_every-th iteration of its thread (1: every iteration; must be > 0)
+    std::chrono::microseconds call_pause{0};   // advancers and reclaimers sleep this long after each call (0: back to back, the flag held most of the time)
 }; // struct StressShape
 
 // What happened during the run (before the end-state calls), for the witnesses.
@@ -5118,6 +5124,7 @@ struct StressWitness {
     size_t pops = 0;                 // free-list pops since construction: nodes_freed (cumulative) minus the free nodes at the quiescent point; exact, since only the free pass pushes and the lists start empty
     size_t reader_triggers = 0;      // reader iterations across which the reader's own bump_ns grew: a trigger proceeded inside one of its contains() (readers make no explicit call)
     bool stopped_by_guard = false;   // the runaway guard (StressShape::slot_limit) ended the run early
+    size_t reclaim_outcomes[4] = {0, 0, 0, 0};   // the reclaimers' reclaim() results by AdvanceResult::Advance (StressShape::reclaimers)
 }; // struct StressWitness
 
 static int stress_writer_key(int t, int i) { return ((t + 1) << 22) | i; }   // writer t's key i, i < 2^22
@@ -5144,20 +5151,26 @@ static void advance_stress_body(const StressShape& shape, const std::string& whe
         for (int i = 0; i < shape.stable; ++i) ASSERT_TRUE(set.insert(h, stress_stable_key(i)));
     }
     const typename SetT::InternalCounters c0 = set.get_internal_counters();
-    const int T = shape.writers + shape.readers + shape.advancers;
+    const int T = shape.writers + shape.readers + shape.advancers + shape.reclaimers;
     std::atomic<bool> stop{false};
     std::barrier start(T + 1);
     std::vector<size_t> bad(T, 0);
     std::vector<int> written(shape.writers, 0);   // writer t inserted its keys 0 .. written[t]-1
-    std::vector<StressWitness> tallies(shape.advancers);
+    std::vector<StressWitness> tallies(shape.advancers + shape.reclaimers);   // advancers first, then reclaimers
     std::vector<size_t> reader_triggers(shape.readers, 0);   // reader r's iterations with a trigger inside (cadenced runs only)
     std::vector<std::thread> threads;
     threads.reserve(T);
+    // Whether writer or reader thread t (its index among all threads) takes a
+    // handle per operation: every one under per_op_handles; under
+    // mixed_handles the even-numbered ones, the odd-numbered keeping a
+    // long-lived handle.
+    auto per_op_thread = [&shape](int t) -> bool { return shape.mixed_handles ? t % 2 == 0 : shape.per_op_handles; };
     // One operation `op(handle)` of a writer or reader under its handle
-    // discipline: a handle of its own for the operation, or the thread's
-    // long-lived `h` (refreshed once per iteration by the loops below).
-    auto under = [&set, &shape](const typename SetT::handle& h, auto op) -> bool {
-        if (shape.per_op_handles) {
+    // discipline: a handle of its own for the operation (`per_op`), or the
+    // thread's long-lived `h` (refreshed by the loops below on every
+    // refresh_every-th iteration).
+    auto under = [&set](bool per_op, const typename SetT::handle& h, auto op) -> bool {
+        if (per_op) {
             const typename SetT::handle own = set.new_handle();
             return op(own);
         }
@@ -5165,18 +5178,19 @@ static void advance_stress_body(const StressShape& shape, const std::string& whe
     }; // under()
     for (int t = 0; t < shape.writers; ++t) {
         threads.emplace_back([&, t]() {
-            typename SetT::handle h = shape.per_op_handles ? typename SetT::handle{} : set.new_handle();
+            const bool per_op = per_op_thread(t);
+            typename SetT::handle h = per_op ? typename SetT::handle{} : set.new_handle();
             start.arrive_and_wait();
             const int W = shape.window;
             int i = 0;
             for (; !stop.load(std::memory_order_relaxed) && i < (1 << 22); ++i) {
-                if (h) h.refresh();
+                if (h && i % shape.refresh_every == 0) h.refresh();
                 const int in = stress_writer_key(t, i), out = stress_writer_key(t, i - W);
-                bad[t] += !under(h, [&](const typename SetT::handle& x) { return set.insert(x, in); });
-                bad[t] += !under(h, [&](const typename SetT::handle& x) { return set.contains(x, in); });
+                bad[t] += !under(per_op, h, [&](const typename SetT::handle& x) { return set.insert(x, in); });
+                bad[t] += !under(per_op, h, [&](const typename SetT::handle& x) { return set.contains(x, in); });
                 if (i >= W) {
-                    bad[t] += !under(h, [&](const typename SetT::handle& x) { return set.erase(x, out); });
-                    bad[t] += under(h, [&](const typename SetT::handle& x) { return set.contains(x, out); });
+                    bad[t] += !under(per_op, h, [&](const typename SetT::handle& x) { return set.erase(x, out); });
+                    bad[t] += under(per_op, h, [&](const typename SetT::handle& x) { return set.contains(x, out); });
                 } // the window's oldest key leaves
             } // writer loop
             written[t] = i;
@@ -5185,11 +5199,12 @@ static void advance_stress_body(const StressShape& shape, const std::string& whe
     for (int r = 0; r < shape.readers; ++r) {
         const int t = shape.writers + r;
         threads.emplace_back([&, t, r]() {
-            typename SetT::handle h = shape.per_op_handles ? typename SetT::handle{} : set.new_handle();
+            const bool per_op = per_op_thread(t);
+            typename SetT::handle h = per_op ? typename SetT::handle{} : set.new_handle();
             std::minstd_rand rng(static_cast<unsigned>(r + 1));
             start.arrive_and_wait();
-            while (!stop.load(std::memory_order_relaxed)) {
-                if (h) h.refresh();
+            for (int i = 0; !stop.load(std::memory_order_relaxed); ++i) {
+                if (h && i % shape.refresh_every == 0) h.refresh();
                 // A reader makes no explicit call, so its own thread_local
                 // bump_ns grows only when a trigger PROCEEDS inside one of its
                 // contains() (a split's cleanup it won retired a run that
@@ -5200,9 +5215,9 @@ static void advance_stress_body(const StressShape& shape, const std::string& whe
                 const int stable = stress_stable_key(static_cast<int>(x%static_cast<unsigned>(shape.stable)));
                 const int never = stress_never_key(static_cast<int>((x >> 8)%1024u));
                 const int any = stress_writer_key(static_cast<int>((x >> 16)%static_cast<unsigned>(shape.writers)), static_cast<int>((x >> 4)%4096u));
-                bad[t] += !under(h, [&](const typename SetT::handle& y) { return set.contains(y, stable); });
-                bad[t] += under(h, [&](const typename SetT::handle& y) { return set.contains(y, never); });
-                (void)under(h, [&](const typename SetT::handle& y) { return set.contains(y, any); });
+                bad[t] += !under(per_op, h, [&](const typename SetT::handle& y) { return set.contains(y, stable); });
+                bad[t] += under(per_op, h, [&](const typename SetT::handle& y) { return set.contains(y, never); });
+                (void)under(per_op, h, [&](const typename SetT::handle& y) { return set.contains(y, any); });
                 if (shape.cadence != 0 && SetT::internal_advance_timers().bump_ns != bump_before) ++reader_triggers[r];
             } // reader loop
         }); // reader thread r
@@ -5215,9 +5230,21 @@ static void advance_stress_body(const StressShape& shape, const std::string& whe
                 const AdvanceResult r = set.advance();
                 tally.bags_freed += r.freed_bags;
                 ++tally.outcomes[static_cast<size_t>(r.advance)];
+                if (shape.call_pause.count() != 0) std::this_thread::sleep_for(shape.call_pause);
             } // advancer loop
         }); // advancer thread a
     } // advancers
+    for (int c = 0; c < shape.reclaimers; ++c) {
+        threads.emplace_back([&, c]() {
+            StressWitness& tally = tallies[shape.advancers + c];
+            start.arrive_and_wait();
+            while (!stop.load(std::memory_order_relaxed)) {
+                const AdvanceResult r = set.reclaim();
+                ++tally.reclaim_outcomes[static_cast<size_t>(r.advance)];
+                if (shape.call_pause.count() != 0) std::this_thread::sleep_for(shape.call_pause);
+            } // reclaimer loop
+        }); // reclaimer thread c
+    } // reclaimers
     start.arrive_and_wait();
     bool stopped_by_guard = false;
     if (shape.slot_limit == 0) {
@@ -5247,8 +5274,11 @@ static void advance_stress_body(const StressShape& shape, const std::string& whe
     w.stopped_by_guard = stopped_by_guard;
     for (const StressWitness& tally : tallies) {
         w.bags_freed += tally.bags_freed;
-        for (size_t o = 0; o < 4; ++o) w.outcomes[o] += tally.outcomes[o];
-    } // sum the advancers' tallies
+        for (size_t o = 0; o < 4; ++o) {
+            w.outcomes[o] += tally.outcomes[o];
+            w.reclaim_outcomes[o] += tally.reclaim_outcomes[o];
+        } // loop over the four outcomes
+    } // sum the advancers' and the reclaimers' tallies
     w.join_retries = c1.join_retries - c0.join_retries;
     w.pops_raced_push = c1.pops_raced_push - c0.pops_raced_push;
     w.free_push_cas_failures = c1.free_push_cas_failures - c0.free_push_cas_failures;
@@ -5277,6 +5307,10 @@ static void advance_stress_body(const StressShape& shape, const std::string& whe
                         where.c_str(), set.get_internal_auto_reclaim_every(), w.auto_reclaims, w.auto_skipped, w.counted_bags_freed,
                         w.nodes_freed, w.pops, w.reader_triggers, w.stopped_by_guard ? "; STOPPED by the runaway guard" : "");
         } // if cadenced
+        if (shape.reclaimers != 0) {
+            std::printf("[   INFO   ] %s: reclaim(): advanced %zu, nothing_retired %zu, ring_full %zu, contended %zu\n", where.c_str(),
+                        w.reclaim_outcomes[1], w.reclaim_outcomes[0], w.reclaim_outcomes[2], w.reclaim_outcomes[3]);
+        } // if reclaimers ran
     } // report
 
     // The end state: every handle is gone (each thread released its own).
@@ -5922,6 +5956,66 @@ TEST(ConcurrentHashSetRcuTest, CadenceTriggerLeavesStragglers) {
     EXPECT_EQ(ProbeKey::corrupt.load(), 0);
 } // CadenceTriggerLeavesStragglers
 
+// An operation that throws AFTER its own trigger ran leaves the trigger's
+// effects standing (the trigger's result is not "lost": nothing reports it).
+// R = 1, CadProbeSet (NoHooks: a throwing ProbeKey hook may be armed).
+// leave_five_stragglers() under h, h released (with h live, the construction's
+// triggers could have filled the ring, and the measured trigger would be
+// `ring_full`). Bucket 1 then holds the dead two-node run 385 -> 129 at its
+// head, then the live 257. Under h2, insert(513) (513 & 255 == 1, absent):
+// its walk unlinks the head run (ONE retire push of two nodes, which crosses
+// R = 1: the trigger proceeds INSIDE the insert and publishes), then compares
+// 257, where equal_hook throws. The insert allocates its node only after the
+// walk, so nothing goes to limbo.
+// Expect: the exception reaches the caller; retire_runs +1, retire_nodes +2,
+// auto_reclaims +1, bumps +1, limbo_pushes +0; the sweep consistent, with the
+// other three stragglers still reachable (3) and none of the run; 513 absent and
+// 257 present; the retried insert(513) succeeds; the destructor's cadence
+// invariants hold.
+// Why: the trigger is the only reclamation that runs inside an operation whose
+// later steps (Hash{}, operator==) may throw; this checks that unwinding
+// through the operation neither undoes nor repeats the trigger's bump and
+// leaves no node unaccounted for.
+// Kills (measured; each also killed elsewhere): the trigger placed before the
+// retire push (bumps +0); a free pass that ignores the pins, a trigger whose free
+// pass takes refs <= 1 for unpinned, and a retire push that writes the list's
+// next pointer into the chain link (the sweep after the throw is inconsistent);
+// a flag never released (the sweep's flag assert).
+TEST(ConcurrentHashSetRcuTest, CadenceThrowAfterTriggerKeepsItsEffects) {
+    using Set = CadProbeSet<64>;
+    ProbeKey::reset_counters();
+    {
+        Set set = cadenced_set<Set>(4, 1, 1);
+        Set::InternalAccounting left{};
+        {
+            const Set::handle h = set.new_handle();
+            ASSERT_NO_FATAL_FAILURE(leave_five_stragglers(set, h, left));
+        } // the construction's handle, released so that the measured trigger can publish
+        const Set::handle h2 = set.new_handle();
+        const Set::InternalCounters c0 = set.get_internal_counters();
+        int fired = 0;
+        ProbeKey::arm(ProbeKey::equal_hook, 257, 1, [&fired]() {
+            ++fired;
+            throw std::runtime_error("operator== armed to throw after the trigger");
+        });
+        EXPECT_THROW(set.insert(h2, 513), std::runtime_error);
+        ProbeKey::disarm_hooks();
+        const Set::InternalCounters c1 = set.get_internal_counters();
+        ASSERT_EQ(fired, 1) << "test precondition: the insert did not reach 257";
+        ASSERT_EQ(c1.retire_runs - c0.retire_runs, 1u) << "test precondition: the walk did not unlink the head run as one push";
+        EXPECT_EQ(c1.retire_nodes - c0.retire_nodes, 2u);
+        EXPECT_EQ(c1.auto_reclaims - c0.auto_reclaims, 1u) << "the trigger did not proceed inside the insert";
+        EXPECT_EQ(c1.bumps - c0.bumps, 1u) << "the trigger's publish does not stand";
+        EXPECT_EQ(c1.limbo_pushes - c0.limbo_pushes, 0u);
+        EXPECT_EQ(expect_consistent(set, "after the throw").reachable_dead, 3u) << "the head run left bucket 1; the other three stragglers stay";
+        EXPECT_FALSE(set.contains(h2, 513));
+        EXPECT_TRUE(set.contains(h2, 257));
+        EXPECT_TRUE(set.insert(h2, 513)) << "the retried insert";
+        EXPECT_TRUE(set.contains(h2, 513));
+    } // the set's lifetime: the destructor's cadence invariants run here
+    EXPECT_EQ(ProbeKey::corrupt.load(), 0);
+} // CadenceThrowAfterTriggerKeepsItsEffects
+
 // The cadence's decoding, read back through
 // get_internal_auto_reclaim_every(), the effective R. Both cadence-off forms
 // read 0; 3 reads 4 and 5 reads 8 (rounded UP to a power of two); 2^63,
@@ -6436,6 +6530,93 @@ TEST(ConcurrentHashSetRcuTest, CadenceStressManyTinySets) {
     EXPECT_GT(auto_reclaims, 0u) << "witness: no trigger proceeded in any round";
     EXPECT_GT(reader_triggers, 0u) << "witness: no trigger proceeded inside a reader's contains()";
 } // CadenceStressManyTinySets
+
+// The broad cadenced stress: what the three cadence stresses above hold fixed
+// (R = 1, long-lived handles refreshed every iteration, advance() the only
+// explicit call, no yields), varied in one run. A fresh 4-bucket set per round
+// (mixing hash, so the table doubles inside every round and readers' lookups
+// win splits whose cleanups trigger), FOUR arena shards, R = 4 (a crossing
+// every fourth node per shard, so most retire pushes do not trigger), a ring
+// of 8 generations (a long-lived handle pins a bag for up to 64 of its
+// iterations, so the ring fills and triggers and calls meet `ring_full`
+// beside operations), and:
+//   - mixed handles: the even-numbered writers and readers take a handle per
+//     operation (every trigger then runs under a temporary handle that pins
+//     the generation it closes), the odd-numbered keep a long-lived handle
+//     refreshed only every 64th iteration;
+//   - one advance() caller AND one reclaim() caller beside the triggers, so
+//     all three holders of the flag meet (each refused call is `contended`,
+//     each refused trigger skipped);
+//   - TestHooks' yield_in_windows: every join yields between its load and its
+//     increment and between its increment and its re-verify, and every
+//     publish -- an explicit call's or a trigger's, inside an operation --
+//     yields before its final free pass, with the flag held.
+// Oracles: advance_stress_body()'s (every writer's and reader's determined
+// booleans, the end state after advance_and_check() at the quiescent point,
+// exact membership), and the destructor's cadence invariants per set.
+// Witnesses, over all rounds: triggers proceeded and were skipped; bags and
+// nodes freed and freed nodes popped again; a trigger inside a reader's
+// contains(); both explicit callers proceeded and some explicit call was
+// refused; joins retried; the after-publish hook ran.
+// Kills, probabilistically: reclaim() ignoring the flag (the only stress with
+// a reclaim() caller); a trigger releasing the flag before its final free
+// pass; a trigger whose free pass takes refs <= 1 for unpinned.
+// The bump's exchanges moved into the publish window are left to the cadence
+// stresses above: here most explicit calls and triggers are refused or find
+// the ring full.
+TEST_F(HashRcuHookTest, CadenceStressMixedHandlesAndCallers) {
+    using Set = ConcurrentResizableHashSetRCU<int, true, CadenceMixHash, 8, TestHooks>;
+    StressShape shape{4, 2, 1, false, 4, 4, 64, 64, std::chrono::milliseconds(100), false};
+    shape.cadence = 4;
+    shape.slot_limit = size_t{1} << 18;
+    shape.reclaimers = 1;
+    shape.mixed_handles = true;
+    shape.refresh_every = 64;
+    shape.call_pause = std::chrono::microseconds(50);
+    TestHooks::yield_in_windows.store(true);
+    const std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+    StressWitness all;
+    size_t rounds = 0, stopped = 0;
+    // A round starts only if it can end by the deadline, so the test stays within the
+    // other cadence stresses' second.
+    while (std::chrono::steady_clock::now() + shape.run_for <= deadline) {
+        StressWitness w;
+        ASSERT_NO_FATAL_FAILURE(advance_stress_body<Set>(shape, "mixed handles and callers, set " + std::to_string(rounds), w));
+        all.auto_reclaims += w.auto_reclaims;
+        all.auto_skipped += w.auto_skipped;
+        all.counted_bags_freed += w.counted_bags_freed;
+        all.nodes_freed += w.nodes_freed;
+        all.pops += w.pops;
+        all.reader_triggers += w.reader_triggers;
+        all.contended += w.contended;
+        all.join_retries += w.join_retries;
+        for (size_t o = 0; o < 4; ++o) {
+            all.outcomes[o] += w.outcomes[o];
+            all.reclaim_outcomes[o] += w.reclaim_outcomes[o];
+        } // loop over the four outcomes
+        stopped += w.stopped_by_guard;
+        ++rounds;
+    } // rounds
+    const size_t advanced = static_cast<size_t>(Advance::advanced), nothing = static_cast<size_t>(Advance::nothing_retired);
+    const size_t full = static_cast<size_t>(Advance::ring_full);
+    std::printf("[   INFO   ] CadenceStressMixedHandlesAndCallers: %zu sets, auto_reclaims %zu, auto_skipped %zu, bags freed %zu, "
+                "nodes freed %zu, pops %zu, reader iterations with a trigger %zu, contended %zu, join retries %zu; advance() "
+                "advanced/nothing_retired/ring_full %zu/%zu/%zu, reclaim() %zu/%zu/%zu; after-publish calls %ld; rounds stopped by the guard %zu\n",
+                rounds, all.auto_reclaims, all.auto_skipped, all.counted_bags_freed, all.nodes_freed, all.pops, all.reader_triggers,
+                all.contended, all.join_retries, all.outcomes[advanced], all.outcomes[nothing], all.outcomes[full],
+                all.reclaim_outcomes[advanced], all.reclaim_outcomes[nothing], all.reclaim_outcomes[full],
+                TestHooks::after_publish.calls.load(), stopped);
+    EXPECT_GT(all.auto_reclaims, 0u) << "witness: no trigger proceeded";
+    EXPECT_GT(all.auto_skipped, 0u) << "witness: no trigger was skipped";
+    EXPECT_GT(all.counted_bags_freed, 0u) << "witness: no bag was freed";
+    EXPECT_GT(all.pops, 0u) << "witness: no freed node was reused";
+    EXPECT_GT(all.reader_triggers, 0u) << "witness: no trigger proceeded inside a reader's contains()";
+    EXPECT_GT(all.outcomes[advanced] + all.outcomes[nothing], 0u) << "witness: the advance() caller never proceeded";
+    EXPECT_GT(all.reclaim_outcomes[advanced] + all.reclaim_outcomes[nothing], 0u) << "witness: the reclaim() caller never proceeded";
+    EXPECT_GT(all.contended, 0u) << "witness: no explicit call met another holder at the flag";
+    EXPECT_GT(all.join_retries, 0u) << "witness: no join ever retried";
+    EXPECT_GT(TestHooks::after_publish.calls.load(), 0) << "witness: no publish entered its publish-to-free-pass window";
+} // CadenceStressMixedHandlesAndCallers
 
 // ===========================================================================
 // CONTRACT TESTS: handles, generations and advance() through the public

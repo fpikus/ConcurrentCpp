@@ -45,7 +45,7 @@
 
 // AddressSanitizer poisoning of free-list nodes (see ASAN POISONING under
 // HANDLES AND GENERATIONS in the class overview): the value bytes of a node
-// are poisoned while the node is on a free list -- by advance()'s free pass,
+// are poisoned while the node is on a free list -- by the free pass,
 // before it pushes the node, and unpoisoned by the pop that wins the node,
 // before it assigns the new value, and by the destructor -- so that a read
 // of a freed value through a stale address is reported instead of returning
@@ -220,8 +220,8 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //              per touched shard per allocation path (each shard adds 256
 //              when it appends a node whose index is a multiple of 256, index
 //              0 included, and 256 on every 256th pop from a free list, the
-//              first pop included), minus every node the free pass of
-//              advance() has freed. One-sided at every quiescent point;
+//              first pop included), minus every node a free pass has
+//              freed. One-sided at every quiescent point;
 //              while operations run it may lag the occupied slots by the
 //              batches whose 256 is not yet added, and it never goes below
 //              zero (the member's comment says why).
@@ -247,8 +247,8 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //       node's current life: a link goes live -> MARKED or live -> FROZEN, by
 //       one CAS. No concurrent operation writes a tagged link. Concurrently,
 //       a published link's address bits change only by an unlink CAS on a
-//       LIVE link, which bypasses a run of dead successors. The free pass of
-//       advance() rewrites the link of every node it frees, while that node
+//       LIVE link, which bypasses a run of dead successors. The free pass
+//       rewrites the link of every node it frees, while that node
 //       is on no chain and observable by no handle (see RECLAMATION).
 //     - a BUCKET HEAD carries a 6-bit SEAL LEVEL: log2 of the largest table size
 //       for which a child split has SEALED this bucket's chain (the seal comes
@@ -279,7 +279,7 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   MARKED. A node address observed by any traversing thread therefore stays
 //   a valid node for as long as that thread's operation runs: a dead node's
 //   memory becomes reusable only when no handle that could observe it is
-//   live (advance() bags it and a free pass puts it on a free list, from
+//   live (a bump bags it and a free pass puts it on a free list, from
 //   which later allocations take it: HANDLES AND GENERATIONS), and is never
 //   returned to the system before the set is destroyed. That is what lets
 //   the read path dereference node pointers with no hazard pointers and no
@@ -378,8 +378,8 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   walk: a standalone call that walks every published chain like a writer
 //   miss walk without inserting anything, at the cost of an API call on
 //   the caller's cadence.
-//   RETIREMENT. A retired node is not reused before an advance() has bagged
-//   it and no handle that could observe it remains: the retired lists only
+//   RETIREMENT. A retired node is not reused before a bump has bagged it
+//   and no handle that could observe it remains: the retired lists only
 //   separate "dead and out of its chain" from "dead and still in it", for
 //   the bump to take without a chain walk (RECLAMATION).
 //
@@ -410,7 +410,8 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   The one deliberate guarantee: NO ARENA SLOT IS LOST TO A THROW. Every
 //   private node an operation holds when an exception passes through it is
 //   pushed to limbo before the exception leaves, so get_internal_accounting()
-//   stays consistent and a later advance() recycles the node. Per operation:
+//   stays consistent and a later bump and free pass recycle the node. Per
+//   operation:
 //   - T (template parameter): must be copy-assignable, because a node reused
 //     from a free list takes its new value by assignment; a throwing
 //     assignment must leave the old object valid, as every standard type's
@@ -483,10 +484,10 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 // RECLAMATION: FREE LISTS, LIMBO LISTS, RETIRED LISTS, BAGS
 //   Every shard has two intrusive singly linked lists threaded through the
 //   nodes' `link` words: a FREE LIST of nodes available for reuse and a LIMBO
-//   LIST of unreachable nodes waiting for the next advance(). The next pointer
-//   lives in the atomic link word and never in the T bytes: a thread that
-//   loses a pop race may still read the node's link while the winner is
-//   already assigning the node's value (see alloc_node()).
+//   LIST of unreachable nodes waiting for the next bump (advance(), reclaim()
+//   or a trigger). The next pointer lives in the atomic link word and never in
+//   the T bytes: a thread that loses a pop race may still read the node's link
+//   while the winner is already assigning the node's value (see alloc_node()).
 //   A third list per shard, the RETIRED LIST, is threaded through a word of
 //   its own, Node::retire_link: it holds the dead nodes that a concurrent
 //   operation has unlinked from their chain (push_retired() is its one entry
@@ -509,7 +510,7 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   handle can observe onto the free lists, dealing the nodes round-robin
 //   over the shards; the WALK unlinks the dead nodes still in their chains
 //   with the writer walks' one-shot CAS and retires them. A retired or
-//   limbo node is reused no earlier than the advance() that bags it, and
+//   limbo node is reused no earlier than the bump that bags it, and
 //   only once no handle of its bag's generation or an older one is live:
 //   retirement changes WHEN a dead node stops being walked, and the bag
 //   decides when its memory comes back.
@@ -576,10 +577,10 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //     run; it is safe because a node is freed only after every handle that
 //     could observe it has left or refreshed, and it is popped by one thread
 //     while on no chain (THE PER-NODE REUSE CHAIN below). A throwing
-//     assignment routes the node to limbo, reused only after a later
-//     advance(). Chosen over destroy-at-free + construct-at-reuse (the deque
-//     destroys every slot at the end, so a destroyed slot would have to be
-//     re-constructed at once) and over raw-storage slots (saves only
+//     assignment routes the node to limbo, reused only after a later bump
+//     and free pass. Chosen over destroy-at-free + construct-at-reuse (the
+//     deque destroys every slot at the end, so a destroyed slot would have to
+//     be re-constructed at once) and over raw-storage slots (saves only
 //     destructor calls, costs a non-destroying container).
 //
 // HANDLES AND GENERATIONS: RECLAMATION BESIDE THE OPERATIONS
@@ -611,8 +612,8 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   new_handle() or with advance(); a handle may be created on one thread
 //   and used on another after a happens-before edge (the handle records no
 //   thread id). An operation runs under a handle of ANY live generation,
-//   the current one or one an advance() has closed since the join, with
-//   its full contract: the generation decides only which bags advance() may
+//   the current one or one a bump has closed since the join, with its full
+//   contract: the generation decides only which bags a free pass may
 //   free while the handle lives, and only refresh() or a release changes
 //   it. A temporary is a handle too: `set.contains(set.new_handle(), k)`
 //   joins, and leaves at the end of the full expression. The precondition
@@ -759,8 +760,8 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   what it bypasses onto the shard's retired lists of the generation that
 //   is current AFTER the bump (after the publish, when there is one: a
 //   `nothing_retired` call publishes nothing). A walk retiree is therefore
-//   freed no earlier than the NEXT advance() (it is exchanged into a bag by
-//   the next call's A3 and freed by that call's free pass at the earliest):
+//   freed no earlier than the NEXT bump (it is exchanged into a bag by the
+//   next bump's A3 and freed by that bump's free pass at the earliest):
 //   two clicks. A dead node still in a chain carries no generation and is
 //   visible to handles of EVERY live generation, which is why the walk can
 //   only make it unreachable with the one-shot unlink CAS every writer walk
@@ -1081,7 +1082,7 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   is safe because the node is popped by one thread while on no chain,
 //   after every handle that could observe it has left or refreshed (the
 //   reuse chain). A throwing assignment routes the node to limbo, reused
-//   only after a later advance().
+//   only after a later bump and free pass.
 //
 //   THE LIMBO LIST under the bump. A limbo node was never published, but a
 //   node popped from a free list whose assignment threw may still have its
@@ -1580,8 +1581,8 @@ private:
     //                   expected value is the LIVE link. MARK and FROZEN are
     //                   therefore mutually exclusive and both terminal for the
     //                   node's life: a tagged link is never written again by a
-    //                   concurrent operation, and only the free pass of
-    //                   advance() rewrites it, when it frees the node for a
+    //                   concurrent operation, and only the free pass
+    //                   rewrites it, when it frees the node for a
     //                   pop to reuse (a free node's link is a bare address,
     //                   no tag bits).
     //   LEVEL_MASK    = 0x3F << 58 (heads only): the seal level, log2 of the
@@ -1844,8 +1845,8 @@ private:
     SpinLock resize_lock_;
 
     // The resize hint: arena occupancy, over-counted by up to 255 per touched
-    // shard's deque and per free list, minus every node the free pass of
-    // advance() has freed. A shard adds 256 when the index of a node it
+    // shard's deque and per free list, minus every node a free pass has
+    // freed. A shard adds 256 when the index of a node it
     // appends is a multiple of 256, index 0 included, so a shard's first
     // node counts as 256; and 256 on every 256th pop from a free list, the
     // list's first pop ever included (see the FREE-LIST HEAD encoding: the
@@ -2817,7 +2818,7 @@ private:
         // equivalent split of j; our subchain was never linked anywhere, so
         // nothing but this thread could ever find it again: it goes, whole,
         // onto our shard's limbo list (one CAS, head to tail), for the next
-        // advance() to bag and a later one to free. The nodes we froze stay
+        // bump to bag and a later free pass to free. The nodes we froze stay
         // frozen, which is correct: the winner copied them. Failure is
         // relaxed: the value that won is not used; our caller re-reads the
         // head with acquire.
@@ -2827,7 +2828,7 @@ private:
             my_shard().splits_published.fetch_add(1, std::memory_order_relaxed);   // diagnostic counter
             cleanup_parent(parent);   // step 4, after the publication (P9); H6 inside
         } else {
-            // CAS failed: subchain abandoned (unpublished, memory waste until advance() frees it).
+            // CAS failed: subchain abandoned (unpublished, memory waste until a later free pass frees it).
             if (new_subchain_head != EMPTY) push_limbo(my_shard(), node_of(new_subchain_head), new_subchain_tail);
         } // if another thread's split of j won
     } // split_bucket()
@@ -3153,7 +3154,7 @@ public:
                     // A non-null new_node means an earlier attempt allocated it,
                     // lost its CAS, and this retry found the key published by
                     // another thread. The node was never published; it is orphaned
-                    // onto our shard's limbo list for advance() to bag and free.
+                    // onto our shard's limbo list for a bump to bag and a free pass to free.
                     if (new_node != nullptr) push_limbo(my_shard(), new_node, new_node);
                     return false;
                 } // if the key is present

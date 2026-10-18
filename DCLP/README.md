@@ -91,9 +91,10 @@ still the best available. On the fleet the hint doubles CAS with no updates on
 Grace and Apple M3, gives 1.3–1.7× on Zen 5 and nothing on Intel (whose compiler
 output already has that layout), which brings CAS level with DCLP. It does not
 rescue CAS when the maximum moves: there DCLP wins at every thread count above
-one, by 1.5× on the best case for CAS and by an order of magnitude or more on
-Intel and M3. (The one exception is a 256-thread Intel cell where CAS throughput
-swings fourfold from run to run.)
+one, by 2× on the best case for CAS and by an order of magnitude or more on
+Intel and M3. (The exceptions are two cells where CAS throughput swings
+fourfold or more from run to run: 256 threads on Intel and 128 threads on
+Zen 5.)
 
 DCLP's plain `if` may or may not need the hint, and that depends on the
 compiler rather than the hardware: Clang lays it out well without one, while

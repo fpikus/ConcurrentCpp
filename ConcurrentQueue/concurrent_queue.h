@@ -251,9 +251,11 @@
 // and its loss so expensive, is the back-off: a waiter that misses the
 // eight-attempt burst is parked for ~50 us (the "short" nanosleep is rounded
 // up by the kernel's default 50 us timer slack on Linux). Nothing else does
-// the store's job: a pure delay inside the critical section restores the
-// regime but stalls the holder and is slower still; a prefetch-for-write of
-// the slot inside the critical section does not help.
+// the store's job reliably: a pure delay inside the critical section restores
+// the regime but stalls the holder, and what that buys depends on the machine
+// (slower still on one, and on another faster at some thread counts and slower
+// at others); a prefetch-for-write of the slot inside the critical section
+// does not help.
 //
 // The rule that follows: the store is for the lock. Moving it after the unlock
 // is correct and slower. The effect belongs to this lock's back-off -- with a

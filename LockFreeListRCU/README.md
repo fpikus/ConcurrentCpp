@@ -156,9 +156,10 @@ The binaries are written to `build/$(hostname)/`: `lock_free_list_rcu_bm`,
 comparison rows above come from `../LockFreeList`'s own benchmark, built there
 with `make benchmarks`.
 
-Requires clang (`../config.mk` selects `clang++-22` and C++23), Google
-Benchmark and GoogleTest; point `GBENCH_DIR` and `GTEST_DIR` at your
-installations if they are not in `$HOME/GoogleBench` and `$HOME/GoogleTest`.
+Requires Google Benchmark and GoogleTest (`../config.mk` selects `clang++-22`
+and C++23; the code also builds with `g++-16`); point `GBENCH_DIR` and
+`GTEST_DIR` at your installations if they are not in `$HOME/GoogleBench` and
+`$HOME/GoogleTest`.
 The benchmark also includes `../Spinlock/gb_wall_clock.h` (through
 `-I../Spinlock`), the wall-clock accounting behind its `wall_items_per_second`
 and `finish_spread` counters.

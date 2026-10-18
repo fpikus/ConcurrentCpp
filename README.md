@@ -9,9 +9,8 @@ applies, and how fast it is in its proper domain.
 
 The first four data structures originate from Chapter 7 of *The Art of
 Writing Efficient Programs, Second Edition* by Fedor G. Pikus, where their
-design is worked out in full — every principle these READMEs state without
-explanation is argued there, benchmark by benchmark. The code here is live
-and may continue to evolve past the version printed in the book.
+design was first worked out. The code here is live and has evolved past the
+version printed in the book.
 
 - **[ConcurrentDeque](ConcurrentDeque/)** — `ConcurrentAppendDeque`, an
   array-like container with strictly wait-free element access that can be

@@ -26,9 +26,8 @@ the container itself; that sentence is most of the user's manual.
 
 ## Design principles
 
-The full reasoning behind each of these decisions is worked out in Chapter 7
-of *The Art of Writing Efficient Programs, Second Edition*; here we only state
-them:
+These decisions were first worked out in Chapter 7 of *The Art of Writing
+Efficient Programs, Second Edition*; here we state them:
 
 - All memory is allocated in fixed-size blocks; an element, once constructed,
   never moves.

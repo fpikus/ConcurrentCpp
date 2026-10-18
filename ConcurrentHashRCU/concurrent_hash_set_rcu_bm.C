@@ -23,6 +23,7 @@
 //
 #include <benchmark/benchmark.h>
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -131,8 +132,18 @@
  * in _Rcu run under the RECLAMATION REGIME: advance() is called from inside
  * the timed loop -- once per thread at its end, or by one thread at a cadence
  * while every thread refreshes its handle each iteration -- and the rows
- * report what the calls did and what they cost (see AdvanceTally). The
- * Advance_ rows measure advance() alone, one thread, nothing else running.
+ * report what the calls did and what they cost (see AdvanceTally). The rows
+ * whose names end in _RcuEach have EVERY thread call advance() at a cadence
+ * of its own erases; the rows whose names end in _Auto call nothing: their set
+ * is constructed with an AUTOMATIC CADENCE (the header's Options), so the set
+ * itself runs the bump and the free pass -- never the walk -- from inside the
+ * retiring thread's erase, once that thread's arena shard has retired another
+ * R nodes; every thread still refreshes its handle each iteration. Every
+ * reclamation row reports the set's own counters of what the calls and the
+ * triggers did, as deltas across the timed loop (ReclaimSnapshot), and the
+ * three churn reclamation rows print a per-thread time series of every call
+ * or trigger return (the "# trace" lines, Trace). The Advance_ rows measure
+ * advance() alone, one thread, nothing else running.
  *
  * Table of contents: every registration, in the order of the file, each run
  * at the thread counts of ThreadRange(1, num_cpu) (one row per thread count,
@@ -231,13 +242,59 @@
  *                                 but the first freeing a bag): the erase
  *                                 cost under reclamation, on a table whose
  *                                 walk is short in absolute terms.
+ *  Erase_Small_Del_RcuEach        the same erases with EVERY thread an
+ *                                 advancer, each after every
+ *                                 kSmallAdvanceEvery/T of its own erases (the
+ *                                 first calls staggered so they do not land
+ *                                 together), with the walk: the attempt
+ *                                 frequency of the _Auto row below, called
+ *                                 explicitly (equal when the per-thread
+ *                                 cadence is a power of two, which the set
+ *                                 rounds its cadence up to: every power-of-two
+ *                                 thread count). The pair _Auto/_RcuEach says
+ *                                 what the walk's absence buys at equal
+ *                                 attempt frequency; _RcuEach/_Rcu what the
+ *                                 frequency alone does; neither is readable
+ *                                 from _Auto/_Rcu, which differ in both.
+ *  Erase_Small_Del_Auto           the same erases on a set that runs the bump
+ *                                 and the free pass itself, from the retiring
+ *                                 thread, every kSmallAdvanceEvery/T nodes
+ *                                 retired per arena shard (the _Rcu row's
+ *                                 per-thread cadence), never walking: what an
+ *                                 erase costs when reclamation is automatic
+ *                                 and spread over the threads, read against
+ *                                 the control, with the one-advancer-with-walk
+ *                                 _Rcu row and the per-thread-caller _RcuEach
+ *                                 row beside it; the attempts that proceeded
+ *                                 against those skipped, and which shard each
+ *                                 thread retired into (the "# shards" line).
  *  Churn_Window_Del_NoReclaim     steady churn: every thread slides a window
  *                                 of live keys (erase the oldest, insert the
  *                                 next, two lookups), nothing reclaimed, so
  *                                 every insert appends and the table grows.
- *  Churn_Window_Del_Rcu           the same under the reclamation regime: the
- *                                 only row in which the free pass pushes
+ *  Churn_Window_Del_Rcu           the same under the reclamation regime, one
+ *                                 advancer with the walk: the first of the
+ *                                 three rows in which the free pass pushes
  *                                 freed nodes while other threads pop them.
+ *  Churn_Window_Del_RcuEach       the same with every thread an advancer
+ *                                 after every kWindowAdvanceEvery of its own
+ *                                 erases (staggered as above): the explicit
+ *                                 like-for-like pair of the next row, as the
+ *                                 small pair above.
+ *  Churn_Window_Del_Auto          steady churn with the automatic cadence at
+ *                                 kWindowAdvanceEvery nodes retired per arena
+ *                                 shard: whether a bump-and-free trigger on
+ *                                 every thread reaches a steady state that
+ *                                 one advancer with a walk did not (the table
+ *                                 size, the slots per live key, the attempts
+ *                                 proceeded against skipped, the free pass's
+ *                                 share of the threads' time), and the
+ *                                 per-call series of the three churn
+ *                                 reclamation rows (the "# trace" lines: the
+ *                                 time of every call or trigger return on
+ *                                 every thread, so the concurrent phase and
+ *                                 the tail are read from the data instead of
+ *                                 bracketed from finish_spread).
  *  InsertHotGrowth_Concurrent     growth on a few hot chains, split while the
  *                                 threads still prepend to them: the cleanup
  *                                 pass's lost CASes and the stragglers they
@@ -283,6 +340,18 @@ static size_t arena_shards_from_env() {
     return static_cast<size_t>(n);
 }
 
+// A new set for a fixture: `buckets` buckets, the arena shards of
+// arena_shards_from_env(), and the automatic cadence `auto_reclaim_every`
+// (nodes retired per arena shard between two automatic reclaims; 0 = off,
+// which is every row but the _Auto rows). Every fixture constructs its set
+// here, through the set's Options form, so that a row with a cadence differs
+// from its twin in one argument and nothing else (the two-parameter
+// constructor is the same with the cadence off).
+template <typename SetType>
+static SetType* new_set(size_t buckets, size_t auto_reclaim_every = 0) {
+    return new SetType(typename SetType::Options{buckets, arena_shards_from_env(), auto_reclaim_every});
+} // new_set()
+
 // ---------------------------------------------------------------------------
 // Workload parameters
 // ---------------------------------------------------------------------------
@@ -316,6 +385,15 @@ public:
     // The second parameter mirrors ConcurrentResizableHashSetRCU's arena_shards so
     // the fixtures can construct both containers the same way; it is ignored.
     explicit LockedHashSet(size_t initial_buckets = 1024, size_t /*arena_shards*/ = 0) : set_(initial_buckets) {}
+    // Mirrors the concurrent set's Options form, which every fixture constructs
+    // its set through (new_set() below): the bucket count is used, the arena
+    // shards and the automatic cadence have no counterpart here and are ignored.
+    struct Options {
+        size_t initial_capacity = 1024;
+        size_t arena_shards = 0;
+        size_t auto_reclaim_every = 0;
+    }; // struct LockedHashSet::Options
+    explicit LockedHashSet(const Options& options) : set_(options.initial_capacity) {}
     // Mirrors the concurrent set's handle, the first argument of each of its
     // operations, so that the fixtures and the bodies compile over both
     // containers: the baseline needs none, so its handle is an empty type,
@@ -348,7 +426,8 @@ using LockedSet     = LockedHashSet<int, std::hash<int>>;
 // after it, so that it runs with no handle alive -- and each thread uses its
 // own only INSIDE the state loop, whose start is a barrier: the happens-before
 // edge a handle created on one thread needs before another thread uses it (see
-// the CAUTION below). Only the rows that call advance() (the _Rcu rows) touch
+// the CAUTION below). Only the reclamation rows (the _Rcu, _RcuEach and _Auto
+// rows: advance() called, or the set's automatic cadence running) touch
 // a handle inside the timed loop beyond using it: a thread refreshes it at the
 // top of every iteration in the rows with a cadence (Own::refresh()), and
 // releases it on its own LAST iteration (Own::finish_iteration(); Google
@@ -378,9 +457,9 @@ public:
     } // ThreadHandles::make()
 
     // Thread 0 only, in TearDown(), before the set is deleted: destroys every
-    // handle; in the rows without advance() this is the leave of each thread's
-    // live handle, in the _Rcu rows each was released on its thread's last
-    // iteration.
+    // handle; in the rows without reclamation this is the leave of each
+    // thread's live handle, in the reclamation rows each was released on its
+    // thread's last iteration.
     void clear() { recs_.clear(); }
 
     // One thread's use of its handle, a local of the body. Trivially
@@ -402,7 +481,7 @@ public:
         // no older one. Inside the state loop only, before
         // finish_iteration() has released the handle.
         void refresh() { (void)handles_.recs_[thread_].h.refresh(); }
-        // The _Rcu rows only, at the end of every iteration; on the thread's
+        // The reclamation rows only, at the end of every iteration; on the thread's
         // last iteration it releases the handle and returns true (false on
         // every other iteration), so that a row can act after the release
         // (see Erase_Presized_Del_Rcu).
@@ -424,33 +503,52 @@ public:
 private:
     // One thread's handle on its own 128-byte block (see above).
     struct alignas(128) Rec {
-        Handle h;   // the thread's handle: joined by thread 0 in SetUp(); released on the thread's last iteration in the _Rcu rows, by thread 0's TearDown() otherwise
+        Handle h;   // the thread's handle: joined by thread 0 in SetUp(); released on the thread's last iteration in the reclamation rows, by thread 0's TearDown() otherwise
     }; // struct Rec
     std::vector<Rec> recs_;   // one per thread of the run; built by make(), destroyed by clear()
 }; // class ThreadHandles
 
 // ---------------------------------------------------------------------------
-// One thread's advance() calls in a timed row.
+// One thread's advance() calls in a timed row, or its automatic triggers.
 //
 // The rows under the reclamation regime call advance() from inside their
 // timed loops. What a call did is in its AdvanceResult; what it cost is in
 // the CALLING thread's own timers (the set's internal_advance_timers(), one
 // set of accumulators per thread, so a thread is charged for its own calls
-// only). An AdvanceTally, a local of the body, zeroes this thread's timers
-// when it is constructed (before the loop: the timers accumulate over the
-// thread's life, and Google Benchmark's thread 0 is the main thread, which
-// ran the fixtures' prep and other rows), counts the results inside the loop
-// (add()) and sets the counters after it (report()). A row that calls
-// advance() at a cadence constructs it with that cadence and asks due() after
-// each erase: ONE thread of the row, thread 0, calls advance(), after every
-// `every` of its own erases, while every thread refreshes its handle. One
-// advancer, because advance() runs one call at a time: with every thread
-// calling at a cadence of its own erases, the calls collide (all but one find
-// the flag held and do nothing) and the number of walks per run changes with
-// the thread count; with one advancer it does not, for the same per-thread
-// work. Every counter is set by every thread and summed over the threads by
+// only -- and for the automatic triggers that PROCEEDED on it: the set
+// charges a trigger's bump and free pass to the thread whose erase ran it,
+// in bump_ns and free_ns, and nothing to advance_ns or walk_ns). An
+// AdvanceTally, a local of the body, zeroes this thread's timers when it is
+// constructed (before the loop: the timers accumulate over the thread's
+// life, and Google Benchmark's thread 0 is the main thread, which ran the
+// fixtures' prep and other rows; the helper threads are new per repetition,
+// so for them the zeroing is a formality -- either way every repetition
+// reads and resets its own threads' accumulators), counts the results inside
+// the loop (add()) and sets the counters after it (report()). Three regimes:
+//   - a cadence with ONE advancer (the _Rcu rows): thread 0 asks due() after
+//     each of its erases and calls advance() after every `every` of them,
+//     while every thread refreshes its handle. One advancer, because
+//     advance() runs one call at a time: with every thread calling at a
+//     cadence of its own erases, the calls collide (all but one find the
+//     flag held and do nothing) and the number of walks per run changes with
+//     the thread count; with one advancer it does not, for the same
+//     per-thread work;
+//   - a cadence with EVERY thread an advancer (the _RcuEach rows): each
+//     thread calls after every `every` of its own erases; the first call of
+//     thread i is due after max(1, every - every*i/T) of them, so the T first
+//     calls are spread over (every/T, every] and do not land together (the
+//     stagger; without it the first calls of a run collide by construction).
+//     Most calls at T >= 8 are expected `contended`: that is the row's point,
+//     the same ATTEMPT frequency as the _Auto rows, with the walk;
+//   - AUTOMATIC (the _Auto rows): nothing is called; the set triggers from
+//     inside the erases. The tally counts the triggers this thread DETECTED
+//     (detected(): the body sees its own bump_ns change across an erase, see
+//     the _Auto rows) and reports the timers the triggers charged. due() then
+//     paces thread 0's table-size samples of the "# trace" series (the churn
+//     row; every = the sampling cadence, 0 = no samples, due() never called).
+// Every counter is set by every thread and summed over the threads by
 // Google Benchmark, so each is a total for the row:
-//   advance_calls      calls made;
+//   advance_calls      calls made (0 on the _Auto rows);
 //   advanced, nothing_retired, contended, ring_full
 //                      their outcomes (AdvanceResult::Advance): `contended`
 //                      did nothing (another thread's call held the flag, and
@@ -460,7 +558,9 @@ private:
 //                      the AdvanceResult counts, summed;
 //   advance_ns, bump_ns, free_ns, walk_ns
 //                      the time spent in the calls, whole and by step (the
-//                      bump, the free pass after it, the walk), in ns;
+//                      bump, the free pass after it, the walk), in ns; on the
+//                      _Auto rows bump_ns and free_ns are the proceeding
+//                      triggers' and the other two are 0;
 //   advance_share, walk_share
 //                      advance_ns and walk_ns over the summed loop time of the
 //                      threads (a per-thread time in seconds with
@@ -471,24 +571,53 @@ private:
 //                      advancer finishes last (finish_spread). Ratios: the
 //                      console prints them with the "/s" it gives every rate
 //                      counter;
-//   advance_every      the cadence: thread 0's erases between two calls (rows
-//                      with a cadence only).
+//   advance_every      the cadence: a thread's erases between two of its
+//                      calls (the explicit rows with a cadence only);
+//   reclaim_ns, reclaim_share
+//                      (_Auto rows only) bump_ns + free_ns, the triggers'
+//                      whole cost, and its share of the summed loop time, as
+//                      walk_share is formed;
+//   detected_triggers  (_Auto rows only) the triggers the threads detected
+//                      inside their erases; equals the set's auto_reclaims
+//                      delta unless a trigger ran outside an erase (a split
+//                      cleanup inside insert() or contains() on a table that
+//                      doubled) or a proceeding trigger's bump took under a
+//                      nanosecond (the detection reads the thread's bump_ns).
 // Trivially destructible, like ThreadHandles::Own.
 // ---------------------------------------------------------------------------
 template <typename SetType>
 class AdvanceTally {
 public:
+    using Timers = typename SetType::InternalTimers;
+    // Which threads of an explicit row call advance() at the cadence.
+    enum class Advancer { thread0, every_thread };
+    // The tag of the automatic rows' constructor.
+    struct Automatic {};
+
     // A row without a cadence (due() is never called).
-    AdvanceTally() : AdvanceTally(0, int64_t{0}) {}
-    // A row with a cadence, for the thread of `state`: thread 0, the row's
-    // one advancer, is due to call advance() after every `every` (> 0) of its
-    // own erases; on every other thread due() is never true.
-    AdvanceTally(int every, const benchmark::State& state)
-        : AdvanceTally(every, state.thread_index() == 0 ? int64_t{every} : std::numeric_limits<int64_t>::max()) {}
+    AdvanceTally() : AdvanceTally(0, int64_t{0}, false) {}
+    // A row with a cadence, for the thread of `state`: the advancing threads
+    // (thread 0 alone, or every thread) are due to call advance() after
+    // every `every` (> 0) of their own erases, every thread's first call
+    // staggered as described above; on a non-advancing thread due() is never
+    // true.
+    AdvanceTally(int every, const benchmark::State& state, Advancer advancer = Advancer::thread0)
+        : AdvanceTally(every, first_due(every, state, advancer), false) {}
+    // An automatic row, for the thread of `state`: no call is made; thread 0
+    // is due (due()) after every `sample_every` of its erases to sample the
+    // table for the "# trace" series, never if `sample_every` is 0.
+    AdvanceTally(Automatic, int sample_every, const benchmark::State& state)
+        : AdvanceTally(sample_every, first_due(sample_every, state, Advancer::thread0), true) {}
+
+    // This thread's own timers (one set per thread, the set's
+    // internal_advance_timers()): the _Auto rows hoist the reference before
+    // the loop and read bump_ns through it around every erase.
+    static Timers& timers() { return SetType::internal_advance_timers(); }
 
     // Inside the loop, after each of the thread's erases, in a row with a
     // cadence: true on every every-th call, when the thread is to call
-    // advance(). A countdown, so the test is a decrement and a compare.
+    // advance() (or, on an automatic row, thread 0 is to sample). A
+    // countdown, so the test is a decrement and a compare.
     bool due() {
         if (--countdown_ != 0) return false;
         countdown_ = every_;
@@ -510,10 +639,18 @@ public:
         nodes_passed_ += r.nodes_passed;
     } // AdvanceTally::add()
 
+    // Inside the loop of an automatic row: one trigger detected in this
+    // thread's erase.
+    void detected() { ++detected_; }
+
+    // The nodes this thread's calls freed so far (the "# trace" entries of
+    // the explicit rows carry it).
+    size_t freed_nodes() const { return freed_nodes_; }
+
     // After the loop, on every thread: this thread's counts and timers as the
     // counters listed above.
     void report(benchmark::State& state) const {
-        const typename SetType::InternalTimers& t = SetType::internal_advance_timers();
+        const Timers& t = timers();
         state.counters["advance_calls"]   = benchmark::Counter(double(calls_));
         state.counters["advanced"]        = benchmark::Counter(double(advanced_));
         state.counters["nothing_retired"] = benchmark::Counter(double(nothing_retired_));
@@ -529,28 +666,300 @@ public:
         state.counters["walk_ns"]         = benchmark::Counter(double(t.walk_ns));
         state.counters["advance_share"]   = benchmark::Counter(double(t.advance_ns)*1e-9, benchmark::Counter::kAvgThreadsRate);
         state.counters["walk_share"]      = benchmark::Counter(double(t.walk_ns)*1e-9, benchmark::Counter::kAvgThreadsRate);
-        if (every_ != 0) state.counters["advance_every"] = benchmark::Counter(double(every_), benchmark::Counter::kAvgThreads);
+        if (automatic_) {
+            state.counters["reclaim_ns"]        = benchmark::Counter(double(t.bump_ns + t.free_ns));
+            state.counters["reclaim_share"]     = benchmark::Counter(double(t.bump_ns + t.free_ns)*1e-9, benchmark::Counter::kAvgThreadsRate);
+            state.counters["detected_triggers"] = benchmark::Counter(double(detected_));
+        } else if (every_ != 0) {
+            state.counters["advance_every"] = benchmark::Counter(double(every_), benchmark::Counter::kAvgThreads);
+        } // the regime's own counters
     } // AdvanceTally::report()
 
 private:
-    // The two public constructors' common part: the cadence, the erases until
-    // the first call, and this thread's timers zeroed.
-    AdvanceTally(int every, int64_t countdown) : every_(every), countdown_(countdown) {
-        SetType::internal_advance_timers() = {0, 0, 0, 0};
-    } // AdvanceTally::AdvanceTally(every, countdown)
+    // The erases until the first call (or sample) of the thread of `state`:
+    // `every` on thread 0 and never on the others with one advancer; the
+    // staggered max(1, every - every*i/T) on thread i of T with every thread
+    // an advancer. "Never" is a countdown that no run reaches.
+    static int64_t first_due(int every, const benchmark::State& state, Advancer advancer) {
+        if (advancer == Advancer::every_thread) {
+            return std::max<int64_t>(1, every - int64_t(every)*state.thread_index()/state.threads());
+        } // every thread an advancer: the stagger
+        return state.thread_index() == 0 ? int64_t{every} : std::numeric_limits<int64_t>::max();
+    } // AdvanceTally::first_due()
 
-    const int every_;              // the cadence: thread 0 calls after every every_ of its erases; 0 = no cadence
-    int64_t countdown_;            // erases left until the next call (rows with a cadence; never reaches 0 off thread 0)
+    // The public constructors' common part: the cadence, the erases until
+    // the first call, the regime, and this thread's timers zeroed.
+    AdvanceTally(int every, int64_t countdown, bool automatic) : every_(every), countdown_(countdown), automatic_(automatic) {
+        timers() = {0, 0, 0, 0};
+    } // AdvanceTally::AdvanceTally(every, countdown, automatic)
+
+    const int every_;              // the cadence: an advancing thread calls (an automatic row's thread 0 samples) after every every_ of its erases; 0 = no cadence
+    int64_t countdown_;            // erases left until the next call or sample (rows with a cadence; never reaches 0 on a non-advancing thread)
+    const bool automatic_;         // an _Auto row: report the triggers' counters instead of advance_every
     int64_t calls_ = 0;            // advance() calls
     int64_t advanced_ = 0;         // of those, by outcome
     int64_t nothing_retired_ = 0;
     int64_t contended_ = 0;
     int64_t ring_full_ = 0;
+    int64_t detected_ = 0;         // _Auto rows: triggers detected in this thread's erases
     size_t freed_nodes_ = 0;       // AdvanceResult counts, summed over the calls
     size_t walk_retired_ = 0;
     size_t buckets_walked_ = 0;
     size_t nodes_passed_ = 0;
 }; // class AdvanceTally
+
+// ---------------------------------------------------------------------------
+// One thread's per-call time series in a churn reclamation row: the "# trace"
+// lines.
+//
+// Why: the rates and the summed timers say how much a row's reclamation cost
+// and freed, not WHEN: with one advancer the churn row has a concurrent
+// phase and a tail in which the advancer walks alone, and the phases could
+// only be bracketed from finish_spread; with every thread a caller or a
+// trigger the question is whether the free passes run back to back. So each
+// thread of the three churn reclamation rows keeps a local array of up to
+// kEntries entries, one per return of its own advance() calls (every
+// outcome, `contended` included: an attempt is an attempt) or of the
+// triggers it detected, and thread 0 of the _Auto row also one per
+// kWindowAdvanceEvery of its own erases (a sample, since it makes no calls):
+// the steady_clock time of the return (ns, relative to the thread's own
+// stamp taken before the loop), the kind (a letter: the outcome of the call,
+// `t` a detected trigger, `s` a sample), the nodes freed so far (the thread's
+// own calls' on the explicit rows; the set-wide count on the _Auto row,
+// whose triggers belong to no thread's tally) and the table size. The array
+// is cold: on the stack, uninitialized, touched only when an entry is
+// written, once per cadence. Entries past kEntries are dropped and COUNTED
+// (thread 0 of the churn _Auto row makes 32 samples per repetition beside
+// its own triggers, which can exceed the array); the attempts by kind are
+// counted whether or not the entry was kept, so that a dropped trigger still
+// counts in the identity "detected triggers == the set's auto_reclaims".
+// After the loop, untimed, every thread prints its line, prepared in one
+// buffer and written with one fputs() (lines from T threads interleave in
+// the console, never within a line):
+//   # trace <row> threads=<T> thread=<i> start_ns=<absolute steady_clock ns
+//   of the thread's stamp before the loop> bump_ns=<..> free_ns=<..>
+//   walk_ns=<..> n=<entries kept> dropped=<d>
+//   kinds=a:<..>,n:<..>,c:<..>,r:<..>,t:<..>,s:<..> | <t>:<kind>:<freed>:<table> ...
+// (the kinds are the attempts by kind, kept and dropped; `t` of an entry is
+// relative to start_ns, so start_ns + t aligns the threads of one
+// repetition). start_ns is the entries' reference only: it is taken before
+// the loop's start barrier, so it includes the thread's spawn skew and is
+// NOT the start of the thread's loop. The thread's loop is bracketed by the
+// wall-clock stamps the loop itself takes (gb_wall_clock.h: the end of the
+// thread's first and of its last iteration), which thread 0 prints for
+// every thread of the run, after the loop (report_stamps(); thread 0 may
+// read every thread's record then, and no other thread may read its own
+// after the loop, since thread 0 releases the records at the end of its
+// body):
+//   # stamps <row> threads=<T> first_ns=<f0>,<f1>,... last_ns=<l0>,<l1>,...
+// (absolute steady_clock ns, in thread order): the per-thread phases --
+// first finish, last finish, the free passes' progress against each
+// thread's own loop -- are read from these two lines together. The lines
+// precede the row's console line, as "# prep" lines do, so a reducer pairs
+// them with the row by order (and splits them at " threads=": the _Auto
+// rows' names contain a space). The record costs one steady_clock read per
+// entry, once per cadence, plus two loads on the explicit rows and the
+// set-wide counter sum on the _Auto row (see there): negligible, and absent
+// from the controls.
+// Trivially destructible, like the other body locals.
+// ---------------------------------------------------------------------------
+class Trace {
+public:
+    static constexpr int kEntries = 64;
+    // What an entry records; the letter printed is the enumerator's.
+    enum class Kind : uint8_t { advanced, nothing_retired, contended, ring_full, trigger, sample, kinds };
+    static constexpr int kKinds = int(Kind::kinds);
+    static constexpr char kLetters[kKinds + 1] = "ancrts";
+
+    // Stamps the thread's start (before the loop; the entries' times are
+    // relative to it).
+    Trace() : start_(now_ns()) {}
+
+    // The kind of an advance() return.
+    static Kind kind_of(AdvanceResult::Advance a) {
+        switch (a) {
+        case AdvanceResult::Advance::advanced:        return Kind::advanced;
+        case AdvanceResult::Advance::nothing_retired: return Kind::nothing_retired;
+        case AdvanceResult::Advance::contended:       return Kind::contended;
+        case AdvanceResult::Advance::ring_full:       return Kind::ring_full;
+        } // switch on the outcome
+        return Kind::ring_full;   // not reached: every enumerator is listed
+    } // Trace::kind_of()
+
+    // Inside the loop: one entry, at the return it records (`freed` and
+    // `table` as described above; both fit 32 bits in every row of this
+    // file, and are stored so to keep an entry at 24 bytes).
+    void record(Kind kind, size_t freed, size_t table) {
+        const int64_t t = now_ns() - start_;
+        ++attempts_[int(kind)];
+        if (n_ == kEntries) {
+            ++dropped_;
+            return;
+        } // the array is full: counted, not kept
+        entries_[n_] = {t, uint32_t(freed), uint32_t(table), kLetters[int(kind)]};
+        ++n_;
+    } // Trace::record()
+
+    // After the loop, on every thread, untimed: this thread's "# trace" line
+    // (above), with this thread's timers `t` (the tally's), written with one
+    // fputs().
+    template <typename Timers>
+    void report(const benchmark::State& state, const Timers& t) const {
+        // The buffer: a header of under 500 characters (the row's name is
+        // up to about 120 of them) and at most kEntries entries of at most
+        // 37 ("<t>:<k>:<freed>:<table> " with a 12-digit t and two 10-digit
+        // counts); an overflow is cut, never overrun, and the cut line still
+        // ends in a newline.
+        char buf[4096];
+        size_t len = 0;
+        const auto put = [&](const char* fmt, auto... args) {
+            if (len >= sizeof buf) return;
+            const int n = snprintf(buf + len, sizeof buf - len, fmt, args...);
+            len = n < 0 ? sizeof buf : std::min(len + size_t(n), sizeof buf);
+        }; // put(): appends one formatted piece
+        put("# trace %s threads=%d thread=%d start_ns=%lld bump_ns=%zu free_ns=%zu walk_ns=%zu n=%d dropped=%u kinds=",
+            state.name().c_str(), state.threads(), state.thread_index(), (long long)start_,
+            t.bump_ns, t.free_ns, t.walk_ns, n_, dropped_);
+        for (int k = 0; k < kKinds; ++k) put("%s%c:%u", k == 0 ? "" : ",", kLetters[k], attempts_[k]);
+        put("%s", " |");   /* "%s": a format with no argument trips -Wformat-security */
+        for (int i = 0; i < n_; ++i) put(" %lld:%c:%u:%u", (long long)entries_[i].t, entries_[i].kind, entries_[i].freed, entries_[i].table);
+        put("%s", "\n");
+        if (len >= sizeof buf) buf[sizeof buf - 2] = '\n';   // cut: the line still ends in a newline
+        buf[sizeof buf - 1] = '\0';
+        fputs(buf, stdout);
+        fflush(stdout);
+    } // Trace::report()
+
+    // After the loop, on thread 0 only, untimed, before the records are
+    // released: the "# stamps" line (above) from every thread's wall-clock
+    // record of this run.
+    static void report_stamps(const benchmark::State& state, const WallRecords& records) {
+        std::string first, last;
+        for (int i = 0; i < state.threads(); ++i) {
+            const WallStamps& s = records.of(i);
+            first += (i == 0 ? "" : ",") + std::to_string(ns_of(s.first));
+            last += (i == 0 ? "" : ",") + std::to_string(ns_of(s.last));
+        } // loop over the threads' records
+        printf("# stamps %s threads=%d first_ns=%s last_ns=%s\n", state.name().c_str(), state.threads(), first.c_str(), last.c_str());
+        fflush(stdout);
+    } // Trace::report_stamps()
+
+private:
+    // A steady_clock time point in ns since its epoch.
+    static int64_t ns_of(std::chrono::steady_clock::time_point tp) {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(tp.time_since_epoch()).count();
+    } // Trace::ns_of()
+    // steady_clock now, in ns since its epoch.
+    static int64_t now_ns() { return ns_of(std::chrono::steady_clock::now()); }
+
+    struct Entry {
+        int64_t t;        // ns after start_
+        uint32_t freed;   // nodes freed so far (see above)
+        uint32_t table;   // the table size
+        char kind;        // the kind's letter
+    }; // struct Trace::Entry
+    static_assert(sizeof(Entry) == 24, "an entry is meant to be 24 bytes");
+
+    const int64_t start_;             // the thread's stamp before the loop (before the start barrier: the entries' reference, not the loop's start)
+    int n_ = 0;                       // entries kept
+    uint32_t dropped_ = 0;            // entries dropped (the array was full)
+    uint32_t attempts_[kKinds] = {};  // entries by kind, kept and dropped alike
+    Entry entries_[kEntries];         // the kept entries; uninitialized on purpose (cold)
+}; // class Trace
+static_assert(std::is_trivially_destructible_v<Trace>, "a body local with a destructor would be live across the state loop");
+
+// ---------------------------------------------------------------------------
+// The set's reclamation counters before a timed loop, and their deltas after
+// it.
+//
+// Every reclamation row reports what the set's own counters say the calls
+// and the triggers did, beside the threads' tallies: the two count the same
+// calls on the explicit rows (set_nodes_freed == the sum of freed_nodes,
+// set_bumps == the sum of advanced, set_contended == the sum of contended:
+// no trigger runs on a cadence-off set), and on the _Auto rows the set's
+// counters are the only readout. The fixture takes the snapshot in thread
+// 0's SetUp(), after its prefill, so every reported count is a DELTA across
+// the timed loop; thread 0 reads the deltas after the loop (every thread
+// has left it; the set is quiescent), untimed. The counters (the set's
+// InternalCounters, see the header; the `set_` prefix keeps them apart from
+// AdvanceTally's per-thread ring_full and contended):
+//   set_bumps, set_ring_full, set_contended, set_bags_freed, set_nodes_freed
+//                      publishes, ring_full outcomes, refused explicit calls,
+//                      bags and nodes freed, whoever ran them;
+//   auto_reclaims, auto_skipped
+//                      automatic triggers that acquired the flag (whatever
+//                      their bump then decided) and that found it held (0 on
+//                      every cadence-off row).
+// On the _Auto rows additionally (report_shards()): which arena shard each
+// thread retired into. A thread's shard is its thread number masked by the
+// shard count, and Google Benchmark's helper threads are new per repetition
+// while thread 0 is the main thread, so two threads of a run can share a
+// shard, which then crosses the cadence twice as often (the attempts stay
+// the same in total: every crossing is one push's). The per-shard
+// retire_nodes deltas say whether that happened:
+//   # shards <row> threads=<T> used=<n> min=<m> max=<M> prefill_splits=<s>
+//   prefill_triggers=<a> deltas=<d0>,<d1>,...
+// (prefill_splits and prefill_triggers: the splits the prefill published
+// and the triggers it ran, before the snapshot, so the row's reader knows
+// whether the untimed prefill retired or triggered anything), and as the
+// counters shards_used (shards with a non-zero delta), shard_min and
+// shard_max (over those), and auto_reclaim_every (the set's effective
+// cadence, read from the set by thread 0 after the loop: the row's witness
+// that it ran at the cadence its name says). A repetition with shards_used
+// < T had a shared shard. A delta is attributed to the shard of the thread
+// that PUSHED the run, which is the eraser for a self-unlink and the
+// unlinking walker otherwise, so a shard's delta is about, not exactly, its
+// thread's erase count.
+// ---------------------------------------------------------------------------
+template <typename SetType>
+struct ReclaimSnapshot {
+    typename SetType::InternalCounters counters{};   // the set's counters at the snapshot
+    std::vector<size_t> retire_nodes_per_shard;      // every shard's retire_nodes at the snapshot, in shard order
+
+    // Thread 0, in SetUp() after the prefill: the snapshot.
+    void take(const SetType& set) {
+        counters = set.get_internal_counters();
+        retire_nodes_per_shard = set.get_internal_retire_nodes_per_shard();
+    } // ReclaimSnapshot::take()
+
+    // Thread 0, after the loop: the set_ and auto_ counters above as deltas.
+    void report_set(benchmark::State& state, const SetType& set) const {
+        const typename SetType::InternalCounters c = set.get_internal_counters();
+        state.counters["set_bumps"]       = benchmark::Counter(double(c.bumps - counters.bumps));
+        state.counters["set_ring_full"]   = benchmark::Counter(double(c.ring_full - counters.ring_full));
+        state.counters["set_contended"]   = benchmark::Counter(double(c.contended - counters.contended));
+        state.counters["set_bags_freed"]  = benchmark::Counter(double(c.bags_freed - counters.bags_freed));
+        state.counters["set_nodes_freed"] = benchmark::Counter(double(c.nodes_freed - counters.nodes_freed));
+        state.counters["auto_reclaims"]   = benchmark::Counter(double(c.auto_reclaims - counters.auto_reclaims));
+        state.counters["auto_skipped"]    = benchmark::Counter(double(c.auto_skipped - counters.auto_skipped));
+    } // ReclaimSnapshot::report_set()
+
+    // Thread 0, after the loop, on the _Auto rows: the "# shards" line and
+    // the shard counters above, and the cadence witness.
+    void report_shards(benchmark::State& state, const SetType& set) const {
+        const std::vector<size_t> now = set.get_internal_retire_nodes_per_shard();
+        size_t used = 0, min = std::numeric_limits<size_t>::max(), max = 0;
+        std::string deltas;
+        for (size_t s = 0; s < now.size(); ++s) {
+            const size_t delta = now[s] - retire_nodes_per_shard[s];
+            if (delta != 0) {
+                ++used;
+                min = std::min(min, delta);
+                max = std::max(max, delta);
+            } // a shard some thread retired into
+            deltas += (s == 0 ? "" : ",") + std::to_string(delta);
+        } // loop over the shards
+        if (used == 0) min = 0;
+        printf("# shards %s threads=%d used=%zu min=%zu max=%zu prefill_splits=%zu prefill_triggers=%zu deltas=%s\n",
+               state.name().c_str(), state.threads(), used, min, max, counters.splits_published,
+               counters.auto_reclaims + counters.auto_skipped, deltas.c_str());
+        fflush(stdout);
+        state.counters["shards_used"]        = benchmark::Counter(double(used));
+        state.counters["shard_min"]          = benchmark::Counter(double(min));
+        state.counters["shard_max"]          = benchmark::Counter(double(max));
+        state.counters["auto_reclaim_every"] = benchmark::Counter(double(set.get_internal_auto_reclaim_every()));
+    } // ReclaimSnapshot::report_shards()
+}; // struct ReclaimSnapshot
 
 // The cadence of advance() in a row that has one (each such row says what its
 // cadence counts): the row's value `registered`, unless the environment
@@ -563,6 +972,20 @@ static int advance_every_from_env(const char* name, int registered) {
     const long n = s ? atol(s) : 0;
     return n > 0 && n <= (1L << 30) ? int(n) : registered;
 } // advance_every_from_env()
+
+// The automatic cadence a fixture constructs its set with, as a policy type
+// (the fixture's last template parameter): auto_reclaim_every(state) is the
+// set's Options::auto_reclaim_every for a run of state.threads() threads.
+// NoCadence, the default, is every row but the _Auto rows; the _Auto rows'
+// policies are defined beside their twins' cadences (SmallAutoCadence,
+// WindowAutoCadence), from the same constants and the same environment
+// overrides, so that a twin and its _Auto row always run at the same
+// cadence. A policy of its own per row, and not a fixture argument, because
+// the fixture's SetUp() constructs the set before the body runs and the
+// cadence depends on the thread count.
+struct NoCadence {
+    static size_t auto_reclaim_every(const benchmark::State& /*state*/) { return 0; }
+}; // struct NoCadence
 
 // ---------------------------------------------------------------------------
 // Fixtures.
@@ -583,7 +1006,7 @@ public:
     static Handles handles;   // the threads' handles (ThreadHandles above)
     void SetUp(const ::benchmark::State& state) override {
         if (state.thread_index() == 0) {
-            set = new SetType(1024, arena_shards_from_env());
+            set = new_set<SetType>(1024);
             handles.make(*set, state.threads());
         }
     }
@@ -611,7 +1034,7 @@ public:
     static Handles handles;   // the threads' handles (ThreadHandles above)
     void SetUp(const ::benchmark::State& state) override {
         if (state.thread_index() == 0) {
-            set = new SetType(kPresizedBuckets, arena_shards_from_env());
+            set = new_set<SetType>(kPresizedBuckets);
             handles.make(*set, state.threads());
         }
     }
@@ -653,7 +1076,7 @@ public:
              * Resize behavior under load is a tail-latency story and gets
              * its own benchmark; it has no business inside a mean.
              */
-            set = new SetType(2*kPrefill, arena_shards_from_env());
+            set = new_set<SetType>(2*kPrefill);
             {   // the prefill's own handle, released before the threads' handles are made
                 const typename SetType::handle h = set->new_handle();
                 for (int k = 0; k < kPrefill; ++k) set->insert(h, mix(k));   // untimed
@@ -978,7 +1401,7 @@ public:
     static Handles handles;   // the threads' handles (ThreadHandles above)
     void SetUp(const ::benchmark::State& state) override {
         if (state.thread_index() != 0) return;
-        set = new SetType(Cfg::buckets, arena_shards_from_env());
+        set = new_set<SetType>(Cfg::buckets);
         // Every prep operation must succeed (the keys are distinct and the
         // victims are present when erased); a failure would silently change
         // the population, so it aborts the run instead.
@@ -1115,8 +1538,32 @@ template <typename Cfg> ThreadHandles<typename Cfg::Set> ChurnFixture<Cfg>::hand
 // A call bags what the erases retired since the
 // previous call and frees the bags no handle pins any more: the advancer's
 // own handle, refreshed before its erase, still pins the generation the call
-// closes, so each bag is freed one call later. Counters: AdvanceTally's,
-// beside retired_per_erase.
+// closes, so each bag is freed one call later. Counters: AdvanceTally's and
+// ReclaimSnapshot's, beside retired_per_erase.
+// Erase_Small_Del_RcuEach: every thread an advancer, each after every
+// kSmallAdvanceEvery/T of its own erases (four calls per thread, 4T per run,
+// the first ones staggered: AdvanceTally), with the walk. Why measure: the
+// attempt frequency of Erase_Small_Del_Auto, called explicitly; the pair
+// separates the walk's share (_Auto/_RcuEach) from the frequency's
+// (_RcuEach/_Rcu). Every call walks the whole table while the other threads'
+// loops are short (kSmallPrefill/T erases each), so at larger thread counts
+// most calls are expected `contended` and the walkers to straggle
+// (finish_spread); the counters say which.
+// Erase_Small_Del_Auto: no call; the set is constructed with the automatic
+// cadence kSmallAdvanceEvery/T nodes retired per arena shard
+// (SmallAutoCadence; the set rounds it up to a power of two, so it equals
+// _RcuEach's per-thread cadence at power-of-two thread counts, and the
+// auto_reclaim_every counter is the witness): each thread erases kSmallPrefill/T keys into its own
+// shard's count, so each crosses four times, 4T attempts per run, and the
+// set runs the bump and the free pass from inside the crossing erase, on
+// that thread, never walking. Every thread refreshes at the top of every
+// iteration and releases on its last, as _Rcu; the trigger detection is the
+// window rows' (see Churn_Window_Del). Why measure: what an erase costs when
+// reclamation is automatic and spread over the threads, against the control,
+// with the one-advancer-with-walk _Rcu row and the per-thread-caller
+// _RcuEach row beside it. Two threads of a run can share an arena shard (the
+// "# shards" line, ReclaimSnapshot), in which case that shard crosses twice
+// as often and the attempts are the same in total.
 // ---------------------------------------------------------------------------
 static constexpr int    kErasePrefill = 1 << 22;
 static constexpr size_t kSmallBuckets = size_t(1) << 17;
@@ -1126,8 +1573,22 @@ static constexpr int    kSmallPrefill = 1 << 16;
 // calls after every kSmallAdvanceEvery/T of its own erases;
 // HASH_BM_SMALL_ADVANCE_EVERY overrides it: advance_every_from_env()). Every
 // call but the first frees the bag the one before it closed. A walk passes
-// every live node.
+// every live node. _RcuEach and _Auto divide it by T the same way (the
+// per-thread cadence, and the per-shard one).
 static constexpr int    kSmallAdvanceEvery = kSmallPrefill/4;
+// The per-thread cadence of the small reclamation rows: kSmallAdvanceEvery/T
+// of a thread's own erases (the _Rcu row's thread 0, every _RcuEach thread),
+// and the automatic cadence of the _Auto row (nodes retired per arena shard:
+// SmallAutoCadence; the set rounds it up to a power of two, so at a thread
+// count or an override that is not one the _Auto row's cadence is the next
+// power of two above this value), with the environment override; at least 1.
+static int small_cadence(const benchmark::State& state) {
+    return std::max(1, advance_every_from_env("HASH_BM_SMALL_ADVANCE_EVERY", kSmallAdvanceEvery)/state.threads());
+} // small_cadence()
+// The automatic cadence of Erase_Small_Del_Auto (see NoCadence).
+struct SmallAutoCadence {
+    static size_t auto_reclaim_every(const benchmark::State& state) { return size_t(small_cadence(state)); }
+}; // struct SmallAutoCadence
 
 // The two erase geometries, EraseFixture's second parameter: the table's
 // buckets, the prefilled keys, and the keys each thread erases.
@@ -1143,15 +1604,19 @@ struct SmallErase {
 }; // struct SmallErase
 
 // Thread 0's prefill in the SetUp() of EraseFixture and WindowFixture: a new
-// set of `buckets` buckets (and the arena shards of arena_shards_from_env()),
-// into which `for_each_key(insert)` inserts its keys through `insert(key)`,
-// under a handle of the prefill's own, released before this returns (before
-// the threads' handles are made). The keys are distinct, so an insert that
-// fails means the set does not hold the population the rows describe: the run
-// aborts, naming `fixture` and the row.
+// set of `buckets` buckets (and the arena shards of arena_shards_from_env()
+// and the automatic cadence `auto_reclaim_every`, 0 = off: new_set()), into
+// which `for_each_key(insert)` inserts its keys through `insert(key)`, under
+// a handle of the prefill's own, released before this returns (before the
+// threads' handles are made). The keys are distinct, so an insert that fails
+// means the set does not hold the population the rows describe: the run
+// aborts, naming `fixture` and the row. The prefill runs under the cadence
+// too: a presized table splits nothing and so retires nothing, but a
+// prefill that doubles its table may trigger, untimed, before the fixture's
+// snapshot (ReclaimSnapshot's prefill_triggers says whether it did).
 template <typename SetType, typename KeyVisitor>
-static SetType* make_prefilled(const ::benchmark::State& state, const char* fixture, size_t buckets, KeyVisitor for_each_key) {
-    SetType* set = new SetType(buckets, arena_shards_from_env());
+static SetType* make_prefilled(const ::benchmark::State& state, const char* fixture, size_t buckets, size_t auto_reclaim_every, KeyVisitor for_each_key) {
+    SetType* set = new_set<SetType>(buckets, auto_reclaim_every);
     long failed = 0;
     {   // the prefill's own handle
         const typename SetType::handle h = set->new_handle();
@@ -1164,30 +1629,35 @@ static SetType* make_prefilled(const ::benchmark::State& state, const char* fixt
     return set;
 } // make_prefilled()
 
-template <typename SetType, typename Geom = PresizedErase>
+// The erase fixture: the geometry `Geom` (above) and the automatic cadence
+// policy `Cadence` (NoCadence above, or an _Auto row's); the cadence is a
+// template parameter so that an _Auto row is a fixture of its own with its
+// own set, and the kept rows' names (the fixture's written template
+// arguments) do not change.
+template <typename SetType, typename Geom = PresizedErase, typename Cadence = NoCadence>
 class EraseFixture : public benchmark::Fixture {
 public:
     using Geometry = Geom;    // the bodies read the per-thread key count through it
     static SetType* set;
     using Handles = ThreadHandles<SetType>;
     static Handles handles;   // the threads' handles (ThreadHandles above)
-    using Tally = AdvanceTally<SetType>;   // one thread's advance() calls in the _Rcu bodies (AdvanceTally above)
-    static size_t retired_before;   // the container's retired-node counter after the prefill
+    using Tally = AdvanceTally<SetType>;   // one thread's advance() calls or triggers in the reclamation bodies (AdvanceTally above)
+    static ReclaimSnapshot<SetType> before;   // the container's counters after the prefill (ReclaimSnapshot above)
     void SetUp(const ::benchmark::State& state) override {
         if (state.thread_index() != 0) return;
-        set = make_prefilled<SetType>(state, "EraseFixture", Geometry::buckets, [](auto insert) {
+        set = make_prefilled<SetType>(state, "EraseFixture", Geometry::buckets, Cadence::auto_reclaim_every(state), [](auto insert) {
             for (int k = 0; k < Geometry::prefill; ++k) insert(mix(k));
         });
-        retired_before = set->get_internal_counters().retire_nodes;
+        before.take(*set);
         handles.make(*set, state.threads());
     } // EraseFixture::SetUp()
     void TearDown(const ::benchmark::State& state) override {
         if (state.thread_index() == 0) { handles.clear(); delete set; set = nullptr; }
     }
 }; // class EraseFixture
-template <typename SetType, typename Geom> SetType* EraseFixture<SetType, Geom>::set = nullptr;
-template <typename SetType, typename Geom> ThreadHandles<SetType> EraseFixture<SetType, Geom>::handles;
-template <typename SetType, typename Geom> size_t EraseFixture<SetType, Geom>::retired_before = 0;
+template <typename SetType, typename Geom, typename Cadence> SetType* EraseFixture<SetType, Geom, Cadence>::set = nullptr;
+template <typename SetType, typename Geom, typename Cadence> ThreadHandles<SetType> EraseFixture<SetType, Geom, Cadence>::handles;
+template <typename SetType, typename Geom, typename Cadence> ReclaimSnapshot<SetType> EraseFixture<SetType, Geom, Cadence>::before;
 
 // The body of the erase rows (see above), as a macro like the bodies above, so
 // that every erase row runs the same code around its own regime. ITERATION is
@@ -1218,7 +1688,7 @@ template <typename SetType, typename Geom> size_t EraseFixture<SetType, Geom>::r
         if (state.thread_index() == 0) {   /* the container's diagnostic counter (see the fixture) */ \
             const double erased = double(state.iterations())*state.threads(); \
             state.counters["retired_per_erase"] = benchmark::Counter(         \
-                double(set->get_internal_counters().retire_nodes - retired_before)/erased); \
+                double(set->get_internal_counters().retire_nodes - before.counters.retire_nodes)/erased); \
         }                                                                     \
         POST                                                                  \
         records.release(state);                                               \
@@ -1259,6 +1729,29 @@ template <typename SetType, typename Geom> size_t EraseFixture<SetType, Geom>::r
 //   walking the threads*kWindow live keys. The nodes a call frees are popped
 //   by every thread's inserts: from the inserting thread's own shard's list
 //   first, then from the others' (the steal).
+// _RcuEach: the same with EVERY thread calling advance() after every
+//   kWindowAdvanceEvery of its own erases, the first calls staggered
+//   (AdvanceTally): the attempt frequency of _Auto, called explicitly and
+//   walking. Most calls at T >= 8 are expected `contended`.
+// _Auto: the set constructed with the automatic cadence kWindowAdvanceEvery
+//   (nodes retired per arena shard: WindowAutoCadence), no call: the set runs
+//   the bump and the free pass from inside the erase whose retire push
+//   crossed the cadence, on that thread, never walking. Every thread still
+//   refreshes at the top of every iteration and releases on its last. A
+//   thread detects its own triggers by reading its own bump_ns (a
+//   thread_local the set charges a proceeding trigger's bump to) just before
+//   the erase and comparing after it: one thread-local load before the erase,
+//   one load, a compare and a predictable not-taken branch after it, the
+//   row's stated added per-erase cost beside the trigger's own (reading the
+//   set's auto_reclaims per erase would be a shared-line load on every
+//   thread, absent from the control), plus the sampling countdown of the
+//   "# trace" series (AdvanceTally::due(): a decrement, a compare and a
+//   predictable branch per erase on EVERY thread, as in the _Rcu row, though
+//   only thread 0's ever reaches zero; the control carries neither). A
+//   skipped trigger reads no clock and
+//   is not detected; a trigger inside an insert's or a lookup's split cleanup
+//   (a table that doubled) is outside the bracket: the set's auto_reclaims
+//   counts all of them, detected_triggers the ones inside erases.
 // Counters, read by thread 0 after the loop (every thread has left it), untimed:
 //   table_size         -- the bucket count at the end;
 //   slots_per_live_key -- arena slots ever appended, over the live keys at the
@@ -1269,7 +1762,13 @@ template <typename SetType, typename Geom> size_t EraseFixture<SetType, Geom>::r
 //                         free pass (or failed spuriously), and pushes whose
 //                         CAS lost to a pop (or failed spuriously): the
 //                         witnesses that frees and pops met;
-// and on _Rcu the AdvanceTally counters.
+//   retired_nodes      -- nodes retired over the timed loop (every erase of a
+//                         present key retires at least its node, by the
+//                         eraser or a later walker, and split copies add to
+//                         it: at least threads*kWindowIters/4): the
+//                         denominator of "freed against retired";
+// on the reclamation rows the AdvanceTally and the ReclaimSnapshot counters,
+// and their threads' "# trace" lines (Trace); on _Auto the "# shards" line.
 // ---------------------------------------------------------------------------
 static constexpr int    kWindow        = 1 << 12;
 static constexpr size_t kWindowBuckets = size_t(1) << 16;
@@ -1277,43 +1776,59 @@ static constexpr int    kWindowIters   = 1 << 20;
 // Churn_Window_Del_Rcu's cadence: thread 0 calls advance() after every
 // kWindowAdvanceEvery of its own erases, two passes over its window
 // (HASH_BM_WINDOW_ADVANCE_EVERY overrides it: advance_every_from_env()).
+// _RcuEach: every thread's cadence of its own erases; _Auto: the set's
+// cadence in nodes retired per arena shard (one thread per shard at the
+// threads' equal rates: the same per-thread frequency), and thread 0's
+// sampling cadence for the "# trace" series.
 static constexpr int    kWindowAdvanceEvery = 2*kWindow;
+// The automatic cadence of Churn_Window_Del_Auto (see NoCadence): the twin's
+// cadence, with the same environment override.
+struct WindowAutoCadence {
+    static size_t auto_reclaim_every(const benchmark::State& /*state*/) {
+        return size_t(advance_every_from_env("HASH_BM_WINDOW_ADVANCE_EVERY", kWindowAdvanceEvery));
+    } // WindowAutoCadence::auto_reclaim_every()
+}; // struct WindowAutoCadence
 
-template <typename SetType>
+// The window fixture: the automatic cadence policy `Cadence` as in
+// EraseFixture (NoCadence for every row but _Auto; the kept rows' names keep
+// the one written template argument).
+template <typename SetType, typename Cadence = NoCadence>
 class WindowFixture : public benchmark::Fixture {
 public:
     static SetType* set;
     using Handles = ThreadHandles<SetType>;
     static Handles handles;   // the threads' handles (ThreadHandles above)
-    using Tally = AdvanceTally<SetType>;   // one thread's advance() calls in the _Rcu bodies (AdvanceTally above)
-    static typename SetType::InternalCounters counters_before;   // the container's diagnostic counters after the prefill
+    using Tally = AdvanceTally<SetType>;   // one thread's advance() calls or triggers in the reclamation bodies (AdvanceTally above)
+    static ReclaimSnapshot<SetType> before;   // the container's counters after the prefill (ReclaimSnapshot above)
     void SetUp(const ::benchmark::State& state) override {
         if (state.thread_index() != 0) return;
         const int threads = state.threads();
-        set = make_prefilled<SetType>(state, "WindowFixture", kWindowBuckets, [threads](auto insert) {
+        set = make_prefilled<SetType>(state, "WindowFixture", kWindowBuckets, Cadence::auto_reclaim_every(state), [threads](auto insert) {
             for (int t = 0; t < threads; ++t) {
                 for (int i = 0; i < kWindow; ++i) insert(mix(t*kKeyStride + i));
             } // every thread's first window
         });
-        counters_before = set->get_internal_counters();
+        before.take(*set);
         handles.make(*set, state.threads());
     } // WindowFixture::SetUp()
     void TearDown(const ::benchmark::State& state) override {
         if (state.thread_index() == 0) { handles.clear(); delete set; set = nullptr; }
     }
 }; // class WindowFixture
-template <typename SetType> SetType* WindowFixture<SetType>::set = nullptr;
-template <typename SetType> ThreadHandles<SetType> WindowFixture<SetType>::handles;
-template <typename SetType> typename SetType::InternalCounters WindowFixture<SetType>::counters_before{};
+template <typename SetType, typename Cadence> SetType* WindowFixture<SetType, Cadence>::set = nullptr;
+template <typename SetType, typename Cadence> ThreadHandles<SetType> WindowFixture<SetType, Cadence>::handles;
+template <typename SetType, typename Cadence> ReclaimSnapshot<SetType> WindowFixture<SetType, Cadence>::before;
 
 // The body of the window rows (see above), as a macro for the same reason as
 // DEFINE_ERASE: PRE declares what the regime needs before the loop, BEFORE
-// runs at the top of every iteration, AFTER_ERASE after every erase, END at
-// the end of every iteration (the release on the last one), POST reports
-// after the loop; all five are empty in _NoReclaim. Same accounting contract
-// as the other bodies.
-#define DEFINE_WINDOW(NAME, PRE, BEFORE, AFTER_ERASE, END, POST)              \
-    BENCHMARK_TEMPLATE_DEFINE_F(WindowFixture, NAME, ConcurrentSetDel)        \
+// runs at the top of every iteration, BEFORE_ERASE immediately before every
+// erase (the _Auto row's first read of its bump_ns; empty in every other
+// row), AFTER_ERASE after every erase, END at the end of every iteration
+// (the release on the last one), POST reports after the loop; all six are
+// empty in _NoReclaim. The fixture's template arguments come last, as in
+// DEFINE_ERASE. Same accounting contract as the other bodies.
+#define DEFINE_WINDOW(NAME, PRE, BEFORE, BEFORE_ERASE, AFTER_ERASE, END, POST, ...) \
+    BENCHMARK_TEMPLATE_DEFINE_F(WindowFixture, NAME, __VA_ARGS__)             \
     (benchmark::State& state) {                                               \
         static constinit WallRecords records;                                 \
         XorShift32 rng(0x1234567u + 0x9e3779b9u*state.thread_index());        \
@@ -1329,6 +1844,7 @@ template <typename SetType> typename SetType::InternalCounters WindowFixture<Set
             BEFORE                                                            \
             if (phase == 0) {                                                 \
                 ++tries;                                                      \
+                BEFORE_ERASE                                                  \
                 ok += set->erase(own.get(), mix(base + lo));                  \
                 AFTER_ERASE                                                   \
             } else if (phase == 1) {                                          \
@@ -1353,8 +1869,9 @@ template <typename SetType> typename SetType::InternalCounters WindowFixture<Set
             state.counters["table_size"] = benchmark::Counter(double(set->get_internal_table_size())); \
             state.counters["slots_per_live_key"] = benchmark::Counter(        \
                 double(set->get_internal_node_count())/(double(state.threads())*kWindow)); \
-            state.counters["pops_raced_push"] = benchmark::Counter(double(c.pops_raced_push - counters_before.pops_raced_push)); \
-            state.counters["free_push_cas_failures"] = benchmark::Counter(double(c.free_push_cas_failures - counters_before.free_push_cas_failures)); \
+            state.counters["pops_raced_push"] = benchmark::Counter(double(c.pops_raced_push - before.counters.pops_raced_push)); \
+            state.counters["free_push_cas_failures"] = benchmark::Counter(double(c.free_push_cas_failures - before.counters.free_push_cas_failures)); \
+            state.counters["retired_nodes"] = benchmark::Counter(double(c.retire_nodes - before.counters.retire_nodes)); \
         }                                                                     \
         POST                                                                  \
         records.release(state);                                               \
@@ -1442,7 +1959,7 @@ public:
     static Handles handles;   // the threads' handles (ThreadHandles above)
     void SetUp(const ::benchmark::State& state) override {
         if (state.thread_index() == 0) {
-            set = new SetType(1024, arena_shards_from_env());
+            set = new_set<SetType>(1024);
             handles.make(*set, state.threads());
         }
     }
@@ -1480,7 +1997,7 @@ static void hot_growth_counters(benchmark::State& state, const SetType& set,
 // below num_cpu, num_cpu), each registered as its own row of benchmark class
 // `Bench` with the per-thread count total/threads: a row whose run does the
 // same `total` operations at every thread count, when the thread count
-// divides it (InsertHotGrowth, Erase_Small_Del, Erase_Small_Del_Rcu). The
+// divides it (InsertHotGrowth and the Erase_Small_Del rows). The
 // registration call is the one BENCHMARK_REGISTER_F() expands to.
 template <typename Bench>
 static void register_shared_total(int total) {
@@ -1791,7 +2308,8 @@ DEFINE_ERASE(Erase_Presized_Del_Rcu,
     ok += set->erase(own.get(), mix(base + next++));
     if (own.finish_iteration()) [[unlikely]] tally.add(set->advance());,
     /* POST */
-    tally.report(state);,
+    tally.report(state);
+    if (state.thread_index() == 0) before.report_set(state, *set);,
     ConcurrentSetDel)
 BENCHMARK_REGISTER_F(EraseFixture, Erase_Presized_Del_Rcu)
     ->ThreadRange(1, num_cpu)->Iterations(kErasePrefill/num_cpu)->UseRealTime();
@@ -1807,32 +2325,135 @@ DEFINE_ERASE(Erase_Small_Del,
 
 DEFINE_ERASE(Erase_Small_Del_Rcu,
     /* PRE */
-    Tally tally(std::max(1, advance_every_from_env("HASH_BM_SMALL_ADVANCE_EVERY", kSmallAdvanceEvery)/state.threads()), state);,
+    Tally tally(small_cadence(state), state);,
     /* ITERATION: refresh, erase, advance() at the cadence */
     own.refresh();
     ok += set->erase(own.get(), mix(base + next++));
     if (tally.due()) tally.add(set->advance());
     own.finish_iteration();,
     /* POST */
-    tally.report(state);,
+    tally.report(state);
+    if (state.thread_index() == 0) before.report_set(state, *set);,
     ConcurrentSetDel, SmallErase)
 [[maybe_unused]] static const bool Erase_Small_Del_Rcu_registered =
     (register_shared_total<BENCHMARK_PRIVATE_CONCAT_NAME(EraseFixture, Erase_Small_Del_Rcu)>(kSmallPrefill), true);
 
+DEFINE_ERASE(Erase_Small_Del_RcuEach,
+    /* PRE */
+    Tally tally(small_cadence(state), state, Tally::Advancer::every_thread);,
+    /* ITERATION: refresh, erase, advance() at this thread's cadence */
+    own.refresh();
+    ok += set->erase(own.get(), mix(base + next++));
+    if (tally.due()) tally.add(set->advance());
+    own.finish_iteration();,
+    /* POST */
+    tally.report(state);
+    if (state.thread_index() == 0) before.report_set(state, *set);,
+    ConcurrentSetDel, SmallErase)
+[[maybe_unused]] static const bool Erase_Small_Del_RcuEach_registered =
+    (register_shared_total<BENCHMARK_PRIVATE_CONCAT_NAME(EraseFixture, Erase_Small_Del_RcuEach)>(kSmallPrefill), true);
+
+DEFINE_ERASE(Erase_Small_Del_Auto,
+    /* PRE: no call; this thread's timers, read around every erase */
+    Tally tally(Tally::Automatic{}, 0, state);
+    Tally::Timers& timers = Tally::timers();,
+    /* ITERATION: refresh, erase, the trigger detection */
+    own.refresh();
+    const size_t bump_before = timers.bump_ns;
+    ok += set->erase(own.get(), mix(base + next++));
+    if (timers.bump_ns != bump_before) [[unlikely]] tally.detected();
+    own.finish_iteration();,
+    /* POST */
+    tally.report(state);
+    if (state.thread_index() == 0) {
+        before.report_set(state, *set);
+        before.report_shards(state, *set);
+    },
+    ConcurrentSetDel, SmallErase, SmallAutoCadence)
+[[maybe_unused]] static const bool Erase_Small_Del_Auto_registered =
+    (register_shared_total<BENCHMARK_PRIVATE_CONCAT_NAME(EraseFixture, Erase_Small_Del_Auto)>(kSmallPrefill), true);
+
 // The window rows (see Churn_Window_Del above).
 DEFINE_WINDOW(Churn_Window_Del_NoReclaim,
-    /* PRE */, /* BEFORE */, /* AFTER_ERASE */, /* END */, /* POST */)
+    /* PRE */, /* BEFORE */, /* BEFORE_ERASE */, /* AFTER_ERASE */, /* END */, /* POST */,
+    ConcurrentSetDel)
 DEFINE_WINDOW(Churn_Window_Del_Rcu,
     /* PRE */
-    Tally tally(advance_every_from_env("HASH_BM_WINDOW_ADVANCE_EVERY", kWindowAdvanceEvery), state);,
+    Tally tally(advance_every_from_env("HASH_BM_WINDOW_ADVANCE_EVERY", kWindowAdvanceEvery), state);
+    Trace trace;,
     /* BEFORE */
     own.refresh();,
-    /* AFTER_ERASE */
-    if (tally.due()) tally.add(set->advance());,
+    /* BEFORE_ERASE */,
+    /* AFTER_ERASE: advance() at the cadence, its return recorded */
+    if (tally.due()) {
+        const AdvanceResult r = set->advance();
+        tally.add(r);
+        trace.record(Trace::kind_of(r.advance), tally.freed_nodes(), set->get_internal_table_size());
+    },
     /* END */
     own.finish_iteration();,
     /* POST */
-    tally.report(state);)
+    tally.report(state);
+    trace.report(state, Tally::timers());
+    if (state.thread_index() == 0) {
+        Trace::report_stamps(state, records);
+        before.report_set(state, *set);
+    },
+    ConcurrentSetDel)
+DEFINE_WINDOW(Churn_Window_Del_RcuEach,
+    /* PRE */
+    Tally tally(advance_every_from_env("HASH_BM_WINDOW_ADVANCE_EVERY", kWindowAdvanceEvery), state, Tally::Advancer::every_thread);
+    Trace trace;,
+    /* BEFORE */
+    own.refresh();,
+    /* BEFORE_ERASE */,
+    /* AFTER_ERASE: advance() at this thread's cadence, its return recorded */
+    if (tally.due()) {
+        const AdvanceResult r = set->advance();
+        tally.add(r);
+        trace.record(Trace::kind_of(r.advance), tally.freed_nodes(), set->get_internal_table_size());
+    },
+    /* END */
+    own.finish_iteration();,
+    /* POST */
+    tally.report(state);
+    trace.report(state, Tally::timers());
+    if (state.thread_index() == 0) {
+        Trace::report_stamps(state, records);
+        before.report_set(state, *set);
+    },
+    ConcurrentSetDel)
+// _Auto: `freed` of a trace entry is the set-wide nodes_freed (the triggers
+// belong to no thread's tally), read through get_internal_counters(), the
+// one accessor that reaches it: a few hundred relaxed loads per entry, once
+// per detected trigger or sample, inside the loop; small beside the free
+// pass the trigger just ran, and stated.
+DEFINE_WINDOW(Churn_Window_Del_Auto,
+    /* PRE: no call; thread 0 samples every kWindowAdvanceEvery of its erases; this thread's timers, read around every erase */
+    Tally tally(Tally::Automatic{}, advance_every_from_env("HASH_BM_WINDOW_ADVANCE_EVERY", kWindowAdvanceEvery), state);
+    Trace trace;
+    Tally::Timers& timers = Tally::timers();,
+    /* BEFORE */
+    own.refresh();,
+    /* BEFORE_ERASE */
+    const size_t bump_before = timers.bump_ns;,
+    /* AFTER_ERASE: the trigger detection, then thread 0's sample */
+    if (timers.bump_ns != bump_before) [[unlikely]] {
+        tally.detected();
+        trace.record(Trace::Kind::trigger, set->get_internal_counters().nodes_freed, set->get_internal_table_size());
+    }
+    if (tally.due()) trace.record(Trace::Kind::sample, set->get_internal_counters().nodes_freed, set->get_internal_table_size());,
+    /* END */
+    own.finish_iteration();,
+    /* POST */
+    tally.report(state);
+    trace.report(state, Tally::timers());
+    if (state.thread_index() == 0) {
+        Trace::report_stamps(state, records);
+        before.report_set(state, *set);
+        before.report_shards(state, *set);
+    },
+    ConcurrentSetDel, WindowAutoCadence)
 
 // The hot-growth probe (see InsertHotGrowth above), on both instantiations.
 DEFINE_HOT_GROWTH(InsertHotGrowth_Concurrent, ConcurrentSet)

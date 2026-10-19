@@ -76,6 +76,27 @@
 #define CHS_RCU_ASAN_POISON(addr, size) ((void)(addr), (void)(size))
 #define CHS_RCU_ASAN_UNPOISON(addr, size) ((void)(addr), (void)(size))
 #endif
+// CHS_RCU_UNLIKELY(c) (header-private, #undef'd at the end): the condition
+// `c`, marked as usually false but taken regularly, with the builtin's
+// default weight, under which GCC keeps the taken path in the caller's own
+// text (not in its cold partition) and does not make it several times
+// slower. With GCC and Clang (including clang-cl) this is
+//   __builtin_expect(!!(c), 0);
+// elsewhere the hint is dropped and the code is still correct, only without
+// the layout benefit. The !! makes the builtin accept exactly what the bare
+// condition accepts (a type with only an explicit operator bool would not
+// convert to the builtin's `long` parameter). Used on the automatic
+// cadence's trigger test in push_retired(), which is identically false with
+// the cadence off and true at most once per crossing of a multiple of the
+// cadence by a shard's retired-node count otherwise. The builtin rather than
+// the standard [[unlikely]] attribute: the standard leaves the attribute's
+// strength to the compiler, while the builtin states the edge's weight, and
+// a compiler without it needs one edit here.
+#if defined(__GNUC__) || defined(__clang__)
+#define CHS_RCU_UNLIKELY(c) __builtin_expect(!!(c), 0)
+#else
+#define CHS_RCU_UNLIKELY(c) (c)
+#endif
 
 namespace concurrent_hash_rcu_detail {
 // Process-wide sequential thread numbering, shared by every instantiation of
@@ -2095,7 +2116,7 @@ private:
         do {   // step 2: the push
             last->retire_link.store(old_head, std::memory_order_relaxed);
         } while (!shard.retired_head.compare_exchange_weak(old_head, word_of(first), std::memory_order_release, std::memory_order_relaxed));
-        if (((old_nodes ^ (old_nodes + count)) & auto_reclaim_mask_) != 0) auto_reclaim();   // step 3: the cadence (identically false with the cadence off)
+        if (CHS_RCU_UNLIKELY(((old_nodes ^ (old_nodes + count)) & auto_reclaim_mask_) != 0)) auto_reclaim();   // step 3: the cadence (identically false with the cadence off)
     } // push_retired()
 
     // THE AUTOMATIC TRIGGER (THE TRIGGER under HANDLES AND GENERATIONS in
@@ -2121,13 +2142,17 @@ private:
     // are noexcept and the guard's destructor throws nothing. No new memory
     // order: the flag's acquire exchange and the guard's release store are
     // advance()'s, and the decision that reached here is arithmetic on the
-    // value a relaxed fetch_add returned. Cold and never inlined: the retire
-    // path reaches it once per cadence at most, and keeping its body out of
+    // value a relaxed fetch_add returned. Never inlined: the retire path
+    // reaches it once per cadence at most, and keeping its body out of
     // push_retired() keeps the push inlined into unlink_run() and the
     // operation paths free of the trigger's body: only the cadence test and
-    // a cold call (an inlined trigger drags the bump and the free pass into
-    // every unlink site).
-    [[gnu::cold]] [[gnu::noinline]] void auto_reclaim() noexcept {
+    // a call (an inlined trigger drags the bump and the free pass into
+    // every unlink site). Not marked cold: under GCC a cold callee puts its
+    // call site in the caller's cold partition, and values the caller keeps
+    // live across that site (a caller's loop counters) can then be homed in
+    // memory; with the call in the caller's own text most of them stay in
+    // registers.
+    [[gnu::noinline]] void auto_reclaim() noexcept {
         if (reclaiming_.exchange(true, std::memory_order_acquire)) {
             advance_counters_.auto_skipped.fetch_add(1, std::memory_order_relaxed);
             return;
@@ -4808,3 +4833,7 @@ private:
 }; // class ConcurrentResizableHashSetRCU
 
 #endif // CONCURRENT_HASH_SET_RCU_H
+// Header-private: expanded when push_retired() above was parsed (macros expand
+// at definition, not at template instantiation), so it is not exported to
+// includers.
+#undef CHS_RCU_UNLIKELY

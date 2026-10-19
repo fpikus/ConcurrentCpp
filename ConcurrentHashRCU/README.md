@@ -533,7 +533,8 @@ make run_tests  # run all three test binaries
 
 The compiler, C++ standard and library paths come from `../config.mk`, shared
 by every directory in this repository and written once per machine; binaries
-go to `build/<hostname>/`. Requires Google Benchmark and GoogleTest. The
+go to `build/<hostname>/`, the benchmark's per-unit objects beside it.
+Requires Google Benchmark and GoogleTest. The
 benchmark also includes `../Spinlock/gb_wall_clock.h` (through
 `-I../Spinlock`), the wall-clock accounting behind its `wall_items_per_second`
 and `finish_spread` counters.
@@ -548,8 +549,14 @@ and `finish_spread` counters.
 - `concurrent_hash_set_rcu_tso_test.C` — the store-buffering regression test;
   it can only fail when built `-O3` without a sanitizer, so it is its own
   binary
-- `concurrent_hash_set_rcu_bm.C` — the benchmarks: the original's fixtures,
-  so that the two sets' rows pair up, plus the cells the original lacks: two
+- `concurrent_hash_set_rcu_bm.C`, `concurrent_hash_set_rcu_bm_*.C` and
+  `concurrent_hash_set_rcu_bm.h` — the benchmarks, one translation unit per
+  family of rows over a shared header, linked into one binary (the index at
+  the top of `concurrent_hash_set_rcu_bm.C` names which unit holds which rows,
+  and why there are several: the code a compiler generates for a row's loop
+  then depends on that row's unit alone, not on every other row). The rows:
+  the original's fixtures, so that the two sets' rows pair up, plus the cells
+  the original lacks: two
   whose state erases built, one that times `erase()` itself, a probe
   (`InsertHotGrowth`) that splits long, hot chains while threads insert into
   them, and counts the unlink CASes the splits' cleanup loses and the dead

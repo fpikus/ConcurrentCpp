@@ -4,19 +4,20 @@ A copy of `ConcurrentResizableHashSet` (see `../ConcurrentHash`) with two
 changes. A node that goes dead — the tombstone `erase()` leaves, or the parent
 copy a lazy split superseded — is taken out of its chain by the concurrent
 operations themselves, best effort, instead of waiting in it for a quiescent
-point. And its memory comes back while the operations run: every operation
-runs under a handle, and a caller-driven `advance()` frees what no handle can
-still see; there is no `reclaim()` and no quiescent point. Everything else is
-the original's: the append-only sharded arena, the lazy copying split, inserts
-that publish with one CAS, and operations that are lock-free except where they
-allocate: the hash's own protocol (walks, splits, unlinks, the publishing CAS)
-takes no lock; a node comes from a free list without a lock, or from an
-append under the arena shard's spinlock (a lookup can get there too, by
-splitting a bucket it meets uninitialized); and the insert that crosses the
-doubling threshold grows the bucket array under the table's resize lock,
-after its own key is published, while another insert that has also crossed a
-doubling threshold waits for it. Read the original's README first; this one
-says only what is different, and why.
+point. And its memory comes back while the operations run: every operation runs
+under a handle, and a caller-driven `advance()` frees what no handle can still
+see; `reclaim()` is that call without its walk of the table, and a set
+constructed with a cadence does that work by itself; there is no quiescent
+point. Everything else is the original's: the append-only sharded arena, the
+lazy copying split, inserts that publish with one CAS, and operations that are
+lock-free except where they allocate: the hash's own protocol (walks, splits,
+unlinks, the publishing CAS) takes no lock; a node comes from a free list
+without a lock, or from an append under the arena shard's spinlock (a lookup
+can get there too, by splitting a bucket it meets uninitialized); and the
+insert that crosses the doubling threshold grows the bucket array under the
+table's resize lock, after its own key is published, while another insert that
+has also crossed a doubling threshold waits for it. Read the original's README
+first; this one says only what is different, and why.
 
 The requirements on `T` and `Hash` are the original's, spelled out here in one
 place: `Hash` must be default-constructible and callable on a `const T&`,
@@ -29,24 +30,25 @@ free list takes its new value by assignment) and comparable as
 keys that compare equal must hash equal. `Hash` is applied to stored values
 as well as to the keys of calls, and one of the places is the walk of
 `advance()`, which hashes the frozen nodes it passes as every writer walk
-does: a `Hash` that throws can make `advance()` throw.
+does: a `Hash` that throws can make `advance()` throw. `reclaim()` hashes
+nothing and never throws.
 
 ## Why
 
 The original keeps a dead node in its chain, where every later walk steps over
-it, until `reclaim()` unlinks it. That is cheap and simple, and it is why the
-original can promise that no node is ever reused while a thread may be looking
-at it: at a quiescent point, nobody is. It is also why reclamation has to wait
-for one. The road to reclaiming memory *without* stopping the world — by
-epochs, generations, RCU, whatever you call it — begins by splitting "dead" in
-two. A dead node still in its chain can be reached by any operation that starts
-later, so nobody can ever say who might be looking at it. A dead node out of
-its chain can be held only by an operation that did not start after it left,
-in happens-before order, and it can be freed once every such operation has
-finished, in the same order. This copy manufactures the second kind, and keeps
-the books that act on it: handles and generations tell when every operation
-that could still hold such a node has finished, and its memory comes back
-while the others keep running.
+it, until the original's `reclaim()` unlinks it. That is cheap and simple,
+and it is why the original can promise that no node is ever reused while a
+thread may be looking at it: at a quiescent point, nobody is. It is also why
+reclamation has to wait for one. The road to reclaiming memory *without*
+stopping the world — by epochs, generations, RCU, whatever you call it —
+begins by splitting "dead" in two. A dead node still in its chain can be
+reached by any operation that starts later, so nobody can ever say who might
+be looking at it. A dead node out of its chain can be held only by an
+operation that did not start after it left, in happens-before order, and it
+can be freed once every such operation has finished, in the same order. This
+copy manufactures the second kind, and keeps the books that act on it:
+handles and generations tell when every operation that could still hold such
+a node has finished, and its memory comes back while the others keep running.
 
 ## What differs
 
@@ -80,11 +82,12 @@ leave their chains here:
 - The walks of `insert()` and `erase()` try to bypass every dead run they pass
   behind a live word. A hit stops a walk at its key, so only a miss walks a
   whole chain.
-- `contains()`'s own walk never writes; a lookup pays for none of this. The
-  one way a lookup unlinks anything is by winning a split, in which case it
-  runs that split's cleanup pass like any other splitter — just as, in the
-  original, a lookup that meets an uninitialized bucket already does the
-  split's work.
+- `contains()`'s own walk never writes; a lookup pays for none of this. The one
+  way a lookup unlinks anything is by winning a split, in which case it runs
+  that split's cleanup pass like any other splitter — just as, in the original,
+  a lookup that meets an uninitialized bucket already does the split's work. On
+  a set constructed with a cadence, the retirements of that cleanup pass can
+  trigger a reclamation like any other's (the cadence, below).
 
 Removal is best effort, not a guarantee. Every site above spends one CAS per
 dead run and never retries (the erase's restart is the one exception, bounded
@@ -101,20 +104,22 @@ straggler gets another attempt from the next writer walk that passes it, from
 the next split of any child of its bucket (that pass walks the whole parent
 chain), and from the walk of `advance()`, which passes every published chain
 with the same one attempt per run: a dead run that no writer walks past again
-waits for the next `advance()`, so its lifetime is bounded by the caller's
-cadence (and by that one CAS winning), never by time. The exception is a
-straggler behind a frozen node whose child is not yet published: that node is
-not dead, so no walk bypasses it, and its link, the word in front of the
-straggler, is written by no concurrent operation; the straggler stays through
-any number of walks, splits, doublings and `advance()` calls, until the node's
-child is published (from then on the cleanup pass of the split that published
-it, or any walk that passes the node, `advance()`'s included, can take the
-node and the straggler out together).
+waits for the next `advance()`, so its lifetime is bounded by how often the
+caller calls it (and by that one CAS winning), never by time. The exception
+is a straggler behind a frozen node whose child is not yet published: that
+node is not dead, so no walk bypasses it, and its link, the word in front of
+the straggler, is written by no concurrent operation; the straggler stays
+through any number of walks, splits, doublings and `advance()` calls, until
+the node's child is published (from then on the cleanup pass of the split
+that published it, or any walk that passes the node, `advance()`'s included,
+can take the node and the straggler out together).
 
-What no concurrent operation does is make memory reusable: inserts and splits
-do take nodes off the free lists, but only `advance()` puts nodes on them. An
-unlinked node goes onto a per-shard *retired* list and waits there for the
-next `advance()`, which bags it with the generation it closes; a node an
+What no concurrent operation does of its own accord is make memory reusable:
+inserts and splits do take nodes off the free lists, but only a *bump* and the
+free pass after it — `advance()`'s, `reclaim()`'s, or, on a set constructed
+with a cadence, the one an operation's own retirement triggers — put nodes on
+them. An unlinked node goes onto a per-shard *retired* list and waits there
+for the next bump, which bags it with the generation it closes; a node an
 operation allocated and never published — a split's subchain that lost its
 publishing CAS or was abandoned by a throw, an insert's node that a retry
 found redundant, a reused node whose value assignment threw — goes onto the
@@ -164,12 +169,15 @@ under [Performance](#performance)):
 ## Handles, generations and `advance()`
 
 Reclamation beside the readers is done the way `../LockFreeListRCU` does it,
-and this section keeps that README's words wherever the mechanism is the
-same: handles that join and leave generations, bags, a free pass that is
-cumulative and oldest-first, a `reclaim()` that refuses rather than waits —
-here named `advance()`, because it also walks. Where the hash differs — it
-hands out no iterators, its retired lists are per arena shard, and its
-collector walks the table — the text says so.
+and this section keeps that README's words wherever the mechanism is the same:
+handles that join and leave generations, bags, a free pass that is cumulative
+and oldest-first, and a reclamation call that refuses rather than waits — the
+list's `reclaim()`. The hash has two such calls: `reclaim()`, the same bump and
+free pass under the same name, and `advance()`, which is `reclaim()` plus a
+walk of the table; and a set constructed with a cadence does `reclaim()`'s work
+by itself. Where the hash differs — it hands out no iterators, its retired
+lists are per arena shard, and its collector walks the table — the text says
+so.
 
 **Handles.** Every operation runs under a handle, its first argument:
 `set.contains(h, key)`, `set.insert(h, key)`, `set.erase(h, key)`.
@@ -190,31 +198,36 @@ reuse. Refreshing costs the caller nothing in validity, and between two calls
 a handle can be refreshed as often as wanted. The advice is to *refresh
 regularly*, not only before advancing: a handle that is never refreshed keeps
 memory from being reused for as long as it lives, and one refreshed only just
-before an `advance()` pins the very generation that call closes (the latency
-paragraph below).
+before an `advance()` or a `reclaim()` pins the very generation that call
+closes (the latency paragraph below).
 
 Thread rules: any number of threads may run operations concurrently, each
 under its own handle or sharing one — concurrent operations under one handle
 are fine. What is exclusive with every other use of a handle is changing its
 membership: `refresh()`, moving from it or over it, swapping it, destroying
 it. These are exclusive with uses of *that* handle only — not with other
-handles, not with `new_handle()`, not with `advance()`. A handle has no
+handles, not with `new_handle()`, not with `advance()` or `reclaim()`. A
+handle has no
 thread affinity: created on one thread, it may be used or destroyed on
 another after a happens-before edge (a `std::thread::join()`, a hand-off
 under a mutex); no thread id is recorded. Taking a handle and refreshing one
-are lock-free and never wait for an `advance()`. Debug builds count the
+are lock-free and never wait for a reclamation. Debug builds count the
 operations in flight under a handle and diagnose a refresh, move, swap or
 destruction while that count is not zero, an operation under an empty handle
 or under a handle of another set, and a set destroyed with a live handle;
 release builds diagnose none of these, and an operation reads nothing of its
 handle.
 
-**Generations and `advance()`.** Nothing is ever freed unless some thread
-calls `advance()`: no operation frees anything, and no handle's leaving does
-either. One call proceeds at a time, under a try-flag; a call that finds
-another in progress returns `contended` at once, having done nothing, and
-never waits. Any thread may call it, with or without a handle. The call that
-proceeds does three things, in order. It *bumps*: looks at every shard's
+**Generations, `advance()` and `reclaim()`.** Nothing is ever freed unless
+some thread calls `advance()` or `reclaim()`, or, on a set constructed with a
+cadence (below), an operation's own retirement triggers what `reclaim()`
+does: no handle's leaving frees anything, and on a set without a cadence no
+operation does either. One reclamation proceeds at a time, under a try-flag
+shared by the two calls and the cadence's triggers; a call that finds another
+in progress returns `contended` at once, having done nothing, and never waits.
+Any thread may call either, with or without a handle. An `advance()` that
+proceeds does three things, in order; a `reclaim()` does the first two and
+stops. It *bumps*: looks at every shard's
 retired list and limbo list, and if all are empty reports `nothing_retired`
 and consumes no generation; otherwise it moves what is on them into the
 closing generation's *bag* and publishes the next generation — unless the
@@ -229,72 +242,160 @@ Every call that is not `contended` runs this pass, so a `nothing_retired` or
 the last call. Then it *walks*: every published bucket, like a writer's miss
 walk that inserts nothing, bypassing the dead runs it passes with one CAS
 each, never retried, and retiring what it bypasses into the generation that
-is current after the bump. Every call but `ring_full` and `contended` walks,
-a `nothing_retired` one included. The result reports which of the four
-outcomes it was and what the call freed, walked and retired. The refusals
-are the list's three and so is the remedy: call again later; there is no
-automatic recovery. The walk is the hash's own. The list's `reclaim()` walks
-nothing — a marked node whose unlink lost a race stays linked until a later
-erase over the same edge helps it out — while the hash's `advance()` is also
-the collector of stragglers.
+is current after the bump. Every `advance()` but `ring_full` and `contended`
+walks, a `nothing_retired` one included. The result reports which of the four
+outcomes it was and what the call freed, walked and retired; a `reclaim()`
+reports the same four outcomes, decided the same way, with the walk's counts
+zero. The refusals are the list's three and so is the remedy: call again
+later; there is no automatic recovery. The walk is the hash's own. The list's
+`reclaim()` walks nothing — a marked node whose unlink lost a race stays
+linked until a later erase over the same edge helps it out — and neither does
+the hash's: a dead run that a writer walk failed to bypass stays reachable
+across any number of `reclaim()` calls, until a writer walk, a split's
+cleanup pass or an `advance()` passes it. Of the two calls, `advance()` alone
+collects stragglers.
 
-A thread that holds a live handle and calls `advance()` frees nothing at or
-after that handle's generation: its own handle pins it. A handle refreshed
-right before the call is at the current generation, which is the one the
-call closes, so it pins the closing bag, and what that bag holds waits for
-the next call. To free in one call, release the handle before it.
+A thread that holds a live handle and calls `advance()` or `reclaim()` frees
+nothing at or after that handle's generation: its own handle pins it. A
+handle refreshed right before the call is at the current generation, which is
+the one the call closes, so it pins the closing bag, and what that bag holds
+waits for the next call. To free in one call, release the handle before it.
 
-What a call costs, in kind: the walk is the price, paid by the calling
-thread on every call that is not `ring_full` or `contended` — a
-`nothing_retired` call pays for a whole-table walk — and it grows with the
+What a call costs, in kind: the walk is the price, paid by the calling thread
+on every `advance()` that is not `ring_full` or `contended` — a
+`nothing_retired` one pays for a whole-table walk — and it grows with the
 published buckets and the nodes in them; the free pass pushes every node it
 frees, dealing them round-robin over the shards' free lists, so a large bag
-touches every shard's; the bump is at most two exchanges per arena shard,
-one store and a counter increment. `advance()` is meant to be called rarely,
-on a cadence. What it costs in numbers is under [Performance](#performance).
+touches every shard's; the bump is at most two exchanges per arena shard, one
+store and a counter increment. A `reclaim()` pays the bump and the free pass
+alone: nothing in it grows with the table, so a `nothing_retired` `reclaim()`
+is cheap. `advance()` is meant to be called rarely; a caller who wants memory
+back often and the walk rarely calls `reclaim()` often and `advance()` rarely,
+or lets the set do `reclaim()`'s work for it (the cadence, below). What they
+cost in numbers is under [Performance](#performance).
 
 **Two guarantees, kept apart.** *Made unreachable* — a dead node leaving
 its chain — is best effort: one CAS per dead run at every site, `advance()`'s
 walk included, and nothing promises that a given dead node ever leaves its
 chain. *Made reusable* — its memory coming back — is a guarantee: a node that
 has left its chain (retired) or never entered one (limbo) is freed when no
-handle of its bag's generation or an older one is live, at an `advance()`
-call, and never otherwise; a node that is freed is never one a live handle
-can observe.
+handle of its bag's generation or an older one is live, at an `advance()` or
+`reclaim()` call or at a trigger of the cadence, and never otherwise; a node
+that is freed is never one a live handle can observe.
 
-Latency: a node retired between two `advance()` calls is freed by the next
-call if every handle was released before it, and by the *second* call after
-its retirement under a long-lived handle refreshed before each call (the
-first call closes the bag the refreshed handle still pins; the second frees
-it). A straggler that the walk of one call bypasses is retired into the
-generation that is current after that call's bump, so it waits for the
-following call either way: with every handle released, that call frees it
-(two clicks); under a handle refreshed before each call, the one after that.
-Nothing is freed earlier than the next `advance()` after its retirement.
+Latency: a node retired between two calls (`advance()` or `reclaim()`, in any
+mix) is freed by the next call if every handle was released before it, and by
+the *second* call after its retirement under a long-lived handle refreshed
+before each call (the first call closes the bag the refreshed handle still
+pins; the second frees it). A straggler that the walk of one `advance()`
+bypasses is retired into the generation that is current after that call's
+bump, so it waits for the following call either way: with every handle
+released, that call frees it (two clicks); under a handle refreshed before
+each call, the one after that. Nothing is freed earlier than the next bump
+after its retirement, whichever call or trigger makes it.
 
-No eventual bound, for either guarantee: a dead run may stay reachable
-through any number of calls — a lost CAS every time, or a run behind a
-frozen node whose child nobody ever touches; a handle holder that stalls
-(preempted, suspended, or simply never refreshing) pins its generation and
-every node retired since for as long as it stalls, the memory under it grows
-without bound, and after `kGenerations - 1` advances `advance()` refuses with
-`ring_full` while retired nodes pile up on the retired lists. The set cannot
-tell a stalled holder from a slow one. That is the trade of epoch-based
+No eventual bound, for either guarantee: a dead run may stay reachable through
+any number of calls — a lost CAS every time, or a run behind a frozen node
+whose child nobody ever touches; a handle holder that stalls (preempted,
+suspended, or simply never refreshing) pins its generation and every node
+retired since for as long as it stalls, the memory under it grows without
+bound, and after `kGenerations - 1` bumps every call or trigger with nodes to
+bag finds `ring_full` while retired nodes pile up on the retired lists. The set
+cannot tell a stalled holder from a slow one. That is the trade of epoch-based
 reclamation, accepted here, and the mitigations are inside the design: the
-refresh discipline, `ring_full` as a visible signal, and the diagnostics —
-the handle count and the bagged count per generation. A thread stalled inside
-`advance()` stalls all reclamation too, every other call `contended` until it
-resumes; it never stalls an operation.
+refresh discipline, `ring_full` as a visible signal, and the diagnostics — the
+handle count and the bagged count per generation. A thread stalled inside
+`advance()`, `reclaim()` or a trigger stalls all reclamation too, every other
+call `contended` and every other trigger skipped until it resumes; it never
+stalls another thread's operation.
 
-**Values.** A freed node keeps its old, constructed `T`; `advance()` destroys
-nothing. Reuse copy-assigns the new value over the old one, while other
+**The cadence.** A set constructed with a cadence reclaims by itself. The
+cadence is opt-in, through the constructor's `Options` aggregate —
+`Set::Options{.auto_reclaim_every = R}`, with `initial_capacity` and
+`arena_shards` beside it, the two parameters of the other constructor — and
+is off by default, so a set constructed any other way behaves exactly as if
+the cadence did not exist, and nothing on it is ever freed unless a thread
+calls `advance()` or `reclaim()`. R counts nodes retired per arena shard: not
+runs, not set-wide, not per thread (two threads retiring into one shard share
+its count). It is rounded up to a power of two, except 0, the default, which
+is off; a value above 2⁶³ is clamped to 2⁶³, silently, which is "never" on
+any real run, so `SIZE_MAX` is a valid spelling of "never". On a cadenced
+set every push onto a retired list — the winner of an unlink CAS retiring a
+run — moves its shard's retired-node count from *old* to *old* + *n*, *n* the
+run's length, and when (*old*, *old* + *n*] contains a multiple of R the push
+*triggers*, once, however many multiples the run jumps: right after the push,
+on the retiring thread, inside the operation that retired, under that
+operation's handle, the set attempts the try-flag and, holding it, does what
+`reclaim()` does — the bump and the free pass — and never the walk. The walk
+is never automatic; it runs only when a caller calls `advance()`. A trigger
+that finds the flag held — by an `advance()` or `reclaim()` on any thread, by
+another thread's trigger, or by this thread's own `advance()`, whose walk is
+retiring — is *skipped*: it does nothing, and nothing re-fires for it; the
+next attempt is at the next multiple, R nodes on, because the multiples are
+absolute positions of the shard's counter, never reset.
+
+What the cadence guarantees is therefore a bound on spacing, not a count: at
+most one attempt per R nodes retired on a shard, and no promise about how many
+attempts proceed. Under contention the skipped attempts can far outnumber the
+ones that proceed, and the set promises no ratio between them; under a flag
+held nearly continuously, by callers or by triggers, every attempt can be
+skipped. A caller who expects a count reads the counters (`auto_reclaims`, the
+triggers that acquired the flag, and `auto_skipped`, the ones that did not).
+The run whose push crossed the multiple is in the bag the trigger closes when
+the trigger's bump reports `advanced` (the push and the exchange are on one
+thread, in that order); when it reports `nothing_retired`, a concurrent bump of
+any cause took the lists between this thread's push and its flag acquisition,
+and the run is in that bump's bag; when it reports `ring_full`, or the trigger
+was skipped, the run stays on the retired list for the next bump of any cause.
+With the cadence on, an `advance()` or `reclaim()` called while operations run
+may return `contended` where it could not before — an operating thread's
+trigger may hold the flag — and at a quiescent point it never does, since a
+trigger lives only inside an operation. A lookup can reach a trigger only one
+way: by entering an uninitialized bucket, winning its split and retiring the
+dead runs that split's cleanup pass bypasses; such a bucket exists only after a
+doubling and only until a split publishes it, so on a cadenced set whose table
+has not doubled no lookup ever bumps or frees, and one that does is a lookup on
+a table that has doubled, of a key whose bucket had not been split since.
+
+Latency under the cadence is one reclamation longer than under explicit calls
+with every handle released, because the trigger runs under a live handle, the
+retiring thread's own: a node retired by a thread is freed only by a free pass
+*after* the bump that bagged it, never by that bump's own, and only once every
+handle of that bag's generation, the retiring thread's included, has refreshed
+or left. A thread that erases under a never-refreshed handle pins its own
+garbage: every trigger it runs closes a bag it then pins, and after
+`kGenerations - 1` such bumps every further trigger that proceeds finds
+`ring_full` and frees nothing, while the retired lists, and the memory under
+them, grow without bound — until the handle refreshes or leaves, when the next
+trigger frees every waiting bag. The same happens, more slowly, when every
+handle merely lags: the ring fills behind the oldest of them, the triggers that
+proceed turn into `ring_full` refusals, and memory grows until the handles
+refresh. The cadence makes the refresh discipline more important, not less.
+What a trigger adds to the operation that retired is work, never a wait: the
+bump's loads and exchanges, and the free pass of every unpinned bag, bounded by
+the bagged nodes — unbounded in time only in that the first trigger after a
+long stall ends frees everything the stall pinned — with no lock, no
+allocation, no call of `Hash` or `operator==`, and no exception; the operation
+then returns what it would have returned.
+
+On a cadenced set the diagnostics that read the generation ring — the current
+generation, a generation's bagged count, the ring's state — need no operation
+in flight on any thread, in addition to no reclamation in progress and every
+earlier reclamation ordered before the call: an operation may be holding the
+try-flag. On a set without a cadence they need only the latter; the counters
+need neither.
+
+**Values.** A freed node keeps its old, constructed `T`; no reclamation,
+`advance()`'s, `reclaim()`'s or a trigger's, destroys anything. Reuse
+copy-assigns the new value over the old one, while other
 operations run — safe because the node is freed only after every handle that
 could observe it has left or refreshed, and it is popped by one thread while
 on no chain. An erased value's resources are therefore released at reuse,
 the assignment's left-hand side, or when the value is destroyed with the set;
-never at `erase()`, never at `advance()`. Callers must not rely on destructor
-timing. This is the other way round from the list, which destroys an erased
-value inside `reclaim()` and constructs the next one in its place at reuse;
+never at `erase()`, never at a reclamation. Callers must not rely on
+destructor timing. This is the other way round from the list, which destroys
+an erased value inside its `reclaim()` and constructs the next one in its
+place at reuse;
 here `T` must be copy-assignable, no `T` is destroyed before the set is, and a
 copy assignment that throws at reuse sends the node to limbo, to be bagged
 and freed by a later call, while the exception leaves the operation as any
@@ -305,7 +406,8 @@ and `Hash`, so that every existing instantiation means what it meant:
 `kGenerations`, the number of generations in the ring, 64 by default and at
 least 2, since one slot is always the current generation; and `Hooks`, last,
 the test seams — a type with three static `noexcept` functions that the set
-calls at fixed points of the join and of `advance()`, whose default,
+calls at fixed points of the join and of the bump, whichever call or trigger
+makes it, whose default,
 `concurrent_hash_rcu_detail::NoHooks`, compiles to nothing. The hooks are
 not part of the contract. The ring is part of the set object: `kGenerations`
 blocks, each with its handle count on a cache line of its own, and each with
@@ -318,13 +420,10 @@ Possible next steps, none of them started and none of them promised:
 
 - A cheaper walk. Every `advance()` that walks at all walks the whole table;
   it could instead walk a bounded slice per call, follow a hint of the buckets
-  worth walking, split the uninitialized buckets it skips (so that a dead run
-  waiting behind a frozen node for that node's child to be published could go
-  too), or leave the walk to a call of its own, apart from the bump and the
-  free pass.
-- An automatic cadence: the set calling `advance()` on its own instead of
-  waiting for the caller to. Such a call would bump and free only; the walk
-  stays where the caller asks for it.
+  worth walking, or split the uninitialized buckets it skips, so that a dead
+  run waiting behind a frozen node for that node's child to be published
+  could go too. The walk does not split because a split allocates and may
+  take the arena shard's lock, and the walk does neither.
 - A `contains()` that also bypasses the dead runs it passes. It would make
   every reader a writer, which is why it was not done here; whether it pays
   is a measurement, and this version is the baseline it would be measured
@@ -334,11 +433,12 @@ Possible next steps, none of them started and none of them promised:
 
 Two sets of measurements. The first compares the unlinking against the
 original, on four machines; it was taken on the copy without handles, with a
-quiescent `reclaim()` in the place of `advance()`. The second, on the laptop
-alone, measures what handles and `advance()` add against that same build, and
-finds the operations under a long-lived handle within noise of it on all but
-a few rows, so on the laptop the first set describes this code as well; the
-servers have not been measured with handles.
+quiescent `reclaim()`, since removed, in the place of `advance()` (not this
+version's `reclaim()`, which is `advance()` without the walk). The second, on
+the laptop alone, measures what handles and `advance()` add against that same
+build, and finds the operations under a long-lived handle within noise of it
+on all but a few rows, so on the laptop the first set describes this code as
+well; the servers have not been measured with handles.
 
 ### Unlinking, against the original
 

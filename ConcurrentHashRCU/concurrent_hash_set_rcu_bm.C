@@ -123,27 +123,29 @@
  *
  * RECLAMATION. Every operation of this container runs under a handle, and
  * nodes that erases and splits retire are made reusable only by advance(),
- * which the caller runs (the header's HANDLES AND GENERATIONS): it closes the
- * current generation's retired nodes into a bag, frees every bag no live
- * handle can observe onto the free lists, and walks every published chain,
- * unlinking the dead nodes it passes. In every row but the ones named next,
- * each thread has one long-lived handle, never refreshed, and nothing in the
- * timed region calls advance() (see ThreadHandles). The rows whose names end
- * in _Rcu run under the RECLAMATION REGIME: advance() is called from inside
- * the timed loop -- once per thread at its end, or by one thread at a cadence
- * while every thread refreshes its handle each iteration -- and the rows
- * report what the calls did and what they cost (see AdvanceTally). The rows
- * whose names end in _RcuEach have EVERY thread call advance() at a cadence
- * of its own erases; the rows whose names end in _Auto call nothing: their set
- * is constructed with an AUTOMATIC CADENCE (the header's Options), so the set
- * itself runs the bump and the free pass -- never the walk -- from inside the
- * retiring thread's erase, once that thread's arena shard has retired another
- * R nodes; every thread still refreshes its handle each iteration. Every
- * reclamation row reports the set's own counters of what the calls and the
- * triggers did, as deltas across the timed loop (ReclaimSnapshot), and the
- * three churn reclamation rows print a per-thread time series of every call
- * or trigger return (the "# trace" lines, Trace). The Advance_ rows measure
- * advance() alone, one thread, nothing else running.
+ * reclaim() (advance() without its walk) or, on a set constructed with a
+ * cadence, the set's own trigger (the header's HANDLES AND GENERATIONS).
+ * advance(), which the caller runs, closes the current generation's retired
+ * nodes into a bag, frees every bag no live handle can observe onto the free
+ * lists, and walks every published chain, unlinking the dead nodes it passes.
+ * In every row but the ones named next, each thread has one long-lived handle,
+ * never refreshed, and nothing in the timed region calls advance() (see
+ * ThreadHandles). The rows whose names end in _Rcu run under the RECLAMATION
+ * REGIME: advance() is called from inside the timed loop -- once per thread at
+ * its end, or by one thread at a cadence while every thread refreshes its
+ * handle each iteration -- and the rows report what the calls did and what
+ * they cost (see AdvanceTally). The rows whose names end in _RcuEach have
+ * EVERY thread call advance() at a cadence of its own erases; the rows whose
+ * names end in _Auto call nothing: their set is constructed with an AUTOMATIC
+ * CADENCE (the header's Options), so the set itself runs the bump and the free
+ * pass -- never the walk -- from inside the retiring thread's erase, once that
+ * thread's arena shard has retired another R nodes; every thread still
+ * refreshes its handle each iteration. Every reclamation row reports the set's
+ * own counters of what the calls and the triggers did, as deltas across the
+ * timed loop (ReclaimSnapshot), and the three churn reclamation rows print a
+ * per-thread time series of every call or trigger return (the "# trace" lines,
+ * Trace). The Advance_ rows measure advance() alone, one thread, nothing else
+ * running.
  *
  * Table of contents: every registration, in the order of the file, each run
  * at the thread counts of ThreadRange(1, num_cpu) (one row per thread count,

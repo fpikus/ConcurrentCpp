@@ -6508,6 +6508,9 @@ struct CadenceMixHash {
 // over all rounds: a reader iteration across which the reader's own bump_ns
 // grew (readers make no explicit call, so only a trigger inside their own
 // contains() charges it), and triggers proceeded.
+// Kills, probabilistically: a trigger that releases the flag before its final
+// free pass, and a trigger that ignores the flag, here with triggers inside
+// readers' contains() among the parties.
 TEST(ConcurrentHashSetRcuTest, CadenceStressManyTinySets) {
     using Set = ConcurrentResizableHashSetRCU<int, true, CadenceMixHash>;
     StressShape shape{4, 2, 0, false, 2, 4, 8, 64, std::chrono::milliseconds(20), false};

@@ -163,10 +163,15 @@ under [Performance](#performance)):
   shards' before it appends, unless a set-wide hint (one load) says that no
   free list holds a node: the free pass deals what it frees over every shard,
   not back to the shard that retired it;
+- every push onto a retired list tests the cadence, on a set constructed
+  without one too: the push adds its node count with an instruction that
+  returns the old count, the old and new counts are tested against a constant
+  mask, and on a set without a cadence the branch to the trigger is never
+  taken;
 - and `advance()` walks the whole table, on the thread that calls it (the next
   section).
 
-## Handles, generations and `advance()`
+## Handles, generations and reclamation
 
 Reclamation beside the readers is done the way `../LockFreeListRCU` does it,
 and this section keeps that README's words wherever the mechanism is the same:
@@ -550,7 +555,11 @@ and `finish_spread` counters.
   them, and counts the unlink CASes the splits' cleanup loses and the dead
   nodes left in their chains; the rows that call `advance()` while they run
   (the timed erases on two table sizes, and steady churn, each beside its
-  control without reclamation), lookups under a handle taken per operation,
+  control without reclamation), the small-table erases and the churn on a
+  set that reclaims by itself through its cadence (`_Auto`), each beside a row
+  where every thread calls `advance()` itself, at the cadence the `_Auto`
+  row's set is constructed with (`_RcuEach`), lookups under a handle taken
+  per operation,
   and the `Advance_` rows, which time `advance()` alone, one thread, nothing
   else running: the walk per bucket and per node, the free pass per freed
   node

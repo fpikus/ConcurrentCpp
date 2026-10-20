@@ -98,9 +98,35 @@ benchmarks: $(BENCHMARKS)
 
 tests: $(TESTS)
 
-# Build benchmark
-$(TARGET_BM): concurrent_hash_set_rcu_bm.C $(HEADERS) $(GB_HEADERS) | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) $(CXX_RPATH) -o $@
+# Build the benchmark: one object per translation unit, linked into one binary.
+# The benchmark is several units over its shared header (BM_HEADER), one per
+# family of rows, because a compiler's inlining decisions depend on the whole
+# unit (GCC's inliner has a unit-wide growth budget): with every row in one
+# unit, which calls are inlined into a row's timed loop depends on the code of
+# every other row, and a change in one row can change the code of rows that do
+# not contain it. As separate units, the code generated for a row depends on
+# its own unit alone. Every unit depends on the headers of the other targets
+# plus BM_HEADER and is compiled with the benchmark flags (CXXFLAGS_BM).
+# BM_SOURCES is in the order the rows are listed and run: Google Benchmark
+# runs the rows in registration order, which is the order of the static
+# initializers, across units the link order; $(BM_OBJECTS) keeps this order on
+# the link line. The first unit, the index and main(), registers no row.
+BM_HEADER = concurrent_hash_set_rcu_bm.h
+BM_SOURCES = concurrent_hash_set_rcu_bm.C \
+             concurrent_hash_set_rcu_bm_vs_baseline.C \
+             concurrent_hash_set_rcu_bm_states_insert.C \
+             concurrent_hash_set_rcu_bm_states_lookup.C \
+             concurrent_hash_set_rcu_bm_erase.C \
+             concurrent_hash_set_rcu_bm_churn.C \
+             concurrent_hash_set_rcu_bm_hot_growth.C \
+             concurrent_hash_set_rcu_bm_advance.C
+BM_OBJECTS = $(BM_SOURCES:%.C=$(BUILD_DIR)/%.o)
+
+$(BUILD_DIR)/%.o: %.C $(HEADERS) $(GB_HEADERS) $(BM_HEADER) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS_BM) -c $< -o $@
+
+$(TARGET_BM): $(BM_OBJECTS)
+	$(CXX) $(CXXFLAGS_BM) $(BM_OBJECTS) $(LIBS_BM) $(CXX_RPATH) -o $@
 
 # Build ASan test
 $(TARGET_TEST_ASAN): concurrent_hash_set_rcu_test.C $(HEADERS) | $(BUILD_DIR)

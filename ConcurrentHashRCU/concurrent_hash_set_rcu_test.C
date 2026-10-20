@@ -34,14 +34,16 @@
 //      some call removes it, and vice versa. No key is ever lost by a resize and
 //      no erased key is ever resurrected by one.
 //   4. At every quiescent point (no operation, no join -- new_handle() or a
-//      refresh() -- and no advance() runs on the set, and the caller's joins
-//      order the point against every call; live idle handles may exist) each
+//      refresh() -- and no advance() or reclaim() runs on the set, and the
+//      caller's joins order the point against every call; live idle handles
+//      may exist) each
 //      arena slot is in exactly one of five places (get_internal_accounting()):
 //      reachable from a published bucket, on a free list, on a limbo list (a
 //      node that was never published), on a retired list (a dead node that an
 //      operation or advance()'s walk unlinked from its chain), or in the BAG of
-//      a closed generation (a retired or limbo node that an advance()
-//      sequestered and has not freed yet). advance() changes no membership.
+//      a closed generation (a retired or limbo node that a bump -- of an
+//      advance(), a reclaim() or an automatic trigger -- sequestered and no
+//      free pass has freed yet). Neither call changes any membership.
 //      Called with every handle released, one advance() frees every retired,
 //      limbo and bagged node, and its walk unlinks and retires every dead node
 //      it can bypass -- every one except a dead run behind a FROZEN node whose
@@ -55,12 +57,23 @@
 //      AND GENERATIONS section and the contract on advance().
 //   5. A node is freed, and so reused, while other operations run, but only
 //      under the handle invariant: never while a live handle of its bag's
-//      generation or of an older one exists, and only by an advance(). With
-//      every handle released before each call, a node retired between two
-//      calls is freed by the next call; with a long-lived handle refreshed
-//      before each call, by the second. A straggler the walk of call k
-//      bypasses is freed by call k + 1 with every handle released, and by
-//      call k + 2 under a handle refreshed before each call. Between advance()
+//      generation or of an older one exists, and only by a free pass: of an
+//      advance() or a reclaim() (advance() without the walk) that some thread
+//      calls, or, on a set constructed with a cadence
+//      (Options::auto_reclaim_every > 0), of an automatic trigger -- a
+//      reclaim() that a retiring operation runs itself, on its own thread
+//      and under its own handle (which pins the generation the trigger
+//      closes), when its retire push takes its arena shard's retired-node
+//      count across a multiple of the cadence; never the walk. With the
+//      cadence off (the default) nothing is freed unless advance() or
+//      reclaim() is called. With every handle released before each call, a
+//      node retired between two calls is freed by the next call; with a
+//      long-lived handle refreshed before each call, by the second (under the
+//      cadence: the trigger after the one that bagged it, the handle
+//      refreshed between). A straggler the walk of advance() call k bypasses
+//      is freed by call k + 1 with every handle released, and by call k + 2
+//      under a handle refreshed before each call; reclaim() and the trigger
+//      collect no straggler. Between advance()
 //      calls a dead node (a tombstone, or a parent copy that a split
 //      superseded) may be unlinked from its chain by a WRITER -- the erase()
 //      that made it a tombstone, the split that superseded it, or a later
@@ -68,7 +81,10 @@
 //      walk unlinks the dead runs it passes in the same way. contains()'s own
 //      walk never writes; a contains() that reaches an UNINITIALIZED bucket and
 //      wins its split runs
-//      that split's cleanup like any other splitter. Where a dead node ends up
+//      that split's cleanup like any other splitter (and, on a cadenced set,
+//      the trigger that the cleanup's retire push may run: so a lookup may
+//      bump and free, but only on a table that has doubled since
+//      construction, the one way to have an UNINITIALIZED bucket). Where a dead node ends up
 //      is asserted only for operations that ran UNCONTENDED, as POSTCONDITIONS
 //      of those operations: an uncontended erase() leaves its own node
 //      unreachable unless a tagged, not-dead node lies between it and the last
@@ -106,6 +122,8 @@
 #include <cstdint>
 #include <csignal>
 #include <type_traits>
+#include <utility>
+#include <limits>
 
 // ---------------------------------------------------------------------------
 // Build identification: one line, printed before the first test, naming the
@@ -469,6 +487,16 @@ TEST(ConcurrentHashSetRcuTest, ArenaShardsParameter) {
         EXPECT_GE(set.get_internal_node_count(), size_t(N));
     } // for each shard count
 } // ArenaShardsParameter
+
+// Both constructors are `explicit`: a bare size is not a set, nor is
+// an Options aggregate, so neither converts implicitly (copy-initialization
+// `Set s = 4096;`, a size or an Options passed where a Set is expected). A
+// type trait, not a compile of `Set s = {};`, which the compilers disagree on
+// for an explicit default constructor (CWG 1518).
+static_assert(!std::is_convertible_v<size_t, ConcurrentResizableHashSetRCU<int>>,
+              "the two-parameter constructor must be explicit");
+static_assert(!std::is_convertible_v<ConcurrentResizableHashSetRCU<int>::Options, ConcurrentResizableHashSetRCU<int>>,
+              "the Options constructor must be explicit");
 
 // A capacity above 2^63 aborts the constructor, in every build: std::bit_ceil()
 // has no representable result for it. The death is SIGABRT from std::abort()
@@ -3901,11 +3929,14 @@ static AdvanceResult cycle(SetT& set, int k) {
 //                              increment of that generation's count;
 //   in_join_after_bump()       on the same attempts, after the increment and
 //                              before the re-verify;
-//   in_advance_after_publish() once per advance() that publishes a generation,
-//                              after the publish and before the (final) free
-//                              pass and the walk, with the advance flag held.
+//   in_advance_after_publish() once per publish of a generation, whichever
+//                              call publishes -- an advance(), a reclaim() or,
+//                              on a cadenced set, an automatic trigger inside
+//                              an operation of the thread --, after the publish
+//                              and before the (final) free pass and, in
+//                              advance(), the walk, with the advance flag held.
 // Never from refresh()'s fast path, a move, a leave or advance()'s own walk
-// handle, whose join is hook-free.
+// handle, whose join is hook-free; never from a skipped trigger.
 // Rules:
 //   - One-shot: firing disarms the slot and moves the action out BEFORE running
 //     it, so a nested call reaching the same hook only counts, and the action
@@ -5063,6 +5094,16 @@ struct StressShape {
     int stable;             // keys inserted before the run and never erased
     std::chrono::milliseconds run_for;   // how long the threads run
     bool report;            // print the run's witnesses on an INFO line
+    // The automatic cadence. Both fields default to off, so the cadence-off
+    // shapes' initializers (which end at `report`) need neither.
+    size_t cadence = 0;     // Options::auto_reclaim_every of the set: 0 = off; > 0 = the automatic cadence, and the run's end state goes through advance_and_check()
+    size_t slot_limit = 0;  // runaway guard: the run STOPS early (it does not fail) when the arena exceeds this many slots; 0 = no guard
+    // The broad cadenced stress's variations (CadenceStressMixedHandlesAndCallers). Each
+    // defaults to what every shape above has, so no other shape changes.
+    int reclaimers = 0;           // threads calling reclaim() in a loop, beside the `advancers` (which call advance())
+    bool mixed_handles = false;   // true: even-numbered writers and readers take a handle per operation, odd-numbered ones a long-lived handle (per_op_handles is then ignored)
+    int refresh_every = 1;        // a long-lived handle is refreshed on every refresh_every-th iteration of its thread (1: every iteration; must be > 0)
+    std::chrono::microseconds call_pause{0};   // advancers and reclaimers sleep this long after each call (0: back to back, the flag held most of the time)
 }; // struct StressShape
 
 // What happened during the run (before the end-state calls), for the witnesses.
@@ -5073,6 +5114,17 @@ struct StressWitness {
     size_t pops_raced_push = 0;
     size_t free_push_cas_failures = 0;
     size_t contended = 0;
+    // The automatic cadence's, filled for a cadenced run only (StressShape::cadence > 0), all
+    // from counters read at the quiescent point after the join: no ring view
+    // is read during the run.
+    size_t auto_reclaims = 0;        // InternalCounters deltas over the run: triggers that proceeded ...
+    size_t auto_skipped = 0;         // ... and triggers that found the flag held
+    size_t counted_bags_freed = 0;   // InternalCounters::bags_freed delta: every free pass's, the triggers' included (bags_freed above sums only the explicit advancers' results)
+    size_t nodes_freed = 0;          // InternalCounters::nodes_freed delta
+    size_t pops = 0;                 // free-list pops since construction: nodes_freed (cumulative) minus the free nodes at the quiescent point; exact, since only the free pass pushes and the lists start empty
+    size_t reader_triggers = 0;      // reader iterations across which the reader's own bump_ns grew: a trigger proceeded inside one of its contains() (readers make no explicit call)
+    bool stopped_by_guard = false;   // the runaway guard (StressShape::slot_limit) ended the run early
+    size_t reclaim_outcomes[4] = {0, 0, 0, 0};   // the reclaimers' reclaim() results by AdvanceResult::Advance (StressShape::reclaimers)
 }; // struct StressWitness
 
 static int stress_writer_key(int t, int i) { return ((t + 1) << 22) | i; }   // writer t's key i, i < 2^22
@@ -5083,27 +5135,42 @@ static int stress_never_key(int i) { return 0x38000000 | i; }                // 
 // every thread's own oracles and the end state, and returns the witnesses for
 // the caller's assertions. `where` labels messages. Callers wrap it in
 // ASSERT_NO_FATAL_FAILURE.
+// The set is constructed through Options with `shape.cadence`, which for a
+// cadence-off shape (cadence 0) is the two-parameter construction (it
+// delegates). A cadenced run differs only where the cadence makes the
+// cadence-off code wrong or blind: the end state goes through
+// advance_and_check() (valid on a cadenced set at a quiescent point; the
+// cadence-off runs keep their two bare calls and their oracle), the trigger witnesses are filled from the
+// counters after the join, readers record whether a trigger proceeded inside
+// their own contains(), and a runaway guard may end the run early.
 template <typename SetT>
 static void advance_stress_body(const StressShape& shape, const std::string& where, StressWitness& w) {
-    SetT set(shape.buckets, shape.shards);
+    SetT set(typename SetT::Options{.initial_capacity = shape.buckets, .arena_shards = shape.shards, .auto_reclaim_every = shape.cadence});
     {
         const typename SetT::handle h = set.new_handle();
         for (int i = 0; i < shape.stable; ++i) ASSERT_TRUE(set.insert(h, stress_stable_key(i)));
     }
     const typename SetT::InternalCounters c0 = set.get_internal_counters();
-    const int T = shape.writers + shape.readers + shape.advancers;
+    const int T = shape.writers + shape.readers + shape.advancers + shape.reclaimers;
     std::atomic<bool> stop{false};
     std::barrier start(T + 1);
     std::vector<size_t> bad(T, 0);
     std::vector<int> written(shape.writers, 0);   // writer t inserted its keys 0 .. written[t]-1
-    std::vector<StressWitness> tallies(shape.advancers);
+    std::vector<StressWitness> tallies(shape.advancers + shape.reclaimers);   // advancers first, then reclaimers
+    std::vector<size_t> reader_triggers(shape.readers, 0);   // reader r's iterations with a trigger inside (cadenced runs only)
     std::vector<std::thread> threads;
     threads.reserve(T);
+    // Whether writer or reader thread t (its index among all threads) takes a
+    // handle per operation: every one under per_op_handles; under
+    // mixed_handles the even-numbered ones, the odd-numbered keeping a
+    // long-lived handle.
+    auto per_op_thread = [&shape](int t) -> bool { return shape.mixed_handles ? t % 2 == 0 : shape.per_op_handles; };
     // One operation `op(handle)` of a writer or reader under its handle
-    // discipline: a handle of its own for the operation, or the thread's
-    // long-lived `h` (refreshed once per iteration by the loops below).
-    auto under = [&set, &shape](const typename SetT::handle& h, auto op) -> bool {
-        if (shape.per_op_handles) {
+    // discipline: a handle of its own for the operation (`per_op`), or the
+    // thread's long-lived `h` (refreshed by the loops below on every
+    // refresh_every-th iteration).
+    auto under = [&set](bool per_op, const typename SetT::handle& h, auto op) -> bool {
+        if (per_op) {
             const typename SetT::handle own = set.new_handle();
             return op(own);
         }
@@ -5111,18 +5178,19 @@ static void advance_stress_body(const StressShape& shape, const std::string& whe
     }; // under()
     for (int t = 0; t < shape.writers; ++t) {
         threads.emplace_back([&, t]() {
-            typename SetT::handle h = shape.per_op_handles ? typename SetT::handle{} : set.new_handle();
+            const bool per_op = per_op_thread(t);
+            typename SetT::handle h = per_op ? typename SetT::handle{} : set.new_handle();
             start.arrive_and_wait();
             const int W = shape.window;
             int i = 0;
             for (; !stop.load(std::memory_order_relaxed) && i < (1 << 22); ++i) {
-                if (h) h.refresh();
+                if (h && i % shape.refresh_every == 0) h.refresh();
                 const int in = stress_writer_key(t, i), out = stress_writer_key(t, i - W);
-                bad[t] += !under(h, [&](const typename SetT::handle& x) { return set.insert(x, in); });
-                bad[t] += !under(h, [&](const typename SetT::handle& x) { return set.contains(x, in); });
+                bad[t] += !under(per_op, h, [&](const typename SetT::handle& x) { return set.insert(x, in); });
+                bad[t] += !under(per_op, h, [&](const typename SetT::handle& x) { return set.contains(x, in); });
                 if (i >= W) {
-                    bad[t] += !under(h, [&](const typename SetT::handle& x) { return set.erase(x, out); });
-                    bad[t] += under(h, [&](const typename SetT::handle& x) { return set.contains(x, out); });
+                    bad[t] += !under(per_op, h, [&](const typename SetT::handle& x) { return set.erase(x, out); });
+                    bad[t] += under(per_op, h, [&](const typename SetT::handle& x) { return set.contains(x, out); });
                 } // the window's oldest key leaves
             } // writer loop
             written[t] = i;
@@ -5131,18 +5199,26 @@ static void advance_stress_body(const StressShape& shape, const std::string& whe
     for (int r = 0; r < shape.readers; ++r) {
         const int t = shape.writers + r;
         threads.emplace_back([&, t, r]() {
-            typename SetT::handle h = shape.per_op_handles ? typename SetT::handle{} : set.new_handle();
+            const bool per_op = per_op_thread(t);
+            typename SetT::handle h = per_op ? typename SetT::handle{} : set.new_handle();
             std::minstd_rand rng(static_cast<unsigned>(r + 1));
             start.arrive_and_wait();
-            while (!stop.load(std::memory_order_relaxed)) {
-                if (h) h.refresh();
+            for (int i = 0; !stop.load(std::memory_order_relaxed); ++i) {
+                if (h && i % shape.refresh_every == 0) h.refresh();
+                // A reader makes no explicit call, so its own thread_local
+                // bump_ns grows only when a trigger PROCEEDS inside one of its
+                // contains() (a split's cleanup it won retired a run that
+                // crossed the cadence). One thread_local read per
+                // iteration, on cadenced runs only.
+                const size_t bump_before = shape.cadence != 0 ? SetT::internal_advance_timers().bump_ns : 0;
                 const unsigned x = rng();
                 const int stable = stress_stable_key(static_cast<int>(x%static_cast<unsigned>(shape.stable)));
                 const int never = stress_never_key(static_cast<int>((x >> 8)%1024u));
                 const int any = stress_writer_key(static_cast<int>((x >> 16)%static_cast<unsigned>(shape.writers)), static_cast<int>((x >> 4)%4096u));
-                bad[t] += !under(h, [&](const typename SetT::handle& y) { return set.contains(y, stable); });
-                bad[t] += under(h, [&](const typename SetT::handle& y) { return set.contains(y, never); });
-                (void)under(h, [&](const typename SetT::handle& y) { return set.contains(y, any); });
+                bad[t] += !under(per_op, h, [&](const typename SetT::handle& y) { return set.contains(y, stable); });
+                bad[t] += under(per_op, h, [&](const typename SetT::handle& y) { return set.contains(y, never); });
+                (void)under(per_op, h, [&](const typename SetT::handle& y) { return set.contains(y, any); });
+                if (shape.cadence != 0 && SetT::internal_advance_timers().bump_ns != bump_before) ++reader_triggers[r];
             } // reader loop
         }); // reader thread r
     } // readers
@@ -5154,38 +5230,108 @@ static void advance_stress_body(const StressShape& shape, const std::string& whe
                 const AdvanceResult r = set.advance();
                 tally.bags_freed += r.freed_bags;
                 ++tally.outcomes[static_cast<size_t>(r.advance)];
+                if (shape.call_pause.count() != 0) std::this_thread::sleep_for(shape.call_pause);
             } // advancer loop
         }); // advancer thread a
     } // advancers
+    for (int c = 0; c < shape.reclaimers; ++c) {
+        threads.emplace_back([&, c]() {
+            StressWitness& tally = tallies[shape.advancers + c];
+            start.arrive_and_wait();
+            while (!stop.load(std::memory_order_relaxed)) {
+                const AdvanceResult r = set.reclaim();
+                ++tally.reclaim_outcomes[static_cast<size_t>(r.advance)];
+                if (shape.call_pause.count() != 0) std::this_thread::sleep_for(shape.call_pause);
+            } // reclaimer loop
+        }); // reclaimer thread c
+    } // reclaimers
     start.arrive_and_wait();
-    std::this_thread::sleep_for(shape.run_for);
+    bool stopped_by_guard = false;
+    if (shape.slot_limit == 0) {
+        std::this_thread::sleep_for(shape.run_for);
+    } else {
+        // The runaway guard: poll the arena size (a race-free diagnostic)
+        // every millisecond and end the run early once it passes the limit.
+        // It stops rather than fails: the end state below is still checked,
+        // and the caller sees `stopped_by_guard` (a run that cannot reuse
+        // memory grows the arena by every insert, and the memory cap of the
+        // run would otherwise end the process instead of the test).
+        const std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::now() + shape.run_for;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (set.get_internal_node_count() > shape.slot_limit) {
+                stopped_by_guard = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        } // poll until the deadline or the limit
+    } // if guarded
     stop.store(true, std::memory_order_relaxed);
     for (std::thread& th : threads) th.join();
 
     // The witnesses: what happened during the run.
     const typename SetT::InternalCounters c1 = set.get_internal_counters();
     w = StressWitness{};
+    w.stopped_by_guard = stopped_by_guard;
     for (const StressWitness& tally : tallies) {
         w.bags_freed += tally.bags_freed;
-        for (size_t o = 0; o < 4; ++o) w.outcomes[o] += tally.outcomes[o];
-    } // sum the advancers' tallies
+        for (size_t o = 0; o < 4; ++o) {
+            w.outcomes[o] += tally.outcomes[o];
+            w.reclaim_outcomes[o] += tally.reclaim_outcomes[o];
+        } // loop over the four outcomes
+    } // sum the advancers' and the reclaimers' tallies
     w.join_retries = c1.join_retries - c0.join_retries;
     w.pops_raced_push = c1.pops_raced_push - c0.pops_raced_push;
     w.free_push_cas_failures = c1.free_push_cas_failures - c0.free_push_cas_failures;
     w.contended = c1.contended - c0.contended;
+    if (shape.cadence != 0) {
+        // Every thread is joined: a quiescent point, so the counters are
+        // exact and the accounting sweep is valid (pops: the free lists
+        // started empty and only the free pass pushes, so what left them is
+        // what was pushed minus what is still there).
+        w.auto_reclaims = c1.auto_reclaims - c0.auto_reclaims;
+        w.auto_skipped = c1.auto_skipped - c0.auto_skipped;
+        w.counted_bags_freed = c1.bags_freed - c0.bags_freed;
+        w.nodes_freed = c1.nodes_freed - c0.nodes_freed;
+        w.pops = c1.nodes_freed - expect_consistent(set, where + ", after the run").free_nodes;
+        for (size_t n : reader_triggers) w.reader_triggers += n;
+    } // if cadenced
     for (int t = 0; t < T; ++t) EXPECT_EQ(bad[t], 0u) << where << ", thread " << t << ": a determined result was wrong";
     if (shape.report) {
         std::printf("[   INFO   ] %s: advanced %zu, nothing_retired %zu, ring_full %zu, contended %zu, bags freed %zu; "
                     "join retries %zu, pops raced a push %zu, free pushes lost a CAS %zu; table %zu, slots %zu\n",
                     where.c_str(), w.outcomes[1], w.outcomes[0], w.outcomes[2], w.outcomes[3], w.bags_freed,
                     w.join_retries, w.pops_raced_push, w.free_push_cas_failures, set.get_internal_table_size(), set.get_internal_node_count());
+        if (shape.cadence != 0) {
+            std::printf("[   INFO   ] %s: cadence %zu: auto_reclaims %zu, auto_skipped %zu, bags freed (all) %zu, nodes freed %zu, "
+                        "pops %zu, reader iterations with a trigger %zu%s\n",
+                        where.c_str(), set.get_internal_auto_reclaim_every(), w.auto_reclaims, w.auto_skipped, w.counted_bags_freed,
+                        w.nodes_freed, w.pops, w.reader_triggers, w.stopped_by_guard ? "; STOPPED by the runaway guard" : "");
+        } // if cadenced
+        if (shape.reclaimers != 0) {
+            std::printf("[   INFO   ] %s: reclaim(): advanced %zu, nothing_retired %zu, ring_full %zu, contended %zu\n", where.c_str(),
+                        w.reclaim_outcomes[1], w.reclaim_outcomes[0], w.reclaim_outcomes[2], w.reclaim_outcomes[3]);
+        } // if reclaimers ran
     } // report
 
     // The end state: every handle is gone (each thread released its own).
     size_t live = static_cast<size_t>(shape.stable);
     for (int t = 0; t < shape.writers; ++t) live += static_cast<size_t>(std::min(written[t], shape.window));
-    (void)set.advance();
-    (void)set.advance();
+    if (shape.cadence == 0) {
+        (void)set.advance();
+        (void)set.advance();
+    } else {
+        // On a cadenced set the full oracle of a quiescent advance(): valid
+        // here because no operation runs, so no trigger can hold the flag
+        // (beside operations an explicit call on a cadenced set may be
+        // `contended`, and the helper's exact oracles would not hold). The
+        // walk's own retirements cross
+        // the cadence and are skipped (the flag is the walk's): no trigger
+        // changes what the two calls do. The handle is released by the
+        // helper before its calls and dropped here before the checks below,
+        // which count none.
+        typename SetT::handle settle = set.new_handle();
+        ASSERT_NO_FATAL_FAILURE(advance_and_check(set, settle, live, where + ", end state"));
+    } // if cadenced
     const typename SetT::InternalAccounting acc = expect_consistent(set, where + ", end state");
     EXPECT_EQ(acc.handle_refs, 0) << where;
     EXPECT_EQ(acc.retired, 0u) << where;
@@ -5302,6 +5448,1178 @@ TEST(ConcurrentHashSetRcuTest, StressAdvanceLongChainsManyTinySets) {
     std::printf("[   INFO   ] StressAdvanceLongChainsManyTinySets: %zu sets, %zu bags freed\n", rounds, bags_freed);
     EXPECT_GT(bags_freed, 0u) << "witness: no bag was freed during any round";
 } // StressAdvanceLongChainsManyTinySets
+
+// ===========================================================================
+// reclaim() AND THE AUTOMATIC CADENCE, white-box.
+//
+// reclaim() is advance() without the walk: the flag or `contended`, the bump,
+// the hook if it published, the final free pass. A set constructed with
+// Options::auto_reclaim_every = R > 0 (rounded up to a power of two; above
+// 2^63 clamped to 2^63; 0 = off) runs that same work ITSELF -- the automatic
+// TRIGGER -- at the end of a retire push whose node count took the retiring
+// arena shard's `retire_nodes` across a multiple of R: on the retiring
+// thread, inside the operation that retired, under that operation's handle,
+// after the push (so a proceeding trigger bags the crossing run too), under
+// the try-flag (held: counted in `auto_skipped`, nothing else; acquired:
+// `auto_reclaims` +1 whatever the bump then decides), never the walk. The
+// header's THE TRIGGER (class overview), push_retired(), auto_reclaim() and
+// bump_and_free() say how and why; each test below gives its derivation in
+// its comment.
+//
+// What every script here shares:
+//   - A cadenced set is the same type as its cadence-off twin, constructed
+//     through Options (cadenced_set() below: the cadenced fixture); ONE arena
+//     shard, except where a script's point is two, so the shard's count is the
+//     set-wide `retire_nodes` the scripts read and no oracle depends on the
+//     test thread's thread number.
+//   - Tuples are expect_tuple()'s (reachable, of them dead, retired, bagged,
+//     free, limbo, handle refs); results {freed_nodes, freed_bags,
+//     walk_retired, buckets_walked, nodes_passed, advance}.
+//   - THE CADENCE SETTING: a presized set (no doubling, no split, no limbo),
+//     one shard, erases of PRESENT keys on one thread with no explicit call in
+//     progress: each erase() that returns true retires exactly one node
+//     (`retire_nodes` +1, `retire_runs` +1), so the R-th erase from a known
+//     phase is the crossing one. Scripts that leave the setting on purpose
+//     (a split's cleanup, the stragglers' multi-node runs, limbo) read the
+//     counts they need from the counters.
+//   - "Attempts" = auto_reclaims + auto_skipped: one per crossing push.
+//     "Fires" = attempts +1 across the step, "proceeds" = auto_reclaims +1,
+//     "is skipped" = auto_skipped +1.
+//   - The trigger runs under the RETIRING operation's own handle, which pins
+//     the generation the trigger closes: the R-th erase's trigger bags its
+//     run and frees none of it; the next crossing frees it, after a refresh
+//     between operations. Every "freed" expectation below is derived with
+//     that pin.
+//   - On a cadenced set the hook in_advance_after_publish() fires inside the
+//     test thread's OWN operations (any crossing erase publishes), so a hook
+//     slot is armed only right before the one call or crossing erase the
+//     script derived, never across erases whose crossings it has not; inside a
+//     trigger's hook the interrupted operation's handle is in flight and the
+//     action touches neither it nor the interrupted operation's bucket; nested
+//     operations use handles created in the action; a nested advance() or
+//     reclaim() is `contended`; a nested crossing is skipped. Ring views and
+//     the accounting sweep are read only between operations, on the test
+//     thread, with no other thread running (operation quiescence: on a
+//     cadenced set an operation can hold the flag), and never inside an
+//     action (the death test below).
+//   - A throwing ProbeKey hook is armed only on NoHooks sets (CadProbeSet), so
+//     no TestHooks action can run inside a trigger while it is armed (a throw
+//     there would unwind into a noexcept hook).
+//   - Each test's comment says which defects it kills, and says ONLY where
+//     no other test here kills one.
+// The cadence's !NDEBUG destructor invariants (no attempt with the cadence
+// off; at most one attempt per multiple crossed; at R = 1 exactly one per
+// retired run) run at the end of every test here: every cadenced set
+// destroyed is a check of the counting.
+// ===========================================================================
+
+// The hooked cadenced instantiation: HookSet<K>'s type, constructed through
+// Options. A separate alias only so that a cadenced script says so.
+template <size_t K>
+using CadHookSet = HookSet<K>;
+// The ProbeKey cadenced instantiation, NoHooks (a throwing ProbeKey hook may
+// be armed on it: no TestHooks action exists).
+template <size_t K>
+using CadProbeSet = ConcurrentResizableHashSetRCU<ProbeKey, true, ProbeKeyHash, K>;
+
+// The cadenced fixture: a SetT constructed through Options with `capacity`
+// buckets, `shards` arena shards and the cadence `every` (designated
+// initializers, the form the header's comment shows). Returned by value: a
+// prvalue initializes the caller's object directly (the set is neither
+// copyable nor movable).
+template <typename SetT>
+static SetT cadenced_set(size_t capacity, size_t shards, size_t every) {
+    return SetT(typename SetT::Options{.initial_capacity = capacity, .arena_shards = shards, .auto_reclaim_every = every});
+} // cadenced_set()
+
+// The trigger attempts of `set` so far: auto_reclaims + auto_skipped, exact
+// at a quiescent point (race-free counters).
+template <typename SetT>
+static size_t cadence_attempts(const SetT& set) {
+    const typename SetT::InternalCounters c = set.get_internal_counters();
+    return c.auto_reclaims + c.auto_skipped;
+} // cadence_attempts()
+
+// The R-th erase from a fresh shard fires, bags the R nodes (the crossing
+// one included: the trigger runs after the push) and frees nothing (its own
+// handle pins them); after a refresh between operations the 2R-th erase frees
+// that first bag; a final reclaim() with no handle frees the second, without
+// walking.
+//   step 0: insert 0 .. 2R-1 under a released handle; phase 0 asserted.
+//   step 1: under h, erase 0 .. R-2: no attempt; R-1 retired, no bump.
+//   step 2: erase R-1: bumps +1, auto_reclaims +1, auto_skipped +0, contended
+//           +0, joins +0 (no walk: the walk always joins), bags_freed +0, the
+//           hook +1; this thread's advance_ns and walk_ns unchanged (the
+//           trigger charges only bump_ns and free_ns, which do not shrink,
+//           and grow over all the test's triggers); tuple
+//           (R, 0, 0, R, 0, 0, 1); ring "S1/R C0" (h pins slot 0).
+//   step 3: refresh h; erase R .. 2R-2 (no attempt); erase 2R-1: bumps +1,
+//           bags_freed +1, nodes_freed +R; tuple (0, 0, 0, R, R, 0, 1). At
+//           K = 2 the bump wraps onto slot 0, freed by the in-wrap pass.
+//   step 4: release h; reclaim() == {R, 1, 0, 0, 0, nothing_retired}, compared
+//           WHOLE (its walk counts are 0).
+// R in {1, 2, 4, 64}: R = 1 makes step 1 empty, R >= 2 puts the crossing
+// strictly after the first push.
+// Kills: the trigger placed BEFORE the retire push (step 2: the crossing node
+// stays retired, `retired` 1 and `bagged` R-1; at R = 1 the trigger finds
+// every list empty, bumps +0); the crossing decided one push late, when the
+// count before the push is a multiple (step 1 at R >= 2: the first erase
+// fires); a trigger that also walks (step 2: joins +1); a trigger's publish
+// that does not fire the hook (step 2: the hook +0); a trigger whose free
+// pass takes its own operation's pin for none, and a free pass that ignores
+// the pins altogether (step 2: bag 0's only pin is h, the retiring
+// operation's own handle); a reclaim() that walks (step 4: buckets_walked and
+// nodes_passed under the whole-literal comparison).
+// `charged` accumulates the bump_ns + free_ns the step-2 trigger charged
+// this thread, for the caller's one strict check over all its calls (one
+// clock delta alone may be zero on a coarse clock).
+template <size_t K>
+static void cadence_fires_at_the_rth_erase_body(size_t R, size_t& charged) {
+    using Set = CadHookSet<K>;
+    const std::string where = "R = " + std::to_string(R);
+    const int r = static_cast<int>(R);
+    Set set = cadenced_set<Set>(256, 1, R);
+    ASSERT_EQ(set.get_internal_auto_reclaim_every(), R) << where << ": test precondition: R is a power of two, kept as is";
+    {
+        const typename Set::handle hs = set.new_handle();
+        for (int k = 0; k < 2*r; ++k) ASSERT_TRUE(set.insert(hs, k));
+    }
+    ASSERT_EQ(set.get_internal_counters().retire_nodes, 0u) << where << ": test precondition: the shard's phase is 0";
+    expect_tuple(set, where + ", step 0", 2*R, 0, 0, 0, 0, 0, 0);
+
+    typename Set::handle h = set.new_handle();
+    for (int k = 0; k + 1 < r; ++k) {   // step 1
+        const size_t a = cadence_attempts(set);
+        EXPECT_TRUE(set.erase(h, k));
+        EXPECT_EQ(cadence_attempts(set), a) << where << ": erase " << k << " fired before the R-th";
+    } // erase 0 .. R-2
+    EXPECT_EQ(set.get_internal_counters().bumps, 0u) << where;
+    expect_tuple(set, where + ", step 1", R + 1, 0, R - 1, 0, 0, 0, 1);
+
+    const typename Set::InternalCounters c0 = set.get_internal_counters();   // step 2
+    const long p0 = TestHooks::after_publish.calls.load();
+    const typename Set::InternalTimers t0 = Set::internal_advance_timers();
+    EXPECT_TRUE(set.erase(h, r - 1));
+    const typename Set::InternalCounters c1 = set.get_internal_counters();
+    const typename Set::InternalTimers t1 = Set::internal_advance_timers();
+    EXPECT_EQ(c1.bumps - c0.bumps, 1u) << where << ": the R-th erase did not publish";
+    EXPECT_EQ(c1.auto_reclaims - c0.auto_reclaims, 1u) << where;
+    EXPECT_EQ(c1.auto_skipped - c0.auto_skipped, 0u) << where;
+    EXPECT_EQ(c1.contended - c0.contended, 0u) << where;
+    EXPECT_EQ(c1.joins - c0.joins, 0u) << where << ": the trigger walked (the walk always joins)";
+    EXPECT_EQ(c1.bags_freed - c0.bags_freed, 0u) << where << ": the trigger freed a bag its own operation's handle pins";
+    EXPECT_EQ(TestHooks::after_publish.calls.load() - p0, 1) << where << ": the trigger's publish did not fire the hook once";
+    EXPECT_EQ(t1.advance_ns, t0.advance_ns) << where << ": a trigger charged advance_ns (the explicit calls' timer)";
+    EXPECT_EQ(t1.walk_ns, t0.walk_ns) << where << ": a trigger charged walk_ns";
+    EXPECT_GE(t1.bump_ns + t1.free_ns, t0.bump_ns + t0.free_ns) << where;
+    charged += (t1.bump_ns + t1.free_ns) - (t0.bump_ns + t0.free_ns);
+    expect_tuple(set, where + ", step 2", R, 0, 0, R, 0, 0, 1);
+    EXPECT_EQ(ring_string(set), ring_expect(K, "S1/" + std::to_string(R) + " C0", 0, 1)) << where;
+
+    h.refresh();   // step 3: between operations, so the next trigger may free bag 0
+    for (int k = r; k + 1 < 2*r; ++k) {
+        const size_t a = cadence_attempts(set);
+        EXPECT_TRUE(set.erase(h, k));
+        EXPECT_EQ(cadence_attempts(set), a) << where << ": erase " << k << " fired before the 2R-th";
+    } // erase R .. 2R-2
+    const typename Set::InternalCounters c2 = set.get_internal_counters();
+    EXPECT_TRUE(set.erase(h, 2*r - 1));
+    const typename Set::InternalCounters c3 = set.get_internal_counters();
+    EXPECT_EQ(c3.bumps - c2.bumps, 1u) << where;
+    EXPECT_EQ(c3.bags_freed - c2.bags_freed, 1u) << where << ": the second trigger did not free the first bag";
+    EXPECT_EQ(c3.nodes_freed - c2.nodes_freed, R) << where;
+    expect_tuple(set, where + ", step 3", 0, 0, 0, R, R, 0, 1);
+
+    h = {};   // step 4
+    EXPECT_EQ(set.reclaim(), (AdvanceResult{R, 1, 0, 0, 0, Advance::nothing_retired})) << where;
+} // cadence_fires_at_the_rth_erase_body()
+TEST_F(HashRcuHookTest, CadenceFiresAtTheRthEraseK2) {
+    size_t charged = 0;
+    for (size_t R : {1, 2, 4, 64}) ASSERT_NO_FATAL_FAILURE(cadence_fires_at_the_rth_erase_body<2>(R, charged));
+    EXPECT_GT(charged, 0u) << "the triggers charged neither bump_ns nor free_ns of their thread";
+} // CadenceFiresAtTheRthEraseK2
+TEST_F(HashRcuHookTest, CadenceFiresAtTheRthEraseK64) {
+    size_t charged = 0;
+    for (size_t R : {1, 2, 4, 64}) ASSERT_NO_FATAL_FAILURE(cadence_fires_at_the_rth_erase_body<64>(R, charged));
+    EXPECT_GT(charged, 0u) << "the triggers charged neither bump_ns nor free_ns of their thread";
+} // CadenceFiresAtTheRthEraseK64
+
+// A trigger inside a split's cleanup that a contains() started (a contains()
+// that wins a split runs its cleanup like any splitter, and the cleanup's
+// retire push may trigger). R = 1, int keys, NoHooks.
+// A presized set has no UNINITIALIZED bucket, so ONE controlled doubling is
+// built as leave_five_stragglers() builds it, without its throwing cleanups:
+// under h, keys whose chains at 128 buckets put 385 -> 129 -> 257 in bucket 1,
+// then fillers 256*(64 + i) until the table doubles to 256. Bucket 129 is then
+// pending (asserted). h is released before the measured call: it pinned every
+// bag the construction's own triggers closed (so the ring may be full of
+// them), and with it released the measured trigger's bump proceeds. Then
+// contains(h2, 129): it splits 129 out of bucket 1, whose two movers 385 and
+// 129 sit at the head, frozen; the cleanup unlinks both as ONE run (retire_runs
+// +1, retire_nodes +2), which crosses R = 1 and triggers: bumps +1 ==
+// retire_runs +1, auto_reclaims +1, auto_skipped +0.
+// Kills: the trigger placed before the retire push (it finds the lists empty:
+// bumps +0 against retire_runs +1). There is no contains()-specific trigger
+// code to break: push_retired() is the one site.
+TEST(ConcurrentHashSetRcuTest, CadenceTriggerInsideSplitCleanup) {
+    using Set = IntSetDel;
+    Set set = cadenced_set<Set>(4, 1, 1);
+    {
+        const Set::handle h = set.new_handle();
+        ASSERT_NO_FATAL_FAILURE(insert_in_order(set, h, {0, 256, 512, 768, 1024, 257, 129, 385, 258, 130, 514, 131, 259, 387, 515}, 128));
+        for (int i = 0; set.get_internal_table_size() == 128; ++i) {   // fillers, until the doubling to 256
+            ASSERT_LT(i, 300) << "test precondition: the fillers did not double the table";
+            ASSERT_TRUE(set.insert(h, 256*(64 + i)));
+        }
+    } // h pinned the construction's bags; released here
+    ASSERT_EQ(set.get_internal_table_size(), 256u);
+    ASSERT_FALSE(set.get_internal_bucket_published(129)) << "test precondition: bucket 129 is published, no split to win";
+    const Set::handle h2 = set.new_handle();
+    const Set::InternalCounters c0 = set.get_internal_counters();
+    EXPECT_TRUE(set.contains(h2, 129));
+    const Set::InternalCounters c1 = set.get_internal_counters();
+    EXPECT_EQ(c1.splits_published - c0.splits_published, 1u) << "the contains() did not win the split of 129";
+    EXPECT_EQ(c1.retire_runs - c0.retire_runs, 1u) << "the cleanup retired the two frozen movers in other than one run";
+    EXPECT_EQ(c1.retire_nodes - c0.retire_nodes, 2u);
+    EXPECT_EQ(c1.bumps - c0.bumps, 1u) << "the cleanup's crossing push did not publish (bumps must equal the runs retired)";
+    EXPECT_EQ(c1.auto_reclaims - c0.auto_reclaims, 1u);
+    EXPECT_EQ(c1.auto_skipped - c0.auto_skipped, 0u);
+} // CadenceTriggerInsideSplitCleanup
+
+// A crossing inside an explicit advance()'s hook is SKIPPED (the flag
+// is the advance()'s); nested advance() and reclaim() are `contended`. R = 4.
+//   step 0: insert 0..9; erase 0, 1, 2 under a released handle: phase 3 = R-1
+//           (asserted: one erase fewer and the nested one would not cross,
+//           and every flag defect below would pass), no attempt;
+//           (7,0,3,0,0,0,0).
+//   step 1: arm after_publish with: under h2 created in the action, erase 3
+//           (crosses 4: skipped); a nested advance() and a nested reclaim().
+//           Then advance() with no handle alive: it publishes (bag 0 = {0,1,2}
+//           is non-empty, so the hook fires), frees bag 0 in the same call
+//           (no pin), and its walk finds nothing dead.
+//           Expect: the action ran once; both nested calls kContended; the
+//           outer {3, 1, 0, advanced}; bumps +1, auto_skipped +1,
+//           auto_reclaims +0, contended +2, the hook +1, retire_nodes +1;
+//           (6,0,1,0,3,0,0): node 3 on generation 1's retired list.
+// The nested erase is in a bucket the interrupted call does not walk (it
+// interrupts advance(), not an operation).
+// Kills: a trigger that ignores the flag (the nested trigger proceeds: bumps
+// +2, auto_reclaims +1, and its guard clears the flag, so the nested calls
+// proceed too); a skipped trigger counted as `contended` (contended +3,
+// auto_skipped +0); a skipped trigger that fires the hook (the hook +2); a
+// reclaim() that ignores the flag (the nested reclaim() proceeds); an
+// advance() that ignores the flag (the nested advance() proceeds).
+TEST_F(HashRcuHookTest, CadenceTriggerSkippedUnderExplicitAdvance) {
+    using Set = CadHookSet<64>;
+    Set set = cadenced_set<Set>(256, 1, 4);
+    {
+        const Set::handle hs = set.new_handle();
+        for (int k = 0; k < 10; ++k) ASSERT_TRUE(set.insert(hs, k));
+    }
+    {
+        const Set::handle h1 = set.new_handle();
+        for (int k = 0; k < 3; ++k) ASSERT_TRUE(set.erase(h1, k));
+    }
+    ASSERT_EQ(set.get_internal_counters().retire_nodes, 3u) << "test precondition: the phase is R - 1";
+    ASSERT_EQ(cadence_attempts(set), 0u);
+    expect_tuple(set, "step 0", 7, 0, 3, 0, 0, 0, 0);
+    int ran = 0;
+    AdvanceResult na{}, nr{};
+    TestHooks::arm(TestHooks::after_publish, [&]() {
+        ++ran;
+        {
+            const Set::handle h2 = set.new_handle();
+            EXPECT_TRUE(set.erase(h2, 3)) << "the nested erase";
+        }
+        na = set.advance();
+        nr = set.reclaim();
+    });
+    const Set::InternalCounters c0 = set.get_internal_counters();
+    const long p0 = TestHooks::after_publish.calls.load();
+    const AdvanceResult r = set.advance();
+    const Set::InternalCounters c1 = set.get_internal_counters();
+    EXPECT_EQ(ran, 1);
+    EXPECT_EQ(na, kContended) << "a nested advance() inside the hook";
+    EXPECT_EQ(nr, kContended) << "a nested reclaim() inside the hook";
+    expect_advance(r, 3, 1, 0, Advance::advanced, "the explicit advance()");
+    EXPECT_EQ(c1.bumps - c0.bumps, 1u) << "the skipped trigger published";
+    EXPECT_EQ(c1.auto_skipped - c0.auto_skipped, 1u);
+    EXPECT_EQ(c1.auto_reclaims - c0.auto_reclaims, 0u);
+    EXPECT_EQ(c1.contended - c0.contended, 2u) << "contended counts the two nested explicit calls, never a skipped trigger";
+    EXPECT_EQ(c1.retire_nodes - c0.retire_nodes, 1u);
+    EXPECT_EQ(TestHooks::after_publish.calls.load() - p0, 1) << "a skipped trigger fired the hook, or a nested call published";
+    expect_tuple(set, "after the call", 6, 0, 1, 0, 3, 0, 0);
+} // CadenceTriggerSkippedUnderExplicitAdvance
+
+// advance()'s walk retires through the same push as the operations,
+// with the flag held by its own thread: every crossing of the walk's runs is
+// SKIPPED (R = 1: every push crosses). leave_five_stragglers() under h (five
+// dead nodes in four runs, ProbeKey's throwing cleanups armed and fired with
+// no TestHooks action: CadProbeSet is NoHooks), h released, then advance():
+// walk_retired 5; retire_runs +4; auto_skipped +4 (= the walk's runs);
+// auto_reclaims +0; contended +0; no dead node reachable afterwards. The call's
+// own bump may be `advanced` or `nothing_retired` (it depends on how many of
+// the construction's triggers found the ring full under h): no oracle reads it.
+// Why apart from the test above: at R = 1 every retirement before an explicit call
+// triggers and empties the lists, so that call's hook would never fire; the
+// walk's crossings need no hook.
+// Kills: a trigger that ignores the flag (auto_reclaims +4); a skipped
+// trigger counted as `contended` (contended +4; the destructor's R = 1
+// invariant too).
+TEST(ConcurrentHashSetRcuTest, CadenceWalkCrossingsAreSkipped) {
+    using Set = CadProbeSet<64>;
+    ProbeKey::reset_counters();
+    {
+        Set set = cadenced_set<Set>(4, 1, 1);
+        Set::InternalAccounting left{};
+        {
+            const Set::handle h = set.new_handle();
+            ASSERT_NO_FATAL_FAILURE(leave_five_stragglers(set, h, left));
+        }
+        const Set::InternalCounters c0 = set.get_internal_counters();
+        const AdvanceResult r = set.advance();
+        const Set::InternalCounters c1 = set.get_internal_counters();
+        EXPECT_EQ(r.walk_retired, 5u) << ::testing::PrintToString(r);
+        EXPECT_EQ(c1.retire_runs - c0.retire_runs, 4u) << "the walk's four runs";
+        EXPECT_EQ(c1.auto_skipped - c0.auto_skipped, 4u) << "every crossing of the walk's own pushes must be skipped";
+        EXPECT_EQ(c1.auto_reclaims - c0.auto_reclaims, 0u) << "a trigger proceeded inside advance()'s walk";
+        EXPECT_EQ(c1.contended - c0.contended, 0u) << "a skipped trigger counted as contended";
+        EXPECT_EQ(expect_consistent(set, "after the walk").reachable_dead, 0u);
+    } // the set's lifetime
+    EXPECT_EQ(ProbeKey::corrupt.load(), 0);
+} // CadenceWalkCrossingsAreSkipped
+
+// Inside a TRIGGER's hook: a nested advance() and reclaim() are
+// `contended`, a nested crossing is skipped, and a handle created in the
+// action joins the NEW generation (the hook follows the publish). R = 1.
+//   step 0: insert 0..3; (4,0,0,0,0,0,0).
+//   step 1: arm after_publish with: under h2 created in the action (its
+//           generation recorded: 1), erase 2 (crosses: skipped); nested
+//           advance() and reclaim(). Then { h; erase(h, 1); }: the erase's
+//           trigger publishes (generation 1) and fires the hook inside the
+//           test thread's own erase; the action touches neither h nor
+//           bucket 1. Expect: the action ran once; gen_in_hook 1; both nested
+//           calls kContended; bumps +1, auto_reclaims +1, auto_skipped +1,
+//           contended +2, the hook +1; (2,0,1,1,0,0,0): node 1 in bag 0 (h
+//           pinned it during the trigger, so its final free pass kept it),
+//           node 2 on generation 1's retired list.
+// Kills: a trigger's publish that does not fire the hook (the action never
+// runs); a trigger that ignores the flag (the nested trigger proceeds inside
+// the outer one: auto_reclaims +2, bumps +2, then the nested calls proceed);
+// a skipped trigger counted as `contended`; a skipped trigger that fires the
+// hook (the hook +2); a reclaim() or an advance() that ignores the flag; the
+// trigger before the retire push (R = 1: the outer trigger finds the lists
+// empty, no publish, the action never runs); the bump's exchanges moved after
+// the hook, through a trigger (node 2 is bagged with node 1:
+// (2,0,0,2,0,0,0)).
+TEST_F(HashRcuHookTest, CadenceTriggerHookNestedCallsContended) {
+    using Set = CadHookSet<64>;
+    Set set = cadenced_set<Set>(256, 1, 1);
+    {
+        const Set::handle hs = set.new_handle();
+        for (int k = 0; k < 4; ++k) ASSERT_TRUE(set.insert(hs, k));
+    }
+    expect_tuple(set, "step 0", 4, 0, 0, 0, 0, 0, 0);
+    int ran = 0;
+    uint64_t gen_in_hook = ~uint64_t{0};
+    AdvanceResult na{}, nr{};
+    TestHooks::arm(TestHooks::after_publish, [&]() {
+        ++ran;
+        {
+            const Set::handle h2 = set.new_handle();
+            gen_in_hook = Set::get_internal_handle_generation(h2);
+            EXPECT_TRUE(set.erase(h2, 2)) << "the nested erase";
+        }
+        na = set.advance();
+        nr = set.reclaim();
+    });
+    const Set::InternalCounters c0 = set.get_internal_counters();
+    const long p0 = TestHooks::after_publish.calls.load();
+    {
+        const Set::handle h = set.new_handle();
+        EXPECT_TRUE(set.erase(h, 1));
+    }
+    const Set::InternalCounters c1 = set.get_internal_counters();
+    EXPECT_EQ(ran, 1) << "the trigger's publish did not fire the hook";
+    EXPECT_EQ(gen_in_hook, 1u) << "a handle created in the hook did not join the published generation";
+    EXPECT_EQ(na, kContended) << "a nested advance() inside a trigger's hook";
+    EXPECT_EQ(nr, kContended) << "a nested reclaim() inside a trigger's hook";
+    EXPECT_EQ(c1.bumps - c0.bumps, 1u);
+    EXPECT_EQ(c1.auto_reclaims - c0.auto_reclaims, 1u);
+    EXPECT_EQ(c1.auto_skipped - c0.auto_skipped, 1u) << "the nested crossing was not skipped";
+    EXPECT_EQ(c1.contended - c0.contended, 2u);
+    EXPECT_EQ(TestHooks::after_publish.calls.load() - p0, 1);
+    expect_tuple(set, "after the erase", 2, 0, 1, 1, 0, 0, 0);
+} // CadenceTriggerHookNestedCallsContended
+
+// Under the eraser's own never-released handle a trigger frees only the
+// bags OLDER than it. R = 1.
+//   step 0: insert 0, 1, 2.
+//   step 1: { h0; erase(h0, 0); }: the trigger bags {0} and frees nothing (h0
+//           pins it); bags_freed +0.
+//   step 2: h1 = new_handle() (generation 1, asserted); erase(h1, 1): the
+//           trigger frees bag 0 (h0 is gone): bags_freed +1, nodes_freed +1
+//           (K = 2: through the ring-wrap pass).
+//   step 3: erase(h1, 2): bags_freed +0 (bag 1 is h1's); bumps +1 at K >= 3,
+//           +0 at K = 2 (`ring_full`: slot 1 pinned by h1).
+//   step 4: release h1; reclaim(): K >= 3 {2, 2, 0, 0, 0, nothing_retired};
+//           K = 2 {2, 2, 0, 0, 0, advanced} (the in-wrap pass frees bag 1, the
+//           bump bags node 2, the final pass frees it). Compared WHOLE.
+// h0 is released between the erases, outside any operation.
+// Kills: a trigger whose free pass takes its own operation's pin for none,
+// and a free pass that ignores the pins (step 1: bags_freed +1); a free pass
+// that skips a pinned bag and frees younger ones, at K >= 3 (step 3: bag 1 is
+// pinned by h1, the defect frees the younger bag 2: nodes_freed +1);
+// auto_reclaims counting only the triggers that published (K = 2: step 3's
+// `ring_full` trigger uncounted; the destructor's R = 1 invariant too).
+template <size_t K>
+static void cadence_trigger_frees_only_older_bags_body() {
+    using Set = CadHookSet<K>;
+    Set set = cadenced_set<Set>(256, 1, 1);
+    {
+        const typename Set::handle hs = set.new_handle();
+        for (int k = 0; k < 3; ++k) ASSERT_TRUE(set.insert(hs, k));
+    }
+    typename Set::InternalCounters c = set.get_internal_counters();
+    {
+        const typename Set::handle h0 = set.new_handle();
+        EXPECT_TRUE(set.erase(h0, 0));
+    }
+    EXPECT_EQ(set.get_internal_counters().bags_freed - c.bags_freed, 0u) << "step 1: the trigger freed the bag its own handle pins";
+    {
+        const typename Set::handle h1 = set.new_handle();
+        ASSERT_EQ(Set::get_internal_handle_generation(h1), 1u) << "test precondition: the first trigger did not publish";
+        c = set.get_internal_counters();
+        EXPECT_TRUE(set.erase(h1, 1));
+        EXPECT_EQ(set.get_internal_counters().bags_freed - c.bags_freed, 1u) << "step 2: bag 0, unpinned, not freed";
+        EXPECT_EQ(set.get_internal_counters().nodes_freed - c.nodes_freed, 1u) << "step 2";
+        c = set.get_internal_counters();
+        EXPECT_TRUE(set.erase(h1, 2));
+        EXPECT_EQ(set.get_internal_counters().bags_freed - c.bags_freed, 0u) << "step 3: a bag at or after h1's generation was freed";
+        EXPECT_EQ(set.get_internal_counters().nodes_freed - c.nodes_freed, 0u) << "step 3";
+        EXPECT_EQ(set.get_internal_counters().bumps - c.bumps, K >= 3 ? 1u : 0u) << "step 3";
+        EXPECT_EQ(set.get_internal_counters().ring_full - c.ring_full, K >= 3 ? 0u : 1u) << "step 3";
+        EXPECT_EQ(set.get_internal_counters().auto_reclaims - c.auto_reclaims, 1u) << "step 3: the trigger acquired the flag and counts, whatever its bump decided";
+    } // h1's scope
+    if constexpr (K >= 3) {
+        EXPECT_EQ(set.reclaim(), (AdvanceResult{2, 2, 0, 0, 0, Advance::nothing_retired})) << "step 4";
+    } else {
+        EXPECT_EQ(set.reclaim(), (AdvanceResult{2, 2, 0, 0, 0, Advance::advanced})) << "step 4, K = 2";
+    }
+} // cadence_trigger_frees_only_older_bags_body()
+TEST_F(HashRcuHookTest, CadenceTriggerFreesOnlyOlderBagsK2) { ASSERT_NO_FATAL_FAILURE(cadence_trigger_frees_only_older_bags_body<2>()); }
+TEST_F(HashRcuHookTest, CadenceTriggerFreesOnlyOlderBagsK3) { ASSERT_NO_FATAL_FAILURE(cadence_trigger_frees_only_older_bags_body<3>()); }
+TEST_F(HashRcuHookTest, CadenceTriggerFreesOnlyOlderBagsK64) { ASSERT_NO_FATAL_FAILURE(cadence_trigger_frees_only_older_bags_body<64>()); }
+
+// Triggers never walk, and neither does reclaim(): the stragglers survive
+// both; advance() collects all. R = 1. leave_five_stragglers() under h (five
+// dead nodes reachable), h released; under h2, erase the fillers 256*64 and
+// 256*65 (bucket 0: no straggler there, and no split cleans bucket 0 at size
+// 256): auto_reclaims +2, bumps +2 (h released first, so both proceed and
+// publish: with h still live the construction's triggers could have left the
+// ring full, and a `ring_full` trigger would make "the stragglers survived a
+// trigger" vacuous), joins +0; h2 released; reachable_dead still 5. Then
+// reclaim(): walk counts 0, joins +0, reachable_dead still 5. Then advance():
+// walk_retired 5. No writer walk passes buckets 1, 2, 3 between the
+// construction and the advance() (a step_over() would collect a straggler).
+// Kills: a trigger that also walks (the first trigger collects the
+// stragglers: reachable_dead 0, joins +1); a reclaim() that walks (it collects
+// them: reachable_dead 0, joins +1, walk counts > 0).
+TEST(ConcurrentHashSetRcuTest, CadenceTriggerLeavesStragglers) {
+    using Set = CadProbeSet<64>;
+    ProbeKey::reset_counters();
+    {
+        Set set = cadenced_set<Set>(4, 1, 1);
+        Set::InternalAccounting left{};
+        {
+            const Set::handle h = set.new_handle();
+            ASSERT_NO_FATAL_FAILURE(leave_five_stragglers(set, h, left));
+        }
+        {
+            const Set::handle h2 = set.new_handle();
+            const Set::InternalCounters c0 = set.get_internal_counters();
+            EXPECT_TRUE(set.erase(h2, 256*64));
+            EXPECT_TRUE(set.erase(h2, 256*65));
+            const Set::InternalCounters c1 = set.get_internal_counters();
+            EXPECT_EQ(c1.auto_reclaims - c0.auto_reclaims, 2u);
+            EXPECT_EQ(c1.bumps - c0.bumps, 2u) << "test precondition: both triggers must publish, or surviving them proves nothing";
+            EXPECT_EQ(c1.joins - c0.joins, 0u) << "a trigger walked";
+        } // h2's scope
+        EXPECT_EQ(expect_consistent(set, "after the triggers").reachable_dead, 5u) << "a trigger collected a straggler";
+        const Set::InternalCounters c2 = set.get_internal_counters();
+        const AdvanceResult rr = set.reclaim();
+        EXPECT_EQ(rr.walk_retired + rr.buckets_walked + rr.nodes_passed, 0u) << "reclaim() walked: " << ::testing::PrintToString(rr);
+        EXPECT_EQ(set.get_internal_counters().joins - c2.joins, 0u) << "reclaim() walked";
+        EXPECT_EQ(expect_consistent(set, "after reclaim()").reachable_dead, 5u) << "reclaim() collected a straggler";
+        EXPECT_EQ(set.advance().walk_retired, 5u) << "advance()'s walk must collect the five";
+    } // the set's lifetime
+    EXPECT_EQ(ProbeKey::corrupt.load(), 0);
+} // CadenceTriggerLeavesStragglers
+
+// An operation that throws AFTER its own trigger ran leaves the trigger's
+// effects standing (the trigger's result is not "lost": nothing reports it).
+// R = 1, CadProbeSet (NoHooks: a throwing ProbeKey hook may be armed).
+// leave_five_stragglers() under h, h released (with h live, the construction's
+// triggers could have filled the ring, and the measured trigger would be
+// `ring_full`). Bucket 1 then holds the dead two-node run 385 -> 129 at its
+// head, then the live 257. Under h2, insert(513) (513 & 255 == 1, absent):
+// its walk unlinks the head run (ONE retire push of two nodes, which crosses
+// R = 1: the trigger proceeds INSIDE the insert and publishes), then compares
+// 257, where equal_hook throws. The insert allocates its node only after the
+// walk, so nothing goes to limbo.
+// Expect: the exception reaches the caller; retire_runs +1, retire_nodes +2,
+// auto_reclaims +1, bumps +1, limbo_pushes +0; the sweep consistent, with the
+// other three stragglers still reachable (3) and none of the run; 513 absent and
+// 257 present; the retried insert(513) succeeds; the destructor's cadence
+// invariants hold.
+// Why: the trigger is the only reclamation that runs inside an operation whose
+// later steps (Hash{}, operator==) may throw; this checks that unwinding
+// through the operation neither undoes nor repeats the trigger's bump and
+// leaves no node unaccounted for.
+// Kills (measured; each also killed elsewhere): the trigger placed before the
+// retire push (bumps +0); a free pass that ignores the pins, a trigger whose free
+// pass takes refs <= 1 for unpinned, and a retire push that writes the list's
+// next pointer into the chain link (the sweep after the throw is inconsistent);
+// a flag never released (the sweep's flag assert).
+TEST(ConcurrentHashSetRcuTest, CadenceThrowAfterTriggerKeepsItsEffects) {
+    using Set = CadProbeSet<64>;
+    ProbeKey::reset_counters();
+    {
+        Set set = cadenced_set<Set>(4, 1, 1);
+        Set::InternalAccounting left{};
+        {
+            const Set::handle h = set.new_handle();
+            ASSERT_NO_FATAL_FAILURE(leave_five_stragglers(set, h, left));
+        } // the construction's handle, released so that the measured trigger can publish
+        const Set::handle h2 = set.new_handle();
+        const Set::InternalCounters c0 = set.get_internal_counters();
+        int fired = 0;
+        ProbeKey::arm(ProbeKey::equal_hook, 257, 1, [&fired]() {
+            ++fired;
+            throw std::runtime_error("operator== armed to throw after the trigger");
+        });
+        EXPECT_THROW(set.insert(h2, 513), std::runtime_error);
+        ProbeKey::disarm_hooks();
+        const Set::InternalCounters c1 = set.get_internal_counters();
+        ASSERT_EQ(fired, 1) << "test precondition: the insert did not reach 257";
+        ASSERT_EQ(c1.retire_runs - c0.retire_runs, 1u) << "test precondition: the walk did not unlink the head run as one push";
+        EXPECT_EQ(c1.retire_nodes - c0.retire_nodes, 2u);
+        EXPECT_EQ(c1.auto_reclaims - c0.auto_reclaims, 1u) << "the trigger did not proceed inside the insert";
+        EXPECT_EQ(c1.bumps - c0.bumps, 1u) << "the trigger's publish does not stand";
+        EXPECT_EQ(c1.limbo_pushes - c0.limbo_pushes, 0u);
+        EXPECT_EQ(expect_consistent(set, "after the throw").reachable_dead, 3u) << "the head run left bucket 1; the other three stragglers stay";
+        EXPECT_FALSE(set.contains(h2, 513));
+        EXPECT_TRUE(set.contains(h2, 257));
+        EXPECT_TRUE(set.insert(h2, 513)) << "the retried insert";
+        EXPECT_TRUE(set.contains(h2, 513));
+    } // the set's lifetime: the destructor's cadence invariants run here
+    EXPECT_EQ(ProbeKey::corrupt.load(), 0);
+} // CadenceThrowAfterTriggerKeepsItsEffects
+
+// The cadence's decoding, read back through
+// get_internal_auto_reclaim_every(), the effective R. Both cadence-off forms
+// read 0; 3 reads 4 and 5 reads 8 (rounded UP to a power of two); 2^63,
+// 2^62 + 1, 2^63 + 1 and SIZE_MAX all read 2^63 (clamped to 2^63 before the
+// rounding) and fire nothing across 3 inserts and 3 erases. Then R = 3 (= 4)
+// from a fresh shard: after erase n (1-based) the attempts are n/4, so the
+// 4th and the 8th fire and the 3rd does not.
+// Kills: the cadence 0 rounded like any other value instead of decided first
+// (it reads 1: bit_ceil(0) is 1); the cadence rounded DOWN (3 reads 2 and
+// fires at the 2nd erase); a cadence above 2^63 taken as off (2^63 + 1 and
+// SIZE_MAX read 0) and a clamp below 2^63 (every large value reads 2^62); no
+// clamp at all, only where std::bit_ceil() checks its precondition (libstdc++'s assertions, on in these -O0 sanitizer
+// builds: bit_ceil(2^63 + 1) aborts; an optimized build returns 1, a cadence
+// of 1, and has no killer); the crossing decided one push late (R = 3 fires
+// at the 1st erase; at 2^63 a fresh shard's first push fires).
+TEST(ConcurrentHashSetRcuTest, CadenceRoundingAndClamp) {
+    using Set = IntSetDel;
+    EXPECT_EQ(Set(256, 1).get_internal_auto_reclaim_every(), 0u) << "the two-parameter form";
+    EXPECT_EQ(cadenced_set<Set>(256, 1, 0).get_internal_auto_reclaim_every(), 0u) << "the cadence 0";
+    EXPECT_EQ(cadenced_set<Set>(256, 1, 3).get_internal_auto_reclaim_every(), 4u) << "3 rounds up";
+    EXPECT_EQ(cadenced_set<Set>(256, 1, 5).get_internal_auto_reclaim_every(), 8u) << "5 rounds up";
+    for (size_t R : {size_t{1} << 63, (size_t{1} << 62) + 1, (size_t{1} << 63) + 1, SIZE_MAX}) {
+        Set set = cadenced_set<Set>(256, 1, R);
+        EXPECT_EQ(set.get_internal_auto_reclaim_every(), size_t{1} << 63) << "cadence " << R;
+        const Set::handle h = set.new_handle();
+        for (int k = 0; k < 3; ++k) ASSERT_TRUE(set.insert(h, k));
+        for (int k = 0; k < 3; ++k) ASSERT_TRUE(set.erase(h, k));
+        EXPECT_EQ(cadence_attempts(set), 0u) << "cadence " << R << " fired within three erases";
+    } // the clamped cadences
+    Set set = cadenced_set<Set>(256, 1, 3);
+    const Set::handle h = set.new_handle();
+    for (int k = 0; k < 8; ++k) ASSERT_TRUE(set.insert(h, k));
+    for (int k = 0; k < 8; ++k) {
+        ASSERT_TRUE(set.erase(h, k));
+        EXPECT_EQ(cadence_attempts(set), static_cast<size_t>((k + 1)/4)) << "after erase " << k + 1 << " at the cadence 3 (= 4)";
+    } // erase 8
+} // CadenceRoundingAndClamp
+
+// A multi-node run that jumps a multiple fires once; the count is in
+// NODES. R = 2. Under h, leave_five_stragglers() (its construction retires
+// runs of unknown sizes); if retire_nodes is even, one filler erase (a
+// one-node run) makes it ODD (asserted: the parity step is what makes both
+// kills independent of the construction's counts). Then erase(h, 1), an
+// ABSENT key of bucket 1, whose miss walk unlinks the two-node run at bucket
+// 1's head (385 -> 129) as ONE push (retire_runs +1, retire_nodes +2,
+// asserted): (odd, odd + 2] holds a multiple of 2, so it fires once. Then one
+// more filler erase: from odd + 2 (odd) it crosses again and fires.
+// Kills, ONLY here: the crossing decided by "the new count is a multiple"
+// (the two-node push lands on an odd count: no fire); the cadence counted in
+// runs, not nodes (the run count crosses at most one of the two pushes: if it
+// is even before the two-node push, that push does not fire; if it is odd, it
+// does, and then the next one-node push does not).
+TEST(ConcurrentHashSetRcuTest, CadenceMultiNodeRunCrossesOnce) {
+    using Set = CadProbeSet<64>;
+    ProbeKey::reset_counters();
+    {
+        Set set = cadenced_set<Set>(4, 1, 2);
+        const Set::handle h = set.new_handle();
+        Set::InternalAccounting left{};
+        ASSERT_NO_FATAL_FAILURE(leave_five_stragglers(set, h, left));
+        if (set.get_internal_counters().retire_nodes % 2 == 0) {   // the parity step: one one-node run
+            ASSERT_TRUE(set.erase(h, 256*64));
+        }
+        const Set::InternalCounters c0 = set.get_internal_counters();
+        ASSERT_EQ(c0.retire_nodes % 2, 1u) << "test precondition: the count before the two-node run is odd";
+        const size_t a0 = cadence_attempts(set);
+        EXPECT_FALSE(set.erase(h, 1)) << "key 1 is absent: a miss walk of bucket 1";
+        const Set::InternalCounters c1 = set.get_internal_counters();
+        ASSERT_EQ(c1.retire_runs - c0.retire_runs, 1u) << "test precondition: the miss walk retired other than one run";
+        ASSERT_EQ(c1.retire_nodes - c0.retire_nodes, 2u) << "test precondition: the run at bucket 1's head is not two nodes";
+        EXPECT_EQ(cadence_attempts(set) - a0, 1u) << "a two-node run from an odd count crosses a multiple of 2";
+        const size_t a1 = cadence_attempts(set);
+        EXPECT_TRUE(set.erase(h, 256*65));
+        EXPECT_EQ(cadence_attempts(set) - a1, 1u) << "the next one-node push from an odd count crosses";
+    } // the set's lifetime
+    EXPECT_EQ(ProbeKey::corrupt.load(), 0);
+} // CadenceMultiNodeRunCrossesOnce
+
+// The ring wraps under a never-refreshed eraser: R = 1, K + 2 keys,
+// under one handle h. Erases 0 .. K-2: each publishes (bumps +1) and frees
+// nothing (h pins every bag). Erases K-1 and K: the ring is full (the next
+// slot is h's pinned generation 0): `ring_full` +1, auto_reclaims +1 (it
+// acquired the flag), bumps +0 each. Then (1, 0, 2, K-1, 0, 0, 1): key K+1
+// reachable, the two last nodes retired, K-1 bagged. h.refresh() between
+// operations, then erase K+1: bumps +1, and the free pass frees the K-1 bags
+// of one node each (generations 0 .. K-2: h, refreshed into generation K-1,
+// no longer pins them); (0, 0, 0, 3, K-1, 0, 1): the three newest nodes in
+// the bag of generation K-1, which h now pins.
+// Kills: auto_reclaims counting only the triggers that published (+0 at
+// `ring_full`; the destructor's R = 1 invariant too).
+template <size_t K>
+static void cadence_ring_wrap_body() {
+    using Set = CadHookSet<K>;
+    Set set = cadenced_set<Set>(256, 1, 1);
+    const int k_max = static_cast<int>(K);
+    {
+        const typename Set::handle hs = set.new_handle();
+        for (int k = 0; k < k_max + 2; ++k) ASSERT_TRUE(set.insert(hs, k));
+    }
+    typename Set::handle h = set.new_handle();
+    for (int k = 0; k + 1 < k_max; ++k) {
+        const typename Set::InternalCounters c = set.get_internal_counters();
+        ASSERT_TRUE(set.erase(h, k));
+        const typename Set::InternalCounters d = set.get_internal_counters();
+        EXPECT_EQ(d.bumps - c.bumps, 1u) << "erase " << k;
+        EXPECT_EQ(d.bags_freed - c.bags_freed, 0u) << "erase " << k << ": a bag the never-refreshed handle pins was freed";
+    } // erases 0 .. K-2
+    for (int k = k_max - 1; k <= k_max; ++k) {
+        const typename Set::InternalCounters c = set.get_internal_counters();
+        ASSERT_TRUE(set.erase(h, k));
+        const typename Set::InternalCounters d = set.get_internal_counters();
+        EXPECT_EQ(d.ring_full - c.ring_full, 1u) << "erase " << k;
+        EXPECT_EQ(d.auto_reclaims - c.auto_reclaims, 1u) << "erase " << k << ": a ring_full trigger acquired the flag and must count";
+        EXPECT_EQ(d.bumps - c.bumps, 0u) << "erase " << k;
+    } // erases K-1 and K: the ring is full
+    expect_tuple(set, "the ring full", 1, 0, 2, K - 1, 0, 0, 1);
+    h.refresh();
+    const typename Set::InternalCounters c = set.get_internal_counters();
+    ASSERT_TRUE(set.erase(h, k_max + 1));
+    const typename Set::InternalCounters d = set.get_internal_counters();
+    EXPECT_EQ(d.bumps - c.bumps, 1u);
+    EXPECT_EQ(d.bags_freed - c.bags_freed, K - 1);
+    EXPECT_EQ(d.nodes_freed - c.nodes_freed, K - 1);
+    expect_tuple(set, "after the refresh", 0, 0, 0, 3, K - 1, 0, 1);
+} // cadence_ring_wrap_body()
+TEST_F(HashRcuHookTest, CadenceRingWrapUnderNeverRefreshedHandleK2) { ASSERT_NO_FATAL_FAILURE(cadence_ring_wrap_body<2>()); }
+TEST_F(HashRcuHookTest, CadenceRingWrapUnderNeverRefreshedHandleK3) { ASSERT_NO_FATAL_FAILURE(cadence_ring_wrap_body<3>()); }
+TEST_F(HashRcuHookTest, CadenceRingWrapUnderNeverRefreshedHandleK64) { ASSERT_NO_FATAL_FAILURE(cadence_ring_wrap_body<64>()); }
+
+// Limbo pushes do not count toward the cadence (a limbo-only state is bagged
+// by the next bump of any cause). R = 1.
+// { h; insert 1; erase 1; } (bag 0, pinned by h during its own trigger);
+// reclaim() == {1, 1, 0, 0, 0, nothing_retired} (one free node now); under
+// h2, the next insert pops that node and its copy assignment throws (ProbeKey's
+// throw_countdown, on a NoHooks set: no TestHooks action can be reached), so
+// the node goes to limbo: limbo_pushes +1, retire_nodes +0, attempts +0.
+// Kills: limbo pushes counted toward the cadence (attempts +1 and
+// retire_nodes +1; the destructor's R = 1 invariant too).
+TEST(ConcurrentHashSetRcuTest, CadenceLimboDoesNotCount) {
+    using Set = CadProbeSet<64>;
+    ProbeKey::reset_counters();
+    {
+        Set set = cadenced_set<Set>(1024, 1, 1);
+        {
+            const Set::handle h = set.new_handle();
+            ASSERT_TRUE(set.insert(h, 1));
+            ASSERT_TRUE(set.erase(h, 1));
+        }
+        EXPECT_EQ(set.reclaim(), (AdvanceResult{1, 1, 0, 0, 0, Advance::nothing_retired})) << "free the one node";
+        const Set::handle h2 = set.new_handle();
+        const Set::InternalCounters c0 = set.get_internal_counters();
+        ProbeKey::throw_countdown = 1;
+        EXPECT_THROW(set.insert(h2, 2), std::runtime_error) << "the popped node's assignment must throw";
+        ProbeKey::throw_countdown = 0;
+        const Set::InternalCounters c1 = set.get_internal_counters();
+        EXPECT_EQ(c1.limbo_pushes - c0.limbo_pushes, 1u) << "test precondition: the thrown-on node did not go to limbo";
+        EXPECT_EQ(c1.retire_nodes - c0.retire_nodes, 0u) << "a limbo push counted as retired nodes";
+        EXPECT_EQ(c1.auto_reclaims + c1.auto_skipped, c0.auto_reclaims + c0.auto_skipped) << "a limbo push triggered";
+    } // the set's lifetime
+    EXPECT_EQ(ProbeKey::corrupt.load(), 0);
+} // CadenceLimboDoesNotCount
+
+// The count is PER SHARD, not set-wide. R = 2, TWO arena shards. Inserts
+// 0, 1, 2 on the test thread (inserts retire nothing). Two helper threads,
+// each started and JOINED before the next starts, each erasing one key under
+// its own handle: the header numbers threads sequentially on first use, so
+// the two get consecutive numbers and therefore distinct shards (asserted
+// through the per-shard counts {1, 1}: the script's precondition, not an
+// oracle); each shard is at 1 = R-1: no attempt. A third helper erases 2: its
+// number is the first helper's plus 2, the same shard, which reaches 2 = R:
+// one attempt (the positive control).
+// Kills, ONLY here: the crossing decided on the set-wide count (the second
+// helper's push takes the set-wide sum to 2: one attempt after two helpers).
+// Not a contract test: it relies on the sequential thread numbering, which
+// the contract does not promise.
+TEST(ConcurrentHashSetRcuTest, CadenceCountsPerShard) {
+    using Set = IntSetDel;
+    Set set = cadenced_set<Set>(256, 2, 2);
+    {
+        const Set::handle h = set.new_handle();
+        for (int k = 0; k < 3; ++k) ASSERT_TRUE(set.insert(h, k));
+    }
+    // One erase of `k` on a fresh thread, under a handle of its own, joined
+    // before this returns.
+    auto erase_on_new_thread = [&set](int k) {
+        std::thread([&set, k]() {
+            const Set::handle h = set.new_handle();
+            EXPECT_TRUE(set.erase(h, k)) << "helper's erase of " << k;
+        }).join();
+    }; // erase_on_new_thread()
+    erase_on_new_thread(0);
+    erase_on_new_thread(1);
+    ASSERT_EQ(set.get_internal_retire_nodes_per_shard(), (std::vector<size_t>{1, 1}))
+        << "test precondition: the two helpers did not retire on distinct shards";
+    EXPECT_EQ(cadence_attempts(set), 0u) << "the cadence counted across shards: each shard is at R - 1";
+    erase_on_new_thread(2);
+    EXPECT_EQ(cadence_attempts(set), 1u) << "positive control: a shard that reaches R fires";
+} // CadenceCountsPerShard
+
+// The suspended old-generation reader under TRIGGERS:
+// SuspendedReaderPinsItsGeneration with every explicit call replaced by a
+// nested erase whose trigger does the work. R = 1, ProbeKey, NoHooks. Keys KEY = 3,
+// S = 259, X = 515 in bucket 3 (chain X -> S -> KEY, newest first), fillers
+// Y = 4, Z = 5.
+//   step 0: insert KEY, S, X, Y, Z: (5, 0, 0, 0, 0, 0, 0).
+//   step 1: h = new_handle() (generation 0: the PIN under test); arm
+//           equal_hook on X with A = { under h1: erase Y } { under h2: erase S
+//           } { under h3: erase Z }, then arm equal_hook on S to count the
+//           step onto S; contains(h, KEY). The correct timeline: h1 (gen 0)
+//           erases Y, its trigger bags Y in gen 0 and frees nothing (h, h1);
+//           h2 joins gen 1, unlinks S through X's link (X live), its trigger
+//           bags S in gen 1 and frees nothing (bag 0 pinned by h; bag 1 by h2
+//           and cumulatively); h3 joins gen 2, erases Z, its trigger bags Z in
+//           gen 2 (K >= 4) or finds the ring full (K = 3; at K = 2 also h2's),
+//           frees nothing. The reader resumes onto S (dead, bagged, alive),
+//           compares it (the chained hook) and finds KEY.
+//           Expect: the action ran once, the step onto S once, found;
+//           auto_reclaims +3, bags_freed +0; K >= 4: bumps +3,
+//           (2, 0, 0, 3, 0, 0, 1); K = 3: bumps +2, ring_full +1,
+//           (2, 0, 1, 2, 0, 0, 1); K = 2: bumps +1, ring_full +2,
+//           (2, 0, 2, 1, 0, 0, 1).
+//   step 2: release h; reclaim(): K >= 4 {3, 3, 0, 0, 0, nothing_retired};
+//           K = 3 {3, 3, 0, 0, 0, advanced}; K = 2 {3, 2, 0, 0, 0, advanced}.
+// Three nested erases and two fillers: with only Y and S, a free pass that
+// skips a pinned bag and frees younger ones would find
+// bag 1 pinned by h2 at the only trigger after S's erase and free nothing.
+// h1, h2, h3 are each released before the next is created, so each joins the
+// generation its predecessor's trigger published. EXPECT_* only inside A.
+// Kills: a trigger whose free pass takes one pin for its own operation's (at
+// h2's trigger bag 0's one pin is the suspended reader's, ANOTHER operation of
+// the same thread: the defect frees bag 0 and bag 1 (refs 1, h2's own), and
+// the reader steps onto a freed S: ASan's use-after-poison in
+// ProbeKey::operator==, the required symptom; under TSan S's link leads into
+// the free list, a wrong miss); a free pass that ignores the pins (the same
+// use-after-poison); a free pass that skips a pinned bag and frees younger
+// ones, at K >= 3 (h3's trigger, or its in-wrap pass at K = 3, skips the
+// pinned bag 0 and frees bag 1 {S}). K = 2 cannot kill the last (no younger
+// bag past a pinned one), as in SuspendedReaderPinsItsGeneration.
+template <size_t K>
+static void cadence_suspended_reader_body() {
+    using Set = CadProbeSet<K>;
+    const int KEY = 3, S = 259, X = 515, Y = 4, Z = 5;
+    {
+        Set set = cadenced_set<Set>(256, 1, 1);
+        {
+            const typename Set::handle hs = set.new_handle();
+            for (int k : {KEY, S, X, Y, Z}) ASSERT_TRUE(set.insert(hs, k));
+        }
+        expect_tuple(set, "step 0", 5, 0, 0, 0, 0, 0, 0);
+        int ran = 0, stepped_on_s = 0;
+        typename Set::handle h = set.new_handle();
+        const typename Set::InternalCounters c0 = set.get_internal_counters();
+        ProbeKey::arm(ProbeKey::equal_hook, X, 1, [&]() {
+            ++ran;
+            {
+                const typename Set::handle h1 = set.new_handle();
+                EXPECT_TRUE(set.erase(h1, Y));
+            }
+            {
+                const typename Set::handle h2 = set.new_handle();
+                EXPECT_TRUE(set.erase(h2, S));
+            }
+            {
+                const typename Set::handle h3 = set.new_handle();
+                EXPECT_TRUE(set.erase(h3, Z));
+            }
+            ProbeKey::arm(ProbeKey::equal_hook, S, 1, [&]() { ++stepped_on_s; });
+        });
+        const bool found = set.contains(h, KEY);
+        ProbeKey::disarm_hooks();
+        const typename Set::InternalCounters c1 = set.get_internal_counters();
+        ASSERT_EQ(ran, 1) << "test precondition: the reader was not suspended at X";
+        EXPECT_EQ(stepped_on_s, 1) << "the reader did not step onto S";
+        EXPECT_TRUE(found) << "the suspended reader lost KEY";
+        EXPECT_EQ(c1.auto_reclaims - c0.auto_reclaims, 3u);
+        EXPECT_EQ(c1.bags_freed - c0.bags_freed, 0u) << "a trigger freed a bag the suspended reader pins";
+        if constexpr (K >= 4) {
+            EXPECT_EQ(c1.bumps - c0.bumps, 3u);
+            expect_tuple(set, "step 1", 2, 0, 0, 3, 0, 0, 1);
+        } else if constexpr (K == 3) {
+            EXPECT_EQ(c1.bumps - c0.bumps, 2u);
+            EXPECT_EQ(c1.ring_full - c0.ring_full, 1u);
+            expect_tuple(set, "step 1", 2, 0, 1, 2, 0, 0, 1);
+        } else {
+            EXPECT_EQ(c1.bumps - c0.bumps, 1u);
+            EXPECT_EQ(c1.ring_full - c0.ring_full, 2u);
+            expect_tuple(set, "step 1", 2, 0, 2, 1, 0, 0, 1);
+        }
+        h = {};
+        if constexpr (K >= 4) {
+            EXPECT_EQ(set.reclaim(), (AdvanceResult{3, 3, 0, 0, 0, Advance::nothing_retired})) << "step 2";
+        } else if constexpr (K == 3) {
+            EXPECT_EQ(set.reclaim(), (AdvanceResult{3, 3, 0, 0, 0, Advance::advanced})) << "step 2";
+        } else {
+            EXPECT_EQ(set.reclaim(), (AdvanceResult{3, 2, 0, 0, 0, Advance::advanced})) << "step 2";
+        }
+    } // the set's lifetime
+    EXPECT_EQ(ProbeKey::corrupt.load(), 0);
+} // cadence_suspended_reader_body()
+TEST_F(HashRcuHookTest, CadenceSuspendedReaderPinsItsGenerationK2) { ASSERT_NO_FATAL_FAILURE(cadence_suspended_reader_body<2>()); }
+TEST_F(HashRcuHookTest, CadenceSuspendedReaderPinsItsGenerationK3) { ASSERT_NO_FATAL_FAILURE(cadence_suspended_reader_body<3>()); }
+TEST_F(HashRcuHookTest, CadenceSuspendedReaderPinsItsGenerationK4) { ASSERT_NO_FATAL_FAILURE(cadence_suspended_reader_body<4>()); }
+TEST_F(HashRcuHookTest, CadenceSuspendedReaderPinsItsGenerationK64) { ASSERT_NO_FATAL_FAILURE(cadence_suspended_reader_body<64>()); }
+
+// The cadence 0 IS the two-parameter form, with erases and literal
+// results: on each, the effective cadence reads 0; { h; insert 1; erase 1; },
+// then the first reclaim() bags and frees node 1 in the same call (no handle
+// is alive) -- {1, 1, 0, 0, 0, advanced} -- the second finds nothing --
+// {0, 0, 0, 0, 0, nothing_retired} --, and no trigger attempt was made.
+// Kills: the cadence 0 rounded to 1 (the erase's own trigger bags node 1
+// under h, so the first reclaim() is {1, 1, 0, 0, 0, nothing_retired}, the
+// accessor reads 1, and attempts is 1).
+template <typename SetT>
+static void cadence_zero_body(SetT& set, const std::string& where) {
+    EXPECT_EQ(set.get_internal_auto_reclaim_every(), 0u) << where;
+    {
+        const typename SetT::handle h = set.new_handle();
+        ASSERT_TRUE(set.insert(h, 1)) << where;
+        ASSERT_TRUE(set.erase(h, 1)) << where;
+    }
+    EXPECT_EQ(set.reclaim(), (AdvanceResult{1, 1, 0, 0, 0, Advance::advanced})) << where << ": bagged and freed by the call";
+    EXPECT_EQ(set.reclaim(), (AdvanceResult{0, 0, 0, 0, 0, Advance::nothing_retired})) << where << ": nothing left";
+    EXPECT_EQ(cadence_attempts(set), 0u) << where;
+} // cadence_zero_body()
+TEST(ConcurrentHashSetRcuTest, CadenceZeroIsTheTwoParameterForm) {
+    using Set = IntSetDel;
+    Set by_parameters(256, 1);
+    ASSERT_NO_FATAL_FAILURE(cadence_zero_body(by_parameters, "Set(256, 1)"));
+    Set by_options = cadenced_set<Set>(256, 1, 0);
+    ASSERT_NO_FATAL_FAILURE(cadence_zero_body(by_options, "Options{256, 1, 0}"));
+} // CadenceZeroIsTheTwoParameterForm
+
+// A cadenced set destroyed with pending bags: the destructor's !NDEBUG
+// cadence invariants (no attempt with the cadence off; attempts at most
+// retire_nodes / R; at R = 1 attempts == retire_runs) hold, and destruction
+// frees the bagged and retired slots with the arena. R = 1 and R = 2, one
+// shard, six keys erased under ONE never-refreshed handle, released before
+// the destruction and after the last trigger: R = 1 makes six attempts that
+// bag one node each (all pinned by h: six bags, nothing freed); R = 2 makes
+// three, at the 2nd, 4th and 6th erase (three bags of two). Before the
+// destruction: (0, 0, 0, 6, 0, 0, 0) -- every node bagged, none free -- and
+// the counters' relation asserted here too (the destructor's form, so a
+// failure names the test, not only the abort).
+// Kills: the crossing decided one push late (R = 2: the attempts land on the
+// 1st, 3rd and 5th erase, so node 6 stays retired: `retired` 1, `bagged` 5).
+TEST(ConcurrentHashSetRcuTest, CadenceDestroyWithPendingBags) {
+    using Set = IntSetDel;
+    for (size_t R : {1, 2}) {
+        const std::string where = "R = " + std::to_string(R);
+        std::unique_ptr<Set> set = std::make_unique<Set>(Set::Options{.initial_capacity = 256, .arena_shards = 1, .auto_reclaim_every = R});
+        {
+            const Set::handle h = set->new_handle();
+            for (int k = 0; k < 6; ++k) ASSERT_TRUE(set->insert(h, k)) << where;
+            for (int k = 0; k < 6; ++k) ASSERT_TRUE(set->erase(h, k)) << where;
+        } // h pinned every bag its own triggers closed
+        const Set::InternalCounters c = set->get_internal_counters();
+        EXPECT_EQ(c.auto_reclaims, 6/R) << where;
+        EXPECT_EQ(c.auto_skipped, 0u) << where;
+        EXPECT_EQ(c.bags_freed, 0u) << where;
+        EXPECT_LE(c.auto_reclaims + c.auto_skipped, c.retire_nodes/R) << where;
+        if (R == 1) {
+            EXPECT_EQ(c.auto_reclaims + c.auto_skipped, c.retire_runs) << where;
+        }
+        expect_tuple(*set, where + ", before the destruction", 0, 0, 0, 6, 0, 0, 0);
+        set.reset();   // the destructor's invariants run here
+    } // loop over the cadences
+} // CadenceDestroyWithPendingBags
+
+#ifndef NDEBUG
+// A ring view inside a TRIGGER's hook aborts (on a cadenced set the ring
+// views need operation quiescence, since an operation's trigger holds the
+// flag; asserted, with a message that names the trigger). R = 1, CadHookSet<64>: insert 1;
+// arm after_publish with get_internal_generation(); { h; erase(h, 1); }: the
+// erase's trigger publishes, the hook fires inside the erase, and the view
+// asserts the flag clear. Required: SIGABRT with the assertion's message
+// naming the trigger (the regex), so a crash or a sanitizer report cannot
+// pass for the diagnosis. The legal twin in the parent: the same erase with
+// the view called after it, between operations.
+// Kills: a trigger's publish that does not fire the hook (no call, no death);
+// the trigger before the retire push (no publish at R = 1, no hook, no
+// death).
+static void cadence_ring_view_in_trigger_hook(bool inside) {
+    using Set = CadHookSet<64>;
+    TestHooks::reset();
+    {
+        Set set = cadenced_set<Set>(256, 1, 1);
+        {
+            const Set::handle h = set.new_handle();
+            (void)set.insert(h, 1);
+        }
+        if (inside) TestHooks::arm(TestHooks::after_publish, [&set]() { (void)set.get_internal_generation(); });
+        {
+            const Set::handle h = set.new_handle();
+            (void)set.erase(h, 1);
+        }
+        (void)set.get_internal_generation();   // between operations: legal
+    } // the set's lifetime
+    TestHooks::reset();
+} // cadence_ring_view_in_trigger_hook()
+
+TEST(ConcurrentHashSetRcuDeathTest, CadenceRingViewInsideTriggerHookAborts) {
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    cadence_ring_view_in_trigger_hook(false);
+    EXPECT_EXIT(cadence_ring_view_in_trigger_hook(true), testing::KilledBySignal(SIGABRT),
+                "during advance\\(\\), reclaim\\(\\) or an automatic trigger");
+} // CadenceRingViewInsideTriggerHookAborts
+#endif
+
+// ---------------------------------------------------------------------------
+// The cadence stresses: advance_stress_body() with StressShape::cadence > 0.
+// Writers and readers refresh their long-lived handles every iteration (with a
+// handle refreshed rarely, every trigger would find its own generation pinned
+// and free nothing). Witnesses come from the counters at the quiescent point
+// after the join, never from a ring view during the run (on a cadenced set an
+// operation can hold the flag). The end state: every thread's handle
+// released, then advance_and_check() (an oracle on a cadenced set only at a
+// quiescent point) and the end-state oracle of advance_stress_body().
+// One second each per sanitizer build.
+// ---------------------------------------------------------------------------
+
+// The cadence alone reclaims: NO explicit advancer, R = 1 (every retire push
+// crosses), writers and readers refreshing per iteration, a runaway guard on
+// the arena (it stops the run early rather than failing it; the INFO line
+// says so). Witnesses: triggers proceeded and were skipped (two retiring
+// threads met at the flag), bags and nodes were freed, and freed nodes were
+// popped again (reuse: nodes_freed > 0 and a pop, counted exactly as the
+// pushes minus what the free lists hold at the end; not "slots < inserts",
+// which a large arena could satisfy without any reuse).
+// Kills, probabilistically: a trigger that releases the flag before its final
+// free pass (another trigger or call then bumps and frees concurrently with
+// it: a race on the free pass's plain fields that TSan reports, or a double
+// push the end state's accounting sees); any premature free the sanitizers or
+// the exact booleans see.
+TEST(ConcurrentHashSetRcuTest, CadenceStressNoAdvancer) {
+    using Set = IntSetDel;
+    StressShape shape{4, 2, 0, false, 2, 1024, 64, 256, std::chrono::milliseconds(1000), true};
+    shape.cadence = 1;
+    shape.slot_limit = size_t{1} << 20;
+    StressWitness w;
+    ASSERT_NO_FATAL_FAILURE(advance_stress_body<Set>(shape, "cadence 1, no advancer", w));
+    EXPECT_GT(w.auto_reclaims, 0u) << "witness: no trigger proceeded";
+    EXPECT_GT(w.auto_skipped, 0u) << "witness: no two triggers met at the flag";
+    EXPECT_GT(w.counted_bags_freed, 0u) << "witness: no bag was freed during the run";
+    EXPECT_GT(w.nodes_freed, 0u) << "witness: no node was freed during the run";
+    EXPECT_GT(w.pops, 0u) << "witness: no freed node was reused";
+} // CadenceStressNoAdvancer
+
+// The cadence beside ONE explicit advancer: its advance() calls meet the
+// triggers at the flag and may return `contended`, which on a cadenced set is
+// legal beside operations. R = 1. With a single explicit
+// caller, every `contended` is a trigger's hold. Witnesses: the advancer was
+// refused by a trigger (contended), and also proceeded (its walk ran beside
+// the triggers); triggers proceeded and were skipped; bags were freed.
+// Kills, probabilistically: a trigger that releases the flag before its final
+// free pass (as above, with the advancer's walk and free pass as the second
+// party); a trigger that ignores the flag (two flag holders, a race TSan
+// reports).
+TEST(ConcurrentHashSetRcuTest, CadenceStressBesideExplicitAdvancer) {
+    using Set = IntSetDel;
+    StressShape shape{4, 2, 1, false, 2, 1024, 64, 256, std::chrono::milliseconds(1000), true};
+    shape.cadence = 1;
+    shape.slot_limit = size_t{1} << 20;
+    StressWitness w;
+    ASSERT_NO_FATAL_FAILURE(advance_stress_body<Set>(shape, "cadence 1, one explicit advancer", w));
+    EXPECT_GT(w.contended, 0u) << "witness: the explicit advancer never met a trigger at the flag";
+    EXPECT_GT(w.outcomes[static_cast<size_t>(Advance::advanced)] + w.outcomes[static_cast<size_t>(Advance::nothing_retired)], 0u)
+        << "witness: the explicit advancer never proceeded";
+    EXPECT_GT(w.auto_reclaims, 0u) << "witness: no trigger proceeded";
+    EXPECT_GT(w.auto_skipped, 0u) << "witness: no trigger was skipped";
+    EXPECT_GT(w.counted_bags_freed, 0u) << "witness: no bag was freed during the run";
+} // CadenceStressBesideExplicitAdvancer
+
+// A mixing hash for the tiny cadenced sets below: mix() (the MurmurHash3
+// finalizer above) of the key. With the identity hash the stress's stable
+// keys (low bits 0 .. stable-1) stop moving once the table outgrows them, so a
+// reader's probe of one never lands on a pending child whose parent holds a
+// mover; mixed, every doubling moves about half of every chain, the stable
+// keys included, and the readers' probes of stable keys split children whose
+// cleanups retire frozen movers.
+struct CadenceMixHash {
+    size_t operator()(int k) const { return static_cast<uint32_t>(mix(k)); }
+}; // struct CadenceMixHash
+
+// Many tiny cadenced sets: a fresh 4-bucket set per round (mixing hash, two
+// shards, R = 1, no explicit advancer), so the table doubles inside every
+// round while the threads run, and the readers' contains() land on
+// UNINITIALIZED buckets, win their splits and run the splits' cleanups, whose
+// retire pushes trigger INSIDE the contains() while writers insert,
+// erase and split beside them. The end state is checked each round. Witness,
+// over all rounds: a reader iteration across which the reader's own bump_ns
+// grew (readers make no explicit call, so only a trigger inside their own
+// contains() charges it), and triggers proceeded.
+// Kills, probabilistically: a trigger that releases the flag before its final
+// free pass, and a trigger that ignores the flag, here with triggers inside
+// readers' contains() among the parties.
+TEST(ConcurrentHashSetRcuTest, CadenceStressManyTinySets) {
+    using Set = ConcurrentResizableHashSetRCU<int, true, CadenceMixHash>;
+    StressShape shape{4, 2, 0, false, 2, 4, 8, 64, std::chrono::milliseconds(20), false};
+    shape.cadence = 1;
+    shape.slot_limit = size_t{1} << 18;
+    const std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+    size_t rounds = 0, reader_triggers = 0, auto_reclaims = 0, auto_skipped = 0, stopped = 0;
+    while (std::chrono::steady_clock::now() < deadline) {
+        StressWitness w;
+        ASSERT_NO_FATAL_FAILURE(advance_stress_body<Set>(shape, "tiny cadenced set " + std::to_string(rounds), w));
+        reader_triggers += w.reader_triggers;
+        auto_reclaims += w.auto_reclaims;
+        auto_skipped += w.auto_skipped;
+        stopped += w.stopped_by_guard;
+        ++rounds;
+    } // rounds
+    std::printf("[   INFO   ] CadenceStressManyTinySets: %zu sets, auto_reclaims %zu, auto_skipped %zu, "
+                "reader iterations with a trigger %zu, rounds stopped by the guard %zu\n",
+                rounds, auto_reclaims, auto_skipped, reader_triggers, stopped);
+    EXPECT_GT(auto_reclaims, 0u) << "witness: no trigger proceeded in any round";
+    EXPECT_GT(reader_triggers, 0u) << "witness: no trigger proceeded inside a reader's contains()";
+} // CadenceStressManyTinySets
+
+// The broad cadenced stress: what the three cadence stresses above hold fixed
+// (R = 1, long-lived handles refreshed every iteration, advance() the only
+// explicit call, no yields), varied in one run. A fresh 4-bucket set per round
+// (mixing hash, so the table doubles inside every round and readers' lookups
+// win splits whose cleanups trigger), FOUR arena shards, R = 4 (a crossing
+// every fourth node per shard, so most retire pushes do not trigger), a ring
+// of 8 generations (a long-lived handle pins a bag for up to 64 of its
+// iterations, so the ring fills and triggers and calls meet `ring_full`
+// beside operations), and:
+//   - mixed handles: the even-numbered writers and readers take a handle per
+//     operation (every trigger then runs under a temporary handle that pins
+//     the generation it closes), the odd-numbered keep a long-lived handle
+//     refreshed only every 64th iteration;
+//   - one advance() caller AND one reclaim() caller beside the triggers, so
+//     all three holders of the flag meet (each refused call is `contended`,
+//     each refused trigger skipped);
+//   - TestHooks' yield_in_windows: every join yields between its load and its
+//     increment and between its increment and its re-verify, and every
+//     publish -- an explicit call's or a trigger's, inside an operation --
+//     yields before its final free pass, with the flag held.
+// Oracles: advance_stress_body()'s (every writer's and reader's determined
+// booleans, the end state after advance_and_check() at the quiescent point,
+// exact membership), and the destructor's cadence invariants per set.
+// Witnesses, over all rounds: triggers proceeded and were skipped; bags and
+// nodes freed and freed nodes popped again; a trigger inside a reader's
+// contains(); both explicit callers proceeded and some explicit call was
+// refused; joins retried; the after-publish hook ran.
+// Kills, probabilistically: reclaim() ignoring the flag (the only stress with
+// a reclaim() caller); a trigger releasing the flag before its final free
+// pass; a trigger whose free pass takes refs <= 1 for unpinned.
+// The bump's exchanges moved into the publish window are left to the cadence
+// stresses above: here most explicit calls and triggers are refused or find
+// the ring full.
+TEST_F(HashRcuHookTest, CadenceStressMixedHandlesAndCallers) {
+    using Set = ConcurrentResizableHashSetRCU<int, true, CadenceMixHash, 8, TestHooks>;
+    StressShape shape{4, 2, 1, false, 4, 4, 64, 64, std::chrono::milliseconds(100), false};
+    shape.cadence = 4;
+    shape.slot_limit = size_t{1} << 18;
+    shape.reclaimers = 1;
+    shape.mixed_handles = true;
+    shape.refresh_every = 64;
+    shape.call_pause = std::chrono::microseconds(50);
+    TestHooks::yield_in_windows.store(true);
+    const std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+    StressWitness all;
+    size_t rounds = 0, stopped = 0;
+    // A round starts only if it can end by the deadline, so the test stays within the
+    // other cadence stresses' second.
+    while (std::chrono::steady_clock::now() + shape.run_for <= deadline) {
+        StressWitness w;
+        ASSERT_NO_FATAL_FAILURE(advance_stress_body<Set>(shape, "mixed handles and callers, set " + std::to_string(rounds), w));
+        all.auto_reclaims += w.auto_reclaims;
+        all.auto_skipped += w.auto_skipped;
+        all.counted_bags_freed += w.counted_bags_freed;
+        all.nodes_freed += w.nodes_freed;
+        all.pops += w.pops;
+        all.reader_triggers += w.reader_triggers;
+        all.contended += w.contended;
+        all.join_retries += w.join_retries;
+        for (size_t o = 0; o < 4; ++o) {
+            all.outcomes[o] += w.outcomes[o];
+            all.reclaim_outcomes[o] += w.reclaim_outcomes[o];
+        } // loop over the four outcomes
+        stopped += w.stopped_by_guard;
+        ++rounds;
+    } // rounds
+    const size_t advanced = static_cast<size_t>(Advance::advanced), nothing = static_cast<size_t>(Advance::nothing_retired);
+    const size_t full = static_cast<size_t>(Advance::ring_full);
+    std::printf("[   INFO   ] CadenceStressMixedHandlesAndCallers: %zu sets, auto_reclaims %zu, auto_skipped %zu, bags freed %zu, "
+                "nodes freed %zu, pops %zu, reader iterations with a trigger %zu, contended %zu, join retries %zu; advance() "
+                "advanced/nothing_retired/ring_full %zu/%zu/%zu, reclaim() %zu/%zu/%zu; after-publish calls %ld; rounds stopped by the guard %zu\n",
+                rounds, all.auto_reclaims, all.auto_skipped, all.counted_bags_freed, all.nodes_freed, all.pops, all.reader_triggers,
+                all.contended, all.join_retries, all.outcomes[advanced], all.outcomes[nothing], all.outcomes[full],
+                all.reclaim_outcomes[advanced], all.reclaim_outcomes[nothing], all.reclaim_outcomes[full],
+                TestHooks::after_publish.calls.load(), stopped);
+    EXPECT_GT(all.auto_reclaims, 0u) << "witness: no trigger proceeded";
+    EXPECT_GT(all.auto_skipped, 0u) << "witness: no trigger was skipped";
+    EXPECT_GT(all.counted_bags_freed, 0u) << "witness: no bag was freed";
+    EXPECT_GT(all.pops, 0u) << "witness: no freed node was reused";
+    EXPECT_GT(all.reader_triggers, 0u) << "witness: no trigger proceeded inside a reader's contains()";
+    EXPECT_GT(all.outcomes[advanced] + all.outcomes[nothing], 0u) << "witness: the advance() caller never proceeded";
+    EXPECT_GT(all.reclaim_outcomes[advanced] + all.reclaim_outcomes[nothing], 0u) << "witness: the reclaim() caller never proceeded";
+    EXPECT_GT(all.contended, 0u) << "witness: no explicit call met another holder at the flag";
+    EXPECT_GT(all.join_retries, 0u) << "witness: no join ever retried";
+    EXPECT_GT(TestHooks::after_publish.calls.load(), 0) << "witness: no publish entered its publish-to-free-pass window";
+} // CadenceStressMixedHandlesAndCallers
 
 // ===========================================================================
 // CONTRACT TESTS: handles, generations and advance() through the public
@@ -7240,3 +8558,1255 @@ TEST(ConcurrentHashSetRcuDeathTest, ContractUseOfHandleWithOperationInFlightAbor
     EXPECT_EXIT(contract_use_handle_with_operation_in_flight(false, 1), testing::KilledBySignal(SIGABRT), "Assertion");
 } // ContractUseOfHandleWithOperationInFlightAborts
 #endif // NDEBUG
+
+// ===========================================================================
+// CONTRACT TESTS: reclaim() (the bump and the free pass without the walk),
+// the Options constructor, and the opt-in automatic cadence, through the
+// public interface.
+//
+// Every test names, in words, the promises it checks. They use the fixtures
+// of the contract tests above (ContractSet, ContractSetK, ContractSetNoDel,
+// kContractBuckets, kContractShards, ContractOneNode, contract_retire(),
+// contract_advance_is(), contract_ring_invariant(), the hooked Hash{} and key
+// types, the unfinished-split and parked-advance constructions, kContended,
+// Advance and its PrintTo).
+//
+// THE MODEL the exact oracles below follow, in addition to the model stated
+// at the top of the contract tests above:
+//   - reclaim() is advance() WITHOUT THE WALK: the same try-flag, the same
+//     `nothing_retired` decision first, the same ring-wrap free pass and
+//     `ring_full`, the same bump and final free pass; so its result is
+//     advance()'s with walk_retired == buckets_walked == nodes_passed == 0 for
+//     EVERY outcome. The generation goes up by one per `advanced` of either
+//     call.
+//   - A CADENCED set (Options::auto_reclaim_every != 0) has an effective
+//     cadence R = bit_ceil(min(value, 2^63)). Each retire push that takes its
+//     arena shard's retired-node count across a multiple of R TRIGGERS once,
+//     right after the push, on the retiring thread, under the retiring
+//     operation's handle: the trigger does reclaim()'s work. Single-threaded,
+//     with no explicit call in progress, every trigger PROCEEDS (auto_reclaims
+//     + 1; it is never skipped) and does what reclaim() would do at that
+//     point.
+//   - THE CADENCE SETTING (the condition of every exact per-erase count): the
+//     ONE-NODE SETTING's construction (kContractBuckets buckets, checked by
+//     ContractOneNode), ONE arena shard, erases of present keys on one thread.
+//     Then every successful erase retires exactly one node (retire_nodes +1,
+//     retire_runs +1), and the one shard's count is the set-wide count. Every
+//     cadence script checks the setting with ContractOneNode and the
+//     retire_nodes/retire_runs deltas of each step.
+//   - The trigger's own handle is live while it runs: the bag a
+//     trigger closes is pinned by the retiring operation's handle, so a
+//     trigger frees only bags of generations older than that handle's. With a
+//     long-lived handle h refreshed between rounds, each round's trigger frees
+//     the PREVIOUS round's bag; never refreshed, h pins every bag its
+//     triggers close, and the ring fills.
+//   - Free-list counts follow reuse before growth: with one arena shard,
+//     every allocation (an insert that misses) pops a freed node before it
+//     appends, so an insert after a free pass takes the free count down by
+//     one while it is non-zero. The expected free counts below say where.
+//   - Diagnostics used: the RACE-FREE counters (get_internal_counters()), the
+//     per-shard retired-node counts and the effective cadence, and, at
+//     quiescent points only (no operation in flight, no explicit call in
+//     progress), the ring views and the accounting sweep.
+// ===========================================================================
+
+// The clamp of the cadence: values above it are clamped to it.
+static constexpr size_t kContractCadenceClamp = size_t{1} << 63;
+
+// Options for a set in the CADENCE SETTING with the requested (not yet
+// rounded) cadence `every`: kContractBuckets buckets and one arena shard.
+template <typename SetT>
+static typename SetT::Options contract_cadence_options(size_t every) {
+    return typename SetT::Options{.initial_capacity = kContractBuckets, .arena_shards = kContractShards, .auto_reclaim_every = every};
+} // contract_cadence_options()
+
+// The counter deltas one step of a cadence script expects; every field is
+// compared, so a step that expects nothing of a counter expects it unchanged.
+struct ContractCounterDelta {
+    size_t retire_nodes = 0;    // nodes retired (pushed onto a shard's retired list)
+    size_t retire_runs = 0;     // runs retired (retire pushes)
+    size_t bumps = 0;           // publishes, of any cause (explicit call or trigger)
+    size_t auto_reclaims = 0;   // triggers that acquired the flag
+    size_t auto_skipped = 0;    // triggers that found the flag held
+    size_t ring_full = 0;       // `ring_full` outcomes, of any cause
+    size_t bags_freed = 0;      // bags freed, by any cause
+    size_t nodes_freed = 0;     // nodes freed, by any cause
+    bool operator==(const ContractCounterDelta&) const = default;
+}; // struct ContractCounterDelta
+
+// Prints a ContractCounterDelta in failure messages.
+static std::ostream& operator<<(std::ostream& os, const ContractCounterDelta& d) {
+    return os << "{retire_nodes " << d.retire_nodes << ", retire_runs " << d.retire_runs << ", bumps " << d.bumps << ", auto_reclaims "
+              << d.auto_reclaims << ", auto_skipped " << d.auto_skipped << ", ring_full " << d.ring_full << ", bags_freed " << d.bags_freed
+              << ", nodes_freed " << d.nodes_freed << "}";
+} // operator<<(ContractCounterDelta)
+
+// Compares the deltas between two counter snapshots with `want`. Also expects
+// `contended` and `joins` unchanged: the scripts bracket only operations and
+// reclaim() calls at quiescent points -- every handle they use is created
+// BEFORE the first snapshot -- and none of them is refused (an explicit call
+// at quiescence is never `contended`, and `contended` never counts a
+// trigger) or joins (`joins` counts no trigger and no reclaim(), and an
+// operation joins nothing). The counters are never reset, so after - before
+// is the step's count. Returns an AssertionResult so
+// that the caller's line is reported.
+template <typename Counters>
+static testing::AssertionResult contract_deltas_are(const Counters& before, const Counters& after, const ContractCounterDelta& want) {
+    const ContractCounterDelta got{static_cast<size_t>(after.retire_nodes - before.retire_nodes),
+                                   static_cast<size_t>(after.retire_runs - before.retire_runs),
+                                   static_cast<size_t>(after.bumps - before.bumps),
+                                   static_cast<size_t>(after.auto_reclaims - before.auto_reclaims),
+                                   static_cast<size_t>(after.auto_skipped - before.auto_skipped),
+                                   static_cast<size_t>(after.ring_full - before.ring_full),
+                                   static_cast<size_t>(after.bags_freed - before.bags_freed),
+                                   static_cast<size_t>(after.nodes_freed - before.nodes_freed)};
+    const size_t contended = static_cast<size_t>(after.contended - before.contended);
+    const size_t joins = static_cast<size_t>(after.joins - before.joins);
+    if (got == want && contended == 0 && joins == 0) return testing::AssertionSuccess();
+    return testing::AssertionFailure() << "counter deltas " << got << ", expected " << want << "; contended +" << contended << ", joins +"
+                                       << joins << " (expected +0 each)";
+} // contract_deltas_are()
+
+// Expects the accounting sweep (quiescent only) to be consistent and to hold
+// exactly `retired` nodes on the retired lists, `bagged` in the bags and
+// `free_nodes` on the free lists.
+template <typename SetT>
+static testing::AssertionResult contract_sweep_is(const SetT& set, size_t retired, size_t bagged, size_t free_nodes) {
+    const typename SetT::InternalAccounting acc = set.get_internal_accounting();
+    if (acc.consistent && acc.retired == retired && acc.bagged == bagged && acc.free_nodes == free_nodes) return testing::AssertionSuccess();
+    return testing::AssertionFailure() << "sweep: consistent " << acc.consistent << ", retired " << acc.retired << " (expected " << retired
+                                       << "), bagged " << acc.bagged << " (expected " << bagged << "), free " << acc.free_nodes
+                                       << " (expected " << free_nodes << ")";
+} // contract_sweep_is()
+
+// The cadence's set-wide invariants at a quiescent point, and the definition
+// of the per-shard view: one entry per arena shard, summing to retire_nodes.
+// With R > 0 the triggers (proceeding + skipped) are the crossing pushes, at
+// most floor(retire_nodes_s / R) on each shard s; with `exact`, which a test
+// passes when every push retired one node (the CADENCE SETTING), exactly
+// that many. At R = 1 every push crosses, so the triggers equal retire_runs.
+// On a cadence-off set (R = 0) both counters are 0.
+template <typename SetT>
+static testing::AssertionResult contract_cadence_invariants(const SetT& set, bool exact) {
+    const typename SetT::InternalCounters c = set.get_internal_counters();
+    const size_t r = set.get_internal_auto_reclaim_every();
+    const std::vector<size_t> per_shard = set.get_internal_retire_nodes_per_shard();
+    size_t sum = 0;
+    size_t crossings_bound = 0;
+    for (size_t n : per_shard) {
+        sum += n;
+        if (r != 0) crossings_bound += n/r;
+    } // loop over the shards
+    const size_t triggers = static_cast<size_t>(c.auto_reclaims + c.auto_skipped);
+    if (per_shard.size() != set.get_internal_arena_shards()) {
+        return testing::AssertionFailure() << "per-shard view has " << per_shard.size() << " entries for " << set.get_internal_arena_shards() << " shards";
+    }
+    if (sum != c.retire_nodes) {
+        return testing::AssertionFailure() << "per-shard retired nodes sum to " << sum << ", retire_nodes is " << c.retire_nodes;
+    }
+    if (r == 0) {
+        if (triggers == 0) return testing::AssertionSuccess();
+        return testing::AssertionFailure() << "cadence-off set counted " << triggers << " triggers";
+    }
+    if (triggers > crossings_bound || (exact && triggers != crossings_bound)) {
+        return testing::AssertionFailure() << "triggers " << triggers << " (auto_reclaims " << c.auto_reclaims << " + auto_skipped "
+                                           << c.auto_skipped << ") vs sum over shards of floor(retire_nodes/R) " << crossings_bound
+                                           << (exact ? " (expected equal)" : " (expected at most)") << ", R " << r;
+    }
+    if (r == 1 && triggers != c.retire_runs) {
+        return testing::AssertionFailure() << "R = 1: triggers " << triggers << " != retire_runs " << c.retire_runs;
+    }
+    return testing::AssertionSuccess();
+} // contract_cadence_invariants()
+
+// ===========================================================================
+// reclaim(): its declaration, outcomes, literals and the no-walk witnesses.
+// ===========================================================================
+
+// reclaim() returns AdvanceResult, is noexcept, and is NOT [[nodiscard]]
+// (the discarded calls below would fail -Werror otherwise);
+// it exists for both AllowDelete values and any ring size.
+TEST(ConcurrentHashSetRcuTest, ContractBumpAndFreeDeclaredSurface) {
+    static_assert(std::is_same_v<decltype(std::declval<ContractSet&>().reclaim()), AdvanceResult>);
+    static_assert(noexcept(std::declval<ContractSet&>().reclaim()));
+    static_assert(noexcept(std::declval<ContractSetNoDel&>().reclaim()));
+    static_assert(noexcept(std::declval<ContractSetK<2>&>().reclaim()));
+    ContractSet set(kContractBuckets, kContractShards);
+    set.reclaim();
+    ContractSetNoDel nodel(kContractBuckets, kContractShards);
+    nodel.reclaim();
+} // ContractBumpAndFreeDeclaredSurface
+
+// A fresh set into which nothing was ever inserted returns {0, 0, 0, 0, 0,
+// nothing_retired} -- whatever its capacity, since reclaim() never walks
+// (contrast advance()'s {0, 0, 0, B, 0, ...}) -- with or without a live
+// handle, again and again, for both AllowDelete values; no slot consumed
+// (generation 0).
+TEST(ConcurrentHashSetRcuTest, ContractBumpAndFreeFreshSetIsNothingRetired) {
+    constexpr AdvanceResult kNothing{0, 0, 0, 0, 0, Advance::nothing_retired};
+    for (size_t capacity : {size_t{1}, size_t{5}, size_t{64}, kContractBuckets}) {
+        ContractSet set(capacity, kContractShards);
+        EXPECT_EQ(set.reclaim(), kNothing) << "capacity " << capacity;
+        EXPECT_EQ(set.reclaim(), kNothing) << "capacity " << capacity;
+        {
+            ContractSet::handle h = set.new_handle();
+            EXPECT_EQ(set.reclaim(), kNothing) << "capacity " << capacity;
+        }
+        EXPECT_EQ(set.get_internal_generation(), 0u);
+        EXPECT_TRUE(contract_ring_invariant(set, 64));
+
+        ContractSetNoDel nodel(capacity, kContractShards);
+        EXPECT_EQ(nodel.reclaim(), kNothing) << "capacity " << capacity;
+        EXPECT_EQ(nodel.get_internal_generation(), 0u);
+    } // loop over capacities
+} // ContractBumpAndFreeFreshSetIsNothingRetired
+
+// One node retired, every handle released: {1, 1, 0, 0, 0, advanced} (as
+// advance()'s, without the walk) -- the bag the
+// call closes is freed in the same call -- and the generation goes 0 -> 1;
+// then nothing retired: {0, 0, 0, 0, 0, nothing_retired}, generation
+// unchanged. Three nodes retired between two calls form ONE bag:
+// {3, 1, 0, 0, 0, advanced}. The diagnostic counters: bumps/bags_freed/
+// nodes_freed count reclaim()'s outcomes as they count advance()'s, joins
+// does not move across a reclaim() (no walk joins), and the cadence counters
+// stay 0 on a cadence-off set. One-node setting (every erase retires exactly
+// one node; checked on the first: retire_nodes +1). Free count at the end:
+// 4 nodes freed, of which the insert of key 2 reused one (reuse before
+// growth): 3.
+TEST(ConcurrentHashSetRcuTest, ContractBumpAndFreeReleasedHandleFreesInSameCall) {
+    ContractSet set(kContractBuckets, kContractShards);
+    const ContractOneNode<ContractSet> setting(set);
+    ContractSet::InternalCounters c0{};
+    ContractSet::InternalCounters c1{};
+    {
+        ContractSet::handle h = set.new_handle();
+        EXPECT_TRUE(set.insert(h, 1));
+        c0 = set.get_internal_counters();
+        EXPECT_TRUE(set.erase(h, 1));
+        c1 = set.get_internal_counters();
+    } // the retiring handle's scope, released before the call
+    EXPECT_TRUE(contract_deltas_are(c0, c1, {.retire_nodes = 1, .retire_runs = 1}));
+    EXPECT_EQ(set.reclaim(), (AdvanceResult{1, 1, 0, 0, 0, Advance::advanced}));
+    ContractSet::InternalCounters c2 = set.get_internal_counters();
+    EXPECT_TRUE(contract_deltas_are(c1, c2, {.bumps = 1, .bags_freed = 1, .nodes_freed = 1}));
+    EXPECT_EQ(set.get_internal_generation(), 1u);
+    EXPECT_EQ(set.reclaim(), (AdvanceResult{0, 0, 0, 0, 0, Advance::nothing_retired}));
+    EXPECT_TRUE(contract_deltas_are(c2, set.get_internal_counters(), {}));
+    EXPECT_EQ(set.get_internal_generation(), 1u);
+
+    contract_retire(set, 2);
+    contract_retire(set, 3);
+    contract_retire(set, 4);
+    c0 = set.get_internal_counters();
+    EXPECT_EQ(set.reclaim(), (AdvanceResult{3, 1, 0, 0, 0, Advance::advanced}));
+    EXPECT_TRUE(contract_deltas_are(c0, set.get_internal_counters(), {.bumps = 1, .bags_freed = 1, .nodes_freed = 3}));
+    EXPECT_EQ(set.get_internal_generation(), 2u);
+    EXPECT_TRUE(contract_sweep_is(set, 0, 0, 3));
+    EXPECT_TRUE(contract_ring_invariant(set, 64));
+    EXPECT_TRUE(contract_cadence_invariants(set, true));
+    EXPECT_TRUE(setting.holds());
+} // ContractBumpAndFreeReleasedHandleFreesInSameCall
+
+// The two-call latency, as advance()'s without the walk: a long-lived handle
+// refreshed before EACH call. Per round: one node retired; refresh()
+// is the fast path (false: the handle is current); the call closes the bag
+// the handle pins: {0, 0, 0, 0, 0, advanced}; refresh() moves (true: an
+// `advanced` call happened-before it); the next call frees the bag:
+// {1, 1, 0, 0, 0, nothing_retired} (nothing retired between the calls).
+// Five rounds: the steady state, not just the first.
+TEST(ConcurrentHashSetRcuTest, ContractBumpAndFreeHeldHandleTwoCallLatency) {
+    ContractSet set(kContractBuckets, kContractShards);
+    const ContractOneNode<ContractSet> setting(set);
+    ContractSet::handle h = set.new_handle();
+    for (int round = 0; round < 5; ++round) {
+        contract_retire(set, round);
+        EXPECT_FALSE(h.refresh()) << "round " << round;
+        EXPECT_EQ(set.reclaim(), (AdvanceResult{0, 0, 0, 0, 0, Advance::advanced})) << "round " << round;
+        EXPECT_EQ(set.get_internal_bag_count(ContractSet::get_internal_handle_generation(h)), 1u) << "round " << round;
+        EXPECT_TRUE(h.refresh()) << "round " << round;
+        EXPECT_EQ(set.reclaim(), (AdvanceResult{1, 1, 0, 0, 0, Advance::nothing_retired})) << "round " << round;
+    } // loop over rounds
+    EXPECT_EQ(set.get_internal_generation(), 5u);
+    EXPECT_TRUE(setting.holds());
+} // ContractBumpAndFreeHeldHandleTwoCallLatency
+
+// `ring_full`, with advance()'s ring arithmetic holding for reclaim() and for
+// any mix of the two calls, and its counts. A ring of K slots, one handle pinned at
+// generation 0, one node retired before each call: calls 1..K-1 return
+// `advanced` and free nothing; with `alternate`, the odd calls are advance()
+// ({0, 0, 0, B, 0, advanced}) and the even ones reclaim() ({0, 0, 0, 0, 0,
+// advanced}). One more node retired: reclaim() returns {0, 0, 0, 0, 0,
+// ring_full} (the free passes free nothing while the pin holds; the window
+// between them is not a target and the pin never leaves here), and so does
+// advance() right after it (one protocol; a ring_full advance() does not walk
+// either); no slot consumed (generation K-1), the node waits on the retired
+// list, K-1 bags pending. Recovery by refresh: {K-1, K-1, 0, 0, 0, advanced}
+// (the refreshed handle pins the bag the call closes, the one node), then the
+// handle released: {1, 1, 0, 0, 0, nothing_retired}. Recovery by release:
+// {K, K, 0, 0, 0, advanced}. The ring invariant holds after every call.
+template <size_t K>
+static void contract_bump_ring_full_then_recover(bool alternate, bool by_refresh) {
+    using SetT = ContractSetK<K>;
+    SCOPED_TRACE(testing::Message() << "kGenerations " << K << (alternate ? ", alternating advance()/reclaim()" : ", reclaim() only")
+                                    << (by_refresh ? ", recovery by refresh" : ", recovery by release"));
+    SetT set(kContractBuckets, kContractShards);
+    const ContractOneNode<SetT> setting(set);
+    std::unique_ptr<typename SetT::handle> pin = std::make_unique<typename SetT::handle>(set.new_handle());
+    int key = 0;
+    for (size_t call = 1; call < K; ++call) {
+        contract_retire(set, key++);
+        if (alternate && call%2 == 1) {
+            EXPECT_TRUE(contract_advance_is(set, 0, 0, Advance::advanced)) << "call " << call;
+        } else {
+            EXPECT_EQ(set.reclaim(), (AdvanceResult{0, 0, 0, 0, 0, Advance::advanced})) << "call " << call;
+        }
+        EXPECT_TRUE(contract_ring_invariant(set, K)) << "call " << call;
+    } // calls 1 .. K-1
+    contract_retire(set, key++);
+    const typename SetT::InternalCounters c0 = set.get_internal_counters();
+    EXPECT_EQ(set.reclaim(), (AdvanceResult{0, 0, 0, 0, 0, Advance::ring_full})) << "call " << K;
+    EXPECT_TRUE(contract_advance_is(set, 0, 0, Advance::ring_full)) << "call " << K + 1;
+    const typename SetT::InternalCounters c1 = set.get_internal_counters();
+    EXPECT_EQ(c1.ring_full - c0.ring_full, 2u);
+    EXPECT_EQ(c1.bumps - c0.bumps, 0u);
+    EXPECT_EQ(set.get_internal_generation(), K - 1);
+    EXPECT_TRUE(contract_ring_invariant(set, K));
+    EXPECT_TRUE(contract_sweep_is(set, 1, K - 1, 0));
+    if (by_refresh) {
+        EXPECT_TRUE(pin->refresh());
+        EXPECT_EQ(set.reclaim(), (AdvanceResult{K - 1, K - 1, 0, 0, 0, Advance::advanced}));
+        EXPECT_TRUE(contract_ring_invariant(set, K));
+        pin.reset();
+        EXPECT_EQ(set.reclaim(), (AdvanceResult{1, 1, 0, 0, 0, Advance::nothing_retired}));
+    } else {
+        pin.reset();
+        EXPECT_EQ(set.reclaim(), (AdvanceResult{K, K, 0, 0, 0, Advance::advanced}));
+    }
+    EXPECT_TRUE(contract_ring_invariant(set, K));
+    EXPECT_EQ(set.get_internal_generation(), K);
+    EXPECT_TRUE(contract_sweep_is(set, 0, 0, K));
+    EXPECT_TRUE(setting.holds());
+} // contract_bump_ring_full_then_recover()
+
+// reclaim() alone: `ring_full` under a held pin and both recoveries, at the
+// minimum ring (2), a small one (4) and the default (64).
+TEST(ConcurrentHashSetRcuTest, ContractBumpAndFreeRingFullWithPinHeld) {
+    contract_bump_ring_full_then_recover<2>(false, true);
+    contract_bump_ring_full_then_recover<2>(false, false);
+    contract_bump_ring_full_then_recover<4>(false, true);
+    contract_bump_ring_full_then_recover<4>(false, false);
+    contract_bump_ring_full_then_recover<64>(false, true);
+    contract_bump_ring_full_then_recover<64>(false, false);
+} // ContractBumpAndFreeRingFullWithPinHeld
+
+// The same with advance() and reclaim() alternating (one protocol).
+TEST(ConcurrentHashSetRcuTest, ContractBumpAndFreeRingFullMixedWithAdvance) {
+    contract_bump_ring_full_then_recover<3>(true, true);
+    contract_bump_ring_full_then_recover<4>(true, false);
+    contract_bump_ring_full_then_recover<64>(true, true);
+    contract_bump_ring_full_then_recover<64>(true, false);
+} // ContractBumpAndFreeRingFullMixedWithAdvance
+
+// A fixed script of inserts, erases, handle moves and explicit calls of both
+// kinds on a set in the one-node setting (kContractBuckets buckets, one
+// shard), each call checked against its literal and appended to `results`.
+// Expected values, from the model above, reclaim() being advance() without
+// the walk (B = kContractBuckets; n = the reachable nodes before an
+// advance(), checked by the sweep before each advance() that has keys
+// present):
+//    1. fresh: reclaim() {0,0,0,0,0,NR}; advance() {0,0,0,B,0,NR}
+//    2. one node retired, no handle: reclaim() {1,1,0,0,0,ADV}        gen 1
+//    3. one node retired, no handle: advance() {1,1,0,B,0,ADV}         gen 2
+//    4. h joins (gen 2); keys 100..104 inserted, 100 erased under h:
+//       reclaim() {0,0,0,0,0,ADV}: h pins the bag it closes            gen 3
+//    5. 101 erased under h: advance() {0,0,0,B,3,ADV}: the pin is
+//       cumulative, 3 keys reachable                                   gen 4
+//    6. h refreshed (moves: true): reclaim() {2,2,0,0,0,NR}: the two
+//       bags h pinned are freed although nothing was retired
+//    7. 102 erased under h; refresh() is the fast path (false):
+//       advance() {0,0,0,B,2,ADV}                                       gen 5
+//    8. h released: reclaim() {1,1,0,0,0,NR}
+//    9. 103, 104 retired, no handle: reclaim() {2,1,0,0,0,ADV}         gen 6
+//   10. advance() {0,0,0,B,0,NR}
+// A call is never `contended` here (single-threaded, quiescent). Returns
+// with no handle of the set live.
+template <typename SetT>
+static void contract_bump_and_advance_script(SetT& set, std::vector<AdvanceResult>& results) {
+    constexpr size_t B = kContractBuckets;
+    // Runs one call, records it, and compares it with `want`.
+    auto call = [&](bool walk, const AdvanceResult& want, const char* step) {
+        const AdvanceResult got = walk ? set.advance() : set.reclaim();
+        results.push_back(got);
+        EXPECT_EQ(got, want) << step << (walk ? ": advance()" : ": reclaim()");
+    }; // call
+    // The precondition of an exact nodes_passed: `live` keys reachable, none dead.
+    auto expect_reachable = [&](size_t live, const char* step) {
+        const typename SetT::InternalAccounting acc = set.get_internal_accounting();
+        EXPECT_EQ(acc.reachable, live) << step;
+        EXPECT_EQ(acc.reachable_dead, 0u) << step;
+    }; // expect_reachable
+    call(false, {0, 0, 0, 0, 0, Advance::nothing_retired}, "1");
+    call(true, {0, 0, 0, B, 0, Advance::nothing_retired}, "1");
+    contract_retire(set, 1);
+    call(false, {1, 1, 0, 0, 0, Advance::advanced}, "2");
+    contract_retire(set, 2);
+    call(true, {1, 1, 0, B, 0, Advance::advanced}, "3");
+    {
+        std::unique_ptr<typename SetT::handle> h = std::make_unique<typename SetT::handle>(set.new_handle());
+        for (int k = 100; k < 105; ++k) EXPECT_TRUE(set.insert(*h, k));
+        EXPECT_TRUE(set.erase(*h, 100));
+        call(false, {0, 0, 0, 0, 0, Advance::advanced}, "4");
+        EXPECT_TRUE(set.erase(*h, 101));
+        expect_reachable(3, "5");
+        call(true, {0, 0, 0, B, 3, Advance::advanced}, "5");
+        EXPECT_TRUE(h->refresh());
+        call(false, {2, 2, 0, 0, 0, Advance::nothing_retired}, "6");
+        EXPECT_TRUE(set.erase(*h, 102));
+        EXPECT_FALSE(h->refresh());
+        expect_reachable(2, "7");
+        call(true, {0, 0, 0, B, 2, Advance::advanced}, "7");
+        h.reset();
+        call(false, {1, 1, 0, 0, 0, Advance::nothing_retired}, "8");
+    } // h's scope
+    {
+        typename SetT::handle h = set.new_handle();
+        EXPECT_TRUE(set.erase(h, 103));
+        EXPECT_TRUE(set.erase(h, 104));
+    } // the temporary handle's scope
+    call(false, {2, 1, 0, 0, 0, Advance::advanced}, "9");
+    call(true, {0, 0, 0, B, 0, Advance::nothing_retired}, "10");
+    EXPECT_EQ(set.get_internal_generation(), 6u);
+} // contract_bump_and_advance_script()
+
+// advance() keeps its contract exactly beside reclaim(); the two are one
+// protocol (the generation +1 per `advanced` of either call, the same bags,
+// pins and cumulative free pass); reclaim()'s literals and advance()'s, walk
+// counts included, on one set mixing both calls: the script above. Then the
+// accounting is consistent, nothing retired or bagged, and the free count is
+// the 7 nodes freed minus the 2 that later inserts reused (reuse before
+// growth: key 2's insert after step 2, key 100's after step 3): 5.
+TEST(ConcurrentHashSetRcuTest, ContractBumpAndFreeMixesWithAdvanceAsOneProtocol) {
+    ContractSet set(kContractBuckets, kContractShards);
+    const ContractOneNode<ContractSet> setting(set);
+    std::vector<AdvanceResult> results;
+    contract_bump_and_advance_script(set, results);
+    EXPECT_EQ(results.size(), 11u);
+    EXPECT_TRUE(contract_sweep_is(set, 0, 0, 5));
+    EXPECT_TRUE(contract_ring_invariant(set, 64));
+    EXPECT_TRUE(setting.holds());
+} // ContractBumpAndFreeMixesWithAdvanceAsOneProtocol
+
+// The per-thread timers: across a reclaim(), the calling
+// thread's advance_ns, bump_ns and free_ns increase and walk_ns does not;
+// `joins` does not move (reclaim() joins nothing; the walk is the one that
+// would). advance_ns is entry to return, so it is at least the bump and free
+// time it contains. One clock tick may be coarser than one call's bump, so
+// the "increase" is asserted over 20 calls, each of which bumps and frees one
+// node ({1, 1, 0, 0, 0, advanced}); walk_ns and joins are asserted unchanged
+// per call.
+TEST(ConcurrentHashSetRcuTest, ContractBumpAndFreeChargesNoWalkTime) {
+    ContractSet set(kContractBuckets, kContractShards);
+    const ContractOneNode<ContractSet> setting(set);
+    using Timers = ContractSet::InternalTimers;
+    uint64_t advance_ns = 0;
+    uint64_t bump_ns = 0;
+    uint64_t free_ns = 0;
+    for (int round = 0; round < 20; ++round) {
+        contract_retire(set, round);
+        const ContractSet::InternalCounters c0 = set.get_internal_counters();
+        const Timers t0 = ContractSet::internal_advance_timers();
+        EXPECT_EQ(set.reclaim(), (AdvanceResult{1, 1, 0, 0, 0, Advance::advanced})) << "round " << round;
+        const Timers t1 = ContractSet::internal_advance_timers();
+        const ContractSet::InternalCounters c1 = set.get_internal_counters();
+        EXPECT_EQ(t1.walk_ns, t0.walk_ns) << "round " << round << ": reclaim() charged walk time";
+        EXPECT_EQ(c1.joins, c0.joins) << "round " << round << ": reclaim() joined";
+        EXPECT_GE(t1.advance_ns - t0.advance_ns, (t1.bump_ns - t0.bump_ns) + (t1.free_ns - t0.free_ns)) << "round " << round;
+        advance_ns += t1.advance_ns - t0.advance_ns;
+        bump_ns += t1.bump_ns - t0.bump_ns;
+        free_ns += t1.free_ns - t0.free_ns;
+    } // loop over rounds
+    EXPECT_GT(advance_ns, 0u);
+    EXPECT_GT(bump_ns, 0u);
+    EXPECT_GT(free_ns, 0u);
+    EXPECT_TRUE(setting.holds());
+} // ContractBumpAndFreeChargesNoWalkTime
+
+// `contended`: the flag is shared, so a reclaim() that finds it held by an
+// advance() returns {0, 0, 0, 0, 0, contended} at once, having done nothing;
+// `contended` counts explicit refusals (+1 per refused call); a `contended`
+// reclaim() charges the calling thread's advance_ns and nothing else. The
+// advance() is parked inside its walk's Hash{} on another thread (the
+// unfinished-split construction of the contract tests above). After it
+// resumes, the next reclaim() is not `contended` (the flag was released).
+TEST(ConcurrentHashSetRcuTest, ContractBumpAndFreeContendedWhileAdvanceParked) {
+    using SetT = ConcurrentResizableHashSetRCU<int, true, ContractHookHash>;
+    using Timers = SetT::InternalTimers;
+    constexpr int kCalls = 10;
+    SetT set(64, 1);
+    int next_key = 0;
+    std::vector<int> thrown;
+    ContractParkedAdvance<SetT, int> parked(set, next_key, thrown);
+    ASSERT_TRUE(parked.parked()) << "construction: no parked walk (the unfinished split was not reached or the walk did not hash)";
+    const SetT::InternalCounters c0 = set.get_internal_counters();
+    const Timers t0 = SetT::internal_advance_timers();
+    for (int i = 0; i < kCalls; ++i) EXPECT_EQ(set.reclaim(), kContended) << "call " << i;
+    const Timers t1 = SetT::internal_advance_timers();
+    const SetT::InternalCounters c1 = set.get_internal_counters();
+    EXPECT_EQ(c1.contended - c0.contended, static_cast<size_t>(kCalls));
+    EXPECT_EQ(c1.bumps, c0.bumps);
+    EXPECT_EQ(c1.nodes_freed, c0.nodes_freed);
+    EXPECT_GT(t1.advance_ns, t0.advance_ns);
+    EXPECT_EQ(t1.bump_ns, t0.bump_ns);
+    EXPECT_EQ(t1.free_ns, t0.free_ns);
+    EXPECT_EQ(t1.walk_ns, t0.walk_ns);
+    const AdvanceResult r = parked.resume();
+    EXPECT_NE(r.advance, Advance::contended);
+    EXPECT_NE(set.reclaim().advance, Advance::contended);
+    EXPECT_EQ(contract_membership_errors<int>(set, next_key, thrown), 0);
+} // ContractBumpAndFreeContendedWhileAdvanceParked
+
+// Nested calls, with reclaim() in advance()'s place: from inside
+// Hash{} while advance()'s walk is calling it (the unfinished-split
+// construction), a nested reclaim() returns `contended`; from inside Hash{}
+// called by an OPERATION, a nested reclaim() proceeds like any other call,
+// and the operation's own handle pins the generation it closes.
+// The second half is exact on a one-node-setting set: one node retired with
+// no handle, then h joins (the current generation 0) and an insert under h
+// runs reclaim() from its first Hash{} call: {0, 0, 0, 0, 0, advanced} (h
+// pins the closed bag); h released, the next call frees it:
+// {1, 1, 0, 0, 0, nothing_retired}.
+TEST(ConcurrentHashSetRcuTest, ContractBumpAndFreeNestedCalls) {
+    using SetT = ConcurrentResizableHashSetRCU<int, true, ContractHookHash>;
+    {
+        SetT set(64, 1);
+        int next_key = 0;
+        std::vector<int> thrown;
+        ASSERT_TRUE(contract_leave_unfinished_split<int>(set, next_key, thrown))
+            << "construction: no insert throwing inside a split left a state whose walk calls Hash{} (an unfinished split)";
+        AdvanceResult nested{};
+        bool ran = false;
+        ContractHashControl::nested = [&] {
+            nested = set.reclaim();
+            ran = true;
+        }; // the nested action
+        const AdvanceResult outer = set.advance();
+        ContractHashControl::nested = nullptr;
+        ASSERT_TRUE(ran) << "the walk did not call Hash{}";
+        EXPECT_EQ(nested, kContended);
+        EXPECT_NE(outer.advance, Advance::contended);
+    } // the walk case
+    {
+        SetT set(kContractBuckets, kContractShards);
+        const ContractOneNode<SetT> setting(set);
+        contract_retire(set, 1);
+        AdvanceResult from_operation{};
+        bool ran = false;
+        {
+            SetT::handle h = set.new_handle();
+            ContractHashControl::nested = [&] {
+                from_operation = set.reclaim();
+                ran = true;
+            }; // the nested action
+            EXPECT_TRUE(set.insert(h, 2));
+            ContractHashControl::nested = nullptr;
+        } // h's scope
+        ASSERT_TRUE(ran) << "the insert did not call Hash{}";
+        EXPECT_EQ(from_operation, (AdvanceResult{0, 0, 0, 0, 0, Advance::advanced}));
+        EXPECT_EQ(set.reclaim(), (AdvanceResult{1, 1, 0, 0, 0, Advance::nothing_retired}));
+        EXPECT_TRUE(set.contains(set.new_handle(), 2));
+        EXPECT_TRUE(setting.holds());
+    } // the operation case
+} // ContractBumpAndFreeNestedCalls
+
+// Returns the result of one reclaim() on `set` with the hooked Hash{} counting
+// and the counted key's call counters checked unchanged across it.
+template <typename SetT>
+static AdvanceResult contract_reclaim_reading_nothing(SetT& set, const char* where) {
+    const size_t d0 = ContractCountedKey::destructor_calls.load();
+    const size_t e0 = ContractCountedKey::equality_calls.load();
+    const size_t a0 = ContractCountedKey::assign_calls.load();
+    const size_t c0 = ContractCountedKey::copy_calls.load();
+    ContractHashControl::mode = ContractHashMode::count;
+    ContractHashControl::calls = 0;
+    const AdvanceResult r = set.reclaim();
+    ContractHashControl::mode = ContractHashMode::plain;
+    EXPECT_EQ(ContractHashControl::calls, 0u) << where << ": Hash{} calls";
+    EXPECT_EQ(ContractCountedKey::destructor_calls.load(), d0) << where << ": destructions";
+    EXPECT_EQ(ContractCountedKey::equality_calls.load(), e0) << where << ": == calls";
+    EXPECT_EQ(ContractCountedKey::assign_calls.load(), a0) << where << ": copy assignments";
+    EXPECT_EQ(ContractCountedKey::copy_calls.load(), c0) << where << ": copy constructions";
+    return r;
+} // contract_reclaim_reading_nothing()
+
+// The twin of advance()'s no-value-read test: reclaim() reads NO stored value -- no
+// Hash{}, no ==, no copy, no assignment, no destruction. Two states: (1) the
+// unfinished-split construction (the one state in which advance()'s walk
+// hashes), where the outcome of the call is whatever the construction left
+// (not asserted beyond "not contended, no walk counts"); (2) a one-node-setting
+// set with one node retired and no handle, where the call bumps and frees:
+// {1, 1, 0, 0, 0, advanced}, and still touches no value.
+TEST(ConcurrentHashSetRcuTest, ContractBumpAndFreeReadsNoStoredValue) {
+    using SetT = ConcurrentResizableHashSetRCU<ContractCountedKey, true, ContractCountedKeyHash>;
+    {
+        SetT set(64, 1);
+        int next_key = 0;
+        std::vector<int> thrown;
+        ASSERT_TRUE(contract_leave_unfinished_split<ContractCountedKey>(set, next_key, thrown))
+            << "construction: no insert throwing inside a split left a state whose walk calls Hash{} (an unfinished split)";
+        const AdvanceResult r = contract_reclaim_reading_nothing(set, "unfinished split");
+        EXPECT_NE(r.advance, Advance::contended);
+        EXPECT_EQ(r.walk_retired + r.buckets_walked + r.nodes_passed, 0u) << testing::PrintToString(r);
+        EXPECT_EQ(contract_membership_errors<ContractCountedKey>(set, next_key, thrown), 0);
+    } // the unfinished-split state
+    {
+        SetT set(kContractBuckets, kContractShards);
+        const ContractOneNode<SetT> setting(set);
+        contract_retire(set, ContractCountedKey(1));
+        EXPECT_EQ(contract_reclaim_reading_nothing(set, "one node retired"), (AdvanceResult{1, 1, 0, 0, 0, Advance::advanced}));
+        EXPECT_TRUE(setting.holds());
+    } // the one-node state
+} // ContractBumpAndFreeReadsNoStoredValue
+
+// ===========================================================================
+// The Options constructor and the effective cadence.
+// ===========================================================================
+
+// Options is a nested aggregate of three size_t fields in the order
+// initial_capacity, arena_shards, auto_reclaim_every, defaults {4, 0, 0},
+// usable with designated initializers and positionally; a plain copyable,
+// movable, trivially copyable and destructible type.
+TEST(ConcurrentHashSetRcuTest, ContractCadenceOptionsIsAPlainAggregate) {
+    using Options = ContractSet::Options;
+    static_assert(std::is_aggregate_v<Options>);
+    static_assert(std::is_trivially_copyable_v<Options>);
+    static_assert(std::is_trivially_destructible_v<Options>);
+    static_assert(std::is_nothrow_copy_constructible_v<Options> && std::is_nothrow_move_constructible_v<Options>);
+    static_assert(std::is_same_v<decltype(Options::initial_capacity), size_t>);
+    static_assert(std::is_same_v<decltype(Options::arena_shards), size_t>);
+    static_assert(std::is_same_v<decltype(Options::auto_reclaim_every), size_t>);
+    const Options defaults{};
+    EXPECT_EQ(defaults.initial_capacity, 4u);
+    EXPECT_EQ(defaults.arena_shards, 0u);
+    EXPECT_EQ(defaults.auto_reclaim_every, 0u);
+    const Options designated{.auto_reclaim_every = 8192};
+    EXPECT_EQ(designated.initial_capacity, 4u);
+    EXPECT_EQ(designated.arena_shards, 0u);
+    EXPECT_EQ(designated.auto_reclaim_every, 8192u);
+    const Options positional{4096, 1, 8};
+    EXPECT_EQ(positional.initial_capacity, 4096u);
+    EXPECT_EQ(positional.arena_shards, 1u);
+    EXPECT_EQ(positional.auto_reclaim_every, 8u);
+    const Options copy = positional;
+    EXPECT_EQ(copy.auto_reclaim_every, 8u);
+} // ContractCadenceOptionsIsAPlainAggregate
+
+// The effective cadence, through
+// get_internal_auto_reclaim_every(): 0 means OFF (decided before any
+// rounding: bit_ceil(0) would be 1); otherwise min(value, 2^63) rounded up to
+// a power of two. Partitions: 0; powers of two (unchanged: 1, 2, 4, 2^62,
+// 2^63); non-powers below the clamp (rounded up: 3 -> 4, 5 -> 8, 1000 ->
+// 1024, 2^62 + 1 -> 2^63, 2^63 - 1 -> 2^63); above the clamp (clamped:
+// 2^63 + 1, SIZE_MAX - 1, SIZE_MAX -> 2^63). The two-parameter constructor in
+// every spelling reads 0 (the cadence off). For three instantiations
+// (the value does not depend on T, AllowDelete or the ring). Each set's
+// cadence counters start at 0.
+TEST(ConcurrentHashSetRcuTest, ContractCadenceEffectiveValueIsRoundedAndClamped) {
+    constexpr size_t kTop = kContractCadenceClamp;
+    const std::pair<size_t, size_t> cases[] = {
+        {0, 0}, {1, 1}, {2, 2}, {3, 4}, {4, 4}, {5, 8}, {1000, 1024},
+        {kTop >> 1, kTop >> 1}, {(kTop >> 1) + 1, kTop}, {kTop - 1, kTop}, {kTop, kTop},
+        {kTop + 1, kTop}, {std::numeric_limits<size_t>::max() - 1, kTop}, {std::numeric_limits<size_t>::max(), kTop},
+    }; // requested -> effective
+    for (const std::pair<size_t, size_t>& c : cases) {
+        ContractSet set(contract_cadence_options<ContractSet>(c.first));
+        EXPECT_EQ(set.get_internal_auto_reclaim_every(), c.second) << "requested " << c.first;
+        const ContractSet::InternalCounters counters = set.get_internal_counters();
+        EXPECT_EQ(counters.auto_reclaims, 0u) << "requested " << c.first;
+        EXPECT_EQ(counters.auto_skipped, 0u) << "requested " << c.first;
+        ContractSetNoDel nodel(contract_cadence_options<ContractSetNoDel>(c.first));
+        EXPECT_EQ(nodel.get_internal_auto_reclaim_every(), c.second) << "requested " << c.first << ", AllowDelete false";
+        ContractSetK<2> small_ring(contract_cadence_options<ContractSetK<2>>(c.first));
+        EXPECT_EQ(small_ring.get_internal_auto_reclaim_every(), c.second) << "requested " << c.first << ", kGenerations 2";
+    } // loop over requested cadences
+    ContractSet two_parameters(kContractBuckets, kContractShards);
+    EXPECT_EQ(two_parameters.get_internal_auto_reclaim_every(), 0u);
+    ContractSet one_parameter(kContractBuckets);
+    EXPECT_EQ(one_parameter.get_internal_auto_reclaim_every(), 0u);
+    ContractSet defaulted;
+    EXPECT_EQ(defaulted.get_internal_auto_reclaim_every(), 0u);
+    ContractSet default_options(ContractSet::Options{});
+    EXPECT_EQ(default_options.get_internal_auto_reclaim_every(), 0u);
+} // ContractCadenceEffectiveValueIsRoundedAndClamped
+
+// The capacity and shard rules, the same for both constructors: Set(c, s)
+// and Set(Options{c, s, 0}) give the same get_internal_table_size() and
+// get_internal_arena_shards() on a fresh set, and both follow them: capacity
+// below 4 becomes 4, else rounded up to a power of two; shards 0 means
+// hardware_concurrency() (1 if that is 0), capped at 2^16, rounded up to a
+// power of two. A non-zero cadence changes neither (it "changes no
+// allocation").
+TEST(ConcurrentHashSetRcuTest, ContractCadenceOptionsConstructorSizesAsTwoParameterOne) {
+    const unsigned hc = std::thread::hardware_concurrency();
+    const size_t default_shards = std::bit_ceil(std::min<size_t>(hc == 0 ? 1 : hc, size_t{1} << 16));
+    const std::pair<size_t, size_t> capacities[] = {{0, 4}, {1, 4}, {3, 4}, {4, 4}, {5, 8}, {100, 128}, {4096, 4096}};
+    const std::pair<size_t, size_t> shards[] = {{0, default_shards}, {1, 1}, {3, 4}, {5, 8}};
+    for (const std::pair<size_t, size_t>& c : capacities) {
+        for (const std::pair<size_t, size_t>& s : shards) {
+            SCOPED_TRACE(testing::Message() << "capacity " << c.first << ", shards " << s.first);
+            ContractSet two(c.first, s.first);
+            ContractSet off(ContractSet::Options{c.first, s.first, 0});
+            ContractSet cadenced(ContractSet::Options{c.first, s.first, 3});
+            EXPECT_EQ(two.get_internal_table_size(), c.second);
+            EXPECT_EQ(off.get_internal_table_size(), c.second);
+            EXPECT_EQ(cadenced.get_internal_table_size(), c.second);
+            EXPECT_EQ(two.get_internal_arena_shards(), s.second);
+            EXPECT_EQ(off.get_internal_arena_shards(), s.second);
+            EXPECT_EQ(cadenced.get_internal_arena_shards(), s.second);
+            EXPECT_EQ(cadenced.get_internal_auto_reclaim_every(), 4u);
+        } // loop over shard counts
+    } // loop over capacities
+} // ContractCadenceOptionsConstructorSizesAsTwoParameterOne
+
+// A set built through Options with cadence 0 is indistinguishable from one
+// built with the
+// two parameters, WITH erases and explicit calls of both kinds: the same
+// script (contract_bump_and_advance_script(), whose every call is also checked
+// against its literal) gives the same whole AdvanceResult literals on both,
+// the same table size and shard count, and auto_reclaims == auto_skipped == 0
+// at the end on both. A cadence of 0 rounded to 1 instead would trigger at
+// every erase and change the explicit calls' results.
+TEST(ConcurrentHashSetRcuTest, ContractCadenceZeroEqualsTwoParameterConstructor) {
+    ContractSet two(kContractBuckets, kContractShards);
+    ContractSet off(contract_cadence_options<ContractSet>(0));
+    const ContractOneNode<ContractSet> two_setting(two);
+    const ContractOneNode<ContractSet> off_setting(off);
+    std::vector<AdvanceResult> two_results;
+    std::vector<AdvanceResult> off_results;
+    {
+        SCOPED_TRACE("two-parameter constructor");
+        contract_bump_and_advance_script(two, two_results);
+    }
+    {
+        SCOPED_TRACE("Options constructor, cadence 0");
+        contract_bump_and_advance_script(off, off_results);
+    }
+    ASSERT_EQ(off_results.size(), two_results.size());
+    for (size_t i = 0; i < two_results.size(); ++i) EXPECT_EQ(off_results[i], two_results[i]) << "call " << i;
+    EXPECT_EQ(off.get_internal_table_size(), two.get_internal_table_size());
+    EXPECT_EQ(off.get_internal_arena_shards(), two.get_internal_arena_shards());
+    for (const ContractSet* set : {&two, &off}) {
+        const ContractSet::InternalCounters c = set->get_internal_counters();
+        EXPECT_EQ(c.auto_reclaims, 0u);
+        EXPECT_EQ(c.auto_skipped, 0u);
+        EXPECT_EQ(set->get_internal_auto_reclaim_every(), 0u);
+        EXPECT_TRUE(contract_cadence_invariants(*set, true));
+    } // loop over the two sets
+    EXPECT_TRUE(two_setting.holds());
+    EXPECT_TRUE(off_setting.holds());
+} // ContractCadenceZeroEqualsTwoParameterConstructor
+
+// ===========================================================================
+// The cadence scripts (CADENCE SETTING, one thread, no explicit call in
+// progress).
+// ===========================================================================
+
+// Requested cadence -> effective R, the partitions the scripts run over:
+// R = 1 (every erase triggers), small powers of two, and non-powers that the
+// rounding moves (3 -> 4, 5 -> 8).
+static constexpr std::pair<size_t, size_t> kContractCadences[] = {{1, 1}, {2, 2}, {3, 4}, {4, 4}, {5, 8}, {8, 8}, {16, 16}};
+
+// The cadence's first round, its exact counting invariant and the per-shard
+// view: with a handle h joined before the first erase, erases 1..R-1
+// trigger nothing (bumps +0, auto_reclaims + auto_skipped +0, nothing freed;
+// each retires exactly one node, the shard's entry +1 per erase) and leave
+// R-1 nodes on the retired list; the R-th erase triggers and the trigger
+// PROCEEDS with an `advanced` bump: bumps +1, auto_reclaims +1, auto_skipped
+// +0, the retired list empty, the bag of the generation g it closed holding
+// all R nodes -- the crossing run included (a trigger placed before the push
+// would leave it on the retired list) -- the generation g + 1, and nothing
+// freed (h pins the closed bag). Inserts retire nothing in the setting.
+// A requested 3 fires at the 4th erase and a requested 5 at the 8th (the
+// rounding up to a power of two).
+TEST(ConcurrentHashSetRcuTest, ContractCadenceRMinusOneErasesFreeNothingRthBagsThem) {
+    for (const std::pair<size_t, size_t>& cadence : kContractCadences) {
+        const size_t r = cadence.second;
+        SCOPED_TRACE(testing::Message() << "requested cadence " << cadence.first << ", R " << r);
+        ContractSet set(contract_cadence_options<ContractSet>(cadence.first));
+        ASSERT_EQ(set.get_internal_auto_reclaim_every(), r);
+        const ContractOneNode<ContractSet> setting(set);
+        std::unique_ptr<ContractSet::handle> h = std::make_unique<ContractSet::handle>(set.new_handle());
+        ContractSet::InternalCounters before = set.get_internal_counters();
+        for (int k = 0; k < static_cast<int>(r); ++k) EXPECT_TRUE(set.insert(*h, k));
+        EXPECT_TRUE(contract_deltas_are(before, set.get_internal_counters(), {})) << "the inserts";
+        const uint64_t g = set.get_internal_generation();
+        for (size_t i = 1; i < r; ++i) {
+            before = set.get_internal_counters();
+            EXPECT_TRUE(set.erase(*h, static_cast<int>(i - 1)));
+            const ContractSet::InternalCounters after = set.get_internal_counters();
+            EXPECT_TRUE(contract_deltas_are(before, after, {.retire_nodes = 1, .retire_runs = 1})) << "erase " << i;
+            const std::vector<size_t> per_shard = set.get_internal_retire_nodes_per_shard();
+            ASSERT_EQ(per_shard.size(), 1u);
+            EXPECT_EQ(per_shard[0], after.retire_nodes) << "erase " << i;
+        } // erases 1 .. R-1
+        EXPECT_TRUE(contract_sweep_is(set, r - 1, 0, 0)) << "after R-1 erases";
+        EXPECT_EQ(set.get_internal_generation(), g);
+        before = set.get_internal_counters();
+        EXPECT_TRUE(set.erase(*h, static_cast<int>(r - 1)));
+        EXPECT_TRUE(contract_deltas_are(before, set.get_internal_counters(), {.retire_nodes = 1, .retire_runs = 1, .bumps = 1, .auto_reclaims = 1}))
+            << "the R-th erase";
+        EXPECT_TRUE(contract_sweep_is(set, 0, r, 0)) << "after the R-th erase";
+        EXPECT_EQ(set.get_internal_bag_count(g), r);
+        EXPECT_EQ(set.get_internal_generation(), g + 1);
+        EXPECT_TRUE(contract_ring_invariant(set, 64));
+        EXPECT_TRUE(contract_cadence_invariants(set, true));
+        EXPECT_TRUE(setting.holds());
+    } // loop over cadences
+} // ContractCadenceRMinusOneErasesFreeNothingRthBagsThem
+
+// Each round's trigger frees the PREVIOUS round's bag,
+// given a refresh of h between rounds. Round 0: R erases, the R-th trigger
+// closes the first bag (h pins it, nothing freed). Rounds 1..4: h.refresh()
+// (moves: the trigger's publish happened-before it), R
+// erases; the R-th trigger frees the previous round's bag (bags_freed +1,
+// nodes_freed + R, free nodes + R) and closes this round's, which h now pins
+// (bagged == R, the bag of the generation it closed == R). Round 5 without
+// the refresh: its trigger frees nothing (h pins its own previous bag)
+// and bagged == 2R. Then h released: nothing is freed by the release (no
+// handle's leave frees anything), and one explicit reclaim() frees both
+// bags: {2R, 2, 0, 0, 0, nothing_retired}.
+TEST(ConcurrentHashSetRcuTest, ContractCadenceEachTriggerFreesThePreviousBagAfterRefresh) {
+    for (const std::pair<size_t, size_t>& cadence : {std::pair<size_t, size_t>{1, 1}, {3, 4}, {8, 8}}) {
+        const size_t r = cadence.second;
+        SCOPED_TRACE(testing::Message() << "requested cadence " << cadence.first << ", R " << r);
+        ContractSet set(contract_cadence_options<ContractSet>(cadence.first));
+        const ContractOneNode<ContractSet> setting(set);
+        std::unique_ptr<ContractSet::handle> h = std::make_unique<ContractSet::handle>(set.new_handle());
+        constexpr int kRounds = 6;
+        for (int k = 0; k < kRounds*static_cast<int>(r); ++k) EXPECT_TRUE(set.insert(*h, k));
+        int next = 0;
+        for (int round = 0; round < kRounds; ++round) {
+            const bool refreshed = round > 0 && round < kRounds - 1;
+            if (refreshed) {
+                EXPECT_TRUE(h->refresh()) << "round " << round;
+                EXPECT_EQ(ContractSet::get_internal_handle_generation(*h), set.get_internal_generation()) << "round " << round;
+            }
+            for (size_t i = 1; i < r; ++i) {
+                const ContractSet::InternalCounters before = set.get_internal_counters();
+                EXPECT_TRUE(set.erase(*h, next++));
+                EXPECT_TRUE(contract_deltas_are(before, set.get_internal_counters(), {.retire_nodes = 1, .retire_runs = 1}))
+                    << "round " << round << ", erase " << i;
+            } // erases 1 .. R-1 of the round
+            const uint64_t g = set.get_internal_generation();
+            const ContractSet::InternalCounters before = set.get_internal_counters();
+            EXPECT_TRUE(set.erase(*h, next++));
+            const size_t freed_bags = refreshed ? 1 : 0;
+            EXPECT_TRUE(contract_deltas_are(before, set.get_internal_counters(),
+                                            {.retire_nodes = 1, .retire_runs = 1, .bumps = 1, .auto_reclaims = 1, .bags_freed = freed_bags,
+                                             .nodes_freed = freed_bags*r}))
+                << "round " << round << ", the R-th erase";
+            const size_t freed_so_far = round < kRounds - 1 ? static_cast<size_t>(round)*r : static_cast<size_t>(kRounds - 2)*r;
+            const size_t bagged = round < kRounds - 1 ? r : 2*r;
+            EXPECT_TRUE(contract_sweep_is(set, 0, bagged, freed_so_far)) << "round " << round;
+            EXPECT_EQ(set.get_internal_bag_count(g), r) << "round " << round;
+            EXPECT_EQ(set.get_internal_generation(), g + 1) << "round " << round;
+            EXPECT_TRUE(contract_ring_invariant(set, 64)) << "round " << round;
+        } // loop over rounds
+        const size_t freed_before_release = static_cast<size_t>(kRounds - 2)*r;
+        h.reset();
+        EXPECT_TRUE(contract_sweep_is(set, 0, 2*r, freed_before_release)) << "after the release";
+        EXPECT_EQ(set.reclaim(), (AdvanceResult{2*r, 2, 0, 0, 0, Advance::nothing_retired}));
+        EXPECT_TRUE(contract_sweep_is(set, 0, 0, freed_before_release + 2*r)) << "after the explicit call";
+        EXPECT_TRUE(contract_cadence_invariants(set, true));
+        EXPECT_TRUE(setting.holds());
+    } // loop over cadences
+} // ContractCadenceEachTriggerFreesThePreviousBagAfterRefresh
+
+// After one round (R erases under h, the R-th trigger
+// closed a bag of R nodes that h pins), an explicit reclaim() at the
+// quiescent point -- never `contended` -- with h refreshed first frees that
+// bag: {R, 1, 0, 0, 0, nothing_retired}; with h still at the old generation
+// it frees nothing: {0, 0, 0, 0, 0, nothing_retired}. An explicit call is
+// not a trigger: auto_reclaims and auto_skipped do not move, and with
+// nothing retired it does not bump.
+TEST(ConcurrentHashSetRcuTest, ContractCadenceExplicitCallAfterFirstRound) {
+    for (const std::pair<size_t, size_t>& cadence : {std::pair<size_t, size_t>{1, 1}, {3, 4}, {8, 8}}) {
+        for (bool refresh : {true, false}) {
+            const size_t r = cadence.second;
+            SCOPED_TRACE(testing::Message() << "R " << r << (refresh ? ", h refreshed" : ", h at the old generation"));
+            ContractSet set(contract_cadence_options<ContractSet>(cadence.first));
+            const ContractOneNode<ContractSet> setting(set);
+            ContractSet::handle h = set.new_handle();
+            for (int k = 0; k < static_cast<int>(r); ++k) EXPECT_TRUE(set.insert(h, k));
+            for (int k = 0; k < static_cast<int>(r); ++k) EXPECT_TRUE(set.erase(h, k));
+            EXPECT_TRUE(contract_sweep_is(set, 0, r, 0)) << "after the first round";
+            if (refresh) {
+                EXPECT_TRUE(h.refresh());
+            }
+            const ContractSet::InternalCounters before = set.get_internal_counters();
+            const size_t freed = refresh ? r : 0;
+            EXPECT_EQ(set.reclaim(), (AdvanceResult{freed, refresh ? 1u : 0u, 0, 0, 0, Advance::nothing_retired}));
+            EXPECT_TRUE(contract_deltas_are(before, set.get_internal_counters(), {.bags_freed = refresh ? 1u : 0u, .nodes_freed = freed}));
+            EXPECT_TRUE(contract_sweep_is(set, 0, r - freed, freed));
+            EXPECT_TRUE(setting.holds());
+        } // loop over refreshed / not
+    } // loop over cadences
+} // ContractCadenceExplicitCallAfterFirstRound
+
+// On a cadenced set (R = 4) at quiescent points, advance() and reclaim()
+// keep their literals -- never `contended` --
+// and share one protocol with the triggers. Handles are released after each
+// operation (contract_retire()); the shard's retired-node count is absolute,
+// so the triggers fire at the 4th and 8th node retired, whatever
+// explicit calls happened in between:
+//   nodes 1, 2 retired (no trigger);       advance() {2,1,0,B,0,ADV}  gen 1
+//   advance() {0,0,0,B,0,NR}; reclaim() {0,0,0,0,0,NR}
+//   nodes 3, 4 retired: node 4 triggers, closing gen 1 (bag 2, pinned by the
+//     retiring operation's handle, freed by nobody yet)          gen 2
+//   advance() {2,1,0,B,0,NR}: that bag freed, nothing retired since
+//   nodes 5, 6, 7 retired;                  reclaim() {3,1,0,0,0,ADV} gen 3
+//   node 8 retired: triggers, closing gen 3 (bag 1, pinned)        gen 4
+//   five keys inserted for good;            advance() {1,1,0,B,5,NR}
+// auto_reclaims == 2 and auto_skipped == 0 at the end (the walks retired
+// nothing: no dead node is ever reachable here). Free counts (inserts
+// reuse freed nodes first): 0 right after node 4's trigger (nodes 3 and 4's
+// inserts reused the 2 freed by the first advance()), 1 at the end (8 nodes
+// freed; the inserts of keys 3, 4, 5, 6, 8, 100 and 101 each reused one).
+TEST(ConcurrentHashSetRcuTest, ContractCadenceAdvanceUnchangedAtQuiescence) {
+    constexpr size_t B = kContractBuckets;
+    ContractSet set(contract_cadence_options<ContractSet>(4));
+    const ContractOneNode<ContractSet> setting(set);
+    contract_retire(set, 1);
+    contract_retire(set, 2);
+    EXPECT_EQ(set.get_internal_counters().auto_reclaims, 0u);
+    EXPECT_EQ(set.advance(), (AdvanceResult{2, 1, 0, B, 0, Advance::advanced}));
+    EXPECT_EQ(set.advance(), (AdvanceResult{0, 0, 0, B, 0, Advance::nothing_retired}));
+    EXPECT_EQ(set.reclaim(), (AdvanceResult{0, 0, 0, 0, 0, Advance::nothing_retired}));
+    EXPECT_EQ(set.get_internal_generation(), 1u);
+    contract_retire(set, 3);
+    // Retires `key` like contract_retire(), checking that its erase alone
+    // retires one node and triggers one proceeding, publishing bump.
+    auto retire_crossing = [&](int key) {
+        ContractSet::handle h = set.new_handle();
+        EXPECT_TRUE(set.insert(h, key));
+        const ContractSet::InternalCounters before = set.get_internal_counters();
+        EXPECT_TRUE(set.erase(h, key));
+        EXPECT_TRUE(contract_deltas_are(before, set.get_internal_counters(), {.retire_nodes = 1, .retire_runs = 1, .bumps = 1, .auto_reclaims = 1}))
+            << "node " << key;
+    }; // retire_crossing
+    retire_crossing(4);
+    EXPECT_EQ(set.get_internal_generation(), 2u);
+    EXPECT_TRUE(contract_sweep_is(set, 0, 2, 0));
+    EXPECT_EQ(set.advance(), (AdvanceResult{2, 1, 0, B, 0, Advance::nothing_retired}));
+    contract_retire(set, 5);
+    contract_retire(set, 6);
+    contract_retire(set, 7);
+    EXPECT_EQ(set.reclaim(), (AdvanceResult{3, 1, 0, 0, 0, Advance::advanced}));
+    EXPECT_EQ(set.get_internal_generation(), 3u);
+    retire_crossing(8);
+    EXPECT_EQ(set.get_internal_generation(), 4u);
+    {
+        ContractSet::handle h = set.new_handle();
+        for (int k = 100; k < 105; ++k) EXPECT_TRUE(set.insert(h, k));
+    }
+    EXPECT_EQ(set.advance(), (AdvanceResult{1, 1, 0, B, 5, Advance::nothing_retired}));
+    const ContractSet::InternalCounters end = set.get_internal_counters();
+    EXPECT_EQ(end.auto_reclaims, 2u);
+    EXPECT_EQ(end.auto_skipped, 0u);
+    EXPECT_EQ(end.contended, 0u);
+    EXPECT_TRUE(contract_sweep_is(set, 0, 0, 1));
+    EXPECT_TRUE(contract_cadence_invariants(set, true));
+    EXPECT_TRUE(setting.holds());
+} // ContractCadenceAdvanceUnchangedAtQuiescence
+
+// A thread that erases under a NEVER
+// refreshed handle h pins its own garbage. R = 1 on a ring of K slots: erases
+// 1..K-1 each trigger `advanced` with nothing freed (bumps +1, bags_freed
+// +0); erase K's trigger is `ring_full` (ring_full +1, auto_reclaims +1,
+// bumps +0, the node stays on the retired list), and so is erase K+1's; after
+// h.refresh() (true: the triggers' publishes happened-before it) the next
+// erase's trigger returns `advanced`, freeing every waiting bag (K-1 bags of
+// one node each: advance()'s ring-wrap shape with the trigger as the caller) and closing a
+// bag of the 3 nodes retired since the last `advanced` bump, which the
+// refreshed h pins. h released, an explicit reclaim() frees it:
+// {3, 1, 0, 0, 0, nothing_retired}.
+template <size_t K>
+static void contract_cadence_never_refreshed_ring_full() {
+    using SetT = ContractSetK<K>;
+    SCOPED_TRACE(testing::Message() << "kGenerations " << K);
+    SetT set(contract_cadence_options<SetT>(1));
+    const ContractOneNode<SetT> setting(set);
+    std::unique_ptr<typename SetT::handle> h = std::make_unique<typename SetT::handle>(set.new_handle());
+    const int keys = static_cast<int>(K) + 2;
+    for (int k = 0; k < keys; ++k) EXPECT_TRUE(set.insert(*h, k));
+    int next = 0;
+    for (size_t erase = 1; erase < K; ++erase) {
+        const typename SetT::InternalCounters before = set.get_internal_counters();
+        EXPECT_TRUE(set.erase(*h, next++));
+        EXPECT_TRUE(contract_deltas_are(before, set.get_internal_counters(), {.retire_nodes = 1, .retire_runs = 1, .bumps = 1, .auto_reclaims = 1}))
+            << "erase " << erase;
+    } // erases 1 .. K-1
+    EXPECT_EQ(set.get_internal_generation(), K - 1);
+    for (size_t erase = K; erase <= K + 1; ++erase) {
+        const typename SetT::InternalCounters before = set.get_internal_counters();
+        EXPECT_TRUE(set.erase(*h, next++));
+        EXPECT_TRUE(contract_deltas_are(before, set.get_internal_counters(), {.retire_nodes = 1, .retire_runs = 1, .auto_reclaims = 1, .ring_full = 1}))
+            << "erase " << erase;
+        EXPECT_TRUE(contract_sweep_is(set, erase - K + 1, K - 1, 0)) << "erase " << erase;
+        EXPECT_EQ(set.get_internal_generation(), K - 1) << "erase " << erase;
+        EXPECT_TRUE(contract_ring_invariant(set, K)) << "erase " << erase;
+    } // erases K, K+1: ring_full
+    EXPECT_TRUE(h->refresh());
+    const typename SetT::InternalCounters before = set.get_internal_counters();
+    EXPECT_TRUE(set.erase(*h, next++));
+    EXPECT_TRUE(contract_deltas_are(before, set.get_internal_counters(),
+                                    {.retire_nodes = 1, .retire_runs = 1, .bumps = 1, .auto_reclaims = 1, .bags_freed = K - 1, .nodes_freed = K - 1}))
+        << "the erase after the refresh";
+    EXPECT_EQ(set.get_internal_generation(), K);
+    EXPECT_TRUE(contract_sweep_is(set, 0, 3, K - 1)) << "after the recovery";
+    EXPECT_EQ(set.get_internal_bag_count(K - 1), 3u);
+    EXPECT_TRUE(contract_ring_invariant(set, K));
+    h.reset();
+    EXPECT_EQ(set.reclaim(), (AdvanceResult{3, 1, 0, 0, 0, Advance::nothing_retired}));
+    EXPECT_TRUE(contract_sweep_is(set, 0, 0, K + 2));
+    EXPECT_TRUE(contract_cadence_invariants(set, true));
+    EXPECT_TRUE(setting.holds());
+} // contract_cadence_never_refreshed_ring_full()
+
+// The never-refreshed holder at the minimum ring (2), a small one (4) and
+// the default (64).
+TEST(ConcurrentHashSetRcuTest, ContractCadenceNeverRefreshedHandleFillsTheRing) {
+    contract_cadence_never_refreshed_ring_full<2>();
+    contract_cadence_never_refreshed_ring_full<4>();
+    contract_cadence_never_refreshed_ring_full<64>();
+} // ContractCadenceNeverRefreshedHandleFillsTheRing
+
+// A cadence of 2^63 "fires at no erase a test can afford":
+// cadences 2^63, 2^63 + 1 and SIZE_MAX (all R = 2^63) and 0 (off): 200
+// erases under h trigger nothing (auto_reclaims + auto_skipped == 0, bumps
+// +0, nothing freed); every node waits on the retired list until an explicit
+// call; with h released, one reclaim() bags and frees all 200 in one bag:
+// {200, 1, 0, 0, 0, advanced}.
+TEST(ConcurrentHashSetRcuTest, ContractCadenceHugeOrZeroCadenceNeverFires) {
+    constexpr int kKeys = 200;
+    for (size_t every : {kContractCadenceClamp, kContractCadenceClamp + 1, std::numeric_limits<size_t>::max(), size_t{0}}) {
+        SCOPED_TRACE(testing::Message() << "requested cadence " << every);
+        ContractSet set(contract_cadence_options<ContractSet>(every));
+        const ContractOneNode<ContractSet> setting(set);
+        {
+            ContractSet::handle h = set.new_handle();
+            for (int k = 0; k < kKeys; ++k) EXPECT_TRUE(set.insert(h, k));
+            const ContractSet::InternalCounters before = set.get_internal_counters();
+            for (int k = 0; k < kKeys; ++k) EXPECT_TRUE(set.erase(h, k));
+            EXPECT_TRUE(contract_deltas_are(before, set.get_internal_counters(), {.retire_nodes = kKeys, .retire_runs = kKeys}));
+            EXPECT_TRUE(contract_sweep_is(set, kKeys, 0, 0));
+        } // h's scope
+        EXPECT_EQ(set.reclaim(), (AdvanceResult{kKeys, 1, 0, 0, 0, Advance::advanced}));
+        EXPECT_TRUE(contract_cadence_invariants(set, true));
+        EXPECT_TRUE(setting.holds());
+    } // loop over cadences
+} // ContractCadenceHugeOrZeroCadenceNeverFires
+
+// A proceeding trigger charges the retiring thread's bump_ns and
+// free_ns, never advance_ns (no explicit call) nor walk_ns; an erase that
+// does not trigger charges nothing. R = 2, h refreshed before each round so
+// that each trigger also frees the previous round's bag; the "increase" is
+// asserted over 20 triggers (one clock tick may be coarser than one bump).
+TEST(ConcurrentHashSetRcuTest, ContractCadenceTriggerChargesBumpAndFreeOnly) {
+    using Timers = ContractSet::InternalTimers;
+    constexpr int kRounds = 20;
+    ContractSet set(contract_cadence_options<ContractSet>(2));
+    const ContractOneNode<ContractSet> setting(set);
+    ContractSet::handle h = set.new_handle();
+    for (int k = 0; k < 2*kRounds; ++k) EXPECT_TRUE(set.insert(h, k));
+    uint64_t bump_and_free_ns = 0;
+    for (int round = 0; round < kRounds; ++round) {
+        if (round > 0) {
+            EXPECT_TRUE(h.refresh()) << "round " << round;
+        }
+        const Timers t0 = ContractSet::internal_advance_timers();
+        EXPECT_TRUE(set.erase(h, 2*round));
+        const Timers t1 = ContractSet::internal_advance_timers();
+        EXPECT_EQ(t1.advance_ns, t0.advance_ns) << "round " << round << ": an erase without a trigger";
+        EXPECT_EQ(t1.bump_ns, t0.bump_ns) << "round " << round << ": an erase without a trigger";
+        EXPECT_EQ(t1.free_ns, t0.free_ns) << "round " << round << ": an erase without a trigger";
+        EXPECT_EQ(t1.walk_ns, t0.walk_ns) << "round " << round << ": an erase without a trigger";
+        const ContractSet::InternalCounters c1 = set.get_internal_counters();
+        EXPECT_TRUE(set.erase(h, 2*round + 1));
+        const Timers t2 = ContractSet::internal_advance_timers();
+        EXPECT_EQ(set.get_internal_counters().auto_reclaims - c1.auto_reclaims, 1u) << "round " << round;
+        EXPECT_EQ(t2.advance_ns, t1.advance_ns) << "round " << round << ": the trigger charged advance_ns";
+        EXPECT_EQ(t2.walk_ns, t1.walk_ns) << "round " << round << ": the trigger charged walk_ns";
+        bump_and_free_ns += (t2.bump_ns - t1.bump_ns) + (t2.free_ns - t1.free_ns);
+    } // loop over rounds
+    EXPECT_GT(bump_and_free_ns, 0u);
+    EXPECT_TRUE(setting.holds());
+} // ContractCadenceTriggerChargesBumpAndFreeOnly
+
+// Limbo does not count toward the cadence, with the reuse construction and
+// a throwing reuse assignment: R = 1, one shard. One node retired (its trigger
+// bags it under the erase's handle) and freed by an explicit reclaim() with
+// no handle ({1, 1, 0, 0, 0, nothing_retired}), so the one free list holds
+// one node. An insert whose reuse copy assignment throws routes that node to
+// limbo: limbo_pushes +1 while retire_nodes, auto_reclaims + auto_skipped
+// and bumps stay +0 across the throwing insert; the key is absent. The
+// limbo node is then bagged and freed by the next explicit call: limbo
+// counts for the bump's `nothing_retired` decision: {1, 1, 0, 0, 0, advanced}.
+TEST(ConcurrentHashSetRcuTest, ContractCadenceLimboDoesNotCount) {
+    using SetT = ConcurrentResizableHashSetRCU<ContractCountedKey, true, ContractCountedKeyHash>;
+    SetT set(contract_cadence_options<SetT>(1));
+    const ContractOneNode<SetT> setting(set);
+    contract_retire(set, ContractCountedKey(1));
+    EXPECT_EQ(set.get_internal_counters().auto_reclaims, 1u);
+    EXPECT_EQ(set.reclaim(), (AdvanceResult{1, 1, 0, 0, 0, Advance::nothing_retired}));
+    EXPECT_TRUE(contract_sweep_is(set, 0, 0, 1));
+    const size_t slots = set.get_internal_node_count();
+    bool threw = false;
+    {
+        SetT::handle h = set.new_handle();
+        const SetT::InternalCounters before = set.get_internal_counters();
+        ContractCountedKey::throw_on_assign = true;
+        try {
+            set.insert(h, ContractCountedKey(2));
+        } catch (const ContractAssignThrow&) {
+            threw = true;
+        }
+        ContractCountedKey::throw_on_assign = false;
+        const SetT::InternalCounters after = set.get_internal_counters();
+        EXPECT_EQ(after.limbo_pushes - before.limbo_pushes, 1u);
+        EXPECT_TRUE(contract_deltas_are(before, after, {}));
+        EXPECT_FALSE(set.contains(h, ContractCountedKey(2)));
+    } // h's scope
+    ASSERT_TRUE(threw) << "construction: the insert did not reuse the free node (its copy assignment did not throw)";
+    EXPECT_EQ(set.get_internal_node_count(), slots) << "the insert appended instead of reusing";
+    EXPECT_EQ(set.get_internal_limbo_count(), 1u);
+    EXPECT_EQ(set.reclaim(), (AdvanceResult{1, 1, 0, 0, 0, Advance::advanced}));
+    EXPECT_TRUE(contract_sweep_is(set, 0, 0, 1));
+    EXPECT_TRUE(contract_cadence_invariants(set, true));
+    EXPECT_TRUE(setting.holds());
+} // ContractCadenceLimboDoesNotCount
+
+// On a cadenced set whose table never doubled (every
+// bucket published since construction), NO lookup retires, bumps or frees.
+// R = 1, so any retirement would trigger. After 50 erases (each with its own
+// handle, so their triggers bump and free freely), 300 contains() of present
+// and absent keys leave retire_nodes, retire_runs, bumps, auto_reclaims,
+// auto_skipped and nodes_freed unchanged, and the free count of the sweep
+// too; every lookup returns the membership.
+TEST(ConcurrentHashSetRcuTest, ContractCadenceContainsOnPresizedSetNeverTriggers) {
+    ContractSet set(contract_cadence_options<ContractSet>(1));
+    const ContractOneNode<ContractSet> setting(set);
+    {
+        ContractSet::handle h = set.new_handle();
+        for (int k = 0; k < 100; ++k) EXPECT_TRUE(set.insert(h, k));
+    }
+    for (int k = 0; k < 50; ++k) EXPECT_TRUE(set.erase(set.new_handle(), k));
+    EXPECT_EQ(set.get_internal_counters().auto_reclaims, 50u);
+    const size_t free0 = set.get_internal_accounting().free_nodes;
+    {
+        ContractSet::handle h = set.new_handle();
+        const ContractSet::InternalCounters before = set.get_internal_counters();
+        for (int k = 0; k < 100; ++k) EXPECT_EQ(set.contains(h, k), k >= 50) << "key " << k;
+        for (int k = 1000; k < 1200; ++k) EXPECT_FALSE(set.contains(h, k)) << "key " << k;
+        EXPECT_TRUE(contract_deltas_are(before, set.get_internal_counters(), {}));
+    } // the lookups' handle
+    EXPECT_EQ(set.get_internal_accounting().free_nodes, free0);
+    EXPECT_TRUE(contract_cadence_invariants(set, true));
+    EXPECT_TRUE(setting.holds());
+} // ContractCadenceContainsOnPresizedSetNeverTriggers
+
+// A contains() retires -- and so triggers -- ONLY by
+// entering an UNINITIALIZED bucket and winning its split, whose cleanup
+// retires the superseded copies. A tiny cadenced set (capacity 4, one shard,
+// R = 1) is grown by 2000 inserts of spread keys (each with its own handle);
+// at the quiescent point some buckets of the doubled table are unpublished
+// (checked: the construction exists). Then each present key is looked up
+// once, each with its own fresh handle: for every lookup that retired k runs
+// (retire_runs + k), auto_reclaims and bumps are + k (single-threaded, every
+// trigger proceeds and publishes), auto_skipped + 0, and a split published
+// during that lookup (splits_published + >= 1: it retired only through a
+// split). At least one lookup must have retired (non-vacuity: otherwise the
+// construction never reached an unpublished bucket holding a moved key).
+TEST(ConcurrentHashSetRcuTest, ContractCadenceContainsTriggersOnlyThroughASplit) {
+    ContractSet set(ContractSet::Options{.initial_capacity = 4, .arena_shards = 1, .auto_reclaim_every = 1});
+    std::vector<int> keys;
+    for (int i = 0; i < 2000; ++i) keys.push_back(static_cast<int>(contract_mix(i) & 0x3fffffff));
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    std::shuffle(keys.begin(), keys.end(), std::mt19937(12345));
+    for (int k : keys) EXPECT_TRUE(set.insert(set.new_handle(), k));
+    ASSERT_GT(set.get_internal_table_size(), 4u) << "construction: the table never doubled";
+    ASSERT_LT(published_buckets(set), set.get_internal_table_size()) << "construction: every bucket of the doubled table is published";
+    size_t retiring_lookups = 0;
+    for (int k : keys) {
+        ContractSet::handle h = set.new_handle();
+        const ContractSet::InternalCounters before = set.get_internal_counters();
+        EXPECT_TRUE(set.contains(h, k)) << "key " << k;
+        const ContractSet::InternalCounters after = set.get_internal_counters();
+        const size_t runs = after.retire_runs - before.retire_runs;
+        EXPECT_EQ(after.auto_reclaims - before.auto_reclaims, runs) << "key " << k;
+        EXPECT_EQ(after.bumps - before.bumps, runs) << "key " << k;
+        EXPECT_EQ(after.auto_skipped, before.auto_skipped) << "key " << k;
+        EXPECT_EQ(after.contended, before.contended) << "key " << k;
+        if (runs > 0) {
+            ++retiring_lookups;
+            EXPECT_GT(after.splits_published, before.splits_published) << "key " << k << ": a lookup retired without publishing a split";
+        }
+    } // loop over present keys
+    std::printf("[   INFO   ] ContractCadenceContainsTriggersOnlyThroughASplit: %zu of %zu lookups retired\n", retiring_lookups, keys.size());
+    EXPECT_GT(retiring_lookups, 0u) << "construction: no lookup entered an unpublished bucket holding a moved key";
+    EXPECT_TRUE(contract_cadence_invariants(set, false));
+    EXPECT_TRUE(set.get_internal_accounting().consistent);
+} // ContractCadenceContainsTriggersOnlyThroughASplit
+
+// The AllowDelete = false twin, with the R = 1 equality: an AllowDelete = false set with
+// a cadence triggers too, because a split's cleanup retires the superseded
+// copies. A tiny cadenced set (capacity 4, one shard, R = 1) grown by 2000
+// inserts of keys 1..2000 (each with its own handle) has retire_runs > 0 and auto_reclaims >
+// 0, every crossing counted (auto_reclaims + auto_skipped == retire_runs),
+// none skipped (single-threaded, no explicit call), and membership
+// exact.
+TEST(ConcurrentHashSetRcuTest, ContractCadenceNoDeleteSetTriggersThroughSplits) {
+    ContractSetNoDel set(ContractSetNoDel::Options{.initial_capacity = 4, .arena_shards = 1, .auto_reclaim_every = 1});
+    constexpr int kKeys = 2000;
+    for (int k = 1; k <= kKeys; ++k) EXPECT_TRUE(set.insert(set.new_handle(), k));
+    const ContractSetNoDel::InternalCounters c = set.get_internal_counters();
+    EXPECT_GT(set.get_internal_table_size(), 4u);
+    EXPECT_GT(c.retire_runs, 0u);
+    EXPECT_GT(c.auto_reclaims, 0u);
+    EXPECT_EQ(c.auto_skipped, 0u);
+    EXPECT_TRUE(contract_cadence_invariants(set, false));
+    ContractSetNoDel::handle h = set.new_handle();
+    for (int k = 1; k <= kKeys; ++k) EXPECT_TRUE(set.contains(h, k)) << "key " << k;
+    EXPECT_FALSE(set.contains(h, 0));
+    EXPECT_TRUE(contract_cadence_invariants(set, false)) << "after the lookups, whose split cleanups trigger under h";
+} // ContractCadenceNoDeleteSetTriggersThroughSplits
+
+// The destructor on a cadenced set: destroyed with bags pending (closed by
+// triggers under a never-refreshed handle, then the handle released), the set
+// destroys exactly get_internal_node_count() values and every object
+// constructed during the test is destroyed exactly once; under ASan/LSan
+// nothing leaks. The destructor's debug asserts on the cadence's counting
+// invariants run here too.
+TEST(ConcurrentHashSetRcuTest, ContractCadenceDestroySetWithPendingBags) {
+    using SetT = ConcurrentResizableHashSetRCU<ContractCountedKey, true, ContractCountedKeyHash>;
+    const unsigned first = ContractCountedKey::next_serial.load();
+    {
+        std::unique_ptr<SetT> set = std::make_unique<SetT>(contract_cadence_options<SetT>(1));
+        {
+            // The setting refers to the set, so it lives in a scope that ends before the set does.
+            const ContractOneNode<SetT> setting(*set);
+            {
+                SetT::handle h = set->new_handle();
+                for (int k = 0; k < 10; ++k) EXPECT_TRUE(set->insert(h, ContractCountedKey(k)));
+                for (int k = 0; k < 6; ++k) EXPECT_TRUE(set->erase(h, ContractCountedKey(k)));
+            } // h's scope
+            EXPECT_TRUE(contract_sweep_is(*set, 0, 6, 0)) << "six pending bags, nothing freed";
+            EXPECT_TRUE(setting.holds());
+        } // the setting's scope
+        const size_t slots = set->get_internal_node_count();
+        const size_t d0 = ContractCountedKey::destructor_calls.load();
+        set.reset();
+        EXPECT_EQ(ContractCountedKey::destructor_calls.load() - d0, slots);
+    } // the set's scope
+    EXPECT_EQ(contract_destruction_errors(first, ContractCountedKey::next_serial.load()), 0);
+} // ContractCadenceDestroySetWithPendingBags

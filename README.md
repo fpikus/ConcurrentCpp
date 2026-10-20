@@ -64,7 +64,8 @@ and documented on their own terms.
   tombstone at most twice), while a lookup's own walk writes nothing;
   and a caller-driven `advance()` recycles them through the free lists once
   no handle can still see them, and walks the table for the dead nodes the
-  writers left behind.
+  writers left behind; `reclaim()` recycles without the walk, and a set
+  constructed with a cadence runs it by itself.
 
 ## Building
 

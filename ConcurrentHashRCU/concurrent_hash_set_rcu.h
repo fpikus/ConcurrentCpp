@@ -45,7 +45,7 @@
 
 // AddressSanitizer poisoning of free-list nodes (see ASAN POISONING under
 // HANDLES AND GENERATIONS in the class overview): the value bytes of a node
-// are poisoned while the node is on a free list -- by advance()'s free pass,
+// are poisoned while the node is on a free list -- by the free pass,
 // before it pushes the node, and unpoisoned by the pop that wins the node,
 // before it assigns the new value, and by the destructor -- so that a read
 // of a freed value through a stale address is reported instead of returning
@@ -76,6 +76,27 @@
 #define CHS_RCU_ASAN_POISON(addr, size) ((void)(addr), (void)(size))
 #define CHS_RCU_ASAN_UNPOISON(addr, size) ((void)(addr), (void)(size))
 #endif
+// CHS_RCU_UNLIKELY(c) (header-private, #undef'd at the end): the condition
+// `c`, marked as usually false but taken regularly, with the builtin's
+// default weight, under which GCC keeps the taken path in the caller's own
+// text (not in its cold partition) and does not make it several times
+// slower. With GCC and Clang (including clang-cl) this is
+//   __builtin_expect(!!(c), 0);
+// elsewhere the hint is dropped and the code is still correct, only without
+// the layout benefit. The !! makes the builtin accept exactly what the bare
+// condition accepts (a type with only an explicit operator bool would not
+// convert to the builtin's `long` parameter). Used on the automatic
+// cadence's trigger test in push_retired(), which is identically false with
+// the cadence off and true at most once per crossing of a multiple of the
+// cadence by a shard's retired-node count otherwise. The builtin rather than
+// the standard [[unlikely]] attribute: the standard leaves the attribute's
+// strength to the compiler, while the builtin states the edge's weight, and
+// a compiler without it needs one edit here.
+#if defined(__GNUC__) || defined(__clang__)
+#define CHS_RCU_UNLIKELY(c) __builtin_expect(!!(c), 0)
+#else
+#define CHS_RCU_UNLIKELY(c) (c)
+#endif
 
 namespace concurrent_hash_rcu_detail {
 // Process-wide sequential thread numbering, shared by every instantiation of
@@ -95,11 +116,14 @@ inline unsigned thread_number() {
 // Hooks type provides the three static functions `NoHooks` documents, each
 // callable with no arguments, returning void and `noexcept`: the set calls
 // them from `noexcept` members (the join, through `new_handle()` and
-// `handle::refresh()`) and from `advance()`, and a hook action that throws
-// terminates the program. The hooks take no arguments: a node or block
-// pointer would expose a private type. The set calls a hook from no function
-// other than the one named at each hook: never from the destructor, from an
-// operation's walk, or from the diagnostic sweep.
+// `handle::refresh()`; the bump-and-free of `advance()`, `reclaim()` and the
+// automatic trigger), and a hook action that throws terminates the program.
+// The hooks take no arguments: a node or block pointer would expose a
+// private type. The set calls a hook from no function other than the one
+// named at each hook: never from the destructor, from an operation's walk
+// itself, or from the diagnostic sweep; on a set constructed with a cadence
+// the publish hook fires from the trigger, which runs INSIDE an operation
+// (THE TRIGGER under HANDLES AND GENERATIONS in the class overview).
 template <typename H>
 concept SetHooks = requires {
     { H::in_join() } noexcept -> std::same_as<void>;
@@ -125,34 +149,42 @@ struct NoHooks {
     // that this generation is still current (a check that fails undoes the
     // count and retries).
     static void in_join_after_bump() noexcept {}
-    // `advance()`: once per call that returns `advanced`, after the new
-    // generation is published and before the free pass and the walk; the
-    // advancer flag is held, so a nested `advance()` from the action returns
-    // `contended`. Not called by calls that return `nothing_retired`,
-    // `ring_full` or `contended`.
+    // Once per PUBLISH, whichever call publishes -- `advance()`, `reclaim()`
+    // or an automatic trigger -- after the new generation is published and
+    // before the final free pass (and, in `advance()`, the walk); the
+    // advancer flag is held, so a nested `advance()` or `reclaim()` from the
+    // action returns `contended` and a nested operation's retire push is a
+    // skipped trigger. Not called on a `nothing_retired`, `ring_full` or
+    // `contended` outcome of anything, nor by a skipped trigger. Inside a
+    // trigger it fires inside the operation that retired, under that
+    // operation's handle, which the action must not refresh, move, swap or
+    // destroy.
     static void in_advance_after_publish() noexcept {}
 }; // NoHooks
 } // namespace concurrent_hash_rcu_detail
 
-// What one `advance()` call of a ConcurrentResizableHashSetRCU did. Not a
-// template and not nested: equal across every instantiation, so tests typed
-// over several sets compare against one literal and one `PrintTo` overload
-// serves them all, and distinct from any other container's result type.
+// What one `advance()` or `reclaim()` call of a ConcurrentResizableHashSetRCU
+// did (`reclaim()` is `advance()` without the walk: its three walk counts
+// are 0 for every outcome). Not a template and not nested: equal across
+// every instantiation, so tests typed over several sets compare against one
+// literal and one `PrintTo` overload serves them all, and distinct from any
+// other container's result type.
 struct AdvanceResult {
     // Whether and how the call advanced the generation. Checked in this
     // order: `contended` at entry; then `nothing_retired`, which wins over
-    // `ring_full`.
+    // `ring_full`. "The walk ran" below is `advance()`'s; `reclaim()` never
+    // walks.
     enum class Advance {
         nothing_retired, // every shard's retired AND limbo heads were found EMPTY (by loads, before any exchange): no generation slot consumed and nothing published; the free pass ran, and the walk ran under the still-current generation
         advanced,        // the retired and limbo lists became the closing generation's bag and a new generation is current (possibly after freeing bags to make room); the free pass and the walk ran, the walk under the new generation
         ring_full,       // every generation slot is still in use after the in-call free pass (the oldest bag is pinned by a handle, or transiently by a concurrent join attempt): no slot consumed, nothing published, NO walk; the free pass ran
-        contended        // another advance() is in progress: this call did nothing and returned at once, with every count 0
+        contended        // another advance(), reclaim() or automatic trigger holds the flag: this call did nothing and returned at once, with every count 0
     };
     size_t freed_nodes;     // nodes moved from freed bags to the free lists in this call: retired and limbo nodes alike
     size_t freed_bags;      // generations whose bags were freed in this call (oldest first)
-    size_t walk_retired;    // dead nodes the walk unlinked and retired in this call (into the current generation's retired lists: reusable at a LATER call)
-    size_t buckets_walked;  // published buckets the walk passed over (UNINITIALIZED ones are skipped and not counted)
-    size_t nodes_passed;    // nodes the walk passed, live and dead alike: every node it loaded, plus the interior of every dead run it unlinked; a run the walk cannot bypass (behind a lost pred, or behind a FROZEN node with an unpublished child) is walked node by node and counted in full; only a run whose one-shot unlink CAS the walk LOST counts its first node alone (reasoned: a loss needs a concurrent writer). An uncontended walk passes exactly the reachable nodes
+    size_t walk_retired;    // dead nodes this call's walk unlinked and retired (into the current generation's retired lists: reusable at a LATER call); 0 for reclaim()
+    size_t buckets_walked;  // published buckets this call's walk passed over (UNINITIALIZED ones are skipped and not counted); 0 for reclaim()
+    size_t nodes_passed;    // nodes this call's walk passed, live and dead alike: every node it loaded, plus the interior of every dead run it unlinked; a run the walk cannot bypass (behind a lost pred, or behind a FROZEN node with an unpublished child) is walked node by node and counted in full; only a run whose one-shot unlink CAS the walk LOST counts its first node alone (reasoned: a loss needs a concurrent writer). An uncontended walk passes exactly the reachable nodes; 0 for reclaim()
     Advance advance;        // see above; `nothing_retired` and `ring_full` do NOT imply freed_nodes == 0 (the free pass still runs); `contended` implies every count 0
     bool operator==(const AdvanceResult&) const = default;
 }; // AdvanceResult
@@ -209,8 +241,8 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //              per touched shard per allocation path (each shard adds 256
 //              when it appends a node whose index is a multiple of 256, index
 //              0 included, and 256 on every 256th pop from a free list, the
-//              first pop included), minus every node the free pass of
-//              advance() has freed. One-sided at every quiescent point;
+//              first pop included), minus every node a free pass has
+//              freed. One-sided at every quiescent point;
 //              while operations run it may lag the occupied slots by the
 //              batches whose 256 is not yet added, and it never goes below
 //              zero (the member's comment says why).
@@ -236,8 +268,8 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //       node's current life: a link goes live -> MARKED or live -> FROZEN, by
 //       one CAS. No concurrent operation writes a tagged link. Concurrently,
 //       a published link's address bits change only by an unlink CAS on a
-//       LIVE link, which bypasses a run of dead successors. The free pass of
-//       advance() rewrites the link of every node it frees, while that node
+//       LIVE link, which bypasses a run of dead successors. The free pass
+//       rewrites the link of every node it frees, while that node
 //       is on no chain and observable by no handle (see RECLAMATION).
 //     - a BUCKET HEAD carries a 6-bit SEAL LEVEL: log2 of the largest table size
 //       for which a child split has SEALED this bucket's chain (the seal comes
@@ -268,7 +300,7 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   MARKED. A node address observed by any traversing thread therefore stays
 //   a valid node for as long as that thread's operation runs: a dead node's
 //   memory becomes reusable only when no handle that could observe it is
-//   live (advance() bags it and a free pass puts it on a free list, from
+//   live (a bump bags it and a free pass puts it on a free list, from
 //   which later allocations take it: HANDLES AND GENERATIONS), and is never
 //   returned to the system before the set is destroyed. That is what lets
 //   the read path dereference node pointers with no hazard pointers and no
@@ -294,7 +326,12 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   - the split winner's cleanup pass over the parent chain, right after it
 //     publishes the child. The pass is lazy with respect to the doubling, as
 //     splitting is; whichever operation won the split's publish runs it, a
-//     contains() included. The copies the split superseded get an unlink
+//     contains() included (and on a set constructed with a cadence that
+//     cleanup's retire pushes can trigger a bump and a free pass, so a
+//     contains() that enters an UNINITIALIZED bucket may reclaim: THE
+//     TRIGGER under HANDLES AND GENERATIONS; a contains() that meets no
+//     UNINITIALIZED bucket never does, so on a table that has not doubled
+//     no lookup bumps or frees). The copies the split superseded get an unlink
 //     attempt from that same split, unless a tagged, not-dead node stands
 //     between them and the pass's last live word (STRAGGLERS: the one
 //     exception, and the stale view); a writer walk that passes them after the publish may
@@ -334,8 +371,9 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   between its freeze and its publish, and from Hash{} throwing inside an
 //   unlinking site (EXCEPTIONS). A dead run that no writer walks past again,
 //   in a bucket none of whose new children is accessed, stays until the next
-//   advance()'s walk: its lifetime is bounded by the caller's advance()
-//   cadence (and by that walk's one-shot CAS winning), except for a run
+//   advance()'s walk (reclaim() and the automatic trigger never walk): its
+//   lifetime is bounded by how often the caller calls advance() (and by
+//   that walk's one-shot CAS winning), except for a run
 //   behind a FROZEN node whose child is not published, which stays until
 //   that one child is accessed.
 //   POSTCONDITIONS. Unlinking is therefore best effort under contention: no
@@ -357,15 +395,16 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   uncontended use arises only after an earlier split threw between its
 //   freeze and its publish (behind such a node nothing can be bypassed until
 //   its child is published and that child's split's cleanup pass, or a
-//   later walk, passes it).
+//   later walk, passes it). reclaim() and the automatic trigger walk no
+//   chain: they make no dead node unreachable and promise nothing here.
 //   NOT TAKEN. One design is deliberately NOT taken here: a contains() that
 //   bypasses the dead runs it passes (it would make every reader a writer);
 //   the read walk stays pure. The collector of the remainder is advance()'s
 //   walk: a standalone call that walks every published chain like a writer
 //   miss walk without inserting anything, at the cost of an API call on
-//   the caller's cadence.
-//   RETIREMENT. A retired node is not reused before an advance() has bagged
-//   it and no handle that could observe it remains: the retired lists only
+//   the caller's schedule.
+//   RETIREMENT. A retired node is not reused before a bump has bagged it
+//   and no handle that could observe it remains: the retired lists only
 //   separate "dead and out of its chain" from "dead and still in it", for
 //   the bump to take without a chain walk (RECLAMATION).
 //
@@ -389,11 +428,15 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   encoding cannot represent is not an exception either: alloc_node()
 //   calls std::abort(), as the constructor does on an initial capacity
 //   above 2^63. A Hooks action that throws terminates (the hooks are
-//   noexcept: TEST SEAMS).
+//   noexcept: TEST SEAMS). reclaim() and the automatic trigger throw
+//   nothing: the bump, the free pass and the hook are noexcept, and nothing
+//   in them hashes, compares, copies or allocates; an operation that throws
+//   AFTER its trigger ran leaves the trigger's effects standing.
 //   The one deliberate guarantee: NO ARENA SLOT IS LOST TO A THROW. Every
 //   private node an operation holds when an exception passes through it is
 //   pushed to limbo before the exception leaves, so get_internal_accounting()
-//   stays consistent and a later advance() recycles the node. Per operation:
+//   stays consistent and a later bump and free pass recycle the node. Per
+//   operation:
 //   - T (template parameter): must be copy-assignable, because a node reused
 //     from a free list takes its new value by assignment; a throwing
 //     assignment must leave the old object valid, as every standard type's
@@ -466,25 +509,26 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 // RECLAMATION: FREE LISTS, LIMBO LISTS, RETIRED LISTS, BAGS
 //   Every shard has two intrusive singly linked lists threaded through the
 //   nodes' `link` words: a FREE LIST of nodes available for reuse and a LIMBO
-//   LIST of unreachable nodes waiting for the next advance(). The next pointer
-//   lives in the atomic link word and never in the T bytes: a thread that
-//   loses a pop race may still read the node's link while the winner is
-//   already assigning the node's value (see alloc_node()).
+//   LIST of unreachable nodes waiting for the next bump (advance(), reclaim()
+//   or a trigger). The next pointer lives in the atomic link word and never in
+//   the T bytes: a thread that loses a pop race may still read the node's link
+//   while the winner is already assigning the node's value (see alloc_node()).
 //   A third list per shard, the RETIRED LIST, is threaded through a word of
 //   its own, Node::retire_link: it holds the dead nodes that a concurrent
 //   operation has unlinked from their chain (push_retired() is its one entry
 //   point, called by the unlink winner with exactly the run it bypassed), and
 //   such a node may still be traversed by an operation that reached it before
 //   the unlink, so its `link` must stay what it was (EXIT). The limbo and
-//   retired lists are LIFO and push-only between two advance() calls; each
+//   retired lists are LIFO and push-only between two bumps; each
 //   push is a RELEASE CAS, so the bump's ACQUIRE exchange of a head is a
 //   happens-before boundary for the whole list below the value it took
 //   (every push is a read-modify-write extending the release sequence of
 //   the one before it).
-//   advance() moves nodes between the lists in three steps (HANDLES AND
-//   GENERATIONS below is the protocol; this paragraph is the data
-//   structure): the BUMP exchanges every shard's retired list, and every
-//   limbo list that is not empty, into the closing generation's BAG -- one
+//   advance() moves nodes between the lists in three steps (reclaim() and
+//   the automatic trigger run the first two; HANDLES AND GENERATIONS below
+//   is the protocol; this paragraph is the data structure): the BUMP
+//   exchanges every shard's retired list, and every limbo list that is not
+//   empty, into the closing generation's BAG -- one
 //   retired-sublist head and one limbo-sublist head per shard, kept in the
 //   generation block, not in the shard, so that the bump's writes never
 //   land on a line the operations contend for -- and publishes the next
@@ -492,7 +536,7 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   handle can observe onto the free lists, dealing the nodes round-robin
 //   over the shards; the WALK unlinks the dead nodes still in their chains
 //   with the writer walks' one-shot CAS and retires them. A retired or
-//   limbo node is reused no earlier than the advance() that bags it, and
+//   limbo node is reused no earlier than the bump that bags it, and
 //   only once no handle of its bag's generation or an older one is live:
 //   retirement changes WHEN a dead node stops being walked, and the bag
 //   decides when its memory comes back.
@@ -509,7 +553,8 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //     to would otherwise never be reused); every list empty: append to the
 //     deque.
 //   - PUSH onto a free list (push_free()) happens ONLY inside the free pass
-//     of advance(), one advancer at a time, with a RELEASE CAS that keeps the
+//     (of advance(), reclaim() or an automatic trigger: ONE ADVANCER), one
+//     flag holder at a time, with a RELEASE CAS that keeps the
 //     counter bits, and runs concurrently with the pops. ABA on the pop is
 //     excluded by the handle invariant together with the single advancer,
 //     not by the counter (ABA WITHOUT VERSION TAGS below): a node another
@@ -549,19 +594,20 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //     is bypassing the run it recorded (ABA WITHOUT VERSION TAGS below is
 //     the argument). There is therefore no ABA problem the client can get
 //     into, and none in the free lists.
-//   - LIFETIME OF VALUES. A free node keeps its old, constructed T;
-//     advance() destroys nothing. Reuse COPY-ASSIGNS the new value over the
-//     old one, so the old value's resources are released at reuse (the
-//     assignment's left-hand side), not at erase() and not at advance();
+//   - LIFETIME OF VALUES. A free node keeps its old, constructed T; no
+//     reclamation -- advance(), reclaim() or a trigger -- destroys
+//     anything. Reuse COPY-ASSIGNS the new value over the old one, so the
+//     old value's resources are released at reuse (the assignment's
+//     left-hand side), not at erase() and not at any reclamation;
 //     values that are never reused are destroyed with the set. Callers must
 //     not rely on destructor timing. Reuse happens while other operations
 //     run; it is safe because a node is freed only after every handle that
 //     could observe it has left or refreshed, and it is popped by one thread
 //     while on no chain (THE PER-NODE REUSE CHAIN below). A throwing
-//     assignment routes the node to limbo, reused only after a later
-//     advance(). Chosen over destroy-at-free + construct-at-reuse (the deque
-//     destroys every slot at the end, so a destroyed slot would have to be
-//     re-constructed at once) and over raw-storage slots (saves only
+//     assignment routes the node to limbo, reused only after a later bump
+//     and free pass. Chosen over destroy-at-free + construct-at-reuse (the
+//     deque destroys every slot at the end, so a destroyed slot would have to
+//     be re-constructed at once) and over raw-storage slots (saves only
 //     destructor calls, costs a non-destroying container).
 //
 // HANDLES AND GENERATIONS: RECLAMATION BESIDE THE OPERATIONS
@@ -590,11 +636,11 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   destruction are exclusive with every other use of that handle (debug
 //   builds count the operations in flight on a handle and assert zero at
 //   each of these), and with nothing else: not with other handles, with
-//   new_handle() or with advance(); a handle may be created on one thread
+//   new_handle(), advance() or reclaim(); a handle may be created on one thread
 //   and used on another after a happens-before edge (the handle records no
 //   thread id). An operation runs under a handle of ANY live generation,
-//   the current one or one an advance() has closed since the join, with
-//   its full contract: the generation decides only which bags advance() may
+//   the current one or one a bump has closed since the join, with its full
+//   contract: the generation decides only which bags a free pass may
 //   free while the handle lives, and only refresh() or a release changes
 //   it. A temporary is a handle too: `set.contains(set.new_handle(), k)`
 //   joins, and leaves at the end of the full expression. The precondition
@@ -602,8 +648,9 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   empty handle or with a handle of another set; refresh() of an empty
 //   handle; refresh(), a move, swap or destruction of a handle while an
 //   operation runs under it; destruction of the set with a live handle or
-//   during an advance(); the accounting sweep or a ring view (DIAGNOSTICS)
-//   during an advance(). Release builds diagnose none of them, and there an
+//   during an advance(), a reclaim() or an automatic trigger; the accounting
+//   sweep or a ring view (DIAGNOSTICS) during any of those three. Release
+//   builds diagnose none of them, and there an
 //   operation touches nothing of its handle, so an operation's cost does
 //   not depend on its handle's age or on how many handles exist. Taking a
 //   handle never waits for an advance(): the join is lock-free and retries
@@ -665,17 +712,30 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   nothing to synchronize with, and its only stale answer is "same", which
 //   keeps the handle in a just-closed generation -- safe and conservative.
 //
-//   ONE ADVANCER. advance() runs under the global try-flag `reclaiming_`:
-//   `exchange(true, acquire)` at entry (a caller that finds it set returns
-//   `contended` at once, every count 0) and `store(false, release)` at
-//   exit, on every path, by an RAII guard. Reclamation is CALLER-DRIVEN:
-//   nothing is ever freed except by an advance() that some thread calls,
-//   with or without a handle of its own; no operation and no handle's
-//   leave frees anything. The flag is held for the whole call, so an
-//   advance() nested inside it -- from the hook, or from a Hash{} the walk
-//   calls -- returns `contended`; one nested in a Hash{} or operator== that
-//   an OPERATION calls is an ordinary call, and the operation's own handle
-//   pins the generation it closes. Between successive advancers the
+//   ONE ADVANCER. Three things reclaim, and they share one global try-flag,
+//   `reclaiming_`: advance() (the bump, the free pass, the walk), reclaim()
+//   (the bump and the free pass, no walk: advance() = reclaim() + walk) and,
+//   on a set constructed with a cadence, the AUTOMATIC TRIGGER (THE TRIGGER
+//   below: reclaim()'s work, run from inside an operation). Every one of
+//   them: `exchange(true, acquire)` at entry (a call that finds the flag set
+//   returns `contended` at once, every count 0; a trigger that finds it set
+//   does nothing and counts itself skipped) and `store(false, release)` at
+//   exit, on every path, by an RAII guard. Reclamation is CALLER-DRIVEN by
+//   default: on a set without a cadence nothing is ever freed except by an
+//   advance() or reclaim() that some thread calls, with or without a handle
+//   of its own, and no operation and no handle's leave frees anything; on a
+//   cadenced set an operation frees only through its trigger, hence only
+//   when it RETIRES (an erase whose self-unlink won, a writer walk that
+//   bypassed a dead run, a split's cleanup pass), and a handle's leave still
+//   frees nothing. The flag is held for the whole call or trigger, so an
+//   advance() or reclaim() nested inside it -- from the hook, or from a
+//   Hash{} the walk calls -- returns `contended`, and a trigger nested
+//   inside it -- the walk's own retire pushes, or an operation the hook
+//   runs -- is skipped; an advance() or reclaim() nested in a Hash{} or
+//   operator== that an OPERATION calls is an ordinary call, and the
+//   operation's own handle pins the generation it closes (the trigger is
+//   this same case without
+//   the walk: THE TRIGGER below). Between successive holders the
 //   flag's acquire/release pair is the ONLY synchronization on the plain
 //   fields `state`, `gen`, the bag slots, `oldest_`, the dealing cursor,
 //   the bump's scratch and the steal hint's stamp counter, and it orders
@@ -684,7 +744,8 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   the flag, through the publish that made its block current: by a
 //   handle's own diagnostic (its successful re-verify read that publish)
 //   and by get_internal_generation() (an acquire load of `current_`).
-//   Inside, sequentially:
+//   Inside, sequentially (A0-A5 and the free pass for every holder; the
+//   walk for advance() alone):
 //   (A0) load every shard's retired head and limbo head (relaxed; a push
 //        racing a load is seen by the next call): all EMPTY -> the result is
 //        `nothing_retired`, no exchange is made, no slot is consumed and
@@ -731,8 +792,8 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   what it bypasses onto the shard's retired lists of the generation that
 //   is current AFTER the bump (after the publish, when there is one: a
 //   `nothing_retired` call publishes nothing). A walk retiree is therefore
-//   freed no earlier than the NEXT advance() (it is exchanged into a bag by
-//   the next call's A3 and freed by that call's free pass at the earliest):
+//   freed no earlier than the NEXT bump (it is exchanged into a bag by the
+//   next bump's A3 and freed by that bump's free pass at the earliest):
 //   two clicks. A dead node still in a chain carries no generation and is
 //   visible to handles of EVERY live generation, which is why the walk can
 //   only make it unreachable with the one-shot unlink CAS every writer walk
@@ -747,10 +808,127 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   still current are the hazards a second advancer brings, and refusal
 //   costs nothing (`contended`, `ring_full` and `nothing_retired` consume no
 //   slot; the caller calls again). A thread that HOLDS a handle and calls
-//   advance() frees nothing at or after that handle's generation, because
-//   its own handle pins it: refresh or release the handle first. A thread
-//   stalled inside advance() stalls all reclamation until it resumes
-//   (every other call `contended`), never an operation.
+//   advance() or reclaim() frees nothing at or after that handle's
+//   generation, because its own handle pins it: refresh or release the
+//   handle first (a trigger cannot: THE TRIGGER). A thread stalled while it
+//   holds the flag -- inside advance(), reclaim() or a trigger -- stalls
+//   all reclamation until it resumes (every call `contended`, every
+//   trigger skipped), never another thread's operation.
+//
+//   THE TRIGGER (the automatic cadence; opt-in through Options). A set
+//   constructed with `auto_reclaim_every` = R > 0 (rounded up to a power
+//   of two; above 2^63 clamped to 2^63, which is "never") runs reclaim()'s
+//   work by itself: every retire push (push_retired(): the winner of an
+//   unlink CAS retiring a run onto its own shard's retired list) takes the
+//   shard's retired-node count from old to old + n, n the run's length, and
+//   if the half-open interval (old, old + n] holds a multiple of R, the push
+//   TRIGGERS, exactly once however many multiples the run jumps: after the
+//   push, on the retiring thread, inside the operation that retired, under
+//   that operation's handle, it attempts the flag and, holding it, runs the
+//   bump, the hook if it published and the final free pass (auto_reclaim(),
+//   bump_and_free()); never the walk. The unit is nodes retired PER ARENA
+//   SHARD: not runs, not set-wide, not per thread; the multiples are
+//   absolute positions of the shard's counter, never reset, so a skipped
+//   attempt is not retried and the next is R nodes on. What the cadence
+//   guarantees is therefore a BOUND ON SPACING, not a count: at most one
+//   attempt per R nodes retired on a shard, and nothing about how many
+//   proceed (an attempt that meets the flag held -- an explicit call, another
+//   thread's trigger, or this thread's own advance() whose walk is retiring
+//   -- is skipped: `auto_skipped`; one that acquires the flag is
+//   `auto_reclaims`, whatever its bump then decides). Under contention the
+//   skipped attempts can far outnumber the proceeding ones; no ratio
+//   between the two is promised, and a caller that needs the counts reads
+//   the two counters. The crossing run's
+//   fate follows the bump's outcome: `advanced`, the trigger's own exchange
+//   took it (push then exchange on one thread: it is in the bag the trigger
+//   closed); `nothing_retired`, a concurrent bump of any cause took it
+//   between this thread's push and its flag acquisition; `ring_full` or
+//   skipped, it stays on the retired list for the next bump of any cause.
+//   Limbo pushes never count and never trigger. Under a cadence an
+//   explicit advance() or reclaim() concurrent with operations may return
+//   `contended` (an operating thread's trigger holds the flag); at a
+//   quiescent point it never does, since a trigger lives only inside an
+//   operation. A contains() can reach a trigger only by entering an
+//   UNINITIALIZED bucket and winning its split, whose cleanup pass retires:
+//   on a table that has not doubled no lookup ever bumps or frees.
+//   WHY THE TRIGGER IS SAFE: it is the nested-call case above (an advance()
+//   from a Hash{} or operator== that an operation calls, which also runs
+//   inside an operation, with that operation's walk state live) minus the
+//   walk, at a different site -- the end of push_retired(), just after the
+//   push. Four claims, each of which the trigger's code keeps:
+//   (alpha) the operation's handle is live and unmoved for the whole
+//           trigger: refresh(), moves and destruction are excluded while
+//           an operation is in flight (HANDLES; debug-asserted), and the
+//           trigger has no handle in scope -- push_retired(), unlink_run()
+//           and the walk state carry none -- so no refresh, leave or move
+//           is reachable from it. Its +1 on its generation g's `refs`
+//           therefore stands, and the trigger's own free pass reads it: the
+//           seq_cst `refs` load is sequenced after this thread's own join
+//           increment, so by coherence (and J2: every -1 follows its own
+//           +1) it reads at least 1 on block g. The store-buffering
+//           argument of THE JOIN is needed for OTHER threads' pins only.
+//   (beta)  the free pass stops at the first pinned bag (oldest-first,
+//           never skipping: direction (II)), hence at or before bag g (bag
+//           g is SEALED with `refs` >= 1, or still CURRENT): a trigger frees
+//           only bags of generations BELOW its own handle's.
+//   (gamma) every node address the operation holds across the trigger --
+//           the walk state's pred word and its value, the head word, the
+//           run just pushed, the successor the walk continues from, the
+//           eraser's tombstone, the inserter's still-private node -- is
+//           either in no bag, or in a bag of generation >= g by direction
+//           (I) (the thread obtained it under g through a chain entered at
+//           a head loaded after the join: C1-C4), or is the just-pushed
+//           run (delta); none is in a bag the trigger's free pass frees.
+//           The values that serve as later CAS expected values (the pred
+//           word, the head word) rest on ABA WITHOUT VERSION TAGS, whose
+//           premise -- the handle's pin stays -- (alpha) keeps.
+//   (delta) the run just pushed is exchanged by the SAME thread in the
+//           trigger's A3 (push then exchange on one atomic, sequenced; an
+//           RMW reads the last value in modification order), so it is in
+//           the bag of the generation the trigger closes, G >= g, which the
+//           thread's own handle pins; it is freed by a later free pass,
+//           after every handle of generation <= G has refreshed or left.
+//   Consequences. LATENCY: under the cadence a node retired by a thread
+//   is freed no earlier than a bump AFTER the one that bagged it, and only
+//   once every handle of that bag's generation, the retiring thread's
+//   included, has refreshed or left: a thread that erases under a
+//   never-refreshed handle pins its own garbage, every trigger it runs
+//   closes a bag it then pins, and after kGenerations - 1 such bumps every
+//   further trigger finds `ring_full` until that handle refreshes; the
+//   refresh advice of HANDLES stands. GROWTH UNDER LAGGING HANDLES: once
+//   the ring has filled behind the oldest pin, every proceeding trigger is
+//   `ring_full` until that pin leaves -- it bags nothing, its free passes
+//   free nothing the pin holds, and the retired lists keep growing -- and
+//   with every handle lagging the ring refills after each release, so when
+//   the triggers far outnumber the refreshes that release the oldest pin,
+//   almost every proceeding trigger is `ring_full`. No node is freed
+//   meanwhile, so every allocation that finds no free node (an insert's
+//   node, a split's copies) appends, and the arena grows without bound for
+//   as long as the pins last (the trade of WHAT THIS DOES AND DOES NOT
+//   GUARANTEE; the cadence does not change it).
+//   THE HOOK fires inside the operation
+//   (TEST SEAMS). COST: a trigger adds WORK to the operation that retired
+//   -- the loads and exchanges of the bump and the free pass of every
+//   unpinned bag, bounded by the bagged nodes, unbounded in time only in
+//   that the first trigger after a long stall ends frees everything the
+//   stall pinned -- never a wait, no lock, no allocation, no Hash{} or
+//   operator== call, noexcept (PROGRESS). What would break the claims, and
+//   is therefore not done: a trigger that refreshes or releases the
+//   operation's handle before its free pass (its own bag, holding nodes the
+//   walk still continues from, would be freed under it: a use after free on
+//   the same thread); a free pass that takes `refs == 1` for "only my pin"
+//   (the one pin may be another thread's, and the thread itself holds nodes
+//   of its own generation's bag); a trigger placed before the push (safe,
+//   since a push that lands after its shard's exchange goes to the next
+//   generation, but the crossing run would then not be in the trigger's
+//   bag); a trigger without the flag's acquire exchange (two holders on
+//   the plain ring fields). The counting invariants, exact at a quiescent
+//   point and asserted by the destructor in debug builds: on a cadence-off
+//   set no attempt; `auto_reclaims + auto_skipped` <= the sum over shards
+//   of `retire_nodes` divided by R (the intervals (old, old + n] of one
+//   shard's pushes partition its count, each multiple lies in exactly one,
+//   and a push attempts at most once); at R = 1 the sum equals the number
+//   of retired runs (every interval holds a multiple).
 //
 //   THE HANDLE INVARIANT, in two directions. Write u_X for the unlink CAS
 //   that bypassed a dead node X (the CAS on X's PRED WORD, the live word
@@ -952,7 +1130,7 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   is safe because the node is popped by one thread while on no chain,
 //   after every handle that could observe it has left or refreshed (the
 //   reuse chain). A throwing assignment routes the node to limbo, reused
-//   only after a later advance().
+//   only after a later bump and free pass.
 //
 //   THE LIMBO LIST under the bump. A limbo node was never published, but a
 //   node popped from a free list whose assignment threw may still have its
@@ -983,12 +1161,16 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   that stalls (preempted, suspended, or simply never refreshing) pins its
 //   generation and every node retired since for as long as it stalls, the
 //   set cannot tell a stalled holder from a slow one, and after
-//   kGenerations - 1 bumps under such a pin advance() refuses with
-//   `ring_full` while retired nodes pile up on the retired lists. This is
+//   kGenerations - 1 bumps under such a pin every bump -- advance()'s,
+//   reclaim()'s or a trigger's -- refuses with `ring_full` while retired
+//   nodes pile up on the retired lists and every insert that finds no
+//   free node grows the arena (GROWTH UNDER LAGGING HANDLES, under THE
+//   TRIGGER). This is
 //   the trade of epoch-based reclamation, accepted here; refresh(),
 //   `ring_full` and the diagnostics (handle refs and bagged counts per
-//   generation) are what a caller has to see a stall. Latency: with a
-//   long-lived handle refreshed before each advance(), a node retired
+//   generation) are what a caller has to see a stall. Latency of the
+//   explicit calls (under the cadence: THE TRIGGER): with a long-lived
+//   handle refreshed before each advance() or reclaim(), a node retired
 //   between two calls is freed TWO calls after its retirement (the first
 //   closes its bag, which the refreshed handle still pins; the second frees
 //   it); with every handle released before each call, by the NEXT call. A
@@ -998,18 +1180,23 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //
 //   TEST SEAMS, outside the operational contract. Two kinds.
 //   The `Hooks` template parameter names three static `noexcept` functions
-//   the set calls at fixed positions of the join and of advance() (see
+//   the set calls at fixed positions of the join and of the bump-and-free
+//   that advance(), reclaim() and the trigger share (see
 //   NoHooks for each): tests force the interleavings the store-buffering
 //   argument depends on -- the join before its increment, the increment
 //   before its re-verify, operations between the publish and the free
 //   pass -- deterministically; the default NoHooks compiles to nothing, and
-//   no hook is on an operation path, in the destructor or in the sweep.
-//   The hooks are `noexcept`, so a hook action that throws terminates the
-//   program. A hook action may run complete operations and advance() on
-//   the same set (a nested advance() inside in_advance_after_publish()
-//   returns `contended`: the same thread holds the flag) but must not
-//   refresh, move or destroy the handle the interrupted join is creating or
-//   refreshing, nor call the diagnostic sweep (get_internal_accounting()
+//   no hook is in the destructor or in the sweep; on a cadence-off set no
+//   hook is on an operation path either, while on a cadenced set the
+//   publish hook fires from the trigger, inside the operation that retired
+//   (THE TRIGGER). The hooks are `noexcept`, so a hook action that throws
+//   terminates the program. A hook action may run complete operations,
+//   advance() and reclaim() on the same set (a nested advance() or
+//   reclaim() inside in_advance_after_publish() returns `contended`: the
+//   same thread holds the flag; a nested operation's retire push there is
+//   a skipped trigger) but must not refresh, move, swap or destroy the
+//   handle the interrupted join is creating or refreshing, nor the handle
+//   of the operation a trigger interrupted, nor call the diagnostic sweep (get_internal_accounting()
 //   and everything derived from it), and inside in_advance_after_publish()
 //   -- or a join hook nested in it -- nor get_internal_generation(),
 //   get_internal_ring_state() or get_internal_bag_count(): each asserts the
@@ -1018,10 +1205,12 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   The get_internal_* accessors (DIAGNOSTICS, before them) show the
 //   arena, the ring and the counters, each under its own precondition:
 //   RACE-FREE ones (counts, the table size, the counters) may run beside
-//   anything and are exact at a quiescent point; RING VIEWS need no
-//   advance() in progress; the QUIESCENT ones -- the accounting sweep and
-//   everything derived from it -- need no operation, no join attempt and no
-//   advance() in progress on any thread, every other call ordered against
+//   anything and are exact at a quiescent point; RING VIEWS need no flag
+//   holder in progress (no advance(), no reclaim(), and on a set
+//   constructed with a cadence no operation); the QUIESCENT ones -- the
+//   accounting sweep and everything derived from it -- need no operation,
+//   no join attempt and no advance() or reclaim() in progress on any
+//   thread, every other call ordered against
 //   them by happens-before, live idle handles allowed.
 //
 //   ASAN POISONING. Under AddressSanitizer a node's VALUE bytes -- the
@@ -1311,7 +1500,13 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //
 // PROGRESS: the hash's own protocol takes no lock. The walks, the splits,
 // the unlinks, the publishing CAS and every retry loop are lock-free, and
-// the pure read/traverse path writes nothing; none of it is wait-free. The
+// the pure read/traverse path writes nothing; none of it is wait-free. On a
+// set constructed with a cadence the retire path also runs the automatic
+// trigger, after the retire push (THE TRIGGER under HANDLES AND
+// GENERATIONS): added WORK on the
+// retiring thread -- the bump's loads and exchanges and the free pass of
+// every unpinned bag, bounded by the bagged nodes, non-blocking by refusal
+// of the try-flag, lock-free, allocation-free and noexcept -- never a wait. The
 // class takes a lock in only two places, both on the allocation side, and
 // only an operation that allocates can reach either, so an operation that
 // allocates nothing is lock-free end to end:
@@ -1346,9 +1541,10 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 // self-unlink makes at most two. The generation protocol adds no lock and
 // no blocking wait either: the join retries only after an advancer
 // published a new generation (a completed step of another thread) and
-// never waits for an advance(); advance() is non-blocking by REFUSAL (a
-// try-flag: a caller that finds it set returns `contended` at once, and
-// nothing ever waits for the holder); the free pass's push loops are
+// never waits for an advance(); advance() and reclaim() are non-blocking
+// by REFUSAL (a try-flag: a caller that finds it set returns `contended`
+// at once, a trigger that finds it set is skipped, and nothing ever waits
+// for the holder); the free pass's push loops are
 // lock-free (each failure a completed pop of the same list, or a spurious
 // failure of the weak CAS); the free-list pop, the steal's included, is a
 // lock-free loop against concurrent pops and pushes (each failure a
@@ -1396,7 +1592,8 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   kGenerations: the number of generation slots in the ring (THE RING under
 //                 HANDLES AND GENERATIONS), at least 2: one slot is always
 //                 CURRENT, so kGenerations - 1 generations can be SEALED and
-//                 pinned at once before advance() refuses with `ring_full`.
+//                 pinned at once before a bump (advance()'s, reclaim()'s or
+//                 a trigger's) refuses with `ring_full`.
 //                 Fixed per instantiation; the ring is part of the set
 //                 object.
 //   Hooks       : the test seams (TEST SEAMS under HANDLES AND GENERATIONS),
@@ -1441,8 +1638,8 @@ private:
     //                   expected value is the LIVE link. MARK and FROZEN are
     //                   therefore mutually exclusive and both terminal for the
     //                   node's life: a tagged link is never written again by a
-    //                   concurrent operation, and only the free pass of
-    //                   advance() rewrites it, when it frees the node for a
+    //                   concurrent operation, and only the free pass
+    //                   rewrites it, when it frees the node for a
     //                   pop to reuse (a free node's link is a bare address,
     //                   no tag bits).
     //   LEVEL_MASK    = 0x3F << 58 (heads only): the seal level, log2 of the
@@ -1538,7 +1735,7 @@ public:
         // link change in exactly one way, by an unlink CAS on a LIVE link
         // that bypasses a run of dead successors (unlink_run()); a TAGGED link
         // (MARK or FROZEN) is written by no concurrent operation, and by the
-        // free pass of advance() only when it frees the node, which happens
+        // free pass only when it frees the node, which happens
         // only once no handle can observe it, so a dead node can always be
         // EXITED through the successor it held when it died, for as long as
         // a handle that reached it lives. On a free or limbo list the same word is
@@ -1551,7 +1748,7 @@ public:
         // was unlinked: its `link` must keep the chain successor (see above).
         // Written only by push_retired() (the retiring thread, privately for
         // the run and then as the list's next pointer) and read only by the
-        // free pass of advance(), after the bump's acquire exchange of the
+        // free pass, after a bump's acquire exchange of the
         // head, and by the accounting sweep; no concurrent operation reads
         // it, so its stores are relaxed and only the retired head's CAS
         // carries ordering. The nine bits an address never uses (63..58 and
@@ -1609,7 +1806,8 @@ private:
         // Free list: the encoded top node address and pop counter (see the
         // FREE-LIST HEAD encoding). Popped with an acquire CAS by
         // alloc_node() on the shard's own threads and by steal_node() on
-        // threads of other shards, pushed by the free pass of advance() with a release CAS that
+        // threads of other shards, pushed by the free pass (of advance(),
+        // reclaim() or an automatic trigger: one flag holder at a time) with a release CAS that
         // keeps the counter bits (push_free()); the counter is never reset.
         // The two run concurrently: the orders are THE PER-NODE REUSE CHAIN
         // in the class overview.
@@ -1617,7 +1815,7 @@ private:
         // Limbo list: the bare address of the top node, or EMPTY; the nodes
         // link through their `link` words. Pushed with a RELEASE CAS by the
         // shard's threads (push_limbo()), exchanged to EMPTY with acquire by
-        // the bump of advance() when its emptiness load found the list
+        // a bump when its emptiness load found the list
         // non-EMPTY (into the closing generation's bag, where the free pass
         // walks it through `link`), read by the accounting sweep. Push-only
         // between two exchanges. The push CAS is ABA-benign: a pusher never
@@ -1632,7 +1830,8 @@ private:
         // `link` (a retired node keeps its chain link: see Node). LIFO and
         // push-only between two bumps: push_retired() pushes a run with one
         // RELEASE CAS on behalf of the thread that unlinked it (its own
-        // shard, see there), the bump of advance() exchanges the head to
+        // shard, see there), a bump (advance()'s, reclaim()'s or an
+        // automatic trigger's) exchanges the head to
         // EMPTY with ACQUIRE into the closing generation's bag, and nothing
         // pops. The push CAS is ABA-benign for the same reason the limbo
         // push is (the pusher stores the head it read into its own tail's
@@ -1662,7 +1861,7 @@ private:
         // are not counted), one per split attempt and one per won publish
         // (on the line after the retired line); see the layout comment above.
         std::atomic<size_t> retire_runs{0};             // push_retired() calls: one per unlinked run
-        std::atomic<size_t> retire_nodes{0};            // nodes those runs held in total
+        std::atomic<size_t> retire_nodes{0};            // nodes those runs held in total; the automatic cadence's input (THE TRIGGER in the class overview): the value its fetch_add returns decides whether the push triggers
         // Lost one-shot unlink CASes, by site and by kind. A loss is a PEER
         // LOSS when the failure value already holds the successor this thread
         // computed: another thread bypassed the same run, and nothing is left
@@ -1703,8 +1902,8 @@ private:
     SpinLock resize_lock_;
 
     // The resize hint: arena occupancy, over-counted by up to 255 per touched
-    // shard's deque and per free list, minus every node the free pass of
-    // advance() has freed. A shard adds 256 when the index of a node it
+    // shard's deque and per free list, minus every node a free pass has
+    // freed. A shard adds 256 when the index of a node it
     // appends is a multiple of 256, index 0 included, so a shard's first
     // node counts as 256; and 256 on every 256th pop from a free list, the
     // list's first pop ever included (see the FREE-LIST HEAD encoding: the
@@ -1797,8 +1996,9 @@ private:
 
     // Push the private chain first..last (linked through their link words,
     // nothing else references them) onto `shard`'s limbo list, where the
-    // bump of advance() will find it (THE LIMBO LIST under HANDLES AND
-    // GENERATIONS in the class overview). Treiber push, ABA-benign: the
+    // next bump will find it (THE LIMBO LIST under HANDLES AND
+    // GENERATIONS in the class overview). Never counted toward the automatic
+    // cadence, which counts retired nodes only. Treiber push, ABA-benign: the
     // pusher never dereferences the head value it read, it only stores it
     // into `last->link`, so a CAS that finds the head value again links the
     // tail to the node that is the head at the CAS. The head load and the failure order
@@ -1829,11 +2029,14 @@ private:
 
     // Retire the run first..last of dead nodes that the calling operation has
     // just unlinked from its chain: push it, as one unit, onto `shard`'s
-    // retired list, where the bump of advance() will find it (it exchanges
+    // retired list, where the next bump will find it (it exchanges
     // the list into the closing generation's bag, and the free pass frees
     // the bag once no handle of that generation or an older one is live:
-    // HANDLES AND GENERATIONS in the class overview). The ONE entry point to
-    // the retired lists.
+    // HANDLES AND GENERATIONS in the class overview); then, on a set
+    // constructed with a cadence, run the automatic trigger if this push
+    // took the shard's retired-node count across a multiple of the cadence
+    // (step 3; THE TRIGGER in the class overview). The ONE entry point to
+    // the retired lists, and the one site of the trigger.
     // Preconditions: every node of the run is dead and TAGGED (MARKED or
     // FROZEN; asserted), the run is the exact set of nodes the caller's OWN
     // successful unlink CAS bypassed (a loser retires nothing: the winner
@@ -1849,7 +2052,7 @@ private:
     // effect on where it is reused; what it does affect is contention, and
     // the caller's own shard's retired line is written concurrently only by
     // the threads that share that shard (and by the bump's exchange, once
-    // per advance()).
+    // per bump of any cause).
     // Steps: (1) link the run privately through the retire_link words,
     // walking the run's own chain links from first to last. This happens
     // AFTER the caller's unlink CAS won, never while recording the run: a
@@ -1874,8 +2077,29 @@ private:
     // loop is lock-free. The retire_link stores are relaxed: nothing reads
     // them before the exchange's acquire (the free pass and the accounting
     // sweep are the only readers). The counters are bumped before the CAS,
-    // on the line the CAS is about to own.
-    static void push_retired(Shard& shard, Node* first, Node* last) {
+    // on the line the CAS is about to own; the value `retire_nodes` held
+    // before this run is kept for step 3. (3) The cadence test, AFTER the
+    // push, on one line with its call: the half-open interval (old, old +
+    // count] holds a multiple of the cadence iff the bits above the
+    // cadence's low bits differ between old and old + count, which the mask
+    // (~(R - 1), or 0 for a cadence-off set, where the test is identically
+    // false and the feature costs the use of the fetch_add's returned value,
+    // one XOR, one AND on a `const` member and one untaken branch) tests; a
+    // run that jumps several multiples fires once. After the push, not before, so that a trigger
+    // which publishes bags THIS run too: push then exchange on one thread
+    // is sequenced, and the exchange reads the push or a later value. A
+    // trigger that does not publish leaves the run to another bump:
+    // `nothing_retired` means a concurrent bump of any cause took the list
+    // between this push and the flag acquisition (the head was not EMPTY
+    // after the push), so the run is in that bump's bag; `ring_full`, like a
+    // skipped attempt, leaves it on the retired list for the next bump of any
+    // cause. No
+    // ordering is needed for the decision: a relaxed fetch_add's returned
+    // value is exact (the counter's modification order totals every earlier
+    // count), and the counter orders nothing. The trigger reads nothing of
+    // the operation's handle, which pins everything this thread still holds
+    // (THE TRIGGER, claims (alpha)-(delta)).
+    void push_retired(Shard& shard, Node* first, Node* last) {
         size_t count = 1;
         for (Node* node = first; node != last; ++count) {   // step 1: link the run privately
             const word_t link = node->link.load(std::memory_order_relaxed);
@@ -1887,12 +2111,57 @@ private:
         } // link the run privately
         assert((last->link.load(std::memory_order_relaxed) & (MARK_BIT | FROZEN_BIT)) != 0 && "retiring a node that is not tagged: it is not dead");
         shard.retire_runs.fetch_add(1, std::memory_order_relaxed);
-        shard.retire_nodes.fetch_add(count, std::memory_order_relaxed);
+        const size_t old_nodes = shard.retire_nodes.fetch_add(count, std::memory_order_relaxed);   // the count before this run: the cadence test's input (step 3)
         word_t old_head = shard.retired_head.load(std::memory_order_relaxed);
         do {   // step 2: the push
             last->retire_link.store(old_head, std::memory_order_relaxed);
         } while (!shard.retired_head.compare_exchange_weak(old_head, word_of(first), std::memory_order_release, std::memory_order_relaxed));
+        if (CHS_RCU_UNLIKELY(((old_nodes ^ (old_nodes + count)) & auto_reclaim_mask_) != 0)) auto_reclaim();   // step 3: the cadence (identically false with the cadence off)
     } // push_retired()
+
+    // THE AUTOMATIC TRIGGER (THE TRIGGER under HANDLES AND GENERATIONS in
+    // the class overview): the tail of push_retired() on a cadenced set,
+    // reached when the push took the shard's retired-node count across a
+    // multiple of the cadence. It is reclaim() with no caller to report to:
+    // the try-flag or nothing (a trigger that finds the flag held -- an
+    // explicit call on any thread, another thread's trigger, or this
+    // thread's own advance() whose walk is retiring -- counts itself in
+    // `auto_skipped` and returns: no clock read, no hook, no `contended`;
+    // the crossing run stays on the retired list for the next bump of any
+    // cause); else, under the guard,
+    // `auto_reclaims` +1 whatever the bump decides, then the bump, the hook
+    // if it published and the final free pass (bump_and_free(), timed on
+    // bump_ns and free_ns of the retiring thread). It runs on the retiring
+    // thread, inside the operation that retired, under that operation's
+    // handle, which it never reads: no handle is in scope here, so no
+    // refresh, move or release of it is reachable from the trigger, and its
+    // free pass stops at the operation's own pin (THE TRIGGER, claims (alpha)
+    // and (beta)). It cannot nest: a retire push inside its hook (a nested
+    // operation from the action) finds the flag held and is skipped. Never
+    // the walk. noexcept end to end: the bump, the free pass and the hook
+    // are noexcept and the guard's destructor throws nothing. No new memory
+    // order: the flag's acquire exchange and the guard's release store are
+    // advance()'s, and the decision that reached here is arithmetic on the
+    // value a relaxed fetch_add returned. Never inlined: the retire path
+    // reaches it once per cadence at most, and keeping its body out of
+    // push_retired() keeps the push inlined into unlink_run() and the
+    // operation paths free of the trigger's body: only the cadence test and
+    // a call (an inlined trigger drags the bump and the free pass into
+    // every unlink site). Not marked cold: under GCC a cold callee puts its
+    // call site in the caller's cold partition, and values the caller keeps
+    // live across that site (a caller's loop counters) can then be homed in
+    // memory; with the call in the caller's own text most of them stay in
+    // registers.
+    [[gnu::noinline]] void auto_reclaim() noexcept {
+        if (reclaiming_.exchange(true, std::memory_order_acquire)) {
+            advance_counters_.auto_skipped.fetch_add(1, std::memory_order_relaxed);
+            return;
+        } // if the flag is held: the attempt is skipped
+        const AdvanceGuard guard(*this);
+        advance_counters_.auto_reclaims.fetch_add(1, std::memory_order_relaxed);
+        AdvanceResult result{0, 0, 0, 0, 0, AdvanceResult::Advance::nothing_retired};
+        bump_and_free(result);
+    } // auto_reclaim()
 
     // The NEXT CHILD of bucket j on the path of a key with hash `h`: the one
     // bucket the key moves to when the table doubles past j, or j itself if
@@ -2617,7 +2886,7 @@ private:
         // equivalent split of j; our subchain was never linked anywhere, so
         // nothing but this thread could ever find it again: it goes, whole,
         // onto our shard's limbo list (one CAS, head to tail), for the next
-        // advance() to bag and a later one to free. The nodes we froze stay
+        // bump to bag and a later free pass to free. The nodes we froze stay
         // frozen, which is correct: the winner copied them. Failure is
         // relaxed: the value that won is not used; our caller re-reads the
         // head with acquire.
@@ -2627,15 +2896,25 @@ private:
             my_shard().splits_published.fetch_add(1, std::memory_order_relaxed);   // diagnostic counter
             cleanup_parent(parent);   // step 4, after the publication (P9); H6 inside
         } else {
-            // CAS failed: subchain abandoned (unpublished, memory waste until advance() frees it).
+            // CAS failed: subchain abandoned (unpublished, memory waste until a later free pass frees it).
             if (new_subchain_head != EMPTY) push_limbo(my_shard(), node_of(new_subchain_head), new_subchain_tail);
         } // if another thread's split of j won
     } // split_bucket()
 
 public:
-    // Initializes the hash set with the given capacity, rounded up to the
-    // nearest power of two (the bucket mask math needs only a power of two;
-    // the minimum of 4 is a convenience). A capacity above 2^63 is a caller's
+    // Construction, through an Options aggregate (designated initializers:
+    // `Set::Options{.auto_reclaim_every = 8192}`) or through the two-parameter
+    // form below, which is the same with the cadence off. Both `explicit`.
+    // The Options form has no default argument: with one, `Set s;` would
+    // be ambiguous against the two-parameter form's defaults.
+    // Options is a parameter type only: the set keeps none, and the
+    // effective values are reachable through the diagnostics
+    // (get_internal_table_size() on a fresh set, get_internal_arena_shards(),
+    // get_internal_auto_reclaim_every()).
+    //
+    // initial_capacity: the number of buckets, rounded up to the nearest
+    // power of two (the bucket mask math needs only a power of two; the
+    // minimum of 4 is a convenience). A capacity above 2^63 is a caller's
     // bug: std::bit_ceil() of it has no representable result, so the
     // constructor calls std::abort(), in every build, before rounding. The
     // buckets are allocated here, eagerly, so a capacity beyond memory throws
@@ -2653,11 +2932,27 @@ public:
     // contention for memory (an untouched shard costs one small object, a
     // touched one at least a block of nodes).
     //
+    // auto_reclaim_every: the automatic cadence (THE TRIGGER under HANDLES
+    // AND GENERATIONS in the class overview), in nodes retired per arena
+    // shard; 0 (the default) means OFF, decided before any rounding; a value
+    // above 2^63 is clamped, silently, to 2^63 (SIZE_MAX is a valid way to
+    // say "never"); the rest is rounded up to a power of two. With the
+    // cadence off the set behaves exactly as one constructed by the
+    // two-parameter form: nothing is freed unless advance() or reclaim() is
+    // called. The cadence allocates nothing and cannot fail.
+    //
     // The set is neither copyable nor movable (its deques and atomics are
     // neither). Its destruction is quiescent: every call on the set must
     // happen-before the destructor, which destroys every value the arena
     // holds (see the destructor for its preconditions on handles).
-    ConcurrentResizableHashSetRCU(size_t initial_capacity = 4, size_t arena_shards = 0) {
+    struct Options {
+        size_t initial_capacity = 4;     // buckets, as the first parameter of the two-parameter constructor
+        size_t arena_shards = 0;         // arena shards, as its second; 0 = the hardware concurrency
+        size_t auto_reclaim_every = 0;   // the cadence: nodes retired per arena shard between two automatic reclaims; 0 = off
+    }; // struct Options
+    explicit ConcurrentResizableHashSetRCU(const Options& options) : auto_reclaim_mask_(auto_reclaim_mask(options.auto_reclaim_every)) {
+        size_t initial_capacity = options.initial_capacity;
+        size_t arena_shards = options.arena_shards;
         if (arena_shards == 0) arena_shards = std::thread::hardware_concurrency();
         if (arena_shards == 0) arena_shards = 1;   // hardware_concurrency() may report 0
         // Cap before rounding: bit_ceil() of a value above 2^63 has no
@@ -2689,7 +2984,14 @@ public:
         ring_[0].state = GenerationState::CURRENT;
         limbo_loaded_ = std::make_unique<word_t[]>(arena_shards);
         table_size_.store(initial_capacity, std::memory_order_release);
-    } // ConcurrentResizableHashSetRCU()
+    } // ConcurrentResizableHashSetRCU(const Options&)
+    // The two-parameter form: the same parameters and defaults as the
+    // Options form, the cadence off. It delegates, so that the one
+    // constructor body and the one `const` mask initializer exist; `explicit`
+    // because a bare size is not a set (copy-initialization from a size or a
+    // braced list is rejected).
+    explicit ConcurrentResizableHashSetRCU(size_t initial_capacity = 4, size_t arena_shards = 0)
+        : ConcurrentResizableHashSetRCU(Options{initial_capacity, arena_shards, 0}) {}
 
     // ------------------------------------------------------------------------
     // PINNED ORDERS. The order in which an operation loads a word, hashes or
@@ -2751,7 +3053,9 @@ public:
     // UNINITIALIZED bucket, so it is not lock-free/wait-free in general (see
     // the class overview). For the same reason it is not const: the split
     // writes the set's internals (a seal, freezes, a publish, allocations,
-    // the cleanup pass's unlinks), though never its membership.
+    // the cleanup pass's unlinks and, on a set constructed with a cadence,
+    // the bump and free pass of a trigger that a cleanup's retire push may
+    // run: THE TRIGGER), though never its membership.
     // Logically deleted nodes are skipped via the MARK_BIT test. The head's seal
     // level and a node's FROZEN bit are deliberately IGNORED here (they are only
     // masked off the address): contains()'s walk writes nothing (the split it
@@ -2922,7 +3226,7 @@ public:
                     // A non-null new_node means an earlier attempt allocated it,
                     // lost its CAS, and this retry found the key published by
                     // another thread. The node was never published; it is orphaned
-                    // onto our shard's limbo list for advance() to bag and free.
+                    // onto our shard's limbo list for a bump to bag and a free pass to free.
                     if (new_node != nullptr) push_limbo(my_shard(), new_node, new_node);
                     return false;
                 } // if the key is present
@@ -2969,11 +3273,12 @@ public:
                     // within 256 per shard); the decision is remade under resize_lock_
                     // against a fresh table_size_ so only ONE thread doubles per epoch
                     // (current_ts == ts). NOTE: node_count_ is arena occupancy minus
-                    // what the free pass of advance() has freed -- it counts
+                    // what the free pass has freed -- it counts
                     // tombstones, stale split copies, lost subchains and orphans
-                    // until an advance() bags and frees them -- so this is an
+                    // until a bump bags them and a free pass frees them -- so this is an
                     // arena-consumption trigger, not a live-load-factor trigger: a
-                    // delete-heavy workload without advance() calls grows the table
+                    // delete-heavy workload without advance() or reclaim() calls
+                    // (and without a cadence) grows the table
                     // although the live key count does not. The count never dips
                     // below zero, concurrent frees included (see node_count_), so
                     // the unsigned compare is safe. New buckets are
@@ -3136,14 +3441,16 @@ public:
     // ------------------------------------------------------------------------
     // The free lists' PUSH side, and the dead-node rule of the diagnostic
     // sweep. Everything else of reclamation -- the bump, the free pass that
-    // calls push_free(), the walk -- is advance()'s, at the end of the class
-    // (HANDLES AND GENERATIONS in the class overview).
+    // calls push_free(), the walk: advance()'s steps, the first two shared
+    // with reclaim() and the trigger -- is at the end of the class (HANDLES
+    // AND GENERATIONS in the class overview); the trigger's entry,
+    // auto_reclaim(), is beside push_retired().
     // ------------------------------------------------------------------------
 
 private:
     // Push `node` onto `shard`'s free list, keeping the head's counter bits.
-    // Called by the free pass of advance() alone (one advancer at a time,
-    // under the flag), for a node that is on no chain and on no list and
+    // Called by the free pass alone (one flag holder at a time: advance(),
+    // reclaim() or an automatic trigger), for a node that is on no chain and on no list and
     // that no live handle can observe (THE HANDLE INVARIANT in the class
     // overview): a bagged retired or limbo node whose bag's generation, and
     // every older one, has no live handle. Runs CONCURRENTLY with the pops of
@@ -3227,17 +3534,21 @@ public:
     // benchmark. They come in three classes:
     //   - RACE-FREE, approximate while operations run:
     //     get_internal_node_count(), get_internal_arena_shards(),
-    //     get_internal_table_size() and get_internal_counters() read only
+    //     get_internal_auto_reclaim_every(), get_internal_table_size(),
+    //     get_internal_counters() and get_internal_retire_nodes_per_shard()
+    //     read only
     //     atomics and values fixed at construction, and may be called
-    //     concurrently with any operation; each value they read is one its
+    //     concurrently with any operation, explicit call or trigger; each
+    //     value they read is one its
     //     source had, but a sum over the shards is not one instant's total. At
-    //     a quiescent point they are exact; get_internal_arena_shards(), a
-    //     value fixed at construction, is exact always.
+    //     a quiescent point they are exact; get_internal_arena_shards() and
+    //     get_internal_auto_reclaim_every(), values fixed at construction,
+    //     are exact always.
     //   - QUIESCENT ONLY: get_internal_accounting(), the free, limbo,
     //     retired and bagged counts taken from it, and
     //     get_internal_bucket_published(). QUIESCENCE here means: no
     //     operation, no join attempt (new_handle(), refresh()'s slow path)
-    //     and no advance() is in progress on any thread while the function
+    //     and no advance() or reclaim() is in progress on any thread while the function
     //     runs, every earlier call happens-before it and it happens-before
     //     every later one (the caller joins or barriers the worker threads
     //     before and starts or releases them after). Live IDLE handles are
@@ -3257,18 +3568,23 @@ public:
     //     get_internal_table_size() does not provide one, and the sweep
     //     itself indexes buckets_ up to a relaxed-loaded table_size_, the
     //     same hazard.
-    //   - RING VIEWS, no advance() in progress (a weaker precondition than
-    //     QUIESCENCE: operations, join attempts and live handles may run):
+    //   - RING VIEWS, no flag holder in progress -- no advance(), no
+    //     reclaim() and, on a set constructed with a cadence, no OPERATION
+    //     (an operation's retire push may run the automatic trigger, which
+    //     holds the flag): on a cadence-off set a weaker precondition than
+    //     QUIESCENCE (operations, join attempts and live handles may run),
+    //     on a cadenced set operation quiescence (join attempts and live
+    //     idle handles may still run):
     //     get_internal_generation(), get_internal_ring_state() and
     //     get_internal_bag_count() read the ring's plain fields and walk the
-    //     bags, which only the advancer writes (asserted: the flag clear),
-    //     and the bagged nodes' `retire_link` and `link`, which no operation
-    //     writes. get_internal_generation() reads `current_` with acquire,
-    //     which reads the publish and so orders the advancer's write of
-    //     `gen` before the read; it needs nothing more. The other two also
-    //     read `state`, `oldest_` and the bag slots, which an advance() may
-    //     write without publishing (a `nothing_retired` or `ring_full` call
-    //     that frees bags), so they need every earlier advance() to
+    //     bags, which only the flag holder writes (asserted: the flag
+    //     clear), and the bagged nodes' `retire_link` and `link`, which no
+    //     operation writes. get_internal_generation() reads `current_` with
+    //     acquire, which reads the publish and so orders the holder's write
+    //     of `gen` before the read; it needs nothing more. The other two
+    //     also read `state`, `oldest_` and the bag slots, which a holder may
+    //     write without publishing (a `nothing_retired` or `ring_full`
+    //     outcome that frees bags), so they need every earlier holder to
     //     happen-before the call (the caller made it, or joined the thread
     //     that did). get_internal_handle_generation(h) needs only a live h.
     //
@@ -3283,6 +3599,25 @@ public:
     // Diagnostic accessor: the number of arena shards (a power of two), as
     // the constructor fixed it.
     size_t get_internal_arena_shards() const { return arena_mask_ + 1; }
+    // Diagnostic accessor, race-free: the effective cadence (nodes retired
+    // per arena shard between two automatic reclaims) as the constructor
+    // fixed it: 0 for a cadence-off set (both constructors with no cadence),
+    // else the requested value clamped to 2^63 and rounded up to a power of
+    // two (the constructor's rules). Decoded from the mask, which stores
+    // ~(R - 1) for a cadence R and 0 for off.
+    size_t get_internal_auto_reclaim_every() const noexcept { return auto_reclaim_mask_ == 0 ? 0 : ~auto_reclaim_mask_ + 1; }
+    // Diagnostic accessor, race-free: every shard's `retire_nodes` (the nodes
+    // retired onto that shard's retired list over the set's life: the
+    // cadence's input), one relaxed load per shard, in shard order (index =
+    // the thread number masked by the shard count); exact at a quiescent
+    // point, a snapshot otherwise; its sum is get_internal_counters()'s
+    // `retire_nodes`.
+    std::vector<size_t> get_internal_retire_nodes_per_shard() const {
+        std::vector<size_t> per_shard;
+        per_shard.reserve(arena_mask_ + 1);
+        for (size_t s = 0; s <= arena_mask_; ++s) per_shard.push_back(shards_[s].retire_nodes.load(std::memory_order_relaxed));
+        return per_shard;
+    } // get_internal_retire_nodes_per_shard()
     // Diagnostic accessors, quiescent only: the number of nodes on all free
     // lists / on all limbo lists, as the accounting sweep below counts them.
     // A corrupted (cyclic) list does not hang: the sweep stops at the first
@@ -3324,15 +3659,21 @@ public:
         size_t advance_cas_failures;     // lost one-shot CASes of advance()'s walk, all kinds
         size_t advance_cas_peer_losses;  // of those, peer losses
         size_t joins;                    // successful join attempts (new_handle(), refresh()'s slow path, the walk's join)
-        size_t join_retries;             // join attempts whose re-verify failed (an advance() published between the load and the re-verify)
-        size_t bumps;                    // advance() calls that published a new generation (`advanced`)
-        size_t ring_full;                // advance() calls refused with `ring_full`
-        size_t contended;                // advance() calls refused with `contended`
-        size_t bags_freed;               // bags the free pass freed
-        size_t nodes_freed;              // nodes the free pass moved to the free lists
+        size_t join_retries;             // join attempts whose re-verify failed (a bump of any cause published between the load and the re-verify)
+        size_t bumps;                    // publishes of a new generation (`advanced`), by advance(), reclaim() or a proceeding automatic trigger alike
+        size_t ring_full;                // `ring_full` outcomes of advance(), reclaim() and proceeding triggers
+        size_t contended;                // advance() and reclaim() calls refused with `contended` (never a skipped trigger: that is `auto_skipped`)
+        size_t bags_freed;               // bags the free pass freed, whoever ran it
+        size_t nodes_freed;              // nodes the free pass moved to the free lists, whoever ran it
         size_t free_push_cas_failures;   // free-list pushes of the free pass that lost a CAS (to a concurrent pop; no other pusher exists) or failed spuriously
         size_t pops_raced_push;          // free-list pops whose CAS lost to a concurrent PUSH (the failure value's counter bits equal the expected ones: a pop would have advanced them) or failed spuriously
         size_t limbo_pushes;             // push_limbo() calls (one per limbo subchain)
+        // The automatic cadence's counters (0 for the life of a cadence-off
+        // set): one attempt per retire push that took its shard's
+        // retired-node count across a multiple of the cadence, counted in
+        // exactly one of the two.
+        size_t auto_reclaims;            // triggers that acquired the flag, whatever their bump then decided (`advanced`, `nothing_retired` or `ring_full`)
+        size_t auto_skipped;             // triggers that found the flag held and did nothing
     }; // struct InternalCounters
     InternalCounters get_internal_counters() const {
         InternalCounters c{};
@@ -3359,6 +3700,8 @@ public:
         c.free_push_cas_failures = advance_counters_.free_push_cas_failures.load(std::memory_order_relaxed);
         c.pops_raced_push = advance_counters_.pops_raced_push.load(std::memory_order_relaxed);
         c.limbo_pushes = advance_counters_.limbo_pushes.load(std::memory_order_relaxed);
+        c.auto_reclaims = advance_counters_.auto_reclaims.load(std::memory_order_relaxed);
+        c.auto_skipped = advance_counters_.auto_skipped.load(std::memory_order_relaxed);
         return c;
     } // get_internal_counters()
 
@@ -3422,7 +3765,7 @@ public:
         std::vector<size_t> free_per_shard; // `free_nodes` split by shard, in shard order
     }; // struct InternalAccounting
     InternalAccounting get_internal_accounting() const {
-        assert(!reclaiming_.load(std::memory_order_relaxed) && "accounting sweep during advance()");
+        assert(!reclaiming_.load(std::memory_order_relaxed) && "accounting sweep during advance(), reclaim() or an automatic trigger");
         // Every slot's address, sorted, with a seen flag per slot. A shard is
         // indexed over [0, size()) with operator[], which the deque allows
         // after the acquire load that its size() is (channel 3); here the
@@ -3533,9 +3876,9 @@ public:
     // that no member above moves (the data members at the very end
     // follow node_count_ in the layout): the generation block and the
     // handle, the join and the leave, the flag's guard, the poison helpers,
-    // the destructor, new_handle(), advance() with its bump, free pass and
-    // walk, the protocol's diagnostics, and the counters, the ring, the
-    // current pointer and the flag.
+    // the destructor, new_handle(), advance() and reclaim() with the bump,
+    // the free pass and the walk, the protocol's diagnostics, and the
+    // counters, the ring, the current pointer and the flag.
     // ------------------------------------------------------------------------
 public:
     // The state of a generation slot (THE RING in the class overview).
@@ -3642,8 +3985,9 @@ public:
         // closed: safe, and merely conservative, it keeps that generation's
         // bag pinned until the next refresh). Returns true iff the handle
         // actually moved to a newer generation (false: it was already
-        // current and nothing changed). Conversely, after an advance() that
-        // returned `advanced` and happens-before the call, a handle of an
+        // current and nothing changed). Conversely, after a publish of any
+        // cause -- an advance() or reclaim() that returned `advanced`, or a
+        // trigger's bump -- that happens-before the call, a handle of an
         // older generation moves: the fast path's load then reads that
         // publish or a later one (coherence), and the handle's own block
         // cannot be CURRENT again while the handle pins it. Releases the
@@ -3788,11 +4132,12 @@ private:
         assert(prev > 0 && "generation refs went negative");   // every -1 follows its own +1 (J2)
     } // leave()
 
-    // Releases the advancer flag when advance() exits on any path (a throw
-    // from the walk's Hash{} included: without it one throw would wedge
-    // reclamation forever, every later call `contended`). release: hands
-    // the plain ring fields and this call's publish to the next holder's
-    // acquire exchange.
+    // Releases the advancer flag when its holder -- advance(), reclaim() or
+    // the automatic trigger -- exits on any path (a throw from advance()'s
+    // walk's Hash{} included: without it one throw would wedge reclamation
+    // forever, every later call `contended` and every trigger skipped).
+    // release: hands the plain ring fields and this holder's publish to the
+    // next holder's acquire exchange.
     class AdvanceGuard {
     public:
         explicit AdvanceGuard(ConcurrentResizableHashSetRCU& set) noexcept : set_(set) {}
@@ -3818,16 +4163,41 @@ private:
         const std::chrono::steady_clock::time_point start_; // when the scope began
     }; // class StepTimer
 
-    // --- The three steps of advance(): the bump, the free pass, the walk ---
+    // --- The three steps of advance() (the first two also reclaim()'s and
+    // the trigger's): the bump, the free pass, the walk ---
     // All three run under the flag (ONE ADVANCER in the class overview):
     // `state`, `gen`, the bag slots, `oldest_`, `deal_`, `limbo_loaded_`
     // and `steal_stamp_` are plain fields of the flag holder, synchronized between holders by
     // the flag's acquire/release alone.
 
+    // THE BUMP AND THE FINAL FREE PASS, the two steps every flag holder runs
+    // (advance(), reclaim() and the automatic trigger): the bump under the
+    // caller thread's bump_ns timer; the hook, once per call that publishes,
+    // after the publish and before the final free pass (and, in advance(),
+    // before the walk: TEST SEAMS) -- the flag is held, so a nested
+    // advance() or reclaim() from the action returns `contended` and a
+    // nested operation's retire push is a skipped trigger; then the final
+    // free pass, for every outcome, under free_ns. Precondition: the caller
+    // holds the flag. `result` accumulates the outcome and the counts.
+    // noexcept: the three callees are. One copy on purpose, so that the
+    // hook's position and the free pass's unconditional run are the same
+    // fact for every holder.
+    void bump_and_free(AdvanceResult& result) noexcept {
+        {
+            const StepTimer timer(internal_advance_timers().bump_ns);
+            result.advance = bump(result);
+        } // the bump, timed
+        if (result.advance == AdvanceResult::Advance::advanced) Hooks::in_advance_after_publish();
+        {
+            const StepTimer timer(internal_advance_timers().free_ns);
+            free_oldest(result);
+        } // the final free pass, timed
+    } // bump_and_free()
+
     // THE BUMP, steps A0-A5 of ONE ADVANCER: decide whether anything is
     // retired, close the current generation's retired and limbo lists into
     // its bag and publish the next generation. Returns the outcome, which
-    // advance() stores in the result: `nothing_retired` (A0: nothing to
+    // bump_and_free() stores in the result: `nothing_retired` (A0: nothing to
     // bag, no slot consumed, nothing published), `ring_full` (A2: the slot
     // after the current one is still SEALED after one free pass: no slot
     // consumed, nothing published, the free pass's counts in `result`) or
@@ -3903,7 +4273,7 @@ private:
         // pass frees under it; a seq_cst RMW instead of the store is
         // EXPECTED-EQUIVALENT). Also the release that direction (I)'s chain
         // ends on: sequenced after every exchange above. From here a joiner
-        // lands in `next`; the hook fires in advance(), right after this.
+        // lands in `next`; the hook fires in bump_and_free(), right after this.
         current_.store(next, std::memory_order_seq_cst);
         advance_counters_.bumps.fetch_add(1, std::memory_order_relaxed);
         return AdvanceResult::Advance::advanced;
@@ -4099,22 +4469,37 @@ private:
     } // node_is_poisoned()
 
 public:
-    // Preconditions (debug-asserted): no advance() in progress, no handle of
-    // this set alive, no concurrent operation (the destruction is quiescent,
-    // as the constructor's note says). The arena's deques then destroy
-    // every slot; bags pending at destruction (SEALED generations whose
-    // holders left after the last advance(), or that no advance() got to)
+    // Preconditions (debug-asserted): no advance(), reclaim() or automatic
+    // trigger in progress, no handle of this set alive, no concurrent
+    // operation (the destruction is quiescent, as the constructor's note
+    // says). The arena's deques then destroy every slot; bags pending at
+    // destruction (SEALED generations whose holders left after the last
+    // free pass, or that no free pass got to)
     // are pushed nowhere: their slots belong to the deques and are
     // destroyed with them, like every other slot. Under ASan every free
     // node's value bytes are unpoisoned first (the third poison site): the
     // deque runs ~T on every slot, and a ~T that reads its object would
     // otherwise be reported. All loads relaxed: exclusive by precondition.
     ~ConcurrentResizableHashSetRCU() {
-        assert(!reclaiming_.load(std::memory_order_relaxed) && "set destroyed during advance()");
+        assert(!reclaiming_.load(std::memory_order_relaxed) && "set destroyed during advance(), reclaim() or an automatic trigger");
 #ifndef NDEBUG
         for (const GenerationBlock& block : ring_) {
             assert(block.refs.load(std::memory_order_relaxed) == 0 && "set destroyed with live handles");
         } // loop over the ring
+        // The cadence's counting invariants, exact here because destruction
+        // is quiescent (THE TRIGGER in the class overview says why each
+        // holds): no attempt on a cadence-off set; at most one attempt per
+        // multiple of the cadence that the shards' retired-node counts
+        // crossed (the division form cannot overflow at the largest
+        // cadence); at a cadence of 1 exactly one attempt per retired run.
+        {
+            const size_t every = get_internal_auto_reclaim_every();
+            const InternalCounters c = get_internal_counters();
+            const size_t attempts = c.auto_reclaims + c.auto_skipped;
+            assert((every != 0 || attempts == 0) && "automatic reclaim attempts on a set with the cadence off");
+            assert((every == 0 || attempts <= c.retire_nodes / every) && "more automatic reclaim attempts than multiples of the cadence crossed");
+            assert((every != 1 || attempts == c.retire_runs) && "at a cadence of 1 the attempts do not equal the retired runs");
+        } // the cadence invariants
 #endif
 #ifdef CHS_RCU_HAVE_ASAN
         for (size_t s = 0; s <= arena_mask_; ++s) {   // unpoison every free node
@@ -4146,11 +4531,15 @@ public:
     // close the current generation's retired and limbo lists into its bag,
     // publish the next generation, free every bag no live handle can
     // observe (oldest first, cumulatively), then walk every published
-    // chain and retire the dead nodes it can bypass. Needs no handle (it
+    // chain and retire the dead nodes it can bypass. reclaim() below is
+    // this call without the walk, and the automatic trigger (THE TRIGGER)
+    // is reclaim()'s work run by the set itself. Needs no handle (it
     // joins one of its own for the walk); non-const. Postcondition: the
     // result describes exactly what this call did (AdvanceResult);
-    // `contended` means another call was in progress and this one did
-    // nothing. Non-blocking: never waits for another advancer or for
+    // `contended` means another holder -- an advance(), a reclaim() or, on a
+    // cadenced set, an operating thread's trigger -- had the flag and this
+    // call did nothing; at a quiescent point a call is never `contended`.
+    // Non-blocking: never waits for another advancer or for
     // handles. Not noexcept: the walk hashes the FROZEN nodes it passes,
     // and Hash{} may throw; a throw propagates with the basic guarantee
     // (the unlinks the walk won stand, their retirees are on the current
@@ -4159,18 +4548,21 @@ public:
     // result is lost; the flag and the walk's handle are released on every
     // path. A thread that holds a handle should refresh or release it
     // before calling: its own handle pins the generation this call closes.
-    // Not [[nodiscard]]: calling on a cadence and ignoring the result is
+    // Not [[nodiscard]]: calling on a schedule and ignoring the result is
     // the normal use, and every refusal is retried by calling again. Cost,
     // in kind, on the calling thread: the walk visits every published
     // bucket and every node in it, for every outcome but `ring_full` and
     // `contended` (a `nothing_retired` call walks the whole table too), and
     // the free pass deals round-robin, so a bag of at least as many nodes as
     // there are shards touches every shard's free line; the call is meant to be
-    // made rarely, on a cadence the caller chooses.
+    // made rarely, on a schedule the caller chooses (a caller who wants the
+    // bump and the free pass often and the walk rarely calls reclaim() for
+    // the former, or lets the set do so through its cadence).
     //
     // FLOW (the steps are bump(), free_oldest() and walk(), each commented
-    // at its definition; the per-thread timers of InternalTimers bracket
-    // each of them and the whole call):
+    // at its definition; steps 2 and 3 are bump_and_free(), shared with
+    // reclaim() and the trigger; the per-thread timers of InternalTimers
+    // bracket each of them and the whole call):
     //   1. the flag, or `contended`;
     //   2. the BUMP: A0 decides `nothing_retired` by loads; a wrapped ring
     //      gets one free pass and, still full, `ring_full`; else A3-A5
@@ -4208,21 +4600,10 @@ public:
         if (reclaiming_.exchange(true, std::memory_order_acquire)) {
             advance_counters_.contended.fetch_add(1, std::memory_order_relaxed);
             return {0, 0, 0, 0, 0, AdvanceResult::Advance::contended};
-        } // if another advance() holds the flag
+        } // if another holder has the flag
         const AdvanceGuard guard(*this);
         AdvanceResult result{0, 0, 0, 0, 0, AdvanceResult::Advance::nothing_retired};
-        {
-            const StepTimer timer(internal_advance_timers().bump_ns);
-            result.advance = bump(result);
-        } // the bump, timed
-        // The hook: once per call that publishes, after the publish and
-        // before the final free pass and the walk (TEST SEAMS); the flag is
-        // held, so a nested advance() from the action returns `contended`.
-        if (result.advance == AdvanceResult::Advance::advanced) Hooks::in_advance_after_publish();
-        {
-            const StepTimer timer(internal_advance_timers().free_ns);
-            free_oldest(result);
-        } // the final free pass, timed
+        bump_and_free(result);   // steps 2 and 3, shared with reclaim() and the trigger
         if (result.advance != AdvanceResult::Advance::ring_full) {
             const StepTimer timer(internal_advance_timers().walk_ns);
             walk(result);
@@ -4230,19 +4611,55 @@ public:
         return result;
     } // advance()
 
+    // Advance the generation and reclaim WITHOUT the walk: advance()'s steps
+    // 1-3 (the flag or `contended`; the bump; the final free pass), nothing
+    // else (advance() = reclaim() + the walk). The call for a caller who
+    // wants memory reused often and the whole-table walk rarely: its cost is
+    // O(shards) for the loads and exchanges plus O(nodes freed) for the free
+    // pass, with no term in the table size, so a `nothing_retired` call is
+    // cheap. It collects no straggler: a dead run a writer walk failed to
+    // bypass stays reachable across any number of reclaim() calls, until a
+    // writer walk, a split's cleanup pass or an advance() passes it. The
+    // name once belonged to a quiescent collector in an earlier version of
+    // this class; that collector is gone, and this reclaim() is the bump and
+    // the free pass. Same flag, same ring, same
+    // counters, same hook (once per publish), same result type with the walk
+    // counts 0 for every outcome; the outcomes and their meaning are
+    // advance()'s. The caller's own handle pins the generation this call
+    // closes, exactly as for advance(): refresh or release it first.
+    // noexcept: the bump, the free pass and the hook are noexcept, nothing
+    // here hashes, compares, copies or allocates, and the guards' destructors
+    // throw nothing. Not [[nodiscard]], as advance(). Clock reads: six per
+    // call that proceeds (the whole call, the bump, the free pass), two per
+    // `contended` call.
+    AdvanceResult reclaim() noexcept {
+        const StepTimer whole(internal_advance_timers().advance_ns);
+        // acquire: as advance()'s (the ONLY synchronization between holders
+        // on the plain ring fields; DESIGNATED there).
+        if (reclaiming_.exchange(true, std::memory_order_acquire)) {
+            advance_counters_.contended.fetch_add(1, std::memory_order_relaxed);
+            return {0, 0, 0, 0, 0, AdvanceResult::Advance::contended};
+        } // if another holder has the flag
+        const AdvanceGuard guard(*this);
+        AdvanceResult result{0, 0, 0, 0, 0, AdvanceResult::Advance::nothing_retired};
+        bump_and_free(result);
+        return result;
+    } // reclaim()
+
     // --- Diagnostics of the generation protocol (see DIAGNOSTICS) --------
 
     // Diagnostic accessor, a RING VIEW (DIAGNOSTICS): the current
-    // generation number. Precondition: no advance() in progress (`gen` is a
-    // plain field the advancer writes; live handles and operations are
-    // fine). Exact under that precondition.
+    // generation number. Precondition: no flag holder in progress -- no
+    // advance(), no reclaim(), and on a cadenced set no operation (`gen` is
+    // a plain field the holder writes; live idle handles are fine). Exact
+    // under that precondition.
     // The load of `current_` is acquire: it reads the publish (a seq_cst
     // store, sequenced after the advancer's write of the block's `gen`), so
     // that write happens-before the read of `gen` even for a caller that
     // never synchronized with the advancer otherwise; relaxed would race
     // with that write.
     uint64_t get_internal_generation() const {
-        assert(!reclaiming_.load(std::memory_order_relaxed) && "get_internal_generation() during advance()");
+        assert(!reclaiming_.load(std::memory_order_relaxed) && "get_internal_generation() during advance(), reclaim() or an automatic trigger");
         return current_.load(std::memory_order_acquire)->gen;
     } // get_internal_generation()
     // Diagnostic accessor: the generation a live handle is joined to.
@@ -4254,15 +4671,15 @@ public:
         assert(h.block_ != nullptr && "generation of an empty handle");
         return h.block_->gen;
     } // get_internal_handle_generation()
-    // Diagnostic accessor, a RING VIEW (DIAGNOSTICS: no advance() in
-    // progress, every earlier one happens-before the call; operations may
-    // run): the number of nodes in the bag of
+    // Diagnostic accessor, a RING VIEW (DIAGNOSTICS: no flag holder in
+    // progress, every earlier one happens-before the call; on a cadenced
+    // set no operation either): the number of nodes in the bag of
     // generation `gen`, retired and limbo sublists over every shard, or 0 if
     // no SEALED slot represents that generation (it was freed, or never
     // closed). Walks the sublists without the sweep's cycle guard: a
     // corrupted bag is the sweep's business.
     size_t get_internal_bag_count(uint64_t gen) const {
-        assert(!reclaiming_.load(std::memory_order_relaxed) && "get_internal_bag_count() during advance()");
+        assert(!reclaiming_.load(std::memory_order_relaxed) && "get_internal_bag_count() during advance(), reclaim() or an automatic trigger");
         for (const GenerationBlock& block : ring_) {
             if (block.state != GenerationState::SEALED || block.gen != gen) continue;
             size_t n = 0;
@@ -4292,11 +4709,12 @@ public:
         size_t oldest_slot;                  // `oldest_`
         std::vector<InternalRingSlot> slots; // one per slot, index = ring index
     }; // struct InternalRingState
-    // Diagnostic accessor, a RING VIEW (DIAGNOSTICS: no advance() in
-    // progress, every earlier one happens-before the call; operations and
-    // live handles may run): the ring-state view above.
+    // Diagnostic accessor, a RING VIEW (DIAGNOSTICS: no flag holder in
+    // progress, every earlier one happens-before the call; live idle
+    // handles may run, and on a cadence-off set operations too): the
+    // ring-state view above.
     InternalRingState get_internal_ring_state() const {
-        assert(!reclaiming_.load(std::memory_order_relaxed) && "get_internal_ring_state() during advance()");
+        assert(!reclaiming_.load(std::memory_order_relaxed) && "get_internal_ring_state() during advance(), reclaim() or an automatic trigger");
         InternalRingState view{slot_index(current_.load(std::memory_order_relaxed)), oldest_, {}};
         view.slots.reserve(kGenerations);
         for (const GenerationBlock& block : ring_) {
@@ -4306,23 +4724,30 @@ public:
         return view;
     } // get_internal_ring_state()
 
-    // The per-thread timers of advance(): the time the CALLING thread spent
-    // in its own advance() calls, the whole call and its three steps,
-    // accumulated in nanoseconds; a thread's own accumulators, reached from
-    // that thread, so a benchmark thread reads its own share without
-    // attributing another advancer's call to itself. One set of
-    // accumulators per thread per instantiation, shared by every set of
-    // that type the thread advances; the caller resets them through the
-    // returned reference. Always compiled, as the counters are: two
-    // steady-clock reads per timed scope, so eight per call that walks
-    // (`advanced` or `nothing_retired`), six per `ring_full` call (no walk)
-    // and two per `contended` call.
+    // The per-thread timers of reclamation: the time the CALLING thread
+    // spent in its own explicit calls (advance() and reclaim(): the whole
+    // call and its steps) and in the automatic triggers that PROCEEDED on
+    // this thread (their bump and free pass only), accumulated in
+    // nanoseconds; a thread's own accumulators, reached from that thread,
+    // so a benchmark thread reads its own share without attributing
+    // another thread's call or trigger to itself. One set of accumulators
+    // per thread per instantiation, shared by every set of that type the
+    // thread reclaims on; the caller resets them through the returned
+    // reference. Per thread, advance_ns - bump_ns - free_ns - walk_ns is
+    // the explicit calls' own overhead for any mix of the two calls, and
+    // stops being so once a trigger proceeded on that thread (its time is
+    // in bump_ns and free_ns with no advance_ns to subtract from). Always
+    // compiled, as the counters are: two steady-clock reads per timed
+    // scope, so advance(): eight per call that walks (`advanced` or
+    // `nothing_retired`), six per `ring_full` call (no walk), two per
+    // `contended` call; reclaim(): six per call that proceeds, two per
+    // `contended` call; a proceeding trigger four, a skipped trigger none.
     // A call that throws from the walk still charges its time (StepTimer).
     struct InternalTimers {
-        size_t advance_ns;  // the whole call, flag acquisition to return (`contended` calls included)
-        size_t bump_ns;     // the bump: the emptiness loads, the ring-wrap free pass if any, the exchanges and the publish
-        size_t free_ns;     // the free pass after the bump
-        size_t walk_ns;     // the walk
+        size_t advance_ns;  // the explicit calls, advance() and reclaim(), from entry to return (before the flag's exchange; `contended` calls included); never a trigger
+        size_t bump_ns;     // the bump, of a call or of a trigger that proceeded on this thread: the emptiness loads, the ring-wrap free pass if any, the exchanges and the publish
+        size_t free_ns;     // the final free pass after the bump, of a call or of a trigger that proceeded on this thread
+        size_t walk_ns;     // advance()'s walk
     }; // struct InternalTimers
     static InternalTimers& internal_advance_timers() noexcept {
         static thread_local InternalTimers timers{0, 0, 0, 0};
@@ -4346,6 +4771,8 @@ private:
         std::atomic<size_t> free_push_cas_failures{0};
         std::atomic<size_t> pops_raced_push{0};
         std::atomic<size_t> limbo_pushes{0};
+        std::atomic<size_t> auto_reclaims{0};   // automatic triggers that acquired the flag (THE TRIGGER in the class overview)
+        std::atomic<size_t> auto_skipped{0};    // automatic triggers that found the flag held
     }; // struct AdvanceCounters
     mutable AdvanceCounters advance_counters_;
     // The generation ring (THE RING in the class overview): kGenerations
@@ -4357,9 +4784,9 @@ private:
     // fast path. On a line of its own, apart from node_count_ (written by
     // every allocating thread) and from the flag.
     alignas(128) std::atomic<GenerationBlock*> current_{&ring_[0]};
-    // The single-advancer try-flag: set while an advance() is in progress
-    // (ONE ADVANCER). On a line of its own; `oldest_` and `deal_`, owned by
-    // the flag holder, share it.
+    // The single-advancer try-flag: set while an advance(), a reclaim() or
+    // an automatic trigger is in progress (ONE ADVANCER). On a line of its
+    // own; `oldest_` and `deal_`, owned by the flag holder, share it.
     alignas(128) std::atomic<bool> reclaiming_{false};
     size_t oldest_ = 0;   // index of the oldest SEALED slot, or of the CURRENT slot when nothing is sealed; owned by the flag holder
     size_t deal_ = 0;     // the free pass's round-robin cursor: the shard the next freed node goes to; owned by the flag holder
@@ -4383,6 +4810,30 @@ private:
     // `steal_stamp_`, is written with the hint, once per freed bag.
     alignas(128) std::atomic<word_t> steal_hint_{STEAL_HINT_EMPTY};
     word_t steal_stamp_ = 0;   // the last stamp the free pass stored into steal_hint_ (shifted left by one there); owned by the flag holder
+    // The cadence's mask from the constructor's `auto_reclaim_every`
+    // (THE TRIGGER in the class overview): 0 means OFF, decided before any
+    // rounding (std::bit_ceil(0) is 1, which would be a cadence of 1); a
+    // value above 2^63 is clamped, silently, to 2^63 before the rounding
+    // (bit_ceil() of it has no representable result; 2^63 is "never" on any
+    // real run, so SIZE_MAX is a valid spelling of never); then the value is
+    // rounded up to a power of two R and the mask is ~(R - 1): the test
+    // `((old ^ (old + count)) & mask) != 0` is true iff (old, old + count]
+    // holds a multiple of R, and identically false for the mask 0.
+    static constexpr size_t auto_reclaim_mask(size_t every) noexcept {
+        if (every == 0) return 0;
+        if (every > (size_t{1} << 63)) every = size_t{1} << 63;
+        return ~(std::bit_ceil(every) - 1);
+    } // auto_reclaim_mask()
+    // The cadence mask (auto_reclaim_mask() above), read by every retire push
+    // and written never: `const`, set in the Options constructor's
+    // mem-initializer. A 128-byte block of its own, like the hint above: the
+    // retire path reads it on every push, and the block before it is written
+    // by the free pass.
+    alignas(128) const size_t auto_reclaim_mask_;
 }; // class ConcurrentResizableHashSetRCU
 
 #endif // CONCURRENT_HASH_SET_RCU_H
+// Header-private: expanded when push_retired() above was parsed (macros expand
+// at definition, not at template instantiation), so it is not exported to
+// includers.
+#undef CHS_RCU_UNLIKELY

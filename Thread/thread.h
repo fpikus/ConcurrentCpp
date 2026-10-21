@@ -57,15 +57,16 @@
 // THE START MASK. Every Thread starts with one fixed mask, whatever the
 // creating thread's mask: every blockable signal is blocked except SIGSEGV,
 // SIGBUS, SIGFPE, SIGILL, SIGPROF, SIGTRAP and SIGSYS, which are unblocked.
-// Why: a process-directed (asynchronous) signal is delivered to some thread
-// that does not block it, so worker threads that block them leave their
-// delivery to the threads the application keeps unblocked (normally the main
-// thread). The seven are synchronous (raised by the faulting thread itself)
-// or profiling signals: a fault in the callable must reach its handler, and
-// a blocked synchronous signal raised by the kernel is delivered with the
-// default action, bypassing any handler, so the seven are unblocked even if
-// the creating thread blocked them. There is no API to change the mask a
-// Thread starts with; a callable that needs a signal unblocks it itself.
+// Why: a process-directed signal (Ctrl-C, kill, a timer) is delivered to some
+// thread that does not block it, so worker threads that block such signals
+// leave their delivery to the threads the application keeps unblocked
+// (normally the main thread). The seven are synchronous (raised by the
+// faulting thread itself) or profiling signals: a fault in the callable must
+// reach its handler, and a blocked synchronous signal raised by the kernel is
+// delivered with the default action, bypassing any handler, so the seven are
+// unblocked even if the creating thread blocked them. There is no API to
+// change the mask a Thread starts with; a callable that needs a signal
+// unblocks it itself.
 // Consequences for the user: a process-directed signal reaches only a thread
 // that leaves it unblocked; a signal aimed at a worker (raise, pthread_kill)
 // stays pending until the worker unblocks it; threads and processes a worker
@@ -79,11 +80,14 @@
 // ADDS blocks, and leaves the seven as it had them, so a fault in the creator
 // during pthread_create still reaches the creator's handler and a profiler
 // keeps sampling it. The new thread's first action then sets the exact start
-// mask, which unblocks any of the seven its creator had blocked. Signals
-// that arrive at the creator during pthread_create stay pending and are
-// delivered to it when its mask is restored. Setting the mask through
-// pthread_attr_setsigmask_np instead is not used: AddressSanitizer's
-// pthread_create interceptor discards it.
+// mask, which unblocks any of the seven its creator had blocked. During
+// pthread_create the creating thread still receives at once any of the
+// seven it has unblocked. Any other signal aimed at the creating thread in
+// that window stays pending and is delivered to it when its mask is
+// restored; any other process-directed signal goes to another thread that
+// leaves it unblocked, or stays pending for the process until one does.
+// Setting the mask through pthread_attr_setsigmask_np instead is not used:
+// AddressSanitizer's pthread_create interceptor discards it.
 //
 // THE STACK STAGGER. Consecutive thread stacks are often adjacent in memory,
 // and with page-multiple stack sizes every thread's top frame then has the
@@ -321,7 +325,8 @@ inline std::size_t tls_size_from(tls_query_fn query) noexcept {
 // libraries loaded at startup, plus glibc's surplus. A library loaded later
 // (dlopen) with initial-exec TLS is placed in that surplus, inside the
 // reported block, and the reported size does not change; a library that
-// does not fit in the surplus fails to load. So caching the value is exact.
+// does not fit in the surplus fails to load. So the cached value never goes
+// stale.
 // nothrow.
 inline std::size_t static_tls_size() noexcept {
     static const std::size_t size = tls_size_from(&_dl_get_tls_static_info);
@@ -436,9 +441,12 @@ inline const sigset_t& start_mask() noexcept {
 // calling thread's mask is its previous mask plus start_mask()'s signals;
 // the seven of unblocked_signals stay as the calling thread had them. A new
 // thread created inside the scope inherits that mask, so every signal outside
-// the seven is blocked in it from its first instruction. Signals that arrive
-// for the calling thread inside the scope stay pending and are delivered when
-// the destructor restores the mask.
+// the seven is blocked in it from its first instruction. Inside the scope
+// the calling thread still receives at once any of the seven it has
+// unblocked. Any other signal aimed at the calling thread stays pending and
+// is delivered to it when the destructor restores the mask; any other
+// process-directed signal goes to another thread that leaves it unblocked,
+// or stays pending for the process until one does.
 // The pthread_sigmask calls cannot fail: `how` is valid and the pointers are
 // valid, which are pthread_sigmask's only error conditions.
 // Not copyable or movable: the scope belongs to one thread's stack frame.
@@ -683,9 +691,10 @@ concept thread_callable =
 // all of them are calls of const members, as for std::thread. The callable
 // must not use its own Thread object (for example through a captured pointer
 // or reference) unless that use is synchronized with the end of the
-// constructor, for example through a latch that the creating thread releases
-// after the constructor returns: the constructor writes the object, and the
-// object may be moved after it returns.
+// constructor, for example through an atomic flag that the creating thread
+// stores with release order after the constructor returns and the callable
+// loads with acquire order before the use: the constructor writes the
+// object, and the object may be moved after it returns.
 class Thread {
 public:
     using native_handle_type = pthread_t;
@@ -701,7 +710,8 @@ public:
         // (2 MiB unless changed). The thread gets AT LEAST this many bytes of
         // stack below the callable's first frame, that is, between the
         // address __builtin_frame_address(0) returns in the callable's body
-        // and the lowest usable address of the stack (the top of the guard);
+        // and the lowest usable address of the stack (the top of the guard,
+        // if there is one);
         // the callable's locals and everything it calls use this space. A
         // lower bound, never an exact size: the class adds room for the
         // static TLS, the stagger and its own frames, and rounds the sum up
@@ -737,11 +747,13 @@ public:
     // get_id() == std::thread::id{}. nothrow.
     Thread() noexcept = default;
 
-    // Starts a thread that runs std::invoke(std::move(f'), std::move(args')...),
-    // f' and args' being decay-copies of f and args made in the calling thread,
-    // with default attributes. Identical to Thread(Attributes{}, f, args...);
-    // see that constructor for the contract. Constrained (thread_callable) so
-    // that it never takes a Thread or an Attributes as the callable.
+    // Starts a thread that runs
+    //   std::invoke(std::move(f'), std::move(args')...),
+    // f' and args' being decay-copies of f and args made in the calling
+    // thread, with default attributes. Identical to
+    // Thread(Attributes{}, f, args...); see that constructor for the
+    // contract. Constrained (thread_callable) so that it never takes a Thread
+    // or an Attributes as the callable.
     template <class F, class... Args>
         requires thread_detail::thread_callable<F, Thread>
     explicit Thread(F&& f, Args&&... args) {
@@ -758,7 +770,8 @@ public:
     //
     // Stack and guard: see Attributes. The stack below the callable's first
     // frame (as defined there) is at least the requested (or default) stack
-    // size.
+    // size, except as stated there for unusually long argument lists in
+    // unoptimized builds.
     //
     // The stagger: a construction that reaches step 3 below takes the next
     // number n of a process-wide creation count (unsigned, wrapping), also
@@ -773,11 +786,11 @@ public:
     //
     // The start mask: the callable starts with every blockable signal blocked
     // except SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGPROF, SIGTRAP and SIGSYS,
-    // which are unblocked, whatever the creating thread's mask; SIGKILL,
-    // SIGSTOP and glibc's two internal signals (32 and 33, the realtime
-    // signals below SIGRTMIN) are never blocked in any thread. When the
-    // constructor returns or throws, the creating thread's mask is what it
-    // was before.
+    // which are unblocked, whatever the creating thread's mask. SIGKILL and
+    // SIGSTOP cannot be blocked, and glibc's two internal signals (32 and 33,
+    // the realtime signals below SIGRTMIN) are left unblocked: glibc's sigset
+    // functions and pthread_sigmask never block them. When the constructor
+    // returns or throws, the creating thread's mask is what it was before.
     //
     // Order of the steps, and what each failure leaves:
     //   1. Sizes computed and checked. With R the requested (or default)
@@ -807,10 +820,10 @@ public:
     // Every std::system_error thrown here uses std::generic_category().
     // Step 1's carries EINVAL, the class's own value, and a message naming
     // the stack and guard size computation and the REQUESTED stack and guard
-    // sizes (R and G). Steps 2 and 4 carry the failing pthread call's return value
-    // (never errno) and a message naming the call, the COMPUTED stack size
-    // and the guard size passed to glibc (G). No other exceptions than those
-    // of steps 1-4 (and std::bad_alloc from building the message).
+    // sizes (R and G). Steps 2 and 4 carry the failing pthread call's return
+    // value (never errno) and a message naming the call, the COMPUTED stack
+    // size and the guard size passed to glibc (G). No other exceptions than
+    // those of steps 1-4 (and std::bad_alloc from building the message).
     // Exception safety: if the constructor throws, no thread was created, no
     // copy of f or args remains, and the creating thread's mask is unchanged.
     //
@@ -870,9 +883,9 @@ public:
     // nothrow.
     [[nodiscard]] bool joinable() const noexcept { return handle_ != native_handle_type{}; }
 
-    // Waits for the owned thread to end. The end of the thread (its callable's
-    // return and the destruction of the copies) happens before join()
-    // returns. Postcondition: joinable() is false.
+    // Waits for the owned thread to end. The end of the thread (the
+    // callable's return or pthread_exit, and the destruction of the copies)
+    // happens before join() returns. Postcondition: joinable() is false.
     // Throws std::system_error (std::generic_category()):
     //   - std::errc::invalid_argument if !joinable();
     //   - std::errc::resource_deadlock_would_occur if called on the thread
@@ -970,8 +983,8 @@ private:
                       (std::is_constructible_v<std::decay_t<Args>, Args> && ...) &&
                       std::is_invocable_v<std::decay_t<F>, std::decay_t<Args>...>) {
             using S = thread_detail::State<std::decay_t<F>, std::decay_t<Args>...>;
-            // Not const: ThreadSanitizer's pthread_create interceptor writes the
-            // raised stack size back into the attributes it is passed.
+            // Not const: ThreadSanitizer's pthread_create interceptor writes
+            // the raised stack size back into the attributes it is passed.
             thread_detail::AttrOwner attr(attributes.stack_size, attributes.guard_size);            // steps 1, 2
             std::unique_ptr<S> state = std::make_unique<S>(thread_detail::next_stagger(), std::forward<F>(f),
                                                            std::forward<Args>(args)...);           // step 3

@@ -26,8 +26,9 @@
 
 // Thread: a thread used like std::jthread (constructed from a callable and
 // its arguments, launched by the constructor, joined by the destructor) that
-// also sets what std::thread cannot: the stack size, the guard size, and the
-// signal mask the new thread starts with. The destructor joins (there is no
+// also sets what std::thread cannot: the stack size and the guard size,
+// chosen by the caller, and the signal mask the new thread starts with,
+// which is fixed (THE START MASK below). The destructor joins (there is no
 // stop request: a callable that loops needs its own flag). An exception that
 // escapes the callable unwinds the thread's stack and then calls
 // std::terminate() with the exception current.
@@ -62,11 +63,12 @@
 // leave their delivery to the threads the application keeps unblocked
 // (normally the main thread). The seven are synchronous (raised by the
 // faulting thread itself) or profiling signals: a fault in the callable must
-// reach its handler, and a blocked synchronous signal raised by the kernel is
-// delivered with the default action, bypassing any handler, so the seven are
-// unblocked even if the creating thread blocked them. There is no API to
-// change the mask a Thread starts with; a callable that needs a signal
-// unblocks it itself.
+// reach its handler (a blocked synchronous signal raised by the kernel is
+// delivered with the default action, bypassing any handler), and SIGPROF
+// must reach the thread so that a profiler sampling the process samples the
+// thread; so the seven are unblocked even if the creating thread blocked
+// them. There is no API to change the mask a Thread starts with; a callable
+// that needs a signal unblocks it itself.
 // Consequences for the user: a process-directed signal reaches only a thread
 // that leaves it unblocked; a signal aimed at a worker (raise, pthread_kill)
 // stays pending until the worker unblocks it; threads and processes a worker
@@ -86,17 +88,17 @@
 // that window stays pending and is delivered to it when its mask is
 // restored; any other process-directed signal goes to another thread that
 // leaves it unblocked, or stays pending for the process until one does.
-// Setting the mask through pthread_attr_setsigmask_np instead is not used:
-// AddressSanitizer's pthread_create interceptor discards it.
+// pthread_attr_setsigmask_np is not used: AddressSanitizer's pthread_create
+// interceptor discards it.
 //
-// THE STACK STAGGER. Consecutive thread stacks are often adjacent in memory,
-// and with page-multiple stack sizes every thread's top frame then has the
-// same address modulo the page size, so the hot top-of-stack cache lines of
-// many threads compete for the same cache sets. Each Thread therefore
-// reserves (n % 16) * 256 bytes at the top of its stack before the callable
-// runs, n being a process-wide creation count: consecutive threads' top
-// frames start at 16 different page offsets, 256 bytes apart. The effect on
-// caching is reasoned from the cache geometry, not promised.
+// THE STACK STAGGER. With page-multiple stack sizes every thread's top frame
+// has the same address modulo the page size, wherever its stack lies, so the
+// hot top-of-stack cache lines of many threads compete for the same cache
+// sets. Each Thread therefore reserves (n % 16) * 256 bytes at the top of
+// its stack before the callable runs, n being a process-wide creation count:
+// consecutive threads' top frames start at 16 different page offsets, 256
+// bytes apart. The effect on caching is reasoned from the cache geometry,
+// not promised.
 
 // Included first: any libstdc++ header defines __GLIBCXX__, and <cstdlib>
 // (glibc's <stdlib.h>, through <features.h>) defines __GLIBC__, so the
@@ -182,9 +184,10 @@ inline constexpr std::size_t stagger_step = 256;
 inline constexpr unsigned stagger_slots = 16;
 inline constexpr std::size_t max_stagger = (stagger_slots - 1)*stagger_step;  // 3840
 
-// The bytes of the requested stack, besides the stagger reservation and the
-// static TLS, that the start-up of a thread uses before the callable's first
-// frame. Two parts, both paid out of the requested size:
+// Room for the frames a thread's start-up puts on the stack before the
+// callable's first frame, besides the stagger reservation and the static
+// TLS; without this allowance they would come out of the requested size.
+// Two parts:
 //   - ABOVE the reservation: glibc's own thread-start frame, in sanitizer
 //     builds the sanitizer runtime's thread-start frame, start_routine()'s
 //     fixed frame, and under AddressSanitizer the redzone it puts above the
@@ -719,14 +722,14 @@ public:
         // cached stack; ThreadSanitizer raises small requests. The room for
         // the class's own frames covers ordinary argument lists; in an
         // unoptimized build each argument enlarges those frames, so a
-        // callable with an unusually long argument list (a member pointer
-        // sooner, through std::invoke's frames) can get less than the full
-        // amount. A value below the system minimum,
-        // sysconf(_SC_THREAD_STACK_MIN), is raised to that minimum (0 gets
-        // the minimum). A value for which the size computation overflows
-        // size_t makes the constructor throw EINVAL (step 1 of the
-        // constructor's contract states the exact condition; SIZE_MAX is one
-        // such value).
+        // callable with an unusually long argument list (for a
+        // member-function pointer a shorter list, since its call goes
+        // through std::invoke's frames) can get less than the full amount.
+        // A value below the system minimum, sysconf(_SC_THREAD_STACK_MIN),
+        // is raised to that minimum (0 gets the minimum). A value for which
+        // the size computation overflows size_t makes the constructor throw
+        // EINVAL (step 1 of the constructor's contract states the exact
+        // condition; SIZE_MAX is one such value).
         std::optional<std::size_t> stack_size = {};
         // Guard size in bytes: an inaccessible region below the stack, which
         // turns a stack overflow into a fault. Empty: 1 MiB. Any other value

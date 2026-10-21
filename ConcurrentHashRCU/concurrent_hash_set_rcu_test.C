@@ -4118,9 +4118,9 @@ static void on_shard(size_t S, size_t s, F&& fn) {
 } // on_shard()
 
 // The expected per-shard views of get_internal_slot_counts() on a set of S
-// arena shards (seam_spec.md 10's e_s and 0-view): view_e(S, s) has a 1 at
-// shard `s` and 0 elsewhere (one live membership, joined on shard s);
-// view_0(S) is all zero (no live membership of the slot).
+// arena shards: view_e(S, s) has a 1 at shard `s` and 0 elsewhere (one live
+// membership, joined on shard s); view_0(S) is all zero (no live membership of
+// the slot).
 static std::vector<long> view_e(size_t S, size_t s) {
     std::vector<long> v(S, 0);
     v.at(s) = 1;

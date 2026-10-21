@@ -66,6 +66,13 @@ and documented on their own terms.
   no handle can still see them, and walks the table for the dead nodes the
   writers left behind; `reclaim()` recycles without the walk, and a set
   constructed with a cadence runs it by itself.
+- **[Thread](Thread/)** — a thread used like `std::jthread`, launched by its
+  constructor and joined by its destructor, that also sets what the standard
+  cannot: a stack size and a guard size per thread, and one fixed start mask,
+  the asynchronous signals blocked and the faults (and SIGPROF) unblocked,
+  whatever the creating thread had. Each thread's stack top is staggered
+  within a page, and an exception that escapes the callable unwinds the
+  thread's stack before it calls `std::terminate()`.
 
 ## Building
 
@@ -73,7 +80,7 @@ Each project builds independently with its own Makefile:
 
 ```sh
 cd ConcurrentDeque   # or any other project
-make                 # benchmarks + ASan/TSan unit tests
+make                 # benchmarks + unit tests: ASan/TSan, some also optimized
 make run_tests
 ```
 
@@ -95,6 +102,9 @@ first `make` then makes the patched copies the build uses. `make imports` makes
 only those copies: in IntrSharedPtr its `mm_hp/`, in SharedPtr its
 `lock_free_shared_ptr/parlay/`, and in LockFreeList both (by asking those two
 projects).
+Thread builds on Linux with glibc and libstdc++ only (any other C or C++
+library stops the build with an `#error`), and needs GoogleTest but not
+Google Benchmark: it has no benchmark yet.
 
 ## License
 

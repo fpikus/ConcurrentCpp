@@ -7143,7 +7143,7 @@ TEST(ConcurrentHashSetRcuTest, ContractHandleSpecialMembersDeclared) {
     static_assert(!std::is_same_v<H, ContractSetK<3>::handle>);                         // a type per instantiation
     static_assert(!std::is_constructible_v<H, ContractSetK<3>::handle&&>);
 #ifdef NDEBUG
-    static_assert(sizeof(H) == sizeof(void*));                                          // one pointer, release builds only
+    static_assert(sizeof(H) == 2*sizeof(void*));                                        // two pointers (the block and the per-shard count), release builds only
 #endif
     SUCCEED();
 } // ContractHandleSpecialMembersDeclared

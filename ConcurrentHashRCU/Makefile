@@ -119,6 +119,7 @@ BM_SOURCES = concurrent_hash_set_rcu_bm.C \
              concurrent_hash_set_rcu_bm_erase.C \
              concurrent_hash_set_rcu_bm_churn.C \
              concurrent_hash_set_rcu_bm_hot_growth.C \
+             concurrent_hash_set_rcu_bm_handles.C \
              concurrent_hash_set_rcu_bm_advance.C
 BM_OBJECTS = $(BM_SOURCES:%.C=$(BUILD_DIR)/%.o)
 

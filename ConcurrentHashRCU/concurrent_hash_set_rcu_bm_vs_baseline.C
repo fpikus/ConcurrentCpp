@@ -72,11 +72,15 @@ DEFINE_MOSTLY_OLD(Lookup_MostlyOld_RWLocked,   LockedSet)
 // (DEFINE_MOSTLY_OLD_UNDER's HANDLE). Why measure: the rows above keep one
 // long-lived handle per thread, whose join happens once, untimed; a caller
 // that cannot keep a handle pays a join and a leave per operation instead.
-// The join is a seq_cst increment of the current generation's handle count
-// and a seq_cst re-load of the current generation, the leave a release
-// decrement of the same count, so every thread's every operation writes the
-// one line that count is on; each join also increments the set's diagnostic
-// join counter (relaxed), one more line that every thread writes. The threads'
-// long-lived handles are still made and destroyed as in every row, unused.
+// The join is a seq_cst increment of the current generation's count in the
+// joining thread's arena shard and a seq_cst re-load of the current
+// generation, plus a relaxed increment of that shard's diagnostic join
+// counter; the leave is a release decrement of the count the join
+// incremented. So a thread's joins and leaves write lines of its own shard's
+// count row only, and threads share those lines only when they share a shard
+// (more threads than shards, or two thread numbers equal modulo the shard
+// count: Google Benchmark's thread 0 is the main thread, numbered before the
+// others). The threads' long-lived handles are still made and destroyed as
+// in every row, unused.
 // Only on the AllowDelete == false set, against _Concurrent.
 DEFINE_MOSTLY_OLD_UNDER(MostlyOldFixture, Lookup_MostlyOld_OpHandle, ConcurrentSet, set->new_handle())

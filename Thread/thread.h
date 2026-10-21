@@ -100,12 +100,14 @@
 #include <cstddef>
 #include <cstdlib>
 
+// The rest of the header is compiled only when both requirements hold, so
+// that an unsupported library reports the requirement and nothing else
+// (compilers continue after #error).
 #if !defined(__GLIBC__)
 #error "thread.h requires Linux with glibc (pthread attributes, static TLS query)"
-#endif
-#if !defined(__GLIBCXX__)
+#elif !defined(__GLIBCXX__)
 #error "thread.h requires libstdc++ (std::thread::id(native_handle_type))"
-#endif
+#else // the requirements hold
 
 #include <pthread.h>
 #include <signal.h>
@@ -176,18 +178,27 @@ inline constexpr std::size_t stagger_step = 256;
 inline constexpr unsigned stagger_slots = 16;
 inline constexpr std::size_t max_stagger = (stagger_slots - 1)*stagger_step;  // 3840
 
-// The bytes of the stack below the reservation that the start routine's own
-// frames use before the callable's first frame: invoke_state()'s frame, which
-// in unoptimized builds also holds the forwarded arguments, and for a
-// member-pointer callable std::invoke's forwarding frames. Part of
-// `stack_extra`, so that the callable gets at least the requested size below
-// its first frame even at the deepest stagger slot. Sized for the
+// The bytes of the requested stack, besides the stagger reservation and the
+// static TLS, that the start-up of a thread uses before the callable's first
+// frame. Two parts, both paid out of the requested size:
+//   - ABOVE the reservation: glibc's own thread-start frame, in sanitizer
+//     builds the sanitizer runtime's thread-start frame, start_routine()'s
+//     fixed frame, and under AddressSanitizer the redzone it puts above the
+//     alloca;
+//   - BELOW the reservation: under AddressSanitizer the redzone it puts
+//     below the alloca, invoke_state()'s frame, which in unoptimized builds
+//     also holds the forwarded arguments, and for a member-pointer callable
+//     std::invoke's forwarding frames.
+// With ordinary argument lists the part above is the larger one.
+// Part of `stack_extra`, so that the callable gets at least the requested
+// size below its first frame even at the deepest stagger slot. Sized for the
 // unoptimized sanitizer builds, whose frames are the largest; an optimized
-// build needs a fraction of it.
+// build needs a fraction of it. Measuring only the part below the
+// reservation understates what the allowance must cover.
 inline constexpr std::size_t start_frames_allowance = 2048;
 
 // What compute_stack_size() adds to the requested size: the deepest stagger
-// reservation and the start routine's frames.
+// reservation and the start-up frames (start_frames_allowance).
 inline constexpr std::size_t stack_extra = max_stagger + start_frames_allowance;
 
 // The rule's two invariants: the positions span one 4 KiB page exactly, and
@@ -204,7 +215,11 @@ constexpr std::size_t stagger_for(unsigned n) noexcept {
 } // stagger_for()
 
 // Returns `n` rounded up to a multiple of `granule`, or an empty optional if
-// that multiple does not fit in size_t. Precondition: granule > 0. nothrow.
+// that multiple does not fit in size_t. Precondition: granule > 0. Exact for
+// a granule that is a power of two (every granule the class uses is: page
+// sizes and TLS alignments); for another granule the overflow check is
+// conservative and can report an overflow for an `n` whose multiple would
+// still fit. nothrow.
 constexpr std::optional<std::size_t> page_round(std::size_t n, std::size_t granule) noexcept {
     if (n > std::numeric_limits<std::size_t>::max() - (granule - 1)) return {};
     return (n + (granule - 1))/granule*granule;
@@ -213,14 +228,15 @@ constexpr std::optional<std::size_t> page_round(std::size_t n, std::size_t granu
 // Returns the stack size the class passes to pthread_attr_setstacksize:
 //   page_round(max(requested, minimum) + extra + tls, granule),
 // or an empty optional if any step overflows size_t. Precondition:
-// granule > 0. nothrow. The terms:
+// granule > 0; exact for a power of two (see page_round()). nothrow. The
+// terms:
 //   - requested: the stack size the caller asked for (or the default);
 //   - minimum: the smallest stack glibc accepts (min_stack_size()); the clamp
 //     applies to the request BEFORE the additions, so the additions are never
 //     absorbed by the clamp: a request below the minimum still gets the extra
 //     and the TLS on top of the minimum;
-//   - extra: stack_extra, the deepest stagger reservation plus the start
-//     routine's frames;
+//   - extra: stack_extra, the deepest stagger reservation plus the start-up
+//     frames above and below it (start_frames_allowance);
 //   - tls: what glibc carves out of the requested stack for the static TLS
 //     and the thread descriptor (static_tls_size()); glibc places them at the
 //     top of the stack it maps, inside the requested size;
@@ -242,7 +258,8 @@ constexpr std::optional<std::size_t> compute_stack_size(std::size_t requested, s
 
 // Returns true if the guard of `guard` bytes, rounded up to `page` the way
 // glibc rounds it, fits in size_t together with a stack of `stack` bytes
-// (glibc maps the two as one block). Precondition: page > 0. nothrow.
+// (glibc maps the two as one block). Precondition: page > 0; exact for a
+// power of two (see page_round()). nothrow.
 constexpr bool guard_fits(std::size_t stack, std::size_t guard, std::size_t page) noexcept {
     const std::optional<std::size_t> rounded = page_round(guard, page);
     return rounded && *rounded <= std::numeric_limits<std::size_t>::max() - stack;
@@ -257,8 +274,10 @@ constexpr bool guard_fits(std::size_t stack, std::size_t guard, std::size_t page
 // rounded size alone is not enough: whenever the static TLS alignment exceeds
 // the thread descriptor's own alignment (an over-aligned thread_local), the
 // unused part above the descriptor comes out of the requested stack too. An
-// alignment of 0 is treated as 1. Saturates at SIZE_MAX instead of wrapping,
-// so that compute_stack_size() reports the overflow. nothrow.
+// alignment of 0 is treated as 1. Exact for an alignment that is a power of
+// two (glibc's always are); for another alignment the rounding's overflow
+// check is conservative (see page_round()). Saturates at SIZE_MAX instead of
+// wrapping, so that compute_stack_size() reports the overflow. nothrow.
 constexpr std::size_t tls_carve_bound(std::size_t size, std::size_t align) noexcept {
     constexpr std::size_t max = std::numeric_limits<std::size_t>::max();
     if (align == 0) align = 1;
@@ -290,17 +309,20 @@ inline StaticTlsInfo tls_info_from(tls_query_fn query) noexcept {
 } // tls_info_from()
 
 // Returns the bytes the class adds to a stack request for the static TLS:
-// tls_carve_bound() of what `query` reports, 0 if `query` is null. nothrow.
+// tls_carve_bound() of what `query` reports; 0 if `query` is null (then
+// tls_info_from() gives {0, 1}, and tls_carve_bound(0, 1) is 0). nothrow.
 inline std::size_t tls_size_from(tls_query_fn query) noexcept {
-    if (query == nullptr) return 0;
     const StaticTlsInfo info = tls_info_from(query);
     return tls_carve_bound(info.size, info.align);
 } // tls_size_from()
 
-// tls_size_from(&_dl_get_tls_static_info), cached. The static TLS of the
-// executable and of the libraries loaded at startup is fixed before main();
-// a library loaded later with initial-exec TLS draws on glibc's surplus,
-// which the reported size already includes. nothrow.
+// tls_size_from(&_dl_get_tls_static_info), cached. The reported size is
+// fixed before main(): it covers the static TLS of the executable and of the
+// libraries loaded at startup, plus glibc's surplus. A library loaded later
+// (dlopen) with initial-exec TLS is placed in that surplus, inside the
+// reported block, and the reported size does not change; a library that
+// does not fit in the surplus fails to load. So caching the value is exact.
+// nothrow.
 inline std::size_t static_tls_size() noexcept {
     static const std::size_t size = tls_size_from(&_dl_get_tls_static_info);
     return size;
@@ -315,14 +337,14 @@ inline std::size_t page_size() noexcept {
     return size;
 } // page_size()
 
-// The smallest stack glibc accepts (sysconf(_SC_THREAD_STACK_MIN), which is
-// what PTHREAD_STACK_MIN expands to on glibc with _GNU_SOURCE), cached.
-// nothrow.
+// The smallest stack glibc accepts, sysconf(_SC_THREAD_STACK_MIN), cached.
+// No fallback value: PTHREAD_STACK_MIN, the obvious one, expands to this
+// same sysconf call on glibc with _GNU_SOURCE, so it cannot answer when the
+// call fails. Were the call to fail, its -1 converts to SIZE_MAX, and every
+// construction then fails with EINVAL (the stack computation overflows)
+// instead of creating a thread with a stack that is too small. nothrow.
 inline std::size_t min_stack_size() noexcept {
-    static const std::size_t size = [] {
-        const long minimum = sysconf(_SC_THREAD_STACK_MIN);
-        return minimum > 0 ? static_cast<std::size_t>(minimum) : static_cast<std::size_t>(PTHREAD_STACK_MIN);
-    }();
+    static const std::size_t size = static_cast<std::size_t>(sysconf(_SC_THREAD_STACK_MIN));
     return size;
 } // min_stack_size()
 
@@ -363,9 +385,11 @@ inline std::atomic<std::size_t> default_stack_bytes{std::size_t{2} << 20};     /
 inline constexpr std::size_t default_guard_bytes = std::size_t{1} << 20;
 
 // The process-wide creation count that numbers threads for the stagger: each
-// construction that gets past the size check takes one value with
-// fetch_add(1, relaxed). Relaxed suffices: a read-modify-write always reads
-// the latest value in the counter's modification order, so concurrent
+// construction that reaches the copying of the callable and the arguments
+// (step 3 of the constructor's contract) takes one value, also one that then
+// fails copying or in pthread_create, with fetch_add(1, relaxed). Relaxed
+// suffices: a read-modify-write always reads the value immediately before
+// its own write in the counter's modification order, so concurrent
 // constructions get distinct values, and nothing is published through the
 // counter. This is a shared counter, not a member of an object under
 // construction, so the rule against read-modify-writes on an object's own
@@ -401,7 +425,7 @@ inline const sigset_t& start_mask() noexcept {
         sigdelset(&set, SIGKILL);
         sigdelset(&set, SIGSTOP);
         return set;
-    }();
+    }(); // the start mask's initializer
     return mask;
 } // start_mask()
 
@@ -441,8 +465,8 @@ private:
 // ---------------------------------------------------------------------------
 
 // Throws std::system_error(code, std::generic_category()) with a message that
-// names the failed call and the stack and guard sizes. Out of line from the
-// callers' hot text.
+// names the failed call, the computed stack size and the guard size passed to
+// glibc. Out of line from the callers' hot text.
 [[noreturn, gnu::cold, gnu::noinline]] inline void throw_error(int code, const char* call, std::size_t stack,
                                                               std::size_t guard) {
     std::string message = std::string("Thread: ") + call + " failed (stack " + std::to_string(stack) +
@@ -451,13 +475,17 @@ private:
     throw std::system_error(code, std::generic_category(), message);
 } // throw_error()
 
-// Throws std::system_error(EINVAL, std::generic_category()) for a size
-// computation that overflows size_t; `stack` is the requested stack size
-// (before the clamp and the additions).
+// Throws std::system_error(EINVAL, std::generic_category()) when the stack
+// size computation or the guard check overflows size_t: the class's own
+// failure, before any pthread call, so the message names the size
+// computation instead of a call. It reports the REQUESTED sizes (`stack`
+// before the clamp and the additions, the guard as requested): those are
+// what the caller passed and can act on, and when the stack computation is
+// the one that overflows no computed stack size exists.
 [[noreturn, gnu::cold, gnu::noinline]] inline void throw_overflow(std::size_t stack, std::size_t guard) {
     throw std::system_error(EINVAL, std::generic_category(),
-                            "Thread: stack size " + std::to_string(stack) + " bytes and guard " +
-                                std::to_string(guard) + " bytes overflow the size computation");
+                            "Thread: stack and guard size computation overflows (requested stack " +
+                                std::to_string(stack) + " bytes, guard " + std::to_string(guard) + " bytes)");
 } // throw_overflow()
 
 // ---------------------------------------------------------------------------
@@ -536,6 +564,11 @@ private:
 // start mask is a constant).
 template <class F, class... Args>
 struct State {
+    // Stores the stagger amount and decay-copies `f` into `callable` and each
+    // of `args` into `arguments` (G and As are F and Args before the decay:
+    // the constructor's own argument types, forwarded). Propagates whatever a
+    // copy or move constructor throws; the members already constructed are
+    // then destroyed.
     template <class G, class... As>
     explicit State(std::size_t stagger_bytes, G&& f, As&&... args)
         : stagger(stagger_bytes), callable(std::forward<G>(f)), arguments(std::forward<As>(args)...) {}
@@ -666,18 +699,24 @@ public:
     struct Attributes {
         // Stack size in bytes. Empty: default_stack_size() at construction
         // (2 MiB unless changed). The thread gets AT LEAST this many bytes of
-        // stack below the callable's first frame (a lower bound, never an
-        // exact size: the class adds room for the static TLS, the stagger and
-        // its own frames, and rounds the sum up to a page or to the static TLS
-        // alignment; glibc may reuse a larger cached stack; ThreadSanitizer
-        // raises small requests). The room for the class's own frames covers
-        // ordinary argument lists; in an unoptimized build each argument
-        // enlarges those frames, so a callable with an unusually long
-        // argument list (a member pointer sooner, through std::invoke's
-        // frames) can get less than the full amount. A value below
-        // the system minimum is raised to the minimum (0 gets the minimum). A
-        // value for which the computation overflows (e.g. SIZE_MAX) makes the
-        // constructor throw EINVAL.
+        // stack below the callable's first frame, that is, between the
+        // address __builtin_frame_address(0) returns in the callable's body
+        // and the lowest usable address of the stack (the top of the guard);
+        // the callable's locals and everything it calls use this space. A
+        // lower bound, never an exact size: the class adds room for the
+        // static TLS, the stagger and its own frames, and rounds the sum up
+        // to a page or to the static TLS alignment; glibc may reuse a larger
+        // cached stack; ThreadSanitizer raises small requests. The room for
+        // the class's own frames covers ordinary argument lists; in an
+        // unoptimized build each argument enlarges those frames, so a
+        // callable with an unusually long argument list (a member pointer
+        // sooner, through std::invoke's frames) can get less than the full
+        // amount. A value below the system minimum,
+        // sysconf(_SC_THREAD_STACK_MIN), is raised to that minimum (0 gets
+        // the minimum). A value for which the size computation overflows
+        // size_t makes the constructor throw EINVAL (step 1 of the
+        // constructor's contract states the exact condition; SIZE_MAX is one
+        // such value).
         std::optional<std::size_t> stack_size = {};
         // Guard size in bytes: an inaccessible region below the stack, which
         // turns a stack overflow into a fault. Empty: 1 MiB. Any other value
@@ -687,9 +726,10 @@ public:
         // thread, so 0 promises nothing about the absence of a guard mapping.
         // The guard is not part of stack_size: glibc maps it in addition.
         // A value whose page-rounded size does not fit in size_t together
-        // with the stack makes the constructor throw EINVAL; values that fit
-        // but are too large for glibc fail as glibc reports them (EAGAIN or
-        // EINVAL from pthread_create).
+        // with the computed stack size makes the constructor throw EINVAL
+        // (step 1 of the constructor's contract); values that fit but are too
+        // large for glibc fail as glibc reports them (EAGAIN or EINVAL from
+        // pthread_create, step 4).
         std::optional<std::size_t> guard_size = {};
     }; // struct Attributes
 
@@ -717,20 +757,42 @@ public:
     // rvalues of the std::decay_t<Args>.
     //
     // Stack and guard: see Attributes. The stack below the callable's first
-    // frame is at least the requested (or default) stack size.
+    // frame (as defined there) is at least the requested (or default) stack
+    // size.
+    //
+    // The stagger: a construction that reaches step 3 below takes the next
+    // number n of a process-wide creation count (unsigned, wrapping), also
+    // when it then fails in step 3 or 4; one that fails in step 1 or 2 takes
+    // none.
+    // The new thread reserves (n % 16) * 256 bytes at the top of its stack
+    // before the callable runs, so the callable's first frame lies that many
+    // bytes deeper than with no reservation; the reservation comes out of the
+    // room the class adds, not out of the requested size. Its purpose, to
+    // spread the top frames of consecutive threads over different cache
+    // sets, is not a promise.
     //
     // The start mask: the callable starts with every blockable signal blocked
     // except SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGPROF, SIGTRAP and SIGSYS,
     // which are unblocked, whatever the creating thread's mask; SIGKILL,
-    // SIGSTOP and glibc's two internal signals are never blocked in any
-    // thread. When the constructor returns or throws, the creating thread's
-    // mask is what it was before.
+    // SIGSTOP and glibc's two internal signals (32 and 33, the realtime
+    // signals below SIGRTMIN) are never blocked in any thread. When the
+    // constructor returns or throws, the creating thread's mask is what it
+    // was before.
     //
     // Order of the steps, and what each failure leaves:
-    //   1. Sizes computed and checked. An overflow (stack_size or guard_size
-    //      = SIZE_MAX, for example) throws std::system_error with EINVAL
-    //      before anything is allocated or copied: f and args are untouched
-    //      (an rvalue argument is not moved from).
+    //   1. Sizes computed and checked. With R the requested (or default)
+    //      stack size and G the requested guard (or 1 MiB), the check fails
+    //      when max(R, sysconf(_SC_THREAD_STACK_MIN)) plus the class's
+    //      additions (thread_detail::stack_extra and
+    //      thread_detail::static_tls_size()), rounded up to
+    //      thread_detail::stack_granule(), does not fit in size_t, or when G
+    //      rounded up to the page size, plus that stack size, does not
+    //      (thread_detail::compute_stack_size() returns empty, or
+    //      thread_detail::guard_fits() returns false). stack_size = SIZE_MAX
+    //      and guard_size = SIZE_MAX both fail it. A failed check throws
+    //      std::system_error with EINVAL before anything is allocated or
+    //      copied: f and args are untouched (an rvalue argument is not moved
+    //      from).
     //   2. Attributes set up (pthread_attr_init and setters; they do not fail
     //      for the computed values).
     //   3. f and args decay-copied into a heap allocation. An exception from
@@ -742,10 +804,13 @@ public:
     //      = std::size_t{1} << 62 fails with EAGAIN); the copies were made and
     //      are destroyed in the calling thread before the exception leaves
     //      the constructor; rvalue arguments are left moved-from.
-    // Every std::system_error thrown here uses std::generic_category(), the
-    // error value of the failing call (never errno), and a message naming the
-    // call and the stack and guard sizes. No other exceptions than those of
-    // steps 1-4 (and std::bad_alloc from building the message).
+    // Every std::system_error thrown here uses std::generic_category().
+    // Step 1's carries EINVAL, the class's own value, and a message naming
+    // the stack and guard size computation and the REQUESTED stack and guard
+    // sizes (R and G). Steps 2 and 4 carry the failing pthread call's return value
+    // (never errno) and a message naming the call, the COMPUTED stack size
+    // and the guard size passed to glibc (G). No other exceptions than those
+    // of steps 1-4 (and std::bad_alloc from building the message).
     // Exception safety: if the constructor throws, no thread was created, no
     // copy of f or args remains, and the creating thread's mask is unchanged.
     //
@@ -758,8 +823,9 @@ public:
     //     returns and before the thread ends (so before join() returns).
     //   - If the callable calls pthread_exit, the thread's stack is unwound
     //     (destructors of the callable's locals run), the copies are
-    //     destroyed, and the thread ends normally: join() returns. Thread
-    //     cancellation through native_handle() is not supported or promised.
+    //     destroyed by the new thread during that unwinding, and the thread
+    //     ends normally: join() returns. Thread cancellation through
+    //     native_handle() is not supported or promised.
     //   - If an exception escapes the callable, the frames between the throw
     //     and the class's start routine are unwound (destructors run), and
     //     then std::terminate() is called with the exception still current:
@@ -904,7 +970,9 @@ private:
                       (std::is_constructible_v<std::decay_t<Args>, Args> && ...) &&
                       std::is_invocable_v<std::decay_t<F>, std::decay_t<Args>...>) {
             using S = thread_detail::State<std::decay_t<F>, std::decay_t<Args>...>;
-            const thread_detail::AttrOwner attr(attributes.stack_size, attributes.guard_size);      // steps 1, 2
+            // Not const: ThreadSanitizer's pthread_create interceptor writes the
+            // raised stack size back into the attributes it is passed.
+            thread_detail::AttrOwner attr(attributes.stack_size, attributes.guard_size);            // steps 1, 2
             std::unique_ptr<S> state = std::make_unique<S>(thread_detail::next_stagger(), std::forward<F>(f),
                                                            std::forward<Args>(args)...);           // step 3
             const int rc = thread_detail::create_thread(handle_, attr.get(), &thread_detail::start_routine<S>,
@@ -914,7 +982,7 @@ private:
                 // `state` destroys the copies while this exception unwinds the
                 // frame, before it leaves the constructor.
                 thread_detail::throw_error(rc, "pthread_create", attr.stack_size(), attr.guard_size());
-            }
+            } // if pthread_create failed
             // The new thread owns the state now and may already have destroyed
             // it: this thread must not touch it again.
             static_cast<void>(state.release());
@@ -931,4 +999,5 @@ private:
 // to includers.
 #undef THREAD_RARELY
 
+#endif // the requirements hold
 #endif // INCLUDED_THREAD_H

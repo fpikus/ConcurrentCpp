@@ -59,6 +59,7 @@
 
 #include <array>
 #include <atomic>
+#include <barrier>
 #include <cerrno>
 #include <chrono>
 #include <climits>
@@ -120,7 +121,8 @@ constexpr std::size_t own_stagger(unsigned n) {
 } // own_stagger()
 
 // What the stack size adds to the request, as documented: the deepest
-// stagger reservation (15 * 256) and the start routine's frames (2048).
+// stagger reservation (15 * 256) and the allowance for the start-up frames
+// above and below the reservation (2048).
 constexpr std::size_t own_extra = 3840 + 2048;
 
 // `n` rounded up to a multiple of `unit` (no overflow: callers pass small
@@ -212,13 +214,14 @@ public:
         rlimit none = saved_;
         none.rlim_cur = 0;
         lowered_ = setrlimit(RLIMIT_NPROC, &none) == 0;
-    }
+    } // NoNewThreadsScope::NoNewThreadsScope()
     ~NoNewThreadsScope() {
         if (lowered_) setrlimit(RLIMIT_NPROC, &saved_);
     }
     NoNewThreadsScope(const NoNewThreadsScope&) = delete;
     NoNewThreadsScope& operator=(const NoNewThreadsScope&) = delete;
 
+    // Whether the soft limit was lowered.
     bool lowered() const { return lowered_; }
 
 private:
@@ -250,7 +253,7 @@ int system_error_code(Fn fn) {
         return e.code().value();
     } catch (...) {
         return -2;
-    }
+    } // catch whatever fn() throws
     return -1;
 } // system_error_code()
 
@@ -263,6 +266,7 @@ int system_error_code(Fn fn) {
 // The seven signals a new Thread always has unblocked, the test's own list.
 constexpr std::array<int, 7> own_seven = {SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGPROF, SIGTRAP, SIGSYS};
 
+// Whether `signo` is one of the seven.
 bool in_seven(int signo) {
     for (const int s : own_seven) {
         if (s == signo) return true;
@@ -278,6 +282,8 @@ bool start_blocked(int signo) {
     return !(signo >= 32 && signo < SIGRTMIN);
 } // start_blocked()
 
+// Whether `mask` blocks `signo` (sigismember is 1; an invalid signal is
+// never blocked).
 bool is_blocked(const sigset_t& mask, int signo) {
     return sigismember(&mask, signo) == 1;
 } // is_blocked()
@@ -305,8 +311,8 @@ testing::AssertionResult mask_is(const sigset_t& mask, Pred expected) {
 
 // A creating thread's mask, named for the failure messages.
 struct CreatorMask {
-    const char* name;
-    sigset_t mask;
+    const char* name;           // shown in the failure messages
+    sigset_t mask;              // the mask the creating thread sets for itself
 }; // struct CreatorMask
 
 // The creator masks the mask tests run from: nothing blocked; everything
@@ -345,12 +351,14 @@ void on_creator(const sigset_t& mask, Fn fn) {
 // The calling thread's stack as glibc reports it: the low end (above the
 // guard) and the size, which includes the static TLS at the top.
 struct StackSpan {
-    std::uintptr_t low = 0;
-    std::size_t size = 0;
+    std::uintptr_t low = 0;     // the lowest address of the stack, just above the guard
+    std::size_t size = 0;       // bytes from `low` to the top of the stack block
 
+    // The top of the stack block (its highest address + 1).
     std::uintptr_t top() const { return low + size; }
 }; // struct StackSpan
 
+// The calling thread's stack, from pthread_getattr_np.
 StackSpan own_stack() {
     pthread_attr_t attr;
     pthread_getattr_np(pthread_self(), &attr);
@@ -419,7 +427,7 @@ std::vector<FrameRecord> place_alive(const std::vector<Thread::Attributes>& attr
             // Releases the threads already waiting, then reports the failure.
             hold.count_down(static_cast<std::ptrdiff_t>(attributes.size() - i));
             throw;
-        }
+        } // catch a failed construction
     } // for every thread to create
     return records;             // `threads` joins every thread here
 } // place_alive()
@@ -468,7 +476,7 @@ struct CopyCounts {
     std::atomic<int> copies{0};                 // copies and moves constructed
     std::atomic<int> copies_destroyed{0};       // of those, destroyed
     std::atomic<int> destroyed_by_creator{0};   // of those, destroyed on the thread that made these counts
-    const std::thread::id creator = std::this_thread::get_id();
+    const std::thread::id creator = std::this_thread::get_id();     // the thread that made these counts
 }; // struct CopyCounts
 
 // A value whose copies and moves are counted in a CopyCounts. The originals a
@@ -508,15 +516,15 @@ struct CallableLocal {
 // a Tracked argument by rvalue reference (so the invocation makes no further
 // copy) and ends as told.
 struct TrackedCallable {
-    Tracked marker;
-    Ending ending = Ending::normal;
+    Tracked marker;                     // counts the callable's own copies
+    Ending ending = Ending::normal;     // how each invocation ends
 
     void operator()(Tracked&& argument) {
         const CallableLocal local;
         static_cast<void>(argument);
         if (ending == Ending::thread_exit) pthread_exit(nullptr);
         if (ending == Ending::exception) throw std::runtime_error("from the callable");
-    }
+    } // TrackedCallable::operator()()
 }; // struct TrackedCallable
 
 // A callable that stores the mask it runs with in *out.
@@ -547,18 +555,19 @@ public:
     PlainAttr(const PlainAttr&) = delete;
     PlainAttr& operator=(const PlainAttr&) = delete;
 
+    // The attributes, for pthread_create.
     const pthread_attr_t& get() const { return attr_; }
 
 private:
-    pthread_attr_t attr_;
+    pthread_attr_t attr_;       // initialized by the constructor; destroyed by the destructor
 }; // class PlainAttr
 
 } // namespace
 
 // ===========================================================================
-// Size arithmetic, at compile time. The mutation runs define
-// THREAD_INTERNALS_NO_STATIC_CHECKS to compile these out, so that a mutated
-// header builds and the runtime tests below show which of them kills it.
+// Size arithmetic, at compile time. Defining THREAD_INTERNALS_NO_STATIC_CHECKS
+// compiles these static checks out, so that a header that breaks one of them
+// still builds and the runtime tests below report the failure.
 // ===========================================================================
 
 #if !defined(THREAD_INTERNALS_NO_STATIC_CHECKS)
@@ -639,7 +648,7 @@ TEST(StaggerFor, RotationAndWrap) {
     for (unsigned n = 0; n != 40; ++n) EXPECT_EQ(thread_detail::stagger_for(n), own_stagger(n)) << "n = " << n;
     for (unsigned n = UINT_MAX - 20; n != 0; ++n) EXPECT_EQ(thread_detail::stagger_for(n), own_stagger(n));
     EXPECT_EQ(thread_detail::stagger_for(UINT_MAX), 3840u);
-}
+} // TEST(StaggerFor, RotationAndWrap)
 
 // next_stagger takes one creation number and returns its stagger amount;
 // from UINT_MAX it wraps to 0.
@@ -652,7 +661,54 @@ TEST(StaggerCounter, NextTakesOneNumber) {
     EXPECT_EQ(thread_detail::next_stagger(), std::size_t{3840});
     EXPECT_EQ(thread_detail::stagger_counter.load(std::memory_order_relaxed), 0u);
     EXPECT_EQ(thread_detail::next_stagger(), std::size_t{0});
-}
+} // TEST(StaggerCounter, NextTakesOneNumber)
+
+// next_stagger called concurrently, 8 threads x 200000 calls: the counter
+// advances by exactly 8 * 200000 (no increment is lost), and the numbers
+// taken are 1.6 million consecutive numbers, so each of the 16 stagger slots
+// is taken exactly 1/16 of the times. A counter that loses an increment
+// fails the final count; the numbers it hands out twice usually unbalance
+// the slot counts as well.
+// The threads meet at a barrier every 1000 calls, so that their calls
+// overlap in every round even when a thread could otherwise finish within
+// one time slice; the overlap makes a lost increment likely, not certain.
+TEST(StaggerCounter, ConcurrentCallsTakeConsecutiveNumbers) {
+    const CounterSaver saver;
+    constexpr unsigned thread_count = 8;
+    constexpr unsigned calls = 200000;
+    constexpr unsigned base = 16*1000;
+    thread_detail::stagger_counter.store(base, std::memory_order_relaxed);
+    std::vector<std::array<unsigned, 16>> slots(thread_count);      // per thread: how often each slot was taken
+    std::vector<unsigned> malformed(thread_count, 0);              // per thread: amounts outside the rule
+    constexpr unsigned round = 1000;                                // calls between two barrier phases
+    static_assert(calls % round == 0);
+    std::barrier sync(thread_count);
+    {
+        std::vector<std::thread> workers;
+        for (unsigned t = 0; t != thread_count; ++t) {
+            workers.emplace_back([&slots, &malformed, &sync, t] {
+                slots[t].fill(0);
+                for (unsigned i = 0; i != calls; ++i) {
+                    if (i % round == 0) sync.arrive_and_wait();
+                    const std::size_t amount = thread_detail::next_stagger();
+                    if (amount % 256 == 0 && amount/256 < 16) {
+                        ++slots[t][amount/256];
+                    } else {
+                        ++malformed[t];
+                    }
+                } // for every call
+            }); // the worker's lambda
+        } // for every thread
+        for (std::thread& worker : workers) worker.join();
+    } // the workers' scope
+    EXPECT_EQ(thread_detail::stagger_counter.load(std::memory_order_relaxed), base + thread_count*calls);
+    for (unsigned slot = 0; slot != 16; ++slot) {
+        unsigned taken = 0;
+        for (unsigned t = 0; t != thread_count; ++t) taken += slots[t][slot];
+        EXPECT_EQ(taken, thread_count*calls/16) << "slot " << slot;
+    } // for every slot
+    for (unsigned t = 0; t != thread_count; ++t) EXPECT_EQ(malformed[t], 0u) << "thread " << t;
+} // TEST(StaggerCounter, ConcurrentCallsTakeConsecutiveNumbers)
 
 // page_round: rounding at the unit's edges, and the overflow point: the
 // largest multiple of the unit that fits is SIZE_MAX + 1 - unit; one more
@@ -668,9 +724,9 @@ TEST(PageRound, EdgesAndOverflow) {
         EXPECT_EQ(thread_detail::page_round(size_max - (unit - 1), unit), size_max - (unit - 1));
         EXPECT_FALSE(thread_detail::page_round(size_max - (unit - 2), unit));
         EXPECT_FALSE(thread_detail::page_round(size_max, unit));
-    }
+    } // for every unit
     EXPECT_EQ(thread_detail::page_round(size_max, 1), size_max);
-}
+} // TEST(PageRound, EdgesAndOverflow)
 
 // The clamp applies to the request BEFORE the additions: a request below the
 // minimum gets the minimum plus the extra and the TLS term, not the larger of
@@ -682,7 +738,7 @@ TEST(ComputeStackSize, ClampBeforeAdditions) {
     EXPECT_EQ(thread_detail::compute_stack_size(16383, 0, 0, 4096, 16384), std::size_t{16384});
     EXPECT_EQ(thread_detail::compute_stack_size(16384, 0, 0, 4096, 16384), std::size_t{16384});
     EXPECT_EQ(thread_detail::compute_stack_size(16385, 0, 0, 4096, 16384), std::size_t{20480});
-}
+} // TEST(ComputeStackSize, ClampBeforeAdditions)
 
 // Page boundaries of the sum: request + extra + TLS = 32767, 32768, 32769.
 // And the TLS term alone carrying the sum over a page boundary (20480 + 4000
@@ -693,7 +749,7 @@ TEST(ComputeStackSize, PageBoundaries) {
     EXPECT_EQ(thread_detail::compute_stack_size(22594, 5888, 4287, 4096, 16384), std::size_t{36864});
     EXPECT_EQ(thread_detail::compute_stack_size(20480, 4000, 0, 4096, 16384), std::size_t{24576});
     EXPECT_EQ(thread_detail::compute_stack_size(20480, 4000, 200, 4096, 16384), std::size_t{28672});
-}
+} // TEST(ComputeStackSize, PageBoundaries)
 
 // Other page sizes and minimums: 16 KiB pages, and 64 KiB pages with the
 // 128 KiB minimum of such systems.
@@ -706,7 +762,7 @@ TEST(ComputeStackSize, LargePages) {
     EXPECT_EQ(thread_detail::compute_stack_size(0, 5888, 4287, 65536, 131072), std::size_t{196608});
     EXPECT_EQ(thread_detail::compute_stack_size(131071, 0, 0, 65536, 131072), std::size_t{131072});
     EXPECT_EQ(thread_detail::compute_stack_size(131073, 0, 0, 65536, 131072), std::size_t{196608});
-}
+} // TEST(ComputeStackSize, LargePages)
 
 // Each overflow point of the computation: request + extra, + TLS, the
 // round-up; just below each, a value. A request so large that request + extra
@@ -721,7 +777,7 @@ TEST(ComputeStackSize, OverflowPoints) {
     EXPECT_EQ(thread_detail::compute_stack_size(size_max - 4095 - 5888 - 4287, 5888, 4287, 4096, 16384),
               size_max - 4095);
     EXPECT_FALSE(thread_detail::compute_stack_size(size_max - 4094 - 5888 - 4287, 5888, 4287, 4096, 16384));
-}
+} // TEST(ComputeStackSize, OverflowPoints)
 
 // guard_fits: the guard is rounded up to a page (as glibc does) before it is
 // added to the stack. With a 1 MiB stack the largest guard that fits is
@@ -737,7 +793,7 @@ TEST(GuardFits, RoundedGuardPlusStack) {
     EXPECT_TRUE(thread_detail::guard_fits(size_max - 4096, 1, 4096));
     EXPECT_FALSE(thread_detail::guard_fits(size_max - 4095, 1, 4096));
     EXPECT_FALSE(thread_detail::guard_fits(std::size_t{1} << 63, std::size_t{1} << 63, 4096));
-}
+} // TEST(GuardFits, RoundedGuardPlusStack)
 
 // tls_carve_bound: the size rounded up to the alignment plus alignment - 1
 // (the descriptor is aligned down from the top of the block, leaving up to
@@ -760,7 +816,7 @@ TEST(TlsCarveBound, RoundedPlusSlack) {
     // reports) reaches the saturation of the addition itself: SIZE_MAX - 2
     // rounds to SIZE_MAX, and + 2 would wrap to 1.
     EXPECT_EQ(thread_detail::tls_carve_bound(size_max - 2, 3), size_max);
-}
+} // TEST(TlsCarveBound, RoundedPlusSlack)
 
 // tls_info_from and tls_size_from with a null query (the symbol absent from
 // glibc) and with fake queries: the alignment 0 a query may report is read
@@ -790,7 +846,7 @@ TEST(TlsQuery, NullAndFakeQueries) {
         *align = 4096;
     };
     EXPECT_EQ(thread_detail::tls_size_from(over_aligned), std::size_t{8191});
-}
+} // TEST(TlsQuery, NullAndFakeQueries)
 
 // The cached machine parameters equal the system's own answers, and the TLS
 // term includes this binary's 64 KiB thread_local (else the TLS test below
@@ -803,7 +859,7 @@ TEST(MachineParameters, MatchTheSystem) {
     const thread_detail::tls_query_fn query = &thread_detail::_dl_get_tls_static_info;
     ASSERT_NE(query, nullptr) << "glibc without the static TLS query";
     EXPECT_GT(own_tls_term(), sizeof big_tls);
-}
+} // TEST(MachineParameters, MatchTheSystem)
 
 // ===========================================================================
 // AttrOwner: the sizes it passes to glibc.
@@ -846,7 +902,7 @@ TEST(AttrOwnerSizes, ExactStackAndGuard) {
                                                                thread_detail::min_stack_size()));
         } // for every guard
     } // for every request
-}
+} // TEST(AttrOwnerSizes, ExactStackAndGuard)
 
 // An unset request takes the process default as it is when the AttrOwner is
 // made (an odd value, so the computation shows).
@@ -857,7 +913,7 @@ TEST(AttrOwnerSizes, UnsetUsesCurrentDefault) {
     std::size_t stack = 0;
     ASSERT_EQ(pthread_attr_getstacksize(&owner.get(), &stack), 0);
     EXPECT_EQ(stack, own_stack_size(odd_default));
-}
+} // TEST(AttrOwnerSizes, UnsetUsesCurrentDefault)
 
 // Every overflow throws EINVAL (generic category): the stack request
 // (SIZE_MAX; SIZE_MAX - extra, where only the additions overflow), the guard
@@ -891,7 +947,7 @@ TEST(AttrOwnerSizes, OverflowThrowsEinval) {
 
     const DefaultStackScope scope(size_max);
     EXPECT_EQ(system_error_code([] { thread_detail::AttrOwner owner(nullopt, nullopt); }), EINVAL);
-}
+} // TEST(AttrOwnerSizes, OverflowThrowsEinval)
 
 // ===========================================================================
 // The start mask.
@@ -901,7 +957,7 @@ TEST(AttrOwnerSizes, OverflowThrowsEinval) {
 // SIGSTOP and glibc's internal signals. No thread involved.
 TEST(StartMaskSet, Membership) {
     EXPECT_TRUE(mask_is(thread_detail::start_mask(), start_blocked));
-}
+} // TEST(StartMaskSet, Membership)
 
 // CreationMaskScope, from each creator mask: inside the scope the calling
 // thread's mask is its previous mask plus the start mask's blocked signals,
@@ -924,7 +980,7 @@ TEST(CreationMaskScopeTest, AddsBlockedPartKeepsSevenRestores) {
             EXPECT_TRUE(mask_is(current_mask(), previous));
         });
     } // for every creator mask
-}
+} // TEST(CreationMaskScopeTest, AddsBlockedPartKeepsSevenRestores)
 
 // create_thread: the new thread's mask on entry (its first instruction, before
 // any of the class's code runs in it) is its creator's mask plus the start
@@ -953,7 +1009,7 @@ TEST(CreationMaskScopeTest, CreateThreadWindowAndRestore) {
             EXPECT_TRUE(mask_is(current_mask(), previous));
         });
     } // for every creator mask
-}
+} // TEST(CreationMaskScopeTest, CreateThreadWindowAndRestore)
 
 // start_routine, called directly on a helper thread with each creator mask
 // (no pthread_create, so nothing is inherited from a creation window): the
@@ -970,7 +1026,7 @@ TEST(StartRoutineDirect, SetsStartMask) {
         });
         EXPECT_TRUE(mask_is(seen, start_blocked));
     } // for every creator mask
-}
+} // TEST(StartRoutineDirect, SetsStartMask)
 
 // Through Thread, from each creator mask: the callable sees the start mask,
 // and the creator's mask is unchanged after a successful construction and
@@ -993,7 +1049,7 @@ TEST(ThreadMask, CallableSeesStartMaskCreatorUnchanged) {
         });
         EXPECT_TRUE(mask_is(seen, start_blocked));
     } // for every creator mask
-}
+} // TEST(ThreadMask, CallableSeesStartMaskCreatorUnchanged)
 
 // ===========================================================================
 // The stack stagger.
@@ -1022,7 +1078,7 @@ TEST(StartRoutineDirect, ReservationLowersCallableFrame) {
     });
     helper.join();
     EXPECT_TRUE(depths_follow_stagger(records, 0));
-}
+} // TEST(StartRoutineDirect, ReservationLowersCallableFrame)
 
 // 16 Threads alive at once (distinct stack blocks): the counter advances by
 // 16, and each callable frame lies its stagger amount deeper than thread 0's
@@ -1033,7 +1089,7 @@ TEST(StaggerDepth, SixteenAliveAtOnce) {
     const std::vector<FrameRecord> records = place_alive(attributes, 100);
     EXPECT_EQ(thread_detail::stagger_counter.load(std::memory_order_relaxed), 116u);
     EXPECT_TRUE(depths_follow_stagger(records, 100));
-}
+} // TEST(StaggerDepth, SixteenAliveAtOnce)
 
 // 16 Threads created and joined one at a time: glibc hands the same cached
 // block back each time, and the stagger alone moves the frame.
@@ -1047,7 +1103,7 @@ TEST(StaggerDepth, CreateAndJoinReusesBlock) {
     }
     EXPECT_EQ(thread_detail::stagger_counter.load(std::memory_order_relaxed), 21u);
     EXPECT_TRUE(depths_follow_stagger(records, 5));
-}
+} // TEST(StaggerDepth, CreateAndJoinReusesBlock)
 
 // Mixed stack sizes (16 KiB to 3 MiB: fresh and cached blocks) and guards
 // (0, a page, 1 MiB), alive at once. The depth is measured from each
@@ -1064,7 +1120,7 @@ TEST(StaggerDepth, MixedSizesAndGuards) {
     const std::vector<FrameRecord> records = place_alive(attributes, 0);
     EXPECT_EQ(thread_detail::stagger_counter.load(std::memory_order_relaxed), 16u);
     EXPECT_TRUE(depths_follow_stagger(records, 0));
-}
+} // TEST(StaggerDepth, MixedSizesAndGuards)
 
 // The counter's wrap: numbers UINT_MAX - 7 .. UINT_MAX, then 0 .. 7. The
 // rotation continues (slots 8..15, then 0..7).
@@ -1074,7 +1130,7 @@ TEST(StaggerDepth, CounterWrap) {
     const std::vector<FrameRecord> records = place_alive(attributes, UINT_MAX - 7);
     EXPECT_EQ(thread_detail::stagger_counter.load(std::memory_order_relaxed), 8u);
     EXPECT_TRUE(depths_follow_stagger(records, UINT_MAX - 7));
-}
+} // TEST(StaggerDepth, CounterWrap)
 
 // What the stagger is for: at the default stack size, 16 consecutive
 // Threads alive at once have their callable frames at 16 distinct page
@@ -1086,7 +1142,7 @@ TEST(StaggerPlacement, DefaultSizeSixteenPageOffsets) {
     const std::vector<FrameRecord> records = place_alive(attributes, 0);
     EXPECT_EQ(distinct_page_offsets(records), std::size_t{16});
     EXPECT_EQ(distinct_unstaggered_offsets(records, 0), std::size_t{1});
-}
+} // TEST(StaggerPlacement, DefaultSizeSixteenPageOffsets)
 
 // Requests of 2 MiB and more that differ modulo the page (2 MiB + i * 100):
 // the stack sizes are rounded to the page, so the stack tops still share one
@@ -1100,20 +1156,33 @@ TEST(StaggerPlacement, RequestsDifferingModuloPage) {
     const std::vector<FrameRecord> records = place_alive(attributes, 0);
     EXPECT_EQ(distinct_page_offsets(records), std::size_t{16});
     EXPECT_EQ(distinct_unstaggered_offsets(records, 0), std::size_t{1});
-}
+} // TEST(StaggerPlacement, RequestsDifferingModuloPage)
+
+// A callable for the headroom test that is never inlined, so that it has a
+// frame of its own, as an ordinary callable does. It records in
+// record->frame __builtin_frame_address(0) taken in its own body: the point
+// the contract measures the stack below the callable's first frame from.
+struct RecordFrameStart {
+    [[gnu::noinline]] void operator()(FrameRecord* record, std::latch* hold) const {
+        record->frame = reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0));
+        record->stack = own_stack();
+        if (hold != nullptr) hold->arrive_and_wait();
+    }
+}; // struct RecordFrameStart
 
 // The stack below the callable's first frame at the deepest stagger slot
-// (15), for every rounding slack granule - 64, ..., 64, 0: the request is
-// chosen so that request + extra + TLS term + slack is one block size, so at
-// slack 0 nothing of the rounding is left over. glibc reuses a cached block
-// that is larger than the request, which would hide a shortfall, so the test
-// checks that each thread's stack is exactly the block and fails otherwise,
-// and avoids such reuse: the block is larger than any other stack of this
-// binary, and the slack decreases, so the requests increase and no earlier
-// block of the sweep is larger than a later request's (whatever sizes a
-// defective computation gives them). The callable is the
-// short-argument-list RecordFrame.
-TEST(StaggerHeadroom, DeepestSlotEverySlack) {
+// (15), for every rounding slack granule - 64, ..., 64, 0, measured where
+// `Callable` records it: the request is chosen so that request + extra + TLS
+// term + slack is one block size, so at slack 0 nothing of the rounding is
+// left over. glibc reuses a cached block that is larger than the request,
+// which would hide a shortfall, so each thread's stack must be exactly the
+// block (the check fails otherwise), and such reuse is avoided: the block is
+// larger than any other stack of this binary, and the slack decreases, so the
+// requests increase and no earlier block of the sweep is larger than a later
+// request's (whatever sizes a defective computation gives them). The callable
+// takes a short argument list.
+template <class Callable>
+void check_deepest_slot_headroom() {
     const CounterSaver saver;
     pthread_attr_t defaults;
     ASSERT_EQ(pthread_getattr_default_np(&defaults), 0);
@@ -1130,12 +1199,25 @@ TEST(StaggerHeadroom, DeepestSlotEverySlack) {
         thread_detail::stagger_counter.store(15, std::memory_order_relaxed);
         FrameRecord record;
         {
-            const Thread worker({.stack_size = request}, RecordFrame{}, &record, no_hold);
+            const Thread worker({.stack_size = request}, Callable{}, &record, no_hold);
         }
         EXPECT_EQ(record.stack.size, block) << "the thread did not get a block of exactly the computed size";
         EXPECT_GE(record.frame - record.stack.low, request);
     } // for every slack, down to 0 (the unsigned wrap below 0 ends the loop)
-}
+} // check_deepest_slot_headroom()
+
+// The headroom below the frame of a callable inlined into the start
+// routine's invoker (the frame the invoker and the callable share).
+TEST(StaggerHeadroom, DeepestSlotEverySlack) {
+    check_deepest_slot_headroom<RecordFrame>();
+} // TEST(StaggerHeadroom, DeepestSlotEverySlack)
+
+// The headroom below the first frame of a callable that is not inlined,
+// measured from __builtin_frame_address(0) in its own body, as the contract
+// states it.
+TEST(StaggerHeadroom, DeepestSlotEverySlackOwnFrame) {
+    check_deepest_slot_headroom<RecordFrameStart>();
+} // TEST(StaggerHeadroom, DeepestSlotEverySlackOwnFrame)
 
 // The TLS term matters: a minimum stack (request 0) in this binary, whose
 // static TLS block holds a 64 KiB thread_local, is created and has at least
@@ -1157,7 +1239,7 @@ TEST(TlsTerm, MinimumStackWithLargeThreadLocal) {
               }),
               -1);
     EXPECT_GE(frame - stack.low, own_minimum());
-}
+} // TEST(TlsTerm, MinimumStackWithLargeThreadLocal)
 
 // ===========================================================================
 // Construction failure paths and the copies.
@@ -1199,7 +1281,7 @@ TEST(ThreadOverflow, NothingCopiedNoNumberTaken) {
               EINVAL);
     EXPECT_EQ(counts.copies.load(), 0);
     EXPECT_FALSE(argument.moved_from);
-}
+} // TEST(ThreadOverflow, NothingCopiedNoNumberTaken)
 
 // A failing pthread_create (stack 2^62: EAGAIN): the copies were made (one of
 // the callable, one of the argument), and are destroyed by the creating
@@ -1219,7 +1301,7 @@ TEST(ThreadCreateFailure, CopiesDestroyedByCreator) {
         EXPECT_EQ(counts.copies.load(), 2);
         EXPECT_EQ(counts.copies_destroyed.load(), 2);
         EXPECT_EQ(counts.destroyed_by_creator.load(), 2);
-    }
+    } // catch the EAGAIN
     EXPECT_TRUE(argument.moved_from);
     EXPECT_EQ(thread_detail::stagger_counter.load(std::memory_order_relaxed), 10u);
     const std::optional<long long> delta = heap_delta([] {
@@ -1228,7 +1310,7 @@ TEST(ThreadCreateFailure, CopiesDestroyedByCreator) {
     if (delta) {
         EXPECT_EQ(*delta, 0);
     }
-}
+} // TEST(ThreadCreateFailure, CopiesDestroyedByCreator)
 
 // A pthread_create that fails after glibc stored the new thread's handle (the
 // clone fails: RLIMIT_NPROC 0) leaves the handle member reset: read from the
@@ -1265,13 +1347,13 @@ TEST(ThreadCreateFailure, HandleResetAfterFailedClone) {
             std::launder(reinterpret_cast<Thread*>(storage))->~Thread();
         } catch (const std::system_error& e) {
             code = e.code().value();
-        }
+        } // catch the EAGAIN
         EXPECT_EQ(code, EAGAIN);
         pthread_t left;
         std::memcpy(&left, storage, sizeof left);
         EXPECT_EQ(left, pthread_t{}) << "the handle was not reset";
     } // for both constructors
-}
+} // TEST(ThreadCreateFailure, HandleResetAfterFailedClone)
 
 // The normal path: the callable and the argument are each copied once, and
 // both copies are destroyed once, by the new thread, before join() returns.
@@ -1283,7 +1365,7 @@ TEST(ThreadCopies, DestroyedOnceByNewThread) {
     EXPECT_EQ(counts.copies.load(), 2);
     EXPECT_EQ(counts.copies_destroyed.load(), 2);
     EXPECT_EQ(counts.destroyed_by_creator.load(), 0);
-}
+} // TEST(ThreadCopies, DestroyedOnceByNewThread)
 
 // pthread_exit in the callable: the stack unwinds through the start routine
 // (which rethrows the forced unwind), the callable's local and both copies
@@ -1307,7 +1389,7 @@ TEST(ThreadCopiesDeathTest, ThreadExitDestroysCopies) {
             std::_Exit(code);
         },
         testing::ExitedWithCode(0), "");
-}
+} // TEST(ThreadCopiesDeathTest, ThreadExitDestroysCopies)
 
 namespace {
 
@@ -1343,7 +1425,7 @@ TEST(ThreadCopiesDeathTest, ExceptionTerminatesWithCopiesAlive) {
             std::_Exit(7);
         },
         testing::ExitedWithCode(42), "");
-}
+} // TEST(ThreadCopiesDeathTest, ExceptionTerminatesWithCopiesAlive)
 
 // ===========================================================================
 // The invoker.
@@ -1352,7 +1434,7 @@ TEST(ThreadCopiesDeathTest, ExceptionTerminatesWithCopiesAlive) {
 // A callable whose overloads say how it was called: 1 for an rvalue callable
 // with an rvalue argument, the call std::thread makes.
 struct ValueCategoryProbe {
-    int* result;
+    int* result;                // receives the code of the overload called
 
     void operator()(int&&) && { *result = 1; }
     void operator()(int&) && { *result = 2; }
@@ -1369,11 +1451,11 @@ TEST(InvokeState, RvalueCallableRvalueArguments) {
     EXPECT_EQ(state.stagger, std::size_t{256});
     thread_detail::invoke_state(state, std::make_index_sequence<S::arity>{});
     EXPECT_EQ(result, 1);
-}
+} // TEST(InvokeState, RvalueCallableRvalueArguments)
 
 // A class with a member function, for the member-pointer invocations.
 struct Accumulator {
-    int value = 0;
+    int value = 0;              // the sum of every add()
 
     void add(int amount) { value += amount; }
 }; // struct Accumulator
@@ -1391,4 +1473,4 @@ TEST(InvokeState, MemberPointers) {
     ByReference by_reference(0, &Accumulator::add, std::ref(target), 6);
     thread_detail::invoke_state(by_reference, std::make_index_sequence<ByReference::arity>{});
     EXPECT_EQ(target.value, 11);
-}
+} // TEST(InvokeState, MemberPointers)

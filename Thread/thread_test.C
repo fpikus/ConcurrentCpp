@@ -52,6 +52,7 @@
 #include <signal.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -61,6 +62,7 @@
 #include <cstring>
 #include <exception>
 #include <functional>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -107,7 +109,7 @@ constexpr std::size_t kSizeMax = std::numeric_limits<std::size_t>::max();
 // Every stack bound in this file is therefore checked with this TLS present.
 // The array is zero-initialized (no dynamic initialization); the TLS test
 // takes its address so that it is kept.
-[[gnu::tls_model("initial-exec")]] thread_local std::array<unsigned char, 128 * 1024> big_tls;
+[[gnu::tls_model("initial-exec")]] thread_local std::array<unsigned char, 128*1024> big_tls;
 
 // ---------------------------------------------------------------------------
 // Census: per-object construction and destruction records for Tracked.
@@ -155,6 +157,7 @@ void retire(int id) {
 // The id the next object will get: a test's first id.
 int mark() { return next_id.load(std::memory_order_relaxed); }
 
+// The number of destructions recorded for the object with this id.
 int destructions(int id) { return slots[id].destructions.load(std::memory_order_relaxed); }
 
 // Success if every object enrolled in [first, mark()) was constructed once
@@ -202,8 +205,11 @@ public:
     Tracked& operator=(Tracked&&) = delete;
     ~Tracked() { census::retire(id_); }
 
+    // The census id of this instance.
     int id() const { return id_; }
+    // The value carried (kMovedFrom after a move out of this instance).
     int value() const { return value_; }
+    // True if this instance has been moved from.
     bool moved_from() const { return value_ == kMovedFrom; }
 
 private:
@@ -359,6 +365,7 @@ private:
 // The seven signals the start mask leaves unblocked.
 constexpr std::array<int, 7> kSeven = {SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGPROF, SIGTRAP, SIGSYS};
 
+// True if `s` is one of the seven signals the start mask leaves unblocked.
 bool is_one_of_seven(int s) {
     for (int u : kSeven) {
         if (u == s) return true;
@@ -368,13 +375,11 @@ bool is_one_of_seven(int s) {
 
 // The contract's start mask, signal by signal: every blockable signal is
 // blocked except the seven; SIGKILL, SIGSTOP and glibc's two internal signals
-// are never blocked. glibc's internal signals are the ones between the
-// kernel's first real-time signal (__SIGRTMIN) and the first one it gives to
-// applications (SIGRTMIN).
+// (32 and 33) are never blocked.
 bool start_mask_blocks(int s) {
     if (is_one_of_seven(s)) return false;
     if (s == SIGKILL || s == SIGSTOP) return false;
-    if (s >= __SIGRTMIN && s < SIGRTMIN) return false;
+    if (s == 32 || s == 33) return false;
     return true;
 } // start_mask_blocks()
 
@@ -417,16 +422,18 @@ enum class CreatorMask { kEmpty, kFull, kSeven, kMixed };
 constexpr std::array<CreatorMask, 4> kCreatorMasks = {CreatorMask::kEmpty, CreatorMask::kFull, CreatorMask::kSeven,
                                                       CreatorMask::kMixed};
 
+// A readable name of the creator mask `k`, for test traces.
 const char* name_of(CreatorMask k) {
     switch (k) {
     case CreatorMask::kEmpty: return "empty";
     case CreatorMask::kFull: return "full";
     case CreatorMask::kSeven: return "the seven";
     case CreatorMask::kMixed: return "mixed";
-    }
+    } // switch over the creator masks
     return "?";
 } // name_of()
 
+// The signal set a creator with mask kind `k` sets as its mask.
 sigset_t make_mask(CreatorMask k) {
     sigset_t m;
     sigemptyset(&m);
@@ -486,20 +493,27 @@ public:
     CountingHandler& operator=(const CountingHandler&) = delete;
     ~CountingHandler() { sigaction(sig_, &previous_, nullptr); }
 
+    // Deliveries of the signal since this handler was installed.
     int count() const { return counts()[sig_].load(); }
+    // The thread that received the last delivery (zero if none).
     pthread_t receiver() const { return receivers()[sig_].load(); }
 
 private:
     static constexpr int kSignals = 65;  // signal numbers 1..64
 
+    // Per-signal delivery counts, shared by the handler and the accessors.
     static std::array<std::atomic<int>, kSignals>& counts() {
         static std::array<std::atomic<int>, kSignals> c{};
         return c;
     } // CountingHandler::counts()
+    // Per-signal last receiving thread, shared by the handler and the
+    // accessors.
     static std::array<std::atomic<pthread_t>, kSignals>& receivers() {
         static std::array<std::atomic<pthread_t>, kSignals> r{};
         return r;
     } // CountingHandler::receivers()
+    // The installed handler: counts the delivery of `sig` and records the
+    // receiving thread (lock-free atomics only: async-signal-safe).
     static void handle(int sig) {
         counts()[sig].fetch_add(1);
         receivers()[sig].store(pthread_self());
@@ -512,40 +526,58 @@ private:
 // ---------------------------------------------------------------------------
 // Stacks and guards.
 
+// The page size.
 std::size_t page_size() { return static_cast<std::size_t>(sysconf(_SC_PAGESIZE)); }
 
+// `n` rounded up to a multiple of the page size.
 std::size_t page_round(std::size_t n) { return (n + page_size() - 1)/page_size()*page_size(); }
 
 // The system minimum stack size the contract raises smaller requests to.
 std::size_t minimum_stack() { return static_cast<std::size_t>(sysconf(_SC_THREAD_STACK_MIN)); }
 
-// Bytes between the frame address and the canonical frame address (where the
-// caller's frame ends and this function's frame begins). On x86-64 with a
-// frame pointer (which __builtin_frame_address(0) forces) the frame address
-// points at the saved frame pointer, with the return address above it. On
-// other targets 0: the bound is then measured from a point inside the frame,
-// which is stricter.
-#if defined(__x86_64__)
-constexpr std::uintptr_t kFrameRecord = 2*sizeof(void*);
-#else
-constexpr std::uintptr_t kFrameRecord = 0;
-#endif
+// The stack size step 1 of the constructor's contract computes for a
+// requested (or default) stack size R: max(R, the system minimum) plus the
+// class's additions (thread_detail::stack_extra and
+// thread_detail::static_tls_size(), the terms the contract names), rounded up
+// to thread_detail::stack_granule(); empty if that does not fit in size_t.
+// The tests use it to place requests exactly at the overflow boundaries the
+// contract states, and to name the computed size in pthread_create's message.
+std::optional<std::size_t> contract_stack_size(std::size_t requested) {
+    const std::size_t base = std::max(requested, minimum_stack());
+    const std::size_t additions = thread_detail::stack_extra + thread_detail::static_tls_size();
+    const std::size_t granule = thread_detail::stack_granule();
+    if (base > kSizeMax - additions) return std::nullopt;
+    const std::size_t sum = base + additions;
+    if (sum > kSizeMax - (granule - 1)) return std::nullopt;
+    return (sum + granule - 1)/granule*granule;
+} // contract_stack_size()
+
+// The largest requested stack size whose computed stack fits in size_t: the
+// computed size is then the largest multiple of the granule, and one byte
+// more overflows the rounding.
+std::size_t largest_fitting_stack_request() {
+    const std::size_t granule = thread_detail::stack_granule();
+    return (kSizeMax - (granule - 1)) - (thread_detail::stack_extra + thread_detail::static_tls_size());
+} // largest_fitting_stack_request()
 
 // The stack as seen from the callable's first frame.
 struct StackView {
     std::uintptr_t lo = 0;       // lowest address of the stack (pthread_getattr_np)
     std::size_t size = 0;        // stack size reported by pthread_getattr_np
     std::size_t guard = 0;       // guard size reported by pthread_getattr_np
-    std::uintptr_t frame = 0;    // where the callable's first frame begins
+    std::uintptr_t frame = 0;    // __builtin_frame_address(0) in the callable's body
     std::uintptr_t tls = 0;      // address of this thread's big_tls
 }; // struct StackView
 
 // The callable of the stack tests, called through a function pointer and
-// never inlined, so its frame is the callable's first frame. Its frame address
-// is a real stack address in every build (AddressSanitizer moves only
-// address-taken locals to its fake stack).
+// never inlined, so its frame is the callable's first frame. The contract
+// measures the stack below that frame from the address
+// __builtin_frame_address(0) returns in the callable's body, down to the
+// lowest usable stack address (pthread_getattr_np's stack address, the top of
+// the guard). The frame address is a real stack address in every build
+// (AddressSanitizer moves only address-taken locals to its fake stack).
 [[gnu::noinline]] void view_stack(StackView* out) {
-    out->frame = reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0)) + kFrameRecord;
+    out->frame = reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0));
     pthread_attr_t attr;
     pthread_getattr_np(pthread_self(), &attr);
     void* addr = nullptr;
@@ -962,13 +994,13 @@ TEST(ThreadLifetimeTest, DestructorJoins) {
 // and native_handle() name the thread itself.
 TEST(ThreadLifetimeTest, SelfJoiningThrowsDeadlockAndLeavesThreadUnchanged) {
     struct Shared {
-        Gate handed_over;
-        Gate used;
-        Thread* self = nullptr;
-        Caught caught;
-        bool still_joinable = false;
-        bool id_is_own = false;
-        bool handle_is_own = false;
+        Gate handed_over;             // opened once `self` is set (after the constructor)
+        Gate used;                    // opened when the callable no longer uses `self`
+        Thread* self = nullptr;       // the callable's own Thread
+        Caught caught;                // what self->join() threw
+        bool still_joinable = false;  // self->joinable() after the throw
+        bool id_is_own = false;       // self->get_id() equals the thread's own id
+        bool handle_is_own = false;   // self->native_handle() equals pthread_self()
     }; // struct Shared
     Shared s;
     Thread t([&s] {
@@ -996,7 +1028,7 @@ TEST(ThreadLifetimeTest, SelfJoiningThrowsDeadlockAndLeavesThreadUnchanged) {
 // returns.
 TEST(ThreadLifetimeTest, DetachReleasesOwnership) {
     struct Done {
-        std::atomic<bool>* flag;
+        std::atomic<bool>* flag;  // set when the live instance is destroyed; null once moved from
         explicit Done(std::atomic<bool>* f) : flag(f) {}
         Done(Done&& other) noexcept : flag(std::exchange(other.flag, nullptr)) {}
         Done(const Done&) = delete;
@@ -1123,50 +1155,67 @@ TEST(ThreadLifetimeTest, SwapExchangesThreads) {
 // ===========================================================================
 // Failures of the constructor.
 
-// The class's EINVAL (step 1) is thrown before anything is allocated or
-// copied: no census object was made, the rvalue callable and arguments are
-// not moved from, the callable never runs. Each request below overflows by
-// the contract's own description: stack SIZE_MAX (its example); a
-// page-aligned stack just below SIZE_MAX (the class adds room for the TLS
-// and its frames and rounds up to a page, which must overflow for any
-// positive addition); guard SIZE_MAX (its page rounding does not fit); a
-// page-aligned guard just below SIZE_MAX (fits alone, not together with any
-// stack).
-TEST(ThreadFailureTest, OverflowThrowsInvalidArgumentBeforeCopying) {
-    const std::size_t page_aligned_max = kSizeMax & ~(page_size() - 1);
-    const std::array<Thread::Attributes, 4> requests = {
-        Thread::Attributes{.stack_size = kSizeMax},
-        Thread::Attributes{.stack_size = page_aligned_max},
-        Thread::Attributes{.guard_size = kSizeMax},
-        Thread::Attributes{.guard_size = page_aligned_max},
-    };
-    for (const Thread::Attributes& attrs : requests) {
-        SCOPED_TRACE(testing::Message() << "stack " << attrs.stack_size.value_or(0) << " guard "
-                                        << attrs.guard_size.value_or(0));
-        std::atomic<bool> invoked{false};
-        FlagFn fn;
-        fn.invoked = &invoked;
-        Tracked arg{3};
-        std::unique_ptr<int> box = std::make_unique<int>(4);
-        const int first = census::mark();
-        const Caught c = catch_system_error([&] { Thread t(attrs, std::move(fn), std::move(arg), std::move(box)); });
-        EXPECT_TRUE(is_error(c, std::errc::invalid_argument));
-        EXPECT_EQ(census::mark(), first) << "an object was copied before the EINVAL";
-        EXPECT_NE(fn.box, nullptr);
-        EXPECT_FALSE(fn.tag.moved_from());
-        EXPECT_FALSE(arg.moved_from());
-        EXPECT_NE(box, nullptr);
-        EXPECT_FALSE(invoked.load());
-    } // loop over the overflowing requests
-} // TEST(ThreadFailureTest, OverflowThrowsInvalidArgumentBeforeCopying)
+// Success if `message` contains `n` in decimal as a whole number, that is,
+// not as part of a longer run of digits (so a guard of 0 is not "found" in
+// the 0 of another size). The contract says the messages name the sizes but
+// gives no format; decimal is the only format assumed. It gives no wording
+// for the name of step 1's size computation either, so that is not checked.
+testing::AssertionResult names_number(const std::string& message, std::size_t n) {
+    const std::string digits = std::to_string(n);
+    const auto is_digit = [](char ch) { return ch >= '0' && ch <= '9'; };
+    for (std::size_t at = message.find(digits); at != std::string::npos; at = message.find(digits, at + 1)) {
+        const bool digit_before = at > 0 && is_digit(message[at - 1]);
+        const std::size_t after = at + digits.size();
+        const bool digit_after = after < message.size() && is_digit(message[after]);
+        if (!digit_before && !digit_after) return testing::AssertionSuccess();
+    } // loop over the occurrences of the digits
+    return testing::AssertionFailure() << "the message does not name " << n << ": " << message;
+} // names_number()
 
-// pthread_create's failure (step 4), forced with the contract's example
-// stack_size = 2^62 (EAGAIN): the copies were made (census objects exist) and
-// are all destroyed, exactly once and on the calling thread, before the
-// exception leaves the constructor (checked inside the handler); the rvalue
-// callable and arguments are left moved from; the callable never ran; the
-// message names the failing call.
-TEST(ThreadFailureTest, PthreadCreateFailureDestroysCopiesBeforeThrowing) {
+// The guard the contract uses for a request: the requested guard, or 1 MiB.
+std::size_t guard_of(const Thread::Attributes& attrs) { return attrs.guard_size.value_or(kMiB); }
+
+// The stack size the contract uses for a request: the requested stack, or
+// the process default.
+std::size_t stack_of(const Thread::Attributes& attrs) {
+    return attrs.stack_size.value_or(Thread::default_stack_size());
+} // stack_of()
+
+// Constructs a Thread with `attrs`, an rvalue move-only callable and rvalue
+// arguments, and checks step 1's failure: std::system_error with EINVAL
+// (generic category) whose message names the REQUESTED stack and guard sizes;
+// thrown before anything is copied (no census object made), the callable and
+// the arguments untouched (not moved from), the callable never run.
+void expect_step1_failure(const Thread::Attributes& attrs) {
+    std::atomic<bool> invoked{false};
+    FlagFn fn;
+    fn.invoked = &invoked;
+    Tracked arg{3};
+    std::unique_ptr<int> box = std::make_unique<int>(4);
+    const int first = census::mark();
+    const Caught c = catch_system_error([&] { Thread t(attrs, std::move(fn), std::move(arg), std::move(box)); });
+    EXPECT_TRUE(is_error(c, std::errc::invalid_argument));
+    EXPECT_TRUE(names_number(c.what, stack_of(attrs)));
+    EXPECT_TRUE(names_number(c.what, guard_of(attrs)));
+    EXPECT_EQ(census::mark(), first) << "an object was copied before the EINVAL";
+    EXPECT_NE(fn.box, nullptr);
+    EXPECT_FALSE(fn.tag.moved_from());
+    EXPECT_FALSE(arg.moved_from());
+    EXPECT_NE(box, nullptr);
+    EXPECT_FALSE(invoked.load());
+} // expect_step1_failure()
+
+// Constructs a Thread with `attrs` (which must pass step 1 and fail in
+// pthread_create) the same way, and checks step 4's failure: std::system_error
+// (generic category) with one of the `codes`, whose message names
+// pthread_create, the COMPUTED stack size and the guard; the copies were made
+// (census objects exist) and are all destroyed, exactly once and on the
+// calling thread, before the exception leaves the constructor (checked inside
+// the handler); the rvalue callable and arguments are left moved from; the
+// callable never ran.
+void expect_step4_failure(const Thread::Attributes& attrs, std::initializer_list<std::errc> codes) {
+    const std::optional<std::size_t> computed = contract_stack_size(stack_of(attrs));
+    ASSERT_TRUE(computed.has_value()) << "the request does not pass step 1";
     std::atomic<bool> invoked{false};
     FlagFn fn;
     fn.invoked = &invoked;
@@ -1175,42 +1224,90 @@ TEST(ThreadFailureTest, PthreadCreateFailureDestroysCopiesBeforeThrowing) {
     const int first = census::mark();
     bool threw = false;
     try {
-        Thread t(Thread::Attributes{.stack_size = std::size_t{1} << 62}, std::move(fn), std::move(arg),
-                 std::move(box));
+        Thread t(attrs, std::move(fn), std::move(arg), std::move(box));
     } catch (const std::system_error& e) {
         threw = true;
         EXPECT_EQ(e.code().category(), std::generic_category());
-        EXPECT_EQ(e.code(), std::make_error_code(std::errc::resource_unavailable_try_again));
-        EXPECT_NE(std::string(e.what()).find("pthread_create"), std::string::npos) << e.what();
+        bool expected_code = false;
+        for (std::errc code : codes) expected_code = expected_code || e.code() == std::make_error_code(code);
+        EXPECT_TRUE(expected_code) << "code " << e.code().value();
+        const std::string what = e.what();
+        EXPECT_NE(what.find("pthread_create"), std::string::npos) << what;
+        EXPECT_TRUE(names_number(what, *computed));
+        EXPECT_TRUE(names_number(what, guard_of(attrs)));
         EXPECT_GT(census::mark(), first) << "no copy was made before pthread_create";
         EXPECT_TRUE(census::each_destroyed_once_on(first, std::this_thread::get_id()));
-    }
+    } // catch the failure of pthread_create
     EXPECT_TRUE(threw);
     EXPECT_EQ(fn.box, nullptr);
     EXPECT_TRUE(fn.tag.moved_from());
     EXPECT_TRUE(arg.moved_from());
     EXPECT_EQ(box, nullptr);
     EXPECT_FALSE(invoked.load());
+} // expect_step4_failure()
+
+// The step-1 check fails, and throws the class's EINVAL before copying, for
+// the requests the contract names (stack_size = SIZE_MAX, guard_size =
+// SIZE_MAX), for a page-aligned stack and guard just below SIZE_MAX, and
+// exactly at the two boundaries its condition states:
+//   - stack: one byte more than the largest request whose computed stack
+//     (max(R, minimum) + the additions, rounded up to the granule) fits, with
+//     guard 0 so that only the stack term overflows;
+//   - guard: with a 1 MiB stack, one byte more than the largest guard whose
+//     page-rounded size fits together with that computed stack.
+TEST(ThreadFailureTest, OverflowThrowsInvalidArgumentBeforeCopying) {
+    const std::size_t page_aligned_max = kSizeMax & ~(page_size() - 1);
+    const std::size_t computed_1mib = *contract_stack_size(kMiB);
+    const std::size_t largest_fitting_guard = kSizeMax - computed_1mib - (page_size() - 1);
+    const std::array<Thread::Attributes, 6> requests = {
+        Thread::Attributes{.stack_size = kSizeMax},
+        Thread::Attributes{.stack_size = page_aligned_max},
+        Thread::Attributes{.guard_size = kSizeMax},
+        Thread::Attributes{.guard_size = page_aligned_max},
+        Thread::Attributes{.stack_size = largest_fitting_stack_request() + 1, .guard_size = 0},
+        Thread::Attributes{.stack_size = kMiB, .guard_size = largest_fitting_guard + 1},
+    };
+    for (const Thread::Attributes& attrs : requests) {
+        SCOPED_TRACE(testing::Message() << "stack " << stack_of(attrs) << " guard " << guard_of(attrs));
+        expect_step1_failure(attrs);
+    } // loop over the overflowing requests
+} // TEST(ThreadFailureTest, OverflowThrowsInvalidArgumentBeforeCopying)
+
+// Just inside the same two boundaries the step-1 check passes: the largest
+// fitting stack request (guard 0), and the largest fitting guard with a
+// 1 MiB stack. Both are far too large for the system, so pthread_create
+// fails (EAGAIN, or EINVAL from glibc), after the copies: the arguments are
+// moved from and the message names pthread_create, which tells this failure
+// from step 1's.
+TEST(ThreadFailureTest, LargestPassingRequestsFailInPthreadCreate) {
+    const std::size_t computed_1mib = *contract_stack_size(kMiB);
+    const std::size_t largest_fitting_guard = kSizeMax - computed_1mib - (page_size() - 1);
+    {
+        SCOPED_TRACE("largest fitting stack");
+        expect_step4_failure(Thread::Attributes{.stack_size = largest_fitting_stack_request(), .guard_size = 0},
+                             {std::errc::resource_unavailable_try_again, std::errc::invalid_argument});
+    } // largest fitting stack
+    {
+        SCOPED_TRACE("largest fitting guard");
+        expect_step4_failure(Thread::Attributes{.stack_size = kMiB, .guard_size = largest_fitting_guard},
+                             {std::errc::resource_unavailable_try_again, std::errc::invalid_argument});
+    } // largest fitting guard
+} // TEST(ThreadFailureTest, LargestPassingRequestsFailInPthreadCreate)
+
+// pthread_create's failure (step 4), forced with the contract's example
+// stack_size = 2^62, which fails with EAGAIN; the checks of
+// expect_step4_failure().
+TEST(ThreadFailureTest, PthreadCreateFailureDestroysCopiesBeforeThrowing) {
+    expect_step4_failure(Thread::Attributes{.stack_size = std::size_t{1} << 62},
+                         {std::errc::resource_unavailable_try_again});
 } // TEST(ThreadFailureTest, PthreadCreateFailureDestroysCopiesBeforeThrowing)
 
 // A guard that fits in size_t with the stack but is too large for glibc
 // fails "as glibc reports it": EAGAIN or EINVAL from pthread_create, so after
-// the copies (they were made, and are destroyed on the calling thread).
+// the copies; the checks of expect_step4_failure().
 TEST(ThreadFailureTest, GuardTooLargeForGlibcFailsInPthreadCreate) {
-    const int first = census::mark();
-    bool threw = false;
-    try {
-        Thread t(Thread::Attributes{.guard_size = std::size_t{1} << 62}, [](Tracked&&) {}, Tracked{});
-    } catch (const std::system_error& e) {
-        threw = true;
-        EXPECT_EQ(e.code().category(), std::generic_category());
-        EXPECT_TRUE(e.code() == std::errc::resource_unavailable_try_again || e.code() == std::errc::invalid_argument)
-            << e.code().value();
-        EXPECT_NE(std::string(e.what()).find("pthread_create"), std::string::npos) << e.what();
-        EXPECT_GT(census::mark(), first + 1) << "no copy was made before pthread_create";
-    }
-    EXPECT_TRUE(threw);
-    EXPECT_TRUE(census::each_destroyed_once(first));
+    expect_step4_failure(Thread::Attributes{.guard_size = std::size_t{1} << 62},
+                         {std::errc::resource_unavailable_try_again, std::errc::invalid_argument});
 } // TEST(ThreadFailureTest, GuardTooLargeForGlibcFailsInPthreadCreate)
 
 // An exception from a copy constructor (lvalue arguments) or a move
@@ -1429,6 +1526,9 @@ struct StackCase {
     std::size_t bound;                   // promised bytes below the first frame
 }; // struct StackCase
 
+// The stack cases of the lower-bound tests: the default, requests at and
+// below the system minimum (0, 1, minimum - 1, minimum), and requests above it
+// that are not page multiples.
 std::vector<StackCase> stack_cases() {
     const std::size_t min = minimum_stack();
     return {
@@ -1444,30 +1544,39 @@ std::vector<StackCase> stack_cases() {
 } // stack_cases()
 
 // Empty if every stack case gets at least its bound below the callable's
-// first frame; otherwise a description of each shortfall. Each thread's
-// callable is view_stack with an ordinary (one-argument) list.
+// first frame at every stagger slot; otherwise a description of each
+// shortfall. The stagger reservation comes out of the room the class adds,
+// not out of the request, so the bound must hold at the deepest slot too:
+// each case is constructed 16 times in a row, and consecutive constructions
+// take consecutive creation numbers, so the 16 cover every n % 16. Each
+// thread's callable is view_stack with an ordinary (one-argument) list.
 std::string stack_bound_failures() {
+    constexpr int kSlots = 16;
     std::string out;
     for (const StackCase& c : stack_cases()) {
-        StackView v;
-        try {
-            Thread t(Thread::Attributes{.stack_size = c.request}, &view_stack, &v);
-            t.join();
-        } catch (const std::exception& e) {
-            out += "request " + std::to_string(c.request.value_or(0)) + " threw " + e.what() + "; ";
-            continue;
-        }
-        if (below_frame(v) < c.bound) {
-            out += "request " + (c.request ? std::to_string(*c.request) : std::string("default")) + ": " +
-                   std::to_string(below_frame(v)) + " bytes below the first frame < " + std::to_string(c.bound) +
-                   "; ";
-        }
+        const std::string name = c.request ? std::to_string(*c.request) : std::string("default");
+        for (int slot = 0; slot < kSlots; ++slot) {
+            StackView v;
+            try {
+                Thread t(Thread::Attributes{.stack_size = c.request}, &view_stack, &v);
+                t.join();
+            } catch (const std::exception& e) {
+                out += "request " + name + " threw " + e.what() + "; ";
+                break;
+            }
+            if (below_frame(v) < c.bound) {
+                out += "request " + name + " (construction " + std::to_string(slot) + " of " +
+                       std::to_string(kSlots) + "): " + std::to_string(below_frame(v)) +
+                       " bytes below the first frame < " + std::to_string(c.bound) + "; ";
+            }
+        } // loop over consecutive constructions (every stagger slot)
     } // loop over the stack cases
     return out;
 } // stack_bound_failures()
 
-// At least stack_size bytes (the default, or the minimum for smaller
-// requests) below the callable's first frame. In this process glibc may hand
+// At least stack_size bytes (the default, or the minimum,
+// sysconf(_SC_THREAD_STACK_MIN), for smaller requests) below the callable's
+// first frame, at every stagger slot. In this process glibc may hand
 // a thread a larger cached stack, which can hide a shortfall; the next test
 // repeats the cases without the cache.
 TEST(ThreadStackTest, LowerBoundBelowFirstFrame) {
@@ -1510,11 +1619,14 @@ TEST(ThreadStackTest, DefaultStackSizeSetAndQuery) {
 
 // Late binding: an Attributes made before set_default_stack_size() and
 // passed to a constructor after it gets the new default; so does the
-// constructor without Attributes. The new default (9 MiB + 1) is larger than
-// any block the old 2 MiB default could get from glibc's cache (at most four
-// times the request), so a default read too early fails the bound.
+// constructor without Attributes. glibc reuses a cached block only if its
+// size (stack plus guard) is at most four times the requested stack plus
+// guard; a request with the old 2 MiB default and the 1 MiB default guard
+// asks for less than 4 MiB in all, so it can get a block of less than
+// 16 MiB. The new default, 16 MiB + 1, is larger than any such block, so a
+// default read too early fails the bound.
 TEST(ThreadStackTest, DefaultReadAtConstruction) {
-    const std::size_t bytes = 9*kMiB + 1;
+    const std::size_t bytes = 16*kMiB + 1;
     const Thread::Attributes made_before{};
     const Thread::Attributes guard_only{.guard_size = 4096};
     const DefaultStackScope scope(bytes);
@@ -1612,36 +1724,94 @@ TEST(ThreadStackTest, RoomForStaticTls) {
     EXPECT_LT(v.tls, v.lo + v.size);
 } // TEST(ThreadStackTest, RoomForStaticTls)
 
-// The stagger: thread n reserves (n % 16) * 256 bytes at the top of its stack
-// before the callable, n being a process-wide creation count. Black-box, n is
-// unknown but consecutive constructions (nothing else constructs a Thread
-// meanwhile) have consecutive n, so the depth of the callable's first frame
-// below the stack top, minus (n % 16) * 256, must be the same for 32
-// consecutive threads for one value of n mod 16 at the first. The depth is
-// measured from the top pthread_getattr_np reports, so it does not depend on
-// where the stack block lies.
-TEST(ThreadStackTest, StaggerReservesConsecutive256ByteSteps) {
-    constexpr int kThreads = 32;
-    std::array<long long, kThreads> depth{};
-    for (int i = 0; i < kThreads; ++i) {
-        StackView v;
-        Thread t(&view_stack, &v);
-        t.join();
-        depth[i] = static_cast<long long>(v.lo + v.size) - static_cast<long long>(v.frame);
-    } // loop over consecutive threads
-    int fitting = -1;
-    for (int r = 0; r < 16; ++r) {
+// One stagger observation: the depth of the callable's first frame below
+// its stack top (pthread_getattr_np's stack address plus size), and the
+// thread's creation number relative to the first observation's.
+struct StaggerSample {
+    long long depth;   // stack top minus __builtin_frame_address(0) in the callable
+    long long number;  // creation number minus the first sample's
+}; // struct StaggerSample
+
+// Constructs a Thread with default attributes whose callable is view_stack,
+// joins it, and returns the depth of its first frame below its stack top.
+long long stagger_depth() {
+    StackView v;
+    Thread t(&view_stack, &v);
+    t.join();
+    return static_cast<long long>(v.lo + v.size) - static_cast<long long>(v.frame);
+} // stagger_depth()
+
+// Success if the samples fit the contract's reservation for exactly one value
+// r of the first sample's n % 16: depth - ((r + number) % 16) * 256 is the
+// same for every sample. The depth is measured from the top
+// pthread_getattr_np reports, so it does not depend on where the stack block
+// lies; everything else above the first frame is the same for every thread
+// (same attributes, same callable).
+testing::AssertionResult stagger_fits(const std::vector<StaggerSample>& samples) {
+    int fitting = 0;
+    for (long long r = 0; r < 16; ++r) {
         bool fits = true;
-        for (int i = 0; i < kThreads; ++i) {
-            const long long expected = 256LL*((r + i) % 16 - r);
-            if (depth[i] - depth[0] != expected) fits = false;
-        } // loop over the threads
-        if (fits) fitting = r;
-    } // loop over the candidate first counts
+        for (const StaggerSample& x : samples) {
+            const long long expected = 256*((r + x.number) % 16 - r);
+            if (x.depth - samples.front().depth != expected) fits = false;
+        } // loop over the samples
+        if (fits) ++fitting;
+    } // loop over the candidate values of the first n % 16
+    if (fitting == 1) return testing::AssertionSuccess();
     std::string depths;
-    for (long long d : depth) depths += std::to_string(d - depth[0]) + " ";
-    EXPECT_GE(fitting, 0) << "depths relative to the first: " << depths;
+    for (const StaggerSample& x : samples) {
+        depths += std::to_string(x.number) + ":" + std::to_string(x.depth - samples.front().depth) + " ";
+    }
+    return testing::AssertionFailure() << fitting << " values of n % 16 fit; number:relative depth " << depths;
+} // stagger_fits()
+
+// The stagger: the thread with creation number n reserves (n % 16) * 256
+// bytes at the top of its stack before the callable runs. Black-box, n is
+// unknown, but consecutive constructions (nothing else constructs a Thread
+// meanwhile) take consecutive numbers, so 32 consecutive threads must fit
+// the reservation for one value of the first n % 16.
+TEST(ThreadStackTest, StaggerReservesConsecutive256ByteSteps) {
+    std::vector<StaggerSample> samples;
+    for (long long i = 0; i < 32; ++i) samples.push_back(StaggerSample{stagger_depth(), i});
+    EXPECT_TRUE(stagger_fits(samples));
 } // TEST(ThreadStackTest, StaggerReservesConsecutive256ByteSteps)
+
+// Which constructions take a creation number: one that fails in step 1 (the
+// size check) takes none; one that gets as far as step 3 or 4 takes the next
+// number even when it then fails there (an exception while copying, or
+// pthread_create). Successful threads interleaved with each kind of failure
+// must fit the reservation with the numbers counted that way: a failure that
+// took a number it should not have (or did not take one it should have)
+// shifts every later depth by 256 bytes.
+TEST(ThreadStackTest, StaggerNumbersSkipOnlyStep1Failures) {
+    std::vector<StaggerSample> samples;
+    long long number = 0;
+    for (int i = 0; i < 24; ++i) {
+        samples.push_back(StaggerSample{stagger_depth(), number});
+        ++number;
+        switch (i % 3) {
+        case 0: {
+            const Caught c = catch_system_error([] { Thread t(Thread::Attributes{.stack_size = kSizeMax}, [] {}); });
+            EXPECT_TRUE(is_error(c, std::errc::invalid_argument));
+            break;  // step 1: no number
+        } // step-1 failure
+        case 1: {
+            Thrower<false> thrower;
+            EXPECT_THROW(Thread([](Thrower<false>&&) {}, thrower), CopyError);
+            ++number;  // step 3: a number
+            break;
+        } // step-3 failure
+        default: {
+            const Caught c =
+                catch_system_error([] { Thread t(Thread::Attributes{.stack_size = std::size_t{1} << 62}, [] {}); });
+            EXPECT_TRUE(is_error(c, std::errc::resource_unavailable_try_again));
+            ++number;  // step 4: a number
+            break;
+        } // step-4 failure
+        } // switch over the failure kinds
+    } // loop over successes and failures
+    EXPECT_TRUE(stagger_fits(samples));
+} // TEST(ThreadStackTest, StaggerNumbersSkipOnlyStep1Failures)
 
 // ===========================================================================
 // Guard size.
@@ -1757,7 +1927,7 @@ bool escape_local_unwound = false;
         std::_Exit(42);
     } catch (...) {
         std::_Exit(44);
-    }
+    } // catch the rethrown current exception
 } // escape_terminate_handler()
 
 // An exception escaping the callable: the callable's frames are unwound (a
@@ -1789,9 +1959,9 @@ TEST(ThreadDeathTest, EscapingExceptionUnwindsThenTerminates) {
 } // TEST(ThreadDeathTest, EscapingExceptionUnwindsThenTerminates)
 
 // pthread_exit in the callable: the thread's stack is unwound (a local is
-// destroyed, on the thread), the copies are destroyed exactly once, and
-// join() returns (with the destructions complete: plain fields read after
-// join()).
+// destroyed, on the thread), the copies are destroyed exactly once by the new
+// thread during that unwinding, and join() returns (with the destructions
+// complete: plain fields read after join()).
 TEST(ThreadExitTest, PthreadExitUnwindsAndDestroysCopies) {
     const int first = census::mark();
     int local_id = -1;
@@ -1813,6 +1983,7 @@ TEST(ThreadExitTest, PthreadExitUnwindsAndDestroysCopies) {
         EXPECT_EQ(census::destructions(local_id), 1);
         EXPECT_EQ(census::slots[local_id].destroyed_on, worker);
         EXPECT_EQ(census::destructions(arg_id), 1);
+        EXPECT_EQ(census::slots[arg_id].destroyed_on, worker);
     } // scope of the Thread
     EXPECT_TRUE(census::each_destroyed_once(first));
 } // TEST(ThreadExitTest, PthreadExitUnwindsAndDestroysCopies)

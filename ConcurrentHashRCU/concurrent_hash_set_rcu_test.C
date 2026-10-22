@@ -7588,6 +7588,138 @@ TEST(ConcurrentHashSetRcuTest, PerShardSwapAcrossGenerationsAndShards) {
     EXPECT_EQ(set.get_internal_accounting().handle_refs, 0);
 } // PerShardSwapAcrossGenerationsAndShards
 
+// THE RESUME INDEX. The free pass checks a bag's counts starting at the shard
+// that stopped the previous scan of the same bag (the flag holder's resume
+// index), wrapping over all S shards; a nonzero count stores its shard as the
+// index and stops the pass; the index goes back to 0 when the oldest bag is
+// freed. No accessor reads the index, so these tests see it only through what
+// each scan frees. Each step's advance() runs on a placed helper.
+
+// A stop on shard 2, then a scan resumed at shard 2. S = 4, P joined on a
+// helper of shard 2 (generation 0); on shard 0, a retire and advance():
+// {0,0,0,advanced} (the scan stops at shard 2, the index becomes 2); on shard 0,
+// a retire and advance() again: {0,0,0,advanced} (the scan resumes at shard 2
+// and stops there), slot 0's view one count on shard 2; on shard 0, P released
+// and advance(): {2,2,0,nothing_retired} (both bags).
+// Kills: a resumed scan that starts one shard AFTER the index (it never reads
+// shard 2's count, and the second call frees bag 0 under P: {1,1,0,advanced});
+// a free pass that reads only shard 0's count, only the advancer's own (0), or
+// frees when ANY count is 0, or ignores the counts (the first call frees under
+// P); the non-cumulative free pass (the second call frees bag 1 past the pinned
+// bag 0).
+TEST(ConcurrentHashSetRcuTest, PerShardResumeRepeatedStop) {
+    constexpr size_t SH = 4;   // arena shards
+    PerShardSet set(256, SH);
+    ASSERT_EQ(set.get_internal_arena_shards(), SH) << "test precondition: the shard mask on_shard() places by";
+    PerShardSet::handle P;
+    on_shard(SH, 2, [&]() { P = set.new_handle(); });
+    AdvanceResult r1{}, r2{}, r3{};
+    on_shard(SH, 0, [&]() {
+        per_shard_retire(set, 1);
+        r1 = set.advance();
+        per_shard_retire(set, 2);
+        r2 = set.advance();
+    }); // two retire-and-advance steps on shard 0
+    expect_advance(r1, 0, 0, 0, Advance::advanced, "the first scan stops at P's count on shard 2");
+    expect_advance(r2, 0, 0, 0, Advance::advanced, "the scan resumed at shard 2 stops there again");
+    EXPECT_EQ(set.get_internal_slot_counts(0), view_e(SH, 2)) << "P alone pins bag 0, on shard 2";
+    on_shard(SH, 0, [&]() {
+        P = {};
+        r3 = set.advance();
+    }); // release and advance on shard 0
+    expect_advance(r3, 2, 2, 0, Advance::nothing_retired, "both bags freed after the release");
+} // PerShardResumeRepeatedStop
+
+// The index across bags: the reset when the oldest bag is freed, and the wrap.
+// S = 2: P1 joined on a helper of shard 1 (generation 0); on shard 0, a retire
+// and advance(): {0,0,0,advanced} (bag 0 stopped by shard 1: the index is 1);
+// P0 joined on a helper of shard 0 (generation 1); on shard 0, a retire and
+// advance(): {0,0,0,advanced} (bag 0 still stopped by shard 1, the scan
+// resumed there); on shard 1, P1 released and advance():
+// {1,1,0,nothing_retired} (bag 0 freed -- its scan reads shard 1, then wraps
+// to shard 0 --, the index reset, bag 1 stopped by P0's count on shard 0), slot
+// 1's view one count on shard 0; on shard 0, P0 released and advance():
+// {1,1,0,nothing_retired}.
+// Kills: a pass with neither the reset nor the wrap (bag 1's scan starts at the
+// stale index 1 and never reads shard 0: it frees bag 1 under P0,
+// {2,2,0,nothing_retired}); this test is that defect's ONLY killer (either
+// guard alone keeps the pass sound: within one bag's life a count that read 0
+// stays 0 for live memberships). Also a resumed scan that starts after the
+// index, or that wraps one shard short (the first scan of bag 0 never reads
+// shard 1), and the free pass reading only shard 0's count, only the
+// advancer's, skipping the last shard's, or freeing on any zero count.
+TEST(ConcurrentHashSetRcuTest, PerShardResumeIndexAcrossBags) {
+    constexpr size_t SH = 2;   // arena shards
+    PerShardSet set(256, SH);
+    ASSERT_EQ(set.get_internal_arena_shards(), SH) << "test precondition: the shard mask on_shard() places by";
+    PerShardSet::handle P1, P0;
+    AdvanceResult r{};
+    on_shard(SH, 1, [&]() { P1 = set.new_handle(); });
+    on_shard(SH, 0, [&]() {
+        per_shard_retire(set, 1);
+        r = set.advance();
+    }); // retire and advance on shard 0
+    expect_advance(r, 0, 0, 0, Advance::advanced, "bag 0 stopped by P1's count on shard 1");
+    on_shard(SH, 0, [&]() { P0 = set.new_handle(); });
+    ASSERT_TRUE(P0) << "test precondition: P0 was not made";
+    EXPECT_EQ(PerShardSet::get_internal_handle_generation(P0), 1u) << "test precondition: P0 pins bag 1, not bag 0";
+    on_shard(SH, 0, [&]() {
+        per_shard_retire(set, 2);
+        r = set.advance();
+    }); // retire and advance on shard 0
+    expect_advance(r, 0, 0, 0, Advance::advanced, "bag 0 still stopped by shard 1 (the resumed scan)");
+    on_shard(SH, 1, [&]() {
+        P1 = {};
+        r = set.advance();
+    }); // release and advance on shard 1
+    expect_advance(r, 1, 1, 0, Advance::nothing_retired, "bag 0 freed; bag 1 stopped by P0's count on shard 0");
+    EXPECT_EQ(set.get_internal_slot_counts(1), view_e(SH, 0)) << "P0 alone pins bag 1, on shard 0";
+    on_shard(SH, 0, [&]() {
+        P0 = {};
+        r = set.advance();
+    }); // release and advance on shard 0
+    expect_advance(r, 1, 1, 0, Advance::nothing_retired, "bag 1 freed after the release");
+} // PerShardResumeIndexAcrossBags
+
+// A pin moving between shards across scans of one bag. S = 4: P1 joined on a
+// helper of shard 1 and P3 on one of shard 3 (generation 0); on shard 0, a
+// retire and advance(): {0,0,0,advanced} (stop at shard 1); P1 released on
+// shard 1; on shard 0, a retire and advance(): {0,0,0,advanced} (the scan
+// resumes at shard 1 and moves on to stop at shard 3), slot 0's view one count
+// on shard 3; P3 released on shard 3; advance() on shard 0:
+// {2,2,0,nothing_retired}.
+// Kills: a free pass that skips the last shard's count (P3's, after P1 left:
+// the second call frees bag 0 under P3), reads only shard 0's count, only the
+// advancer's, frees on any zero count, or ignores the counts; the
+// non-cumulative free pass (the second call frees bag 1 past the pinned bag
+// 0). No resume-index defect is designated here: within one bag's life pins
+// only leave, so every resumed order is sound; the test covers the index
+// moving to a later shard.
+TEST(ConcurrentHashSetRcuTest, PerShardResumePinMovesAcrossScans) {
+    constexpr size_t SH = 4;   // arena shards
+    PerShardSet set(256, SH);
+    ASSERT_EQ(set.get_internal_arena_shards(), SH) << "test precondition: the shard mask on_shard() places by";
+    PerShardSet::handle P1, P3;
+    AdvanceResult r{};
+    on_shard(SH, 1, [&]() { P1 = set.new_handle(); });
+    on_shard(SH, 3, [&]() { P3 = set.new_handle(); });
+    on_shard(SH, 0, [&]() {
+        per_shard_retire(set, 1);
+        r = set.advance();
+    }); // retire and advance on shard 0
+    expect_advance(r, 0, 0, 0, Advance::advanced, "the first scan stops at P1's count on shard 1");
+    on_shard(SH, 1, [&]() { P1 = {}; });
+    on_shard(SH, 0, [&]() {
+        per_shard_retire(set, 2);
+        r = set.advance();
+    }); // retire and advance on shard 0
+    expect_advance(r, 0, 0, 0, Advance::advanced, "the scan resumed at shard 1 stops at P3's count on shard 3");
+    EXPECT_EQ(set.get_internal_slot_counts(0), view_e(SH, 3)) << "P3 alone pins bag 0, on shard 3";
+    on_shard(SH, 3, [&]() { P3 = {}; });
+    on_shard(SH, 0, [&]() { r = set.advance(); });
+    expect_advance(r, 2, 2, 0, Advance::nothing_retired, "both bags freed after the releases");
+} // PerShardResumePinMovesAcrossScans
+
 // Moved handles under stress (advance_stress_body() with
 // StressShape::hand_over): four writers, numbered one at a time so that they
 // sit on the four DISTINCT shards of a four-shard set, hand live handles to one

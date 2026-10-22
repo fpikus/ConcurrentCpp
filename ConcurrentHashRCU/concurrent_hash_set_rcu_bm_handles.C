@@ -269,8 +269,10 @@ static void register_join_leave() {
 //
 // Why measure: the free pass frees a sealed generation's bag only once it
 // has found no live handle in that generation, by loading that generation's
-// count in every arena shard's count row, in shard order, stopping at the
-// first that is not 0 (the header's free_oldest()). That test runs in every
+// count in the arena shards' count rows, from the shard whose count stopped
+// the previous test of the same generation (the resume index; shard 0 for a
+// generation not tested before), wrapping, and stopping at the first count
+// that is not 0 (the header's free_oldest()). That test runs in every
 // advance(), reclaim() and automatic trigger that finds a sealed bag (twice
 // in a call that finds the ring full). A join and its leave write the current
 // generation's count in the joining thread's shard's row, where the counts of
@@ -298,13 +300,15 @@ static void register_join_leave() {
 // current generation is the one in slot 0 (the ring has kCheckRingSlots
 // slots): in every shard's row the count the test reads (slot 1) and the
 // current count (slot 0) share a 64-byte line, as they do for 7 of the 8
-// positions of the current slot in a line; the current count is written in
-// the rows of the W joiners' shards (and in the measured thread's own,
-// between its calls), in none at W = 0. The eighth (the current
-// slot the last of its line, so the oldest the first of the next) is not
-// measured at P = 1. At P = 0 the slots move on by one per call, so 1 call
-// in 8 tests a count on another line than the current one. The pin_slot and
-// current_slot counters witness the placement.
+// positions of the current slot in a line; the current count is written in the
+// rows of the W joiners' shards (and in the measured thread's own, between its
+// calls), in none at W = 0. The eighth (the current slot the last of its line,
+// so the oldest the first of the next) is not measured at P = 1. With the
+// resume index the tests after the first read the pin's row alone, a line a
+// joiner writes only when one shares the pin's shard (W = 15 at S = 16). At
+// P = 0 the slots move on by one per call, so 1 call in 8 tests a count on
+// another line than the current one. The pin_slot and current_slot counters
+// witness the placement.
 //
 // One measured thread (Threads(1), a new thread: FreshThreadRunner), on a
 // set constructed with kCheckBuckets buckets and holding the one key
@@ -345,11 +349,14 @@ static void register_join_leave() {
 //               the final free pass tests the oldest generation again and
 //               stops (free_ns). So bump_ns + free_ns is both of a call's
 //               tests plus those 2S loads and S stores and the increment,
-//               and no other free-pass work: at S = 256 the head loads are as
-//               many as the two tests' loads. With P = 1 every call from the
+//               and no other free-pass work. With P = 1 every call from the
 //               64th on is `ring_full` (the ring holds 64 generations and the
-//               pinned one never frees), each test reading every shard's
-//               count up to the pin's on S - 1. Without a pin, whenever a
+//               pinned one never frees); the first test of the pinned
+//               generation (the free pass of call 1) reads every shard's
+//               count up to the pin's on S - 1 and leaves the resume index
+//               there, so every later test, both of every `ring_full` call's
+//               included, is one load of the pin's count, and bump_ns +
+//               free_ns is mostly the head loads. Without a pin, whenever a
 //               handle stays in a generation for more than 63 calls (a joiner
 //               descheduled between its join and its leave): the test then
 //               stops wherever that handle's count is read.

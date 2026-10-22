@@ -816,10 +816,10 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   (the trigger is this same case without the walk: THE TRIGGER below).
 //   Between successive holders the flag's acquire/release pair is the ONLY
 //   synchronization on the plain fields `state`, `gen`, the bag slots,
-//   `oldest_`, the dealing cursor, the bump's scratch and the steal hint's
-//   stamp counter, and it orders one holder's publish before a later holder's
-//   count loads (the store-buffering argument across calls: FACT 2 of THE
-//   JOIN). `gen` is also read outside the flag, through the publish that made
+//   `oldest_`, the free pass's resume index, the dealing cursor, the bump's
+//   scratch and the steal hint's stamp counter, and it orders one holder's
+//   publish before a later holder's count loads (the store-buffering
+//   argument across calls: FACT 2 of THE JOIN). `gen` is also read outside the flag, through the publish that made
 //   its block current: by a handle's own diagnostic (its successful re-verify
 //   read that publish) and by get_internal_generation() (an acquire load of
 //   `current_`). Inside, sequentially (A0-A5 and the free pass for every
@@ -855,8 +855,10 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //        in_advance_after_publish() fires here (TEST SEAMS).
 //   Then the FREE PASS (free_oldest()): while ring_[oldest_] is SEALED and
 //   EVERY one of its S per-shard counts reads 0 -- one seq_cst load per
-//   count, in ascending shard order, the first count that is not 0 ending
-//   the pass -- free its bag -- every retired sublist
+//   count, in shard order starting from the RESUME INDEX (the shard whose
+//   count stopped the last scan of this bag; 0 for a bag no scan stopped
+//   at) and wrapping, the first count that is not 0 ending the pass and
+//   becoming the resume index -- free its bag -- every retired sublist
 //   through `retire_link` (read, never written here) and every limbo
 //   sublist through `link`, each node's next word read BEFORE push_free()
 //   rewrites `link` into the free list's next pointer -- dealing the nodes
@@ -871,8 +873,9 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   and a count read 0 had every member on it left, its leave acquired by
 //   that load. For the same reason the order of the loads, or comparing
 //   their sum with 0 (the counts are never negative), would do as well for
-//   this protocol; ascending order with an early exit costs one load per
-//   count up to the first pinned one. Then the WALK, under
+//   this protocol, which is what lets each scan start where the last one
+//   stopped: with an early exit a pin that stays put costs one load per
+//   scan. Then the WALK, under
 //   a handle of advance()'s own (joined through the hook-free join path):
 //   every published bucket, with the split winner's cleanup pass's shape --
 //   head load with acquire, one unlink attempt per dead run, never retried,
@@ -4429,9 +4432,9 @@ private:
     // --- The three steps of advance() (the first two also reclaim()'s and
     // the trigger's): the bump, the free pass, the walk ---
     // All three run under the flag (ONE ADVANCER in the class overview):
-    // `state`, `gen`, the bag slots, `oldest_`, `deal_`, `limbo_loaded_`
-    // and `steal_stamp_` are plain fields of the flag holder, synchronized between holders by
-    // the flag's acquire/release alone.
+    // `state`, `gen`, the bag slots, `oldest_`, `deal_`, `limbo_loaded_`,
+    // `scan_start_` and `steal_stamp_` are plain fields of the flag holder,
+    // synchronized between holders by the flag's acquire/release alone.
 
     // THE BUMP AND THE FINAL FREE PASS, the two steps every flag holder runs
     // (advance(), reclaim() and the automatic trigger): the bump under the
@@ -4551,9 +4554,12 @@ private:
     // counts that is not 0 (a handle of that generation on that count -- or
     // a join attempt's stale increment, J2 -- pins it and, by direction
     // (II) of THE HANDLE INVARIANT, every younger bag: a block is never
-    // skipped). The counts are read one seq_cst load each, in ascending
-    // shard order, before the bag is touched; the loop below says why each
-    // load is seq_cst and why they need not be one snapshot. A freed block's
+    // skipped). The counts are read one seq_cst load each, before the bag
+    // is touched, in shard order starting from the RESUME INDEX
+    // (`scan_start_`: the shard whose count stopped the last scan of this
+    // bag, 0 for a bag no scan stopped at) and wrapping; the loop below says
+    // why each load is seq_cst, why they need not be one snapshot, and why
+    // any order, hence any start, is sound. A freed block's
     // counts are left untouched (J2) and its bag slots are walked IN PLACE,
     // each slot holding the sublist's next head until it reads EMPTY, so a bag is
     // EMPTY the moment its last node is pushed. Per node: the next word --
@@ -4595,12 +4601,21 @@ private:
             // CHAIN. The loads need not be one snapshot: after the publish
             // that sealed this block no join of it succeeds, and no
             // membership moves between counts, so a count read 0 stays 0 for
-            // memberships of this generation. Ascending order: free for the
-            // protocol (any order, or a sum, would do: the counts are never
-            // negative); the early exit is why this is a loop of its own and
-            // not the diagnostics' relaxed sum (slot_counts()).
-            for (size_t s = 0; s <= arena_mask_; ++s) {   // every shard's count of this generation
-                if (rows_[s].refs[oldest_].load(std::memory_order_seq_cst) != 0) return;
+            // memberships of this generation. Hence the ORDER of the loads is
+            // free for the protocol (any order, or a sum, would do: the
+            // counts are never negative); the early exit is why this is a
+            // loop of its own and not the diagnostics' relaxed sum
+            // (slot_counts()). THE RESUME INDEX: the scan starts at `scan_start_`, the shard whose count
+            // stopped the previous scan of this same bag, and wraps, so it
+            // still reads all S counts before a free; a pin that stays put
+            // then costs one load per scan instead of up to S. Any start is
+            // sound for the reason just given (any order would do); the
+            // index is a cost hint only, reset when `oldest_` moves on.
+            for (size_t i = 0, s = scan_start_; i <= arena_mask_; ++i, s = (s + 1) & arena_mask_) {   // every shard's count of this generation, from the resume index, wrapping
+                if (rows_[s].refs[oldest_].load(std::memory_order_seq_cst) != 0) {   // pinned: the next scan of this bag starts here
+                    scan_start_ = s;
+                    return;
+                } // if this count pins the bag
             } // every shard's count of this generation
 #ifndef NDEBUG
             const size_t slots = get_internal_node_count();   // the cycle bound (an assert-only shard-size sum)
@@ -4627,6 +4642,7 @@ private:
             } // every shard's two sublists of this bag
             block.state = GenerationState::EMPTY;
             oldest_ = (oldest_ + 1) % kGenerations;
+            scan_start_ = 0;   // a new oldest bag: no pin of it is known yet
             node_count_.fetch_sub(count, std::memory_order_relaxed);   // relaxed: a hint, read relaxed by insert(); never below zero (see node_count_)
             // The steal's hint: a new stamp, EMPTY clear, after this bag's
             // pushes. release: a scan that reads it with its acquire reload
@@ -5092,7 +5108,8 @@ private:
     alignas(128) std::atomic<GenerationBlock*> current_{&ring_[0]};
     // The single-advancer try-flag: set while an advance(), a reclaim() or
     // an automatic trigger is in progress (ONE ADVANCER). On a line of its
-    // own; `oldest_` and `deal_`, owned by the flag holder, share it.
+    // own; the plain fields owned by the flag holder share it: `oldest_`,
+    // `deal_`, the `limbo_loaded_` pointer and `scan_start_`.
     alignas(128) std::atomic<bool> reclaiming_{false};
     size_t oldest_ = 0;   // index of the oldest SEALED slot, or of the CURRENT slot when nothing is sealed; owned by the flag holder
     size_t deal_ = 0;     // the free pass's round-robin cursor: the shard the next freed node goes to; owned by the flag holder
@@ -5101,6 +5118,15 @@ private:
     // load that decides whether A3 exchanges that shard's limbo list. Owned
     // by the flag holder; meaningless outside a bump.
     std::unique_ptr<word_t[]> limbo_loaded_;
+    // The free pass's RESUME INDEX: the arena shard whose count stopped the
+    // last scan of the bag at `oldest_` (0 when no scan of it stopped yet).
+    // The next scan of that bag starts there and wraps (free_oldest()), so a
+    // pin that stays put costs one load per scan, not up to S. A cost hint
+    // only: the free pass is sound from any start. Owned by the flag holder
+    // (synchronized between holders by the flag, as `oldest_` is); reset
+    // when `oldest_` moves on. After `limbo_loaded_`, in the flag's block, so
+    // no member moves.
+    size_t scan_start_ = 0;
     // The steal's set-wide hint (THE HINT at steal_scan()): a stamp in bits
     // 63..1 and STEAL_HINT_EMPTY in bit 0, "a scan found every free list
     // empty since the last stamp". Written by the free pass (a release

@@ -153,8 +153,10 @@ under [Performance](#performance)):
   whether the node is dead; a lookup's own walk does not;
 - every operation takes a handle, and in a release build reads nothing of it:
   what a handle costs is paid when it is taken, refreshed or destroyed — a
-  join writes lines that every joining thread writes too, the generation's
-  handle count among them — and never on an operation's path;
+  join and a leave write the count row of the joining thread's arena shard
+  (the leave from whatever thread runs it), and no line that the threads of
+  other shards write for handles of their own — and never on an operation's
+  path;
 - the free-list pop and the limbo push carry orders the original's do not
   (acquire on the pop, release on the push), because freed nodes come back
   onto the free lists while the operations run; on x86 they compile to the
@@ -212,10 +214,19 @@ are fine. What is exclusive with every other use of a handle is changing its
 membership: `refresh()`, moving from it or over it, swapping it, destroying
 it. These are exclusive with uses of *that* handle only — not with other
 handles, not with `new_handle()`, not with `advance()` or `reclaim()`. A
-handle has no
-thread affinity: created on one thread, it may be used or destroyed on
-another after a happens-before edge (a `std::thread::join()`, a hand-off
-under a mutex); no thread id is recorded. Taking a handle and refreshing one
+handle has no thread affinity, but it has a hand-off rule: created on one
+thread, it may be used on another, and its membership may be changed —
+destroyed, refreshed, assigned over, moved from, swapped — on another thread
+than the one that used it last, only after a *synchronizing* hand-off between
+the two threads (a `std::thread::join()`, a hand-off under a mutex, a release
+store read by an acquire load: any happens-before edge). Every use of the
+handle, its creation included, must happen-before the call that ends or moves
+its membership, as its creation must happen-before its first use elsewhere.
+Not overlapping in time is not enough: the leave orders only the accesses that
+happen before it, so after a hand-off that does not synchronize, the free pass
+can reuse a node a reader on the other thread is still reading. The handle
+records the per-shard count its join incremented, never a thread id, so a
+leave on any thread decrements that count. Taking a handle and refreshing one
 are lock-free and never wait for a reclamation. Debug builds count the
 operations in flight under a handle and diagnose a refresh, move, swap or
 destruction while that count is not zero, an operation under an empty handle
@@ -269,15 +280,18 @@ waits for the next call. To free in one call, release the handle before it.
 What a call costs, in kind: the walk is the price, paid by the calling thread
 on every `advance()` that is not `ring_full` or `contended` — a
 `nothing_retired` one pays for a whole-table walk — and it grows with the
-published buckets and the nodes in them; the free pass pushes every node it
-frees, dealing them round-robin over the shards' free lists, so a large bag
-touches every shard's; the bump is at most two exchanges per arena shard, one
-store and a counter increment. A `reclaim()` pays the bump and the free pass
-alone: nothing in it grows with the table, so a `nothing_retired` `reclaim()`
-is cheap. `advance()` is meant to be called rarely; a caller who wants memory
-back often and the walk rarely calls `reclaim()` often and `advance()` rarely,
-or lets the set do `reclaim()`'s work for it (the cadence, below). What they
-cost in numbers is under [Performance](#performance).
+published buckets and the nodes in them; the free pass reads one handle count
+per arena shard of each bag it examines (a bag that stays pinned costs one
+read per pass while the count that stopped the last pass is still above zero:
+the pass resumes at that count and reads on only once it has dropped) and pushes
+every node it frees, dealing them round-robin over the shards' free lists, so
+a large bag touches every shard's; the bump is at most two exchanges per arena
+shard, one store and a counter increment. A `reclaim()` pays the bump and the
+free pass alone: nothing in it grows with the table, so a `nothing_retired`
+`reclaim()` is cheap. `advance()` is meant to be called rarely; a caller who
+wants memory back often and the walk rarely calls `reclaim()` often and
+`advance()` rarely, or lets the set do `reclaim()`'s work for it (the cadence,
+below). What they cost in numbers is under [Performance](#performance).
 
 **Two guarantees, kept apart.** *Made unreachable* — a dead node leaving
 its chain — is best effort: one CAS per dead run at every site, `advance()`'s
@@ -309,10 +323,12 @@ bag finds `ring_full` while retired nodes pile up on the retired lists. The set
 cannot tell a stalled holder from a slow one. That is the trade of epoch-based
 reclamation, accepted here, and the mitigations are inside the design: the
 refresh discipline, `ring_full` as a visible signal, and the diagnostics — the
-handle count and the bagged count per generation. A thread stalled inside
-`advance()`, `reclaim()` or a trigger stalls all reclamation too, every other
-call `contended` and every other trigger skipped until it resumes; it never
-stalls another thread's operation.
+live-handle count per generation, which is a sum over the arena shards' counts
+(exact at a quiescent point; with joins or leaves running, each shard's count
+is one it had, but their sum is no one instant's), and the bagged count per
+generation. A thread stalled inside `advance()`, `reclaim()` or a trigger
+stalls all reclamation too, every other call `contended` and every other
+trigger skipped until it resumes; it never stalls another thread's operation.
 
 **The cadence.** A set constructed with a cadence reclaims by itself. The
 cadence is opt-in, through the constructor's `Options` aggregate —
@@ -415,9 +431,20 @@ calls at fixed points of the join and of the bump, whichever call or trigger
 makes it, whose default,
 `concurrent_hash_rcu_detail::NoHooks`, compiles to nothing. The hooks are
 not part of the contract. The ring is part of the set object: `kGenerations`
-blocks, each with its handle count on a cache line of its own, and each with
-a bag of two words per arena shard, which the constructor allocates, so the
-constructor can throw before any operation exists.
+blocks of 128 bytes, each with a bag of two words per arena shard. The
+live-handle counts are not in the blocks but in one *count row* per arena
+shard — the shard's count of every generation slot, then its two join
+counters, rounded up to 128 bytes — so that a join and a leave write only
+the row of the joining thread's shard; the free pass reads one count per
+shard of each bag it examines. The bags and the rows are allocated by the
+constructor, so the constructor can throw before any operation exists.
+`arena_shards` therefore sets more than the arena's sharding: it is how far
+the handle counts are spread — threads whose numbers are congruent modulo the
+shard count share a row — and how many counts a free pass reads per bag. One
+shard does not restore the costs of a single count per generation: the join
+and the leave keep the per-shard code, which finds the count through the
+thread's row, and the check of a pinned oldest bag then reads a count on the
+one row every joiner writes.
 
 ## What is not here yet
 
@@ -443,13 +470,19 @@ version's `reclaim()`, which is `advance()` without the walk). The second
 measures what handles and `advance()` add against that same build: on the
 laptop it finds the operations under a long-lived handle within noise of it on
 all but a few rows, so there the first set describes this code as well; on the
-two x86 servers it finds the same on the lookups but not on all the inserts,
-and not on the rows where the steal reuses other shards' nodes; on a fifth
-machine, a 2-socket Grace (144 Neoverse V2 cores, aarch64), not on the inserts
-into a deletable set either. The third measures what `reclaim()` and the
-cadence add to the build with handles, and the cadence against explicit calls,
-on the laptop and on the three servers. The M3 Ultra was not measured with
-handles.
+servers — the two x86 servers and a fifth machine, a 2-socket Grace (144
+Neoverse V2 cores, aarch64) — it finds the lookups within noise or up to 15%
+either way, the inserts moving both ways, and the rows where the steal
+reuses other shards' nodes far below. The third measures what `reclaim()` and
+the cadence add to the build with handles, and the cadence against explicit
+calls, on the laptop and on the three servers. The live-handle count per
+generation is kept per arena shard (the count rows under "Template parameters"
+above); the second set was measured with that layout on the laptop, on the
+EPYC and on the Grace, and with one count per generation on the Xeon, whose
+figures are marked so where the two layouts differ; the third set's figures
+were taken with one count per generation, except where a sentence gives both
+layouts' figures, and the second set says how the same rows run with the count
+per shard. The M3 Ultra was not measured with handles.
 
 ### Unlinking, against the original
 
@@ -502,7 +535,8 @@ a time, two of them on a state that erases built.
 
 Measured on the laptop (clang-22, `-O3 -march=native`, 16 arena shards,
 threads unpinned), with the same fixtures as above plus rows of their own;
-the last bullet is the servers'.
+the last bullet is the servers', and the one before it names the servers
+where it leaves the laptop.
 
 - **The handle.** Under a long-lived handle, and with the steal (next) set
   aside, the operations run within noise of the build without handles on 78
@@ -526,36 +560,83 @@ the last bullet is the servers'.
   M/s for the same erases without reclamation. At these thread counts the
   walk takes 0.21 and 0.16 of the threads' time; at fewer threads the one
   walking thread's share is larger.
-- **A handle per operation** instead of one per thread: lookups at 0.80 of
-  the long-lived handle's rate at one thread and at 0.22 at sixteen, because
-  every join and every leave writes lines that all joining threads share.
+- **A handle per operation** instead of one per thread: lookups at 0.74 of
+  the long-lived handle's rate at one thread and 0.72 at sixteen (146 against
+  44 M lookups/s at sixteen for the same row with one count per generation).
+  A join and a leave write the count row of the joining thread's arena shard
+  and nothing another shard's threads write for handles of their own, so with
+  as many shards as threads the per-operation handle scales as the long-lived
+  one does; with one count per generation, which every joining thread writes,
+  the same row ran at 0.85 of the long-lived handle's rate at one thread and
+  0.22 at sixteen. The per-shard count has a one-thread price: a join and a
+  leave execute 31 instructions against 18 (the shard's row address replaces
+  one field of the generation block), and the per-operation lookup row itself,
+  measured against the same row with one count, runs at 0.91 at one thread on
+  the laptop, 0.79 on the EPYC and 0.72 on the Grace (the two ratios to the
+  long-lived handle above would give 0.88 on the laptop: the long-lived row's
+  own rate moved 2-3% between the two builds' runs, on identical code). Of the
+  rows measured with both layouts — every operation row and every reclaiming
+  row on the laptop, the reclaiming rows and the long-lived lookups on the EPYC
+  and on the Grace — most run within noise of the same code with one count per
+  generation. On the laptop two cells moved beyond it, growth inserts into a
+  delete-free set at one thread (0.93) and lookups over a reclaimed set at
+  sixteen (0.94); on the Grace the long-lived lookups read 0.91 at one thread
+  and 0.77 at 144, with the one-count build's own runs spread as far. Under
+  gcc the compiler laid out some rows' code differently in the two builds, and
+  those rows moved both ways with nothing attributed to the layout: on the
+  EPYC the small-table erases under reclamation 1.1-1.3x at 16-128 threads,
+  the churn row where every thread calls `advance()` 1.8x at 128; on the Grace
+  the pre-sized erases 0.67-1.15 at 2-32 (on the EPYC the churn row without
+  reclamation read 0.91 at 128 on identical code: a cell that moved between
+  two runs of the same binary). One row whose timed body the compiler did not
+  change is slower: on the EPYC the pre-sized erases followed by one
+  `advance()` per thread (`Erase_Presized_Del_Rcu`) run 3-5% slower at 1-32
+  threads with the count per shard, within noise at 64 and 128. A profile puts
+  all of the difference in the table walk inside that `advance()`, whose
+  source is the same in both builds but whose loop gcc compiled with a
+  different register allocation; the per-shard free pass and its resume index
+  take no measurable time on this row.
 - **On the servers** (the 2-socket Xeon, the EPYC and the Grace, gcc 16.2, `-O3
   -march=native`, 256, 128 and 256 arena shards, threads unpinned, from one
-  thread to the machine's), the handle and the generation protocol, with the
-  steal set aside, are within noise of the build without them, or up to 15%
-  faster, on every lookup row. The inserts, the steal again aside, move both
-  ways. On the Xeon the inserts into a deletable set are 2-24% slower wherever
-  they leave the noise (8-10% on the plain pre-sized row at 1-8 threads, up to
-  24% over a resident population), except the growth row, 17-18% faster at
-  16-32 threads; into a delete-free set the pre-sized inserts are 1.5-1.7x
-  faster at 16-32 and the growth inserts, where they leave the noise, 4-21%
-  faster at 16-64 and 6% slower at 256. On the EPYC the growth inserts (the
-  `InsertHotGrowth` probe among them), where they leave the noise, are 4-10%
-  slower at 32 threads and up and, at 1-4 threads, between 7% slower and 22%
-  faster; the pre-sized inserts are within noise but for two cells 5-7% slower.
-  On the Grace the inserts into a deletable set, the `InsertHotGrowth` probe
-  aside, are 5-52% slower at 1-16 threads and 8-25% at 128-144, within about
-  10% at 32-64; the probe and the delete-free rows are within noise but for two
-  cells 4% slower. Where the steal reuses other shards' nodes (inserts into a
-  set half of whose keys were erased and reclaimed) the build with handles runs
-  at 0.01-0.2 of the build without them from 4 threads up to, not including,
-  each x86 machine's full count, at which it is at 0.75-0.94, and at 0.03-0.3
-  from 4 threads to 144 on the Grace; lookups over that set run at 0.04-0.67 of
-  the other build's at 16-128 threads on the Xeon, 0.93 at 8 and 0.55 at 64 on
-  the EPYC and 0.15-0.84 at 16-144 on the Grace. A handle per operation: on the
-  Xeon 0.76 of the long-lived handle's lookup rate at one thread (24.7 against
-  32.7 M/s) and 0.002 at 256 (4.8 against 2035 M/s); on the Grace 0.63 at one
-  thread and 0.007 at 144.
+  thread to the machine's), the handle and the generation protocol against the
+  build without them, the steal set aside. On the Xeon, with one handle count
+  per generation, the lookups are within noise of the build without handles,
+  or up to 15% faster, on every row; the inserts into a deletable set are
+  2-24% slower wherever they leave the noise (8-10% on the plain pre-sized row
+  at 1-8 threads, up to 24% over a resident population), except the growth
+  row, 17-18% faster at 16-32 threads; into a delete-free set the pre-sized
+  inserts are 1.5-1.7x faster at 16-32 and the growth inserts, where they
+  leave the noise, 4-21% faster at 16-64 and 6% slower at 256. On the EPYC,
+  with the count per shard, the lookups are within noise but on the deletable
+  set, 10-15% slower at 1-2 threads and 10-15% faster at 16-64; the growth
+  inserts into a deletable set are 6-12% slower where they leave the noise,
+  the pre-sized ones 5-25% slower at 4-16 and 128 threads, the delete-free
+  rows within noise but for 2-3% slower at 1 and 4 threads on the growth row;
+  the `InsertHotGrowth` probe is 8-18% slower at 4 and 32 threads on the
+  delete-free set and 8-24% faster at 4-16 on the deletable one. On the Grace,
+  with the count per shard, every lookup row is within noise or 1-4% either
+  way; the inserts into a deletable set are 9-29% slower at 1-16 threads,
+  1-11% faster at 32-64 and 10-18% slower at 128-144, the `InsertHotGrowth`
+  probe within noise on every cell; into a delete-free set the growth inserts
+  are 3% faster at 16-32 and the pre-sized ones 4-15% faster at 1-64 where
+  they leave the noise and 6.5% slower at 144. The fixtures' control rows (the
+  same populations built without churn) and the inserts over a set erased but
+  not reclaimed, which the sentences above leave out, lie at 0.86-1.23 of the
+  build without handles on the EPYC where they leave the noise (the control
+  lookups 10-23% faster at 1-8 threads) and at 0.64-0.94 on the Grace. Where
+  the steal reuses other shards' nodes (inserts into a set half of whose keys
+  were erased and reclaimed) the build with handles runs at 0.01-0.2 of the
+  build without them from 4 threads up to, not including, each x86 machine's
+  full count, at which it is at 0.74-0.94 (and at 0.25-0.71 at 1-2 threads on
+  the EPYC), and at 0.025-0.33 from 4 threads to 144 on the Grace (0.67-0.76
+  at 1-2); lookups over that set run at 0.04-0.67 of the other build's at
+  16-128 threads on the Xeon, 1.18 at 8, 0.84 at 32 and 0.56 at 64 on the EPYC
+  and 0.16-0.85 at 16-144 on the Grace. A handle per operation, with the count
+  per shard: on the EPYC 0.52-0.80 of the long-lived handle's lookup rate from
+  16 threads to 128, on the Grace 0.39-0.70 from 16 to 144, where one count
+  per generation gave 0.025 and 0.007 at the two machines' full counts; on the
+  Xeon, with one count per generation, 0.76 at one thread (24.7 against 32.7
+  M/s) and 0.002 at 256 (4.8 against 2035 M/s).
 
 ### `reclaim()` and the cadence
 
@@ -566,7 +647,10 @@ thread to the machine's). The cadence's test is measured on the laptop against
 the build with handles and `advance()` but neither `reclaim()` nor the cadence,
 and on the servers against this build with the test removed; the cadence is
 measured against this build's own rows that reclaim by explicit calls or not at
-all. Unless a sentence names a machine, it is the laptop's.
+all. Unless a sentence names a machine, it is the laptop's. The servers'
+figures were taken with one handle count per generation; the EPYC's and the
+Grace's rows run again with the count per shard are within noise of them, or
+moved as "A handle per operation" above says.
 
 - **The cadence off.** Every push onto a retired list tests the cadence whether
   the set has one or not (under clang four instructions per retired run on x86;
@@ -586,13 +670,19 @@ all. Unless a sentence names a machine, it is the laptop's.
   without the test on the EPYC, within noise or 2% faster on the Grace, and
   4-8% slower at one and two threads on the Xeon.
 - **A `reclaim()` that finds nothing retired** pays the bump and an empty free
-  pass, timed on one thread from the `advance()` rows on an empty table (the
-  bump and the free pass are the same code in both): about 30-570 ns for the
+  pass, timed on one thread from the `advance()` rows (the bump and the free
+  pass are the same code in both), with one handle count per generation and
+  with the count per shard alike. On an empty table: about 30-650 ns for the
   bump with the generation ring in cache (the larger figures on the rows with
   bigger tables, where an `advance()` walks the whole table between two timed
-  bumps; the bump's own work does not grow with the table) and 20-30 ns for the
-  pass; with the ring cold, 0.8-1.3 µs and 60-160 ns. It never walks, so the
-  8 ms an empty 2²³-bucket walk costs `advance()` is not in it.
+  bumps; the bump's own work does not grow with the table) and 20-40 ns for the
+  pass while the walk between two bumps leaves the ring in cache (up to 2²²
+  buckets). After a walk over a populated table of 2²⁰ buckets and more the
+  pass costs 40-95 ns with one count and 55-110 ns with the count per shard;
+  in the per-shard build that is one miss on the ring block's line the walk
+  evicted, in the one-count build the cause was not traced. With the ring
+  cold, 0.8-1.3 µs and 60-160 ns. It never walks, so the 8 ms an empty
+  2²³-bucket walk costs `advance()` is not in it.
 - **The automatic cadence, erasing a small table.** On the small table above
   (2¹⁶ keys in 2¹⁷ buckets, every thread refreshing its handle before each
   erase), a set that reclaims by itself every 16384/T nodes retired per shard,

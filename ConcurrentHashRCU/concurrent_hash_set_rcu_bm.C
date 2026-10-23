@@ -80,22 +80,27 @@
  *  concurrent_hash_set_rcu_bm_hot_growth.C
  *      the split's cleanup pass on hot chains:
  *      InsertHotGrowth_Concurrent, InsertHotGrowth_Del
+ *  concurrent_hash_set_rcu_bm_handles.C
+ *      the handle's own costs: the join and the leave alone, and the free
+ *      pass's check of the handle counts under concurrent joins:
+ *      Handle_JoinLeave, Reclaim_FreePassCheck
  *  concurrent_hash_set_rcu_bm_advance.C
  *      advance() alone, one thread:
  *      Advance_FreePass_*, Advance_Walk_*
  *
  * Every registration is run at the thread counts of ThreadRange(1, num_cpu)
  * (one row per thread count, all rows of a registration the same workload)
- * except the Advance_ rows (one thread, one row per geometry). A bucket count
- * chosen so that a table does not resize holds only up to some thread count:
- * the pre-sized concurrent table doubles once its arena holds about
- * 2*kPresizedBuckets nodes (64 threads' worth of timed inserts, fewer after a
- * prefill); the lookup table once it holds about 4*kPrefill, which no thread
- * count up to 256 reaches except in the Erased cell, whose arena keeps the
- * erased victims' slots (2*kPrefill in all after the prefill), so its table
- * doubles past about 200 threads. A baseline std::unordered_set rehashes once
- * it holds more keys than buckets: never at 32 threads or fewer in the
- * pre-sized cell, 100 or fewer in the lookup cell.
+ * except the Advance_ rows (one thread, one row per geometry) and
+ * Reclaim_FreePassCheck (one measured thread beside helper threads, one row
+ * per argument set). A bucket count chosen so that a table does not resize
+ * holds only up to some thread count: the pre-sized concurrent table doubles
+ * once its arena holds about 2*kPresizedBuckets nodes (64 threads' worth of
+ * timed inserts, fewer after a prefill); the lookup table once it holds about
+ * 4*kPrefill, which no thread count up to 256 reaches except in the Erased
+ * cell, whose arena keeps the erased victims' slots (2*kPrefill in all after
+ * the prefill), so its table doubles past about 200 threads. A baseline
+ * std::unordered_set rehashes once it holds more keys than buckets: never at
+ * 32 threads or fewer in the pre-sized cell, 100 or fewer in the lookup cell.
  *
  * THE WORKLOADS. Fixed-composition workloads, so that every row of a
  * ThreadRange measures the *same* workload.
@@ -154,13 +159,16 @@
  * kNewIters / kOldIters to taste; keep kKeyStride >= kNewIters and
  * (max_threads * kKeyStride + kNewBase) within int range.
  *
- * Every registration measures real time (->UseRealTime(); the row names end
- * in /real_time/threads:N), so the rates are over real time: the default CPU
+ * Every registration but the Advance_ rows and Reclaim_FreePassCheck
+ * measures real time (->UseRealTime(); the row names end in
+ * /real_time/threads:N), so the rates are over real time: the default CPU
  * time leaves out the time a thread spends blocked -- in the baseline's
  * std::shared_mutex, in the back-off sleeps of the arena's SpinLock -- which
- * is part of what each container costs. Every row reports two rates and a
- * fairness measure (../Spinlock/gb_wall_clock.h defines them and does the
- * stamping):
+ * is part of what each container costs. Those two measure manual time (their
+ * row names carry /manual_time; an iteration's time is the one call it
+ * measures, from the set's own timers) and report times per call instead of
+ * rates. Every real-time row reports two rates and a fairness measure
+ * (../Spinlock/gb_wall_clock.h defines them and does the stamping):
  *   items_per_second      -- Google Benchmark's own: the operations of all
  *                            threads over the MEAN of the threads' loop times;
  *   wall_items_per_second -- the same total over the wall-clock span of the
@@ -183,7 +191,12 @@
  * lists, and walks every published chain, unlinking the dead nodes it passes.
  * In every row but the ones named next, each thread has one long-lived handle,
  * never refreshed, and nothing in the timed region calls advance() (see
- * ThreadHandles in the benchmark header). The rows whose names end in _Rcu
+ * ThreadHandles in the benchmark header). Lookup_MostlyOld_OpHandle takes a
+ * handle of its own around every operation (its long-lived handles exist,
+ * unused), Handle_JoinLeave's iterations are a join and a leave and nothing
+ * else, and Reclaim_FreePassCheck's one measured thread calls reclaim() once
+ * per iteration while helper threads join and leave
+ * (concurrent_hash_set_rcu_bm_handles.C). The rows whose names end in _Rcu
  * run under the RECLAMATION REGIME: advance() is called from inside the timed
  * loop -- once per thread at its end, or by one thread at a cadence while
  * every thread refreshes its handle each iteration -- and the rows report

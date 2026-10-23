@@ -108,18 +108,54 @@ inline int mix(int k) {
     return static_cast<int>(x);
 }
 
+// A benchmark knob read from the environment: an integer the variable holds.
+// `text` is the variable's value, nullptr when it is not set; `valid` is true
+// when that value is a whole decimal integer (optional leading white space and
+// sign, digits, nothing after them), and `value` is then that integer.
+struct EnvCount {
+    const char* text = nullptr;   // the variable's value as set; nullptr when unset
+    bool valid = false;           // text is a whole decimal integer
+    long long value = 0;          // that integer, when valid
+}; // struct EnvCount
+
+// Reads the knob `name` (getenv) and parses it with strtoll, not atol: an
+// out-of-range value is clamped to the range of long long rather than
+// undefined, and a value with no digits or with anything after them ("one",
+// "0x10", "1x", "") is reported invalid rather than read as 0 or as its
+// leading digits. Prints nothing: each caller says on stderr what it does
+// with an invalid value.
+inline EnvCount count_from_env(const char* name) {
+    EnvCount c;
+    c.text = getenv(name);
+    if (c.text == nullptr) return c;
+    char* end = nullptr;
+    c.value = strtoll(c.text, &end, 10);
+    c.valid = end != c.text && *end == '\0';
+    return c;
+} // count_from_env()
+
 // Arena shard count for ConcurrentResizableHashSetRCU, from the environment:
 // HASH_ARENA_SHARDS=<n> (0 or unset = the header's default, the hardware
-// concurrency rounded up to a power of two). Exists so one binary can measure
-// how many shards a machine with many cores actually needs: the same
-// workload is run with 16 shards and with one per hardware thread.
+// concurrency rounded up to a power of two; a negative n is the default too,
+// and an n above 2^16 is 2^16, the header's own cap). A value that is not a
+// whole decimal integer is the default as well, and is reported once on
+// stderr. Exists so one binary can measure how many shards a machine with
+// many cores actually needs: the same workload is run with 16 shards and
+// with one per hardware thread.
 inline size_t arena_shards_from_env() {
-    const char* s = getenv("HASH_ARENA_SHARDS");
-    long n = s ? atol(s) : 0;
-    if (n < 0) n = 0;                  // nonsense means "the default"
-    if (n > (1L << 16)) n = 1L << 16;  // the header's own cap
+    const EnvCount c = count_from_env("HASH_ARENA_SHARDS");
+    if (c.text == nullptr) return 0;
+    if (!c.valid) {
+        // Once per process: it is called at every set construction.
+        [[maybe_unused]] static const bool reported =
+            (fprintf(stderr, "HASH_ARENA_SHARDS=\"%s\" is not a decimal integer: the header's default shard count is used\n", c.text), true);
+        return 0;
+    } // if not a number
+    long long n = c.value;
+    if (n < 0) n = 0;                    // nonsense means "the default"
+    if (n > (1LL << 16)) n = 1LL << 16;  // the header's own cap
     return static_cast<size_t>(n);
-}
+} // arena_shards_from_env()
 
 // A new set for a fixture: `buckets` buckets, the arena shards of
 // arena_shards_from_env(), and the automatic cadence `auto_reclaim_every`

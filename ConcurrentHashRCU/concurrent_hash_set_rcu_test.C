@@ -124,6 +124,8 @@
 #include <type_traits>
 #include <utility>
 #include <limits>
+#include <mutex>
+#include <deque>
 
 // ---------------------------------------------------------------------------
 // Build identification: one line, printed before the first test, naming the
@@ -223,8 +225,9 @@ static int scramble(int i) {
 // The barrier (rather than a spin on a start flag) is what makes the racing
 // window open at the same instant on every thread. `h` is thread t's own handle
 // of `set`: the thread joins it BEFORE the barrier, so that no join (an RMW on
-// the generation's shared count) runs inside the racing window, and destroys it
-// when fn returns, before the thread is joined, so it never outlives `set`.
+// its arena shard's count of the generation) runs inside the racing window, and
+// destroys it when fn returns, before the thread is joined, so it never
+// outlives `set`.
 template <typename SetT, typename F>
 static void run_threads(int T, SetT& set, F fn) {
     std::barrier start(T);
@@ -3881,7 +3884,8 @@ static void expect_tuple(const SetT& set, const std::string& where, size_t R, si
 
 // The ring-state view as one string: a token per slot in ring order -- E<refs>
 // for an EMPTY slot, C<refs> for the CURRENT one, S<refs>/<bagged> for a SEALED
-// one -- then "o=<oldest slot> c=<current slot>". Quiescent only (it asserts the
+// one, <refs> being the slot's live-handle count summed over the arena shards
+// -- then "o=<oldest slot> c=<current slot>". Quiescent only (it asserts the
 // advance flag clear).
 template <typename SetT>
 static std::string ring_string(const SetT& set) {
@@ -3926,7 +3930,8 @@ static AdvanceResult cycle(SetT& set, int k) {
 //   in_join()                  on every join attempt of new_handle() and of
 //                              refresh()'s slow path, after the attempt's load
 //                              of the current generation and before its
-//                              increment of that generation's count;
+//                              increment of its shard's count of that
+//                              generation;
 //   in_join_after_bump()       on the same attempts, after the increment and
 //                              before the re-verify;
 //   in_advance_after_publish() once per publish of a generation, whichever
@@ -4043,12 +4048,105 @@ static HookCounts hook_counts(const SetT& set) {
             c.join_retries, c.contended};
 } // hook_counts()
 
+// ---------------------------------------------------------------------------
+// PER-SHARD PLACEMENT. Each generation's live-handle count is S counts, one per
+// arena shard (S = get_internal_arena_shards(), a power of two): a join
+// increments the count of the JOINING thread's shard, thread_number() & (S - 1);
+// the handle records that count, and every leave of it -- its destruction, a
+// move assignment over it, the old side of a refresh() that returns true --
+// decrements that same count, whatever thread runs the leave; a move or a swap
+// carries the count with the block. The free pass frees a generation's bag only
+// when every one of its S counts reads 0. So a defect that misplaces a +1 or a
+// -1 shows only on a test whose roles run on DIFFERENT shards, and only in a
+// per-shard oracle: a sum of the counts (handle_refs, a ring view's refs, every
+// tuple) is blind to a -1 on the wrong count until something goes negative.
+// The PerShard* tests therefore
+//   - run every per-shard role (a joiner, a pin, an advancer or a trigger, a
+//     destroyer, a refresher) on a helper thread placed on a chosen shard by
+//     on_shard() below, never on the test thread, whose thread number is a
+//     process constant the tests do not control (it depends on which tests ran
+//     before);
+//   - read the per-shard view get_internal_slot_counts(slot) (the slot of
+//     generation g is g % K) or get_internal_handle_shard(h), with the
+//     expected view written as view_e() / view_0() below, so that a -1 on the
+//     wrong count shows as a wrong view (or as the header's "count went
+//     negative" assert at that -1, when the wrong count was 0: the views are
+//     asserted BEFORE each cross-shard leave for that reason);
+//   - name, in their comments, the defects they kill and the oracle that sees
+//     each.
+// ---------------------------------------------------------------------------
+
+// Runs fn() on a fresh thread whose arena shard is `s` of `S`: the shard a set
+// of S arena shards computes for that thread's joins, allocations and retire
+// pushes, thread_number() & (S - 1). Threads are started and joined ONE AT A
+// TIME until one lands on `s`: thread numbers are process-wide, sequential and
+// fixed per thread (taken at a thread's first join or shard use, or at its
+// first call of thread_number(), which is what each candidate thread does
+// first), so S consecutive candidates cover every shard, and at most S tries
+// land one on `s`, whatever tests ran before and whatever --gtest_filter
+// selected. A candidate that does not land calls thread_number() and nothing
+// else: it joins nothing, so it fires no TestHooks hook (which could consume
+// a slot a script armed) and takes no count. The landing test is the placement
+// precondition: fn() runs only on a thread of shard `s` (each placed role's
+// per-shard oracle confirms it independently: the view or the handle shard
+// its join produced). The thread is joined before on_shard() returns, so
+// everything fn() did happens-before the caller's next step -- the hand-off
+// the header's thread rules ask of a handle created, used or destroyed on
+// another thread -- and nothing runs concurrently with fn(): the caller is
+// blocked in the join, so fn() may touch ProbeKey's plain statics (hook_depth)
+// and the caller's locals. A gtest failure inside fn() is recorded in the
+// current test like any other; an ASSERT_* there returns from fn() only.
+// Precondition: S is a power of two and s < S (a failure is reported, and fn()
+// does not run).
+template <typename F>
+static void on_shard(size_t S, size_t s, F&& fn) {
+    if (!std::has_single_bit(S) || s >= S) {
+        ADD_FAILURE() << "on_shard(): shard " << s << " of " << S << " shards (S must be a power of two, s < S)";
+        return;
+    } // if the placement cannot exist
+    for (size_t tries = 0; tries < S; ++tries) {
+        bool landed = false;
+        std::thread candidate([&]() {
+            if ((concurrent_hash_rcu_detail::thread_number() & (S - 1)) != s) return;
+            landed = true;
+            fn();
+        }); // thread candidate
+        candidate.join();
+        if (landed) return;
+    } // one candidate thread at a time
+    ADD_FAILURE() << "on_shard(): no thread landed on shard " << s << " of " << S << " in " << S << " tries";
+} // on_shard()
+
+// The expected per-shard views of get_internal_slot_counts() on a set of S
+// arena shards: view_e(S, s) has a 1 at shard `s` and 0 elsewhere (one live
+// membership, joined on shard s); view_0(S) is all zero (no live membership of
+// the slot).
+static std::vector<long> view_e(size_t S, size_t s) {
+    std::vector<long> v(S, 0);
+    v.at(s) = 1;
+    return v;
+} // view_e()
+static std::vector<long> view_0(size_t S) { return std::vector<long>(S, 0); }
+
+// The precondition of a script that runs whole on a placed thread: `set` has
+// `shards` arena shards (so the set's shard mask is the S - 1 on_shard()
+// placed by) and the calling thread is on shard `j` of them.
+template <typename SetT>
+static ::testing::AssertionResult runs_on_shard(const SetT& set, size_t shards, size_t j) {
+    if (set.get_internal_arena_shards() != shards) {
+        return ::testing::AssertionFailure() << "the set has " << set.get_internal_arena_shards() << " arena shards, not " << shards;
+    }
+    const size_t mine = concurrent_hash_rcu_detail::thread_number() & (shards - 1);
+    if (mine != j) return ::testing::AssertionFailure() << "the script runs on shard " << mine << ", not " << j;
+    return ::testing::AssertionSuccess();
+} // runs_on_shard()
+
 // A join on a fresh set lands in generation 0, and the count of that generation
-// is the number of live handles.
+// (on one shard, its one per-shard count) is the number of live handles.
 //
-// Kills: a join that does not count itself in the generation it joins (refs 0
-// under a live handle: the free pass could then free under it), or that counts
-// itself twice; a fresh ring that does not start with slot 0 CURRENT.
+// Kills: a join that does not count itself in the generation it joins (a count
+// of 0 under a live handle: the free pass could then free under it), or that
+// counts itself twice; a fresh ring that does not start with slot 0 CURRENT.
 TEST(ConcurrentHashSetRcuTest, JoinOnFreshSetLandsInGenerationZero) {
     using Set = ConcurrentResizableHashSetRCU<int, true>;
     Set set(256, 1);
@@ -4379,6 +4477,33 @@ TEST(ConcurrentHashSetRcuTest, FreedNodesDoNotStrandOnUnusedShards) {
 // the ring of ring_string(), and the hook and counter deltas of hook_counts().
 // Each script names the defects it kills -- the protocol step it exists for,
 // removed or misplaced -- and what each one changes in its expected values.
+// THE PER-SHARD COPIES of the five join scripts (PerShardHook<script>S2K<K>, and
+// PerShardHookJoinRaceRetriesS4LastK<K>): the same body on Set(256, S), run
+// WHOLE on one helper thread J placed on shard j = S - 1 (on_shard()): the
+// stale joiner, every nested cycle of the actions and every advance() run
+// there, and the test thread only waits. So every join of the script is on
+// shard j, no other thread joins while a slot is armed (the hooks are
+// process-global: a join anywhere would fire them), and every expected value of
+// the one-shard script holds unchanged -- tuples, rings and results are sums
+// over the shards, and the arming order is the one-shard script's. The copies
+// add the per-shard views (only at S > 1, so the one-shard tests keep exactly
+// their oracles): J's handle is on shard j, its stale +1 and its undo were on
+// shard j's count of the stale slot, its membership on shard j's count of its
+// own. What they kill beyond the one-shard scripts, from j = S - 1 != 0:
+//   - an undo on ANOTHER shard's count of the stale block (the next shard's,
+//     say) where every script with a retry has one: that count is 0, since no
+//     other thread joined, so the header's "count went negative at a join's
+//     undo" assert fires inside new_handle(), whatever j is, the wrap
+//     j = S - 1 included;
+//   - a free pass that reads only shard 0's count, or skips the last shard's
+//     count: J's pin on shard j is invisible to it, and a later step's
+//     advance() frees the bag under J (the result's counts);
+//   - a free pass that frees a bag when ANY of its counts is 0: the same;
+//   - join_retries summed over shard 0 only, or without the last shard: the
+//     retry's +1 is on shard j (the scripts with a retry assert +1).
+// A free pass that reads only the flag holder's own count survives every copy
+// by construction (J is the advancer: its count IS the pin's); the pin-sweep
+// and suspended-reader tests of the per-shard section kill it.
 // ---------------------------------------------------------------------------
 
 // JOIN-BEFORE-INCREMENT (in_join): an advance() completes between a join's load
@@ -4404,11 +4529,28 @@ TEST(ConcurrentHashSetRcuTest, FreedNodesDoNotStrandOnUnusedShards) {
 // and no handle of the test
 // thread is alive across the hooked new_handle() (a live one in slot 0 would
 // keep it SEALED, and the EMPTY-slot oracle would be gone).
+// The per-shard copies (`shards` > 1; the body runs on a thread of J's shard
+// j = `j_shard`; the defaults are the one-shard script): the same values, plus
+// J's handle on shard j and the views: after step 1 slot 0 all zero (the undo
+// took the stale +1 off shard j's count) and slot 1 one count on shard j, still
+// so at step 4.
+// At step 2 X's freed node sits on shard 0's free list (the free pass deals
+// round-robin from shard 0), so J's pop on shard j steals it: the same tuple,
+// and the table stays at 256 as in the one-shard script (a failed steal would
+// append, leaving X's node free: F = 1 at step 2). Beyond the one-shard kills
+// (see the section comment): the undo on another shard's count (the assert at
+// the undo, inside new_handle()), the free pass reading only shard 0's count or
+// skipping the last shard's or freeing on ANY zero count (step 4 frees Y under
+// J), join_retries not summed over shard j.
 template <size_t K>
-static void hook_join_race_retries_body() {
+static void hook_join_race_retries_body(size_t shards = 1, size_t j_shard = 0) {
     using Set = HookSet<K>;
     const int X = 1, Y = 2;
-    Set set(256, 1);
+    Set set(256, shards);
+    const bool per_shard = shards > 1;   // a PerShard copy: the per-shard checks too
+    if (per_shard) {
+        ASSERT_TRUE(runs_on_shard(set, shards, j_shard)) << "test precondition";
+    }
     {
         const typename Set::handle hs = set.new_handle();
         ASSERT_TRUE(set.insert(hs, X));
@@ -4436,6 +4578,11 @@ static void hook_join_race_retries_body() {
     expect_tuple(set, "step 1", 0, 0, 0, 0, 1, 0, 1);
     EXPECT_EQ(ring_string(set), ring_expect(K, "E0 C1", 1, 1)) << "step 1";
     EXPECT_EQ(Set::get_internal_handle_generation(J), 1u) << "step 1";
+    if (per_shard) {
+        EXPECT_EQ(Set::get_internal_handle_shard(J), j_shard) << "step 1: J's count is its joining thread's shard's";
+        EXPECT_EQ(set.get_internal_slot_counts(0), view_0(shards)) << "step 1: the undo took the stale +1 off shard j's count of slot 0";
+        EXPECT_EQ(set.get_internal_slot_counts(1), view_e(shards, j_shard)) << "step 1: J's membership";
+    } // if per shard
 
     EXPECT_TRUE(set.insert(J, Y));   // step 2
     expect_tuple(set, "step 2", 1, 0, 0, 0, 0, 0, 1);
@@ -4447,6 +4594,9 @@ static void hook_join_race_retries_body() {
     expect_advance(set.advance(), 0, 0, 0, Advance::advanced, "step 4: J pins slot 1");   // step 4
     expect_tuple(set, "step 4", 0, 0, 0, 1, 0, 0, 1);
     EXPECT_EQ(ring_string(set), K == 2 ? ring_expect(K, "C0 S1/1", 1, 0) : ring_expect(K, "E0 S1/1 C0", 1, 2)) << "step 4";
+    if (per_shard) {
+        EXPECT_EQ(set.get_internal_slot_counts(1), view_e(shards, j_shard)) << "step 4: J's pin, on shard j";
+    } // if per shard
     J = {};   // step 5
     expect_advance(set.advance(), 1, 1, 0, Advance::nothing_retired, "step 5");
     expect_tuple(set, "step 5", 0, 0, 0, 0, 1, 0, 0);
@@ -4456,6 +4606,14 @@ static void hook_join_race_retries_body() {
 TEST_F(HashRcuHookTest, HookJoinRaceRetriesK2) { ASSERT_NO_FATAL_FAILURE(hook_join_race_retries_body<2>()); }
 TEST_F(HashRcuHookTest, HookJoinRaceRetriesK3) { ASSERT_NO_FATAL_FAILURE(hook_join_race_retries_body<3>()); }
 TEST_F(HashRcuHookTest, HookJoinRaceRetriesK64) { ASSERT_NO_FATAL_FAILURE(hook_join_race_retries_body<64>()); }
+// The per-shard copies: two shards with J on shard 1, and four shards with J on
+// the last shard, 3 (the free pass skipping the last count needs J there).
+TEST_F(HashRcuHookTest, PerShardHookJoinRaceRetriesS2K2) { ASSERT_NO_FATAL_FAILURE(on_shard(2, 1, [] { hook_join_race_retries_body<2>(2, 1); })); }
+TEST_F(HashRcuHookTest, PerShardHookJoinRaceRetriesS2K3) { ASSERT_NO_FATAL_FAILURE(on_shard(2, 1, [] { hook_join_race_retries_body<3>(2, 1); })); }
+TEST_F(HashRcuHookTest, PerShardHookJoinRaceRetriesS2K64) { ASSERT_NO_FATAL_FAILURE(on_shard(2, 1, [] { hook_join_race_retries_body<64>(2, 1); })); }
+TEST_F(HashRcuHookTest, PerShardHookJoinRaceRetriesS4LastK2) { ASSERT_NO_FATAL_FAILURE(on_shard(4, 3, [] { hook_join_race_retries_body<2>(4, 3); })); }
+TEST_F(HashRcuHookTest, PerShardHookJoinRaceRetriesS4LastK3) { ASSERT_NO_FATAL_FAILURE(on_shard(4, 3, [] { hook_join_race_retries_body<3>(4, 3); })); }
+TEST_F(HashRcuHookTest, PerShardHookJoinRaceRetriesS4LastK64) { ASSERT_NO_FATAL_FAILURE(on_shard(4, 3, [] { hook_join_race_retries_body<64>(4, 3); })); }
 
 // JOIN-BEFORE-INCREMENT, the ring wrapped back: K cycles inside in_join bring
 // the current generation back to slot 0, so J's increment lands on the recycled
@@ -4470,10 +4628,19 @@ TEST_F(HashRcuHookTest, HookJoinRaceRetriesK64) { ASSERT_NO_FATAL_FAILURE(hook_j
 //      ring [C1 ...] o=0 c=0; J's generation K;
 //   2. cycle(k_K): J pins slot 0;                             (0,0,0,1,K,0,1)
 //   3. J released, advance(): freed, nothing_retired.         (0,0,0,0,K+1,0,0)
+// The per-shard copies (`shards` > 1, the body on a thread of J's shard j =
+// `j_shard`): the same values, plus J's handle on shard j and slot 0's view one
+// count on shard j after steps 1 and 2. They kill the free pass that reads only
+// shard 0's count, skips the last shard's or frees on any zero count (step 2
+// frees the bag under J); there is no retry, so no undo defect reaches them.
 template <size_t K>
-static void hook_stale_bump_reverify_succeeds_on_recycled_slot_body() {
+static void hook_stale_bump_reverify_succeeds_on_recycled_slot_body(size_t shards = 1, size_t j_shard = 0) {
     using Set = HookSet<K>;
-    Set set(256, 1);
+    Set set(256, shards);
+    const bool per_shard = shards > 1;   // a PerShard copy: the per-shard checks too
+    if (per_shard) {
+        ASSERT_TRUE(runs_on_shard(set, shards, j_shard)) << "test precondition";
+    }
     {
         const typename Set::handle hs = set.new_handle();
         for (int i = 0; i <= static_cast<int>(K); ++i) ASSERT_TRUE(set.insert(hs, i + 1));
@@ -4496,10 +4663,17 @@ static void hook_stale_bump_reverify_succeeds_on_recycled_slot_body() {
     expect_tuple(set, "step 1", 1, 0, 0, 0, K, 0, 1);
     EXPECT_EQ(ring_string(set), ring_expect(K, "C1", 0, 0)) << "step 1";
     EXPECT_EQ(Set::get_internal_handle_generation(J), K) << "step 1";
+    if (per_shard) {
+        EXPECT_EQ(Set::get_internal_handle_shard(J), j_shard) << "step 1";
+        EXPECT_EQ(set.get_internal_slot_counts(0), view_e(shards, j_shard)) << "step 1: J's +1 on the recycled current slot, shard j's count";
+    }
 
     expect_advance(cycle(set, static_cast<int>(K) + 1), 0, 0, 0, Advance::advanced, "step 2: J pins slot 0");
     expect_tuple(set, "step 2", 0, 0, 0, 1, K, 0, 1);
     EXPECT_EQ(ring_string(set), ring_expect(K, "S1/1 C0", 0, 1)) << "step 2";
+    if (per_shard) {
+        EXPECT_EQ(set.get_internal_slot_counts(0), view_e(shards, j_shard)) << "step 2: J's pin, on shard j";
+    }
     J = {};
     expect_advance(set.advance(), 1, 1, 0, Advance::nothing_retired, "step 3");
     expect_tuple(set, "step 3", 0, 0, 0, 0, K + 1, 0, 0);
@@ -4508,6 +4682,9 @@ static void hook_stale_bump_reverify_succeeds_on_recycled_slot_body() {
 TEST_F(HashRcuHookTest, HookStaleBumpReverifySucceedsOnRecycledSlotK2) { ASSERT_NO_FATAL_FAILURE(hook_stale_bump_reverify_succeeds_on_recycled_slot_body<2>()); }
 TEST_F(HashRcuHookTest, HookStaleBumpReverifySucceedsOnRecycledSlotK3) { ASSERT_NO_FATAL_FAILURE(hook_stale_bump_reverify_succeeds_on_recycled_slot_body<3>()); }
 TEST_F(HashRcuHookTest, HookStaleBumpReverifySucceedsOnRecycledSlotK64) { ASSERT_NO_FATAL_FAILURE(hook_stale_bump_reverify_succeeds_on_recycled_slot_body<64>()); }
+TEST_F(HashRcuHookTest, PerShardHookStaleBumpReverifySucceedsOnRecycledSlotS2K2) { ASSERT_NO_FATAL_FAILURE(on_shard(2, 1, [] { hook_stale_bump_reverify_succeeds_on_recycled_slot_body<2>(2, 1); })); }
+TEST_F(HashRcuHookTest, PerShardHookStaleBumpReverifySucceedsOnRecycledSlotS2K3) { ASSERT_NO_FATAL_FAILURE(on_shard(2, 1, [] { hook_stale_bump_reverify_succeeds_on_recycled_slot_body<3>(2, 1); })); }
+TEST_F(HashRcuHookTest, PerShardHookStaleBumpReverifySucceedsOnRecycledSlotS2K64) { ASSERT_NO_FATAL_FAILURE(on_shard(2, 1, [] { hook_stale_bump_reverify_succeeds_on_recycled_slot_body<64>(2, 1); })); }
 
 // JOIN-BEFORE-INCREMENT, one cycle further: K+1 cycles inside in_join recycle
 // slot 0 to CURRENT and then seal and free it again before J's increment, so
@@ -4523,10 +4700,21 @@ TEST_F(HashRcuHookTest, HookStaleBumpReverifySucceedsOnRecycledSlotK64) { ASSERT
 // on the re-loaded block (the header's negative-count assert at step 1). Not
 // vacuous: every cycle must be `advanced` (one cycle short turns
 // this script into the one above), and no test-thread handle is alive.
+// The per-shard copies (`shards` > 1, the body on a thread of J's shard j =
+// `j_shard`): the same values, plus J's handle on shard j, slot 0 all zero
+// after step 1 (the undo on shard j's count) and slot 1 one count on shard j.
+// Beyond the one-shard kills (see the section comment): the undo on another
+// shard's count (the assert at the undo), the free pass reading only shard 0's
+// count or skipping the last shard's or freeing on any zero count (step 2 frees
+// under J), join_retries not summed over shard j.
 template <size_t K>
-static void hook_stale_bump_undo_after_recycle_body() {
+static void hook_stale_bump_undo_after_recycle_body(size_t shards = 1, size_t j_shard = 0) {
     using Set = HookSet<K>;
-    Set set(256, 1);
+    Set set(256, shards);
+    const bool per_shard = shards > 1;   // a PerShard copy: the per-shard checks too
+    if (per_shard) {
+        ASSERT_TRUE(runs_on_shard(set, shards, j_shard)) << "test precondition";
+    }
     {
         const typename Set::handle hs = set.new_handle();
         for (int i = 0; i <= static_cast<int>(K) + 1; ++i) ASSERT_TRUE(set.insert(hs, i + 1));
@@ -4550,6 +4738,11 @@ static void hook_stale_bump_undo_after_recycle_body() {
     expect_tuple(set, "step 1", 1, 0, 0, 0, K + 1, 0, 1);
     EXPECT_EQ(ring_string(set), ring_expect(K, "E0 C1", 1, 1)) << "step 1";
     EXPECT_EQ(Set::get_internal_handle_generation(J), K + 1) << "step 1";
+    if (per_shard) {
+        EXPECT_EQ(Set::get_internal_handle_shard(J), j_shard) << "step 1";
+        EXPECT_EQ(set.get_internal_slot_counts(0), view_0(shards)) << "step 1: the undo took the stale +1 off shard j's count of slot 0";
+        EXPECT_EQ(set.get_internal_slot_counts(1), view_e(shards, j_shard)) << "step 1: J's membership";
+    } // if per shard
 
     expect_advance(cycle(set, static_cast<int>(K) + 2), 0, 0, 0, Advance::advanced, "step 2: J pins slot 1");
     expect_tuple(set, "step 2", 0, 0, 0, 1, K + 1, 0, 1);
@@ -4561,20 +4754,23 @@ static void hook_stale_bump_undo_after_recycle_body() {
 TEST_F(HashRcuHookTest, HookStaleBumpUndoAfterRecycleK2) { ASSERT_NO_FATAL_FAILURE(hook_stale_bump_undo_after_recycle_body<2>()); }
 TEST_F(HashRcuHookTest, HookStaleBumpUndoAfterRecycleK3) { ASSERT_NO_FATAL_FAILURE(hook_stale_bump_undo_after_recycle_body<3>()); }
 TEST_F(HashRcuHookTest, HookStaleBumpUndoAfterRecycleK64) { ASSERT_NO_FATAL_FAILURE(hook_stale_bump_undo_after_recycle_body<64>()); }
+TEST_F(HashRcuHookTest, PerShardHookStaleBumpUndoAfterRecycleS2K2) { ASSERT_NO_FATAL_FAILURE(on_shard(2, 1, [] { hook_stale_bump_undo_after_recycle_body<2>(2, 1); })); }
+TEST_F(HashRcuHookTest, PerShardHookStaleBumpUndoAfterRecycleS2K3) { ASSERT_NO_FATAL_FAILURE(on_shard(2, 1, [] { hook_stale_bump_undo_after_recycle_body<3>(2, 1); })); }
+TEST_F(HashRcuHookTest, PerShardHookStaleBumpUndoAfterRecycleS2K64) { ASSERT_NO_FATAL_FAILURE(on_shard(2, 1, [] { hook_stale_bump_undo_after_recycle_body<64>(2, 1); })); }
 
 // INCREMENT-BEFORE-RE-VERIFY (in_join_after_bump), the two seams in one script:
 // slot 0 is freed before J's increment (in_join: one cycle), then recycled to
 // CURRENT with J's stale +1 on it before J's re-verify (in_join_after_bump: K-1
 // cycles); the re-verify succeeds and the stale +1 IS J's count. The +1 sat on
 // the slot while it went from EMPTY to CURRENT: whoever recycles a slot must not
-// reset its count (J2).
+// reset its counts (J2).
 //   0. insert k_0 .. k_K;                                      (K+1,0,0,0,0,0,0)
 //   1. arm in_join with { cycle(k_0); arm in_join_after_bump with K-1 cycles },
 //      J = new_handle(): both join hooks +(K+1), no retry;   (1,0,0,0,K,0,1)
 //      ring [C1 ...] o=0 c=0; J's generation K;
 //   2. cycle(k_K): J pins slot 0;                             (0,0,0,1,K,0,1)
 //   3. J released, advance(): freed, nothing_retired.         (0,0,0,0,K+1,0,0)
-// Kills a count reset on recycling (the advancer STORES 0 into the count of the
+// Kills a count reset on recycling (the advancer STORES 0 into the counts of the
 // slot it makes CURRENT, or right after its publish): the store runs inside the
 // second action, after
 // J's increment and before its re-verify, and wipes J's +1: H = 0 at step 1,
@@ -4587,10 +4783,21 @@ TEST_F(HashRcuHookTest, HookStaleBumpUndoAfterRecycleK64) { ASSERT_NO_FATAL_FAIL
 // `advanced` (one short leaves slot 0 EMPTY at J's re-verify, and the store hits
 // a slot without J's +1; asserted by J's generation and no retry); no
 // test-thread handle (a pinned slot makes the cycles end in ring_full).
+// The per-shard copies (`shards` > 1, the body on a thread of J's shard j =
+// `j_shard`): the same values, plus J's handle on shard j and slot 0's view
+// one count on shard j after step 1 (the stale +1 IS J's count, per shard; the
+// count reset wipes it to all zero). They also kill the free pass that reads
+// only shard 0's count, skips the last shard's or frees on any zero count
+// (step 2 frees the bag under J); there is no retry, so no undo defect
+// reaches them.
 template <size_t K>
-static void hook_stale_increment_survives_recycle_body() {
+static void hook_stale_increment_survives_recycle_body(size_t shards = 1, size_t j_shard = 0) {
     using Set = HookSet<K>;
-    Set set(256, 1);
+    Set set(256, shards);
+    const bool per_shard = shards > 1;   // a PerShard copy: the per-shard checks too
+    if (per_shard) {
+        ASSERT_TRUE(runs_on_shard(set, shards, j_shard)) << "test precondition";
+    }
     {
         const typename Set::handle hs = set.new_handle();
         for (int i = 0; i <= static_cast<int>(K); ++i) ASSERT_TRUE(set.insert(hs, i + 1));
@@ -4621,6 +4828,10 @@ static void hook_stale_increment_survives_recycle_body() {
     expect_tuple(set, "step 1", 1, 0, 0, 0, K, 0, 1);
     EXPECT_EQ(ring_string(set), ring_expect(K, "C1", 0, 0)) << "step 1: J's stale increment must be J's count";
     EXPECT_EQ(Set::get_internal_handle_generation(J), K) << "step 1";
+    if (per_shard) {
+        EXPECT_EQ(Set::get_internal_handle_shard(J), j_shard) << "step 1";
+        EXPECT_EQ(set.get_internal_slot_counts(0), view_e(shards, j_shard)) << "step 1: J's stale increment must be J's count, on shard j";
+    }
 
     expect_advance(cycle(set, static_cast<int>(K) + 1), 0, 0, 0, Advance::advanced, "step 2: J pins slot 0");
     expect_tuple(set, "step 2", 0, 0, 0, 1, K, 0, 1);
@@ -4632,6 +4843,9 @@ static void hook_stale_increment_survives_recycle_body() {
 TEST_F(HashRcuHookTest, HookStaleIncrementSurvivesRecycleK2) { ASSERT_NO_FATAL_FAILURE(hook_stale_increment_survives_recycle_body<2>()); }
 TEST_F(HashRcuHookTest, HookStaleIncrementSurvivesRecycleK3) { ASSERT_NO_FATAL_FAILURE(hook_stale_increment_survives_recycle_body<3>()); }
 TEST_F(HashRcuHookTest, HookStaleIncrementSurvivesRecycleK64) { ASSERT_NO_FATAL_FAILURE(hook_stale_increment_survives_recycle_body<64>()); }
+TEST_F(HashRcuHookTest, PerShardHookStaleIncrementSurvivesRecycleS2K2) { ASSERT_NO_FATAL_FAILURE(on_shard(2, 1, [] { hook_stale_increment_survives_recycle_body<2>(2, 1); })); }
+TEST_F(HashRcuHookTest, PerShardHookStaleIncrementSurvivesRecycleS2K3) { ASSERT_NO_FATAL_FAILURE(on_shard(2, 1, [] { hook_stale_increment_survives_recycle_body<3>(2, 1); })); }
+TEST_F(HashRcuHookTest, PerShardHookStaleIncrementSurvivesRecycleS2K64) { ASSERT_NO_FATAL_FAILURE(on_shard(2, 1, [] { hook_stale_increment_survives_recycle_body<64>(2, 1); })); }
 
 // INCREMENT-BEFORE-RE-VERIFY, one cycle further: K cycles in the second action
 // recycle slot 0 (carrying J's stale +1) and SEAL it again; the free pass reads
@@ -4650,10 +4864,23 @@ TEST_F(HashRcuHookTest, HookStaleIncrementSurvivesRecycleK64) { ASSERT_NO_FATAL_
 // after the publish) at step 1: the wiped +1 lets the last cycle free slot 0
 // (`{1,1,0,advanced}`), and J's undo then drives the count negative (the
 // header's assert inside new_handle()). Not vacuous: as above.
+// The per-shard copies (`shards` > 1, the body on a thread of J's shard j =
+// `j_shard`): the same values, plus J's handle on shard j, slot 0 all zero
+// after step 1 (the undo on shard j's count) and slot 1 one count on shard j;
+// the last cycle of step 1 stops on the stale +1 on shard j's count. Beyond the
+// one-shard kills (see the section comment): the undo on another shard's count
+// (the assert at the undo), the free pass reading only shard 0's count or
+// skipping the last shard's or freeing on any zero count (the last cycle of
+// step 1 frees slot 0 under J's stale +1: its result's counts), join_retries
+// not summed over shard j.
 template <size_t K>
-static void hook_stale_increment_on_resealed_slot_body() {
+static void hook_stale_increment_on_resealed_slot_body(size_t shards = 1, size_t j_shard = 0) {
     using Set = HookSet<K>;
-    Set set(256, 1);
+    Set set(256, shards);
+    const bool per_shard = shards > 1;   // a PerShard copy: the per-shard checks too
+    if (per_shard) {
+        ASSERT_TRUE(runs_on_shard(set, shards, j_shard)) << "test precondition";
+    }
     {
         const typename Set::handle hs = set.new_handle();
         for (int i = 0; i <= static_cast<int>(K) + 1; ++i) ASSERT_TRUE(set.insert(hs, i + 1));
@@ -4685,6 +4912,11 @@ static void hook_stale_increment_on_resealed_slot_body() {
     expect_tuple(set, "step 1", 1, 0, 0, 1, K, 0, 1);
     EXPECT_EQ(ring_string(set), ring_expect(K, "S0/1 C1", 0, 1)) << "step 1";
     EXPECT_EQ(Set::get_internal_handle_generation(J), K + 1) << "step 1";
+    if (per_shard) {
+        EXPECT_EQ(Set::get_internal_handle_shard(J), j_shard) << "step 1";
+        EXPECT_EQ(set.get_internal_slot_counts(0), view_0(shards)) << "step 1: the undo took the stale +1 off shard j's count of slot 0";
+        EXPECT_EQ(set.get_internal_slot_counts(1), view_e(shards, j_shard)) << "step 1: J's membership";
+    } // if per shard
 
     expect_advance(set.advance(), 1, 1, 0, Advance::nothing_retired, "step 2: the delayed bag");
     expect_tuple(set, "step 2", 1, 0, 0, 0, K + 1, 0, 1);
@@ -4698,6 +4930,9 @@ static void hook_stale_increment_on_resealed_slot_body() {
 TEST_F(HashRcuHookTest, HookStaleIncrementOnResealedSlotK2) { ASSERT_NO_FATAL_FAILURE(hook_stale_increment_on_resealed_slot_body<2>()); }
 TEST_F(HashRcuHookTest, HookStaleIncrementOnResealedSlotK3) { ASSERT_NO_FATAL_FAILURE(hook_stale_increment_on_resealed_slot_body<3>()); }
 TEST_F(HashRcuHookTest, HookStaleIncrementOnResealedSlotK64) { ASSERT_NO_FATAL_FAILURE(hook_stale_increment_on_resealed_slot_body<64>()); }
+TEST_F(HashRcuHookTest, PerShardHookStaleIncrementOnResealedSlotS2K2) { ASSERT_NO_FATAL_FAILURE(on_shard(2, 1, [] { hook_stale_increment_on_resealed_slot_body<2>(2, 1); })); }
+TEST_F(HashRcuHookTest, PerShardHookStaleIncrementOnResealedSlotS2K3) { ASSERT_NO_FATAL_FAILURE(on_shard(2, 1, [] { hook_stale_increment_on_resealed_slot_body<3>(2, 1); })); }
+TEST_F(HashRcuHookTest, PerShardHookStaleIncrementOnResealedSlotS2K64) { ASSERT_NO_FATAL_FAILURE(on_shard(2, 1, [] { hook_stale_increment_on_resealed_slot_body<64>(2, 1); })); }
 
 // OPERATIONS-BETWEEN-PUBLISH-AND-FREE-PASS (in_advance_after_publish): inside the
 // hook, a handle of the NEW generation erases L. Every exchange preceded the
@@ -4921,6 +5156,113 @@ TEST_F(HashRcuHookTest, SuspendedReaderPinsItsGenerationK2) { ASSERT_NO_FATAL_FA
 TEST_F(HashRcuHookTest, SuspendedReaderPinsItsGenerationK3) { ASSERT_NO_FATAL_FAILURE(suspended_reader_pins_its_generation_body<3>()); }
 TEST_F(HashRcuHookTest, SuspendedReaderPinsItsGenerationK64) { ASSERT_NO_FATAL_FAILURE(suspended_reader_pins_its_generation_body<64>()); }
 
+// The same script on TWO arena shards, with the reader's pin on one shard and
+// the advancer on the other: a free pass must read EVERY shard's count of a
+// bag, not only some of them. The test thread is still the reader (the
+// suspended contains() runs on it), but no per-shard role does:
+//   - the pin h is joined on a helper thread placed on shard PIN = 1 (= S - 1)
+//     by `h = set.new_handle()` and handed to the test thread (the helper is
+//     joined before contains()): h's count is shard 1's;
+//   - the action's two erase-and-advance cycles (h1, r1, h2, r2) run on a
+//     helper placed on shard ADV = 0, inside the action; the chained hook on S
+//     is armed by the test thread after that helper is joined;
+//   - step 2, the release of h and r3, runs on a helper on shard 0: a leave on
+//     another shard's thread than the join's; step 0's inserts run on a helper
+//     on shard 0 too.
+// Expected: the one-shard script's values (tuples, rings, results, found, the
+// step onto S, no corrupt object: all sums), plus h on shard 1 and slot 0's
+// view one count on shard 1, before contains() and after it (h is the only pin;
+// h1 and h2, on shard 0, are released before their calls).
+// Kills, with ASan's use-after-poison in ProbeKey::operator== REQUIRED in the
+// log (the reader steps onto a freed S; under TSan the wrong miss, `found`
+// false, as in the one-shard script; the result counts in both builds):
+//   - a free pass that reads only shard 0's count, only the advancer's own
+//     shard's (0), or every count but the last shard's (S = 2: shard 0's only),
+//     or that frees when ANY count is 0: each misses h's count on shard 1, so
+//     r1 frees {Y} and r2 frees {S}, at every K;
+//   - the free pass ignoring the counts (every K), and the non-cumulative free
+//     pass (K >= 3), as in the one-shard script;
+//   - a leave on the LEAVING thread's shard instead of the recorded one: h's
+//     release on shard 0 decrements shard 0's count of slot 0, which is 0 (the
+//     view says so before it), so the header's "count went negative at a
+//     leave" assert fires at step 2 (no use-after-poison: nothing is freed
+//     early).
+// Not vacuous: as the one-shard script, plus: h is the only pin and sits on
+// shard 1, the advancer on shard 0 != 1 (a pass reading the advancer's own
+// count needs that); the helpers inside the equal_hook action see ProbeKey's
+// hook_depth > 0 (written by the test thread before the helper starts and
+// after it is joined), so their own comparisons neither count nor fire, as the
+// nested calls of the one-shard script do on the test thread.
+template <size_t K>
+static void per_shard_suspended_reader_body() {
+    using Set = ConcurrentResizableHashSetRCU<ProbeKey, true, ProbeKeyHash, K>;
+    constexpr size_t SH = 2, PIN = 1, ADV = 0;   // shards; the pin's shard; the advancer's
+    const int KEY = 3, S = 259, X = 515, Y = 4;
+    {
+        Set set(256, SH);
+        ASSERT_EQ(set.get_internal_arena_shards(), SH) << "test precondition: the shard mask on_shard() places by";
+        on_shard(SH, ADV, [&]() {
+            const typename Set::handle hs = set.new_handle();
+            for (int k : {KEY, S, X, Y}) EXPECT_TRUE(set.insert(hs, k));
+        }); // step 0, on shard ADV
+        expect_tuple(set, "step 0", 4, 0, 0, 0, 0, 0, 0);
+        int ran = 0, stepped_on_s = 0;
+        AdvanceResult r1{}, r2{}, r3{};
+        typename Set::handle h;
+        on_shard(SH, PIN, [&]() { h = set.new_handle(); });
+        ASSERT_TRUE(h) << "test precondition: the pin was not placed";
+        EXPECT_EQ(Set::get_internal_handle_shard(h), PIN) << "the pin's count is its joining thread's shard's";
+        EXPECT_EQ(set.get_internal_slot_counts(0), view_e(SH, PIN)) << "step 1, before contains(): the pin alone";
+        ProbeKey::arm(ProbeKey::equal_hook, X, 1, [&]() {
+            ++ran;
+            on_shard(SH, ADV, [&]() {
+                {
+                    const typename Set::handle h1 = set.new_handle();
+                    EXPECT_TRUE(set.erase(h1, Y));
+                }
+                r1 = set.advance();
+                {
+                    const typename Set::handle h2 = set.new_handle();
+                    EXPECT_TRUE(set.erase(h2, S));
+                }
+                r2 = set.advance();
+            }); // the advancer, on shard ADV
+            ProbeKey::arm(ProbeKey::equal_hook, S, 1, [&]() { ++stepped_on_s; });
+        }); // the equal_hook action on X
+        const bool found = set.contains(h, KEY);
+        ProbeKey::disarm_hooks();
+        ASSERT_EQ(ran, 1) << "test precondition: the hook on the reader's comparison against X did not fire";
+        EXPECT_EQ(stepped_on_s, 1) << "the reader did not step onto S after the hook";
+        EXPECT_TRUE(found) << "the suspended reader missed KEY: it walked through a freed node";
+        expect_advance(r1, 0, 0, 0, Advance::advanced, "r1: bag 0 = {Y}, pinned by the reader's count on shard 1");
+        if constexpr (K == 2) {
+            expect_advance(r2, 0, 0, 0, Advance::ring_full, "r2: the only other slot is pinned");
+            expect_tuple(set, "step 1", 2, 0, 1, 1, 0, 0, 1);
+            EXPECT_EQ(ring_string(set), ring_expect(K, "S1/1 C0", 0, 1)) << "step 1";
+        } else {
+            expect_advance(r2, 0, 0, 0, Advance::advanced, "r2: bag 1 = {S}, behind the pinned bag 0");
+            expect_tuple(set, "step 1", 2, 0, 0, 2, 0, 0, 1);
+            EXPECT_EQ(ring_string(set), ring_expect(K, "S1/1 S0/1 C0", 0, 2)) << "step 1";
+        } // K
+        EXPECT_EQ(set.get_internal_slot_counts(0), view_e(SH, PIN)) << "step 1, after contains(): the pin alone, on shard 1";
+        on_shard(SH, ADV, [&]() {
+            h = {};   // a leave on shard 0's thread of a count on shard 1
+            r3 = set.advance();
+        }); // step 2, on shard ADV
+        if constexpr (K == 2) {
+            expect_advance(r3, 2, 2, 0, Advance::advanced, "step 2: the in-wrap pass frees bag 0, the bump bags S");
+        } else {
+            expect_advance(r3, 2, 2, 0, Advance::nothing_retired, "step 2");
+        } // K
+        expect_tuple(set, "step 2", 2, 0, 0, 0, 2, 0, 0);
+    } // the set's lifetime
+    EXPECT_EQ(ProbeKey::corrupt.load(), 0);
+} // per_shard_suspended_reader_body()
+
+TEST_F(HashRcuHookTest, PerShardSuspendedReaderPinsItsGenerationK2) { ASSERT_NO_FATAL_FAILURE(per_shard_suspended_reader_body<2>()); }
+TEST_F(HashRcuHookTest, PerShardSuspendedReaderPinsItsGenerationK3) { ASSERT_NO_FATAL_FAILURE(per_shard_suspended_reader_body<3>()); }
+TEST_F(HashRcuHookTest, PerShardSuspendedReaderPinsItsGenerationK64) { ASSERT_NO_FATAL_FAILURE(per_shard_suspended_reader_body<64>()); }
+
 // The in-walk seam: advance()'s walk hashes a FROZEN node it passes right after
 // a usable predecessor, to decide whether it is dead. build_unfinished_split()
 // leaves exactly such a node (PROBE_X2, FROZEN behind the live 1029, its child
@@ -5074,7 +5416,7 @@ TEST(ConcurrentHashSetRcuTest, FreeNodesArePoisonedAfterAdvance) {
 // would be freed), or, in the per-operation variant, takes a new handle for
 // every operation.
 // The two-advancer run is also the probabilistic killer of a count reset when a
-// slot is freed (a free pass that stores 0 into the count of a slot it makes
+// slot is freed (a free pass that stores 0 into the counts of a slot it makes
 // EMPTY): a joiner's stale increment landing in that window is wiped, and its
 // undo or leave drives the count
 // negative, which the header asserts. Readers refreshing every iteration join
@@ -5104,6 +5446,12 @@ struct StressShape {
     bool mixed_handles = false;   // true: even-numbered writers and readers take a handle per operation, odd-numbered ones a long-lived handle (per_op_handles is then ignored)
     int refresh_every = 1;        // a long-lived handle is refreshed on every refresh_every-th iteration of its thread (1: every iteration; must be > 0)
     std::chrono::microseconds call_pause{0};   // advancers and reclaimers sleep this long after each call (0: back to back, the flag held most of the time)
+    // The moved-handle variant (PerShardStressMovedHandles). Defaults to off, so no
+    // other shape changes. Requires long-lived handles (per_op_handles and
+    // mixed_handles false), 2 <= writers <= shards, shards a power of two, stable > 0,
+    // and the cadence off (a cadenced run sweeps the accounting right after the run,
+    // before the mailboxes' handles are released).
+    bool hand_over = false;   // true: the writers are numbered one at a time (so on distinct shards) and hand live handles to one another (advance_stress_body())
 }; // struct StressShape
 
 // What happened during the run (before the end-state calls), for the witnesses.
@@ -5125,6 +5473,15 @@ struct StressWitness {
     size_t reader_triggers = 0;      // reader iterations across which the reader's own bump_ns grew: a trigger proceeded inside one of its contains() (readers make no explicit call)
     bool stopped_by_guard = false;   // the runaway guard (StressShape::slot_limit) ended the run early
     size_t reclaim_outcomes[4] = {0, 0, 0, 0};   // the reclaimers' reclaim() results by AdvanceResult::Advance (StressShape::reclaimers)
+    // The moved-handle variant's (StressShape::hand_over), summed over the writers.
+    size_t handovers = 0;               // live handles a writer received from another writer
+    size_t handovers_cross_shard = 0;   // ... whose count was on another shard than the receiver's (get_internal_handle_shard())
+    size_t handover_swaps = 0;          // received handles swapped with the receiver's long-lived handle
+    size_t handover_move_assigns = 0;   // received handles move-assigned over the receiver's live long-lived handle
+    size_t handover_refreshes = 0;      // received handles whose refresh() on the receiver's thread returned true
+    size_t handover_destroys = 0;       // received handles destroyed on the receiver's thread (a leave there)
+    size_t handover_passes = 0;         // received handles handed on to another writer
+    size_t handover_gifts = 0;          // fresh handles a writer joined and gave to another writer
 }; // struct StressWitness
 
 static int stress_writer_key(int t, int i) { return ((t + 1) << 22) | i; }   // writer t's key i, i < 2^22
@@ -5143,8 +5500,26 @@ static int stress_never_key(int i) { return 0x38000000 | i; }                // 
 // cadence-off runs keep their two bare calls and their oracle), the trigger witnesses are filled from the
 // counters after the join, readers record whether a trigger proceeded inside
 // their own contains(), and a runaway guard may end the run early.
+// The moved-handle variant (shape.hand_over) differs only in its writers: they
+// are started and numbered one at a time, so they take consecutive thread
+// numbers and sit on distinct arena shards (asserted after the run), and each
+// runs a hand-over step every iteration before its operations: it receives at
+// most one live handle from its mailbox (where the other writers leave
+// handles for it, at most kMailboxCap at a time: each waiting handle pins its
+// generation), looks up a stable key under it, then swaps it with its own
+// long-lived handle, move-assigns it over that handle, refreshes it, or keeps
+// it as is, and finally hands it on to another writer or destroys it; and on
+// average every fourth iteration it gives a fresh handle to another writer.
+// The handles still waiting in the mailboxes when the run ends are destroyed
+// by the test thread before the end state.
 template <typename SetT>
 static void advance_stress_body(const StressShape& shape, const std::string& where, StressWitness& w) {
+    if (shape.hand_over) {
+        ASSERT_TRUE(!shape.per_op_handles && !shape.mixed_handles && shape.writers >= 2 && static_cast<size_t>(shape.writers) <= shape.shards &&
+                    std::has_single_bit(shape.shards) && shape.stable > 0 && shape.cadence == 0)
+            << where << ": test precondition: a moved-handle shape needs long-lived handles, 2 <= writers <= shards (a power of two), "
+            << "stable keys and no cadence";
+    } // if the moved-handle variant
     SetT set(typename SetT::Options{.initial_capacity = shape.buckets, .arena_shards = shape.shards, .auto_reclaim_every = shape.cadence});
     {
         const typename SetT::handle h = set.new_handle();
@@ -5158,6 +5533,20 @@ static void advance_stress_body(const StressShape& shape, const std::string& whe
     std::vector<int> written(shape.writers, 0);   // writer t inserted its keys 0 .. written[t]-1
     std::vector<StressWitness> tallies(shape.advancers + shape.reclaimers);   // advancers first, then reclaimers
     std::vector<size_t> reader_triggers(shape.readers, 0);   // reader r's iterations with a trigger inside (cadenced runs only)
+    // The moved-handle variant's state (shape.hand_over; unused otherwise).
+    // Mailbox: the live handles other writers left for one writer, oldest
+    // first, under its mutex (the hand-off that orders a handle's use on the
+    // giver's thread before its use on the receiver's, as the thread rules ask).
+    struct Mailbox {
+        std::mutex m;                                // guards `handles`
+        std::deque<typename SetT::handle> handles;   // live handles waiting for the mailbox's writer
+    }; // struct Mailbox
+    constexpr size_t kMailboxCap = 2;   // at most this many handles wait for one writer (each pins its generation while it waits)
+    std::unique_ptr<Mailbox[]> mail;    // writer t's mailbox is mail[t]
+    if (shape.hand_over) mail = std::make_unique<Mailbox[]>(static_cast<size_t>(shape.writers));
+    std::vector<size_t> writer_shard(shape.writers, 0);           // writer t's arena shard, recorded before the run
+    std::vector<StressWitness> hand_tallies(shape.writers);       // writer t's hand-over counts (the handover* fields only)
+    std::atomic<int> numbered{0};                                 // writers numbered so far (the test thread waits for each)
     std::vector<std::thread> threads;
     threads.reserve(T);
     // Whether writer or reader thread t (its index among all threads) takes a
@@ -5176,14 +5565,85 @@ static void advance_stress_body(const StressShape& shape, const std::string& whe
         }
         return op(h);
     }; // under()
+    // The moved-handle variant's hand-over step of writer t (on shard `shard`),
+    // once per iteration before its operations: `h` is t's long-lived handle
+    // (always live), `rng` t's generator, `tally` t's counts. See the comment
+    // above the function for the steps; each receiving action is a membership
+    // carried, or left, or rejoined on t's thread, very likely not the thread
+    // that joined it.
+    auto hand_over_step = [&](int t, size_t shard, typename SetT::handle& h, std::minstd_rand& rng, StressWitness& tally) {
+        // Leaves `x` in writer `to`'s mailbox (a move construction on the giver's
+        // thread) if it has room, and returns whether it did; otherwise `x` stays
+        // the caller's, untouched.
+        auto give = [&](int to, typename SetT::handle& x) -> bool {
+            const std::lock_guard<std::mutex> lock(mail[to].m);
+            if (mail[to].handles.size() >= kMailboxCap) return false;
+            mail[to].handles.push_back(std::move(x));
+            return true;
+        }; // give()
+        // A writer other than t, at random.
+        auto other = [&]() -> int { return (t + 1 + static_cast<int>(rng()%static_cast<unsigned>(shape.writers - 1)))%shape.writers; };
+        typename SetT::handle got;   // the received handle, if any
+        {
+            const std::lock_guard<std::mutex> lock(mail[t].m);
+            if (!mail[t].handles.empty()) {
+                got = std::move(mail[t].handles.front());   // a move assignment into an empty handle
+                mail[t].handles.pop_front();                 // destroys the moved-from, empty handle: no leave
+            }
+        } // the mailbox's lock
+        if (got) {
+            ++tally.handovers;
+            if (SetT::get_internal_handle_shard(got) != shard) ++tally.handovers_cross_shard;
+            bad[t] += !set.contains(got, stress_stable_key(static_cast<int>(rng()%static_cast<unsigned>(shape.stable))));
+            switch (rng()%4) {
+                case 0:   // t works under the received membership from now on; `got` takes t's previous one
+                    h.swap(got);
+                    ++tally.handover_swaps;
+                    break;
+                case 1:   // t's previous membership is left here, on t's thread; `got` is empty
+                    h = std::move(got);
+                    ++tally.handover_move_assigns;
+                    break;
+                case 2:   // a join on t's shard if the generation moved, and the old count left here
+                    if (got.refresh()) ++tally.handover_refreshes;
+                    break;
+                default:   // kept as received
+                    break;
+            } // the receiving action
+            if (got) {
+                if (rng()%2 == 0 && give(other(), got)) {
+                    ++tally.handover_passes;
+                } else {
+                    got = typename SetT::handle{};   // a leave on t's thread
+                    ++tally.handover_destroys;
+                }
+            } // if `got` still holds a membership
+        } // if a handle was received
+        if (rng()%4 == 0) {
+            typename SetT::handle fresh = set.new_handle();   // joined on t's shard
+            if (give(other(), fresh)) ++tally.handover_gifts;
+        } // a gift (left here, on t's thread, when the mailbox is full)
+    }; // hand_over_step()
     for (int t = 0; t < shape.writers; ++t) {
         threads.emplace_back([&, t]() {
+            size_t shard = 0;   // this writer's arena shard (the moved-handle variant only)
+            if (shape.hand_over) {
+                // The writer's first call takes its thread number, while the
+                // test thread waits for it (below) before it starts the next
+                // writer: consecutive numbers, distinct shards.
+                shard = concurrent_hash_rcu_detail::thread_number() & (set.get_internal_arena_shards() - 1);
+                writer_shard[t] = shard;
+                numbered.fetch_add(1, std::memory_order_release);
+                numbered.notify_one();
+            } // if the moved-handle variant
             const bool per_op = per_op_thread(t);
             typename SetT::handle h = per_op ? typename SetT::handle{} : set.new_handle();
+            std::minstd_rand rng(static_cast<unsigned>(t + 1001));   // the hand-over step's choices
             start.arrive_and_wait();
             const int W = shape.window;
             int i = 0;
             for (; !stop.load(std::memory_order_relaxed) && i < (1 << 22); ++i) {
+                if (shape.hand_over) hand_over_step(t, shard, h, rng, hand_tallies[t]);
                 if (h && i % shape.refresh_every == 0) h.refresh();
                 const int in = stress_writer_key(t, i), out = stress_writer_key(t, i - W);
                 bad[t] += !under(per_op, h, [&](const typename SetT::handle& x) { return set.insert(x, in); });
@@ -5195,6 +5655,7 @@ static void advance_stress_body(const StressShape& shape, const std::string& whe
             } // writer loop
             written[t] = i;
         }); // writer thread t
+        if (shape.hand_over) numbered.wait(t, std::memory_order_acquire);   // writer t has its number before writer t + 1 starts
     } // writers
     for (int r = 0; r < shape.readers; ++r) {
         const int t = shape.writers + r;
@@ -5295,6 +5756,25 @@ static void advance_stress_body(const StressShape& shape, const std::string& whe
         w.pops = c1.nodes_freed - expect_consistent(set, where + ", after the run").free_nodes;
         for (size_t n : reader_triggers) w.reader_triggers += n;
     } // if cadenced
+    if (shape.hand_over) {
+        for (const StressWitness& tally : hand_tallies) {
+            w.handovers += tally.handovers;
+            w.handovers_cross_shard += tally.handovers_cross_shard;
+            w.handover_swaps += tally.handover_swaps;
+            w.handover_move_assigns += tally.handover_move_assigns;
+            w.handover_refreshes += tally.handover_refreshes;
+            w.handover_destroys += tally.handover_destroys;
+            w.handover_passes += tally.handover_passes;
+            w.handover_gifts += tally.handover_gifts;
+        } // sum the writers' hand-over tallies
+        std::vector<size_t> shards = writer_shard;
+        std::sort(shards.begin(), shards.end());
+        EXPECT_TRUE(std::adjacent_find(shards.begin(), shards.end()) == shards.end())
+            << where << ": test precondition: the writers did not land on distinct shards";
+        // The handles still waiting leave here, on the test thread (every writer
+        // is joined: the hand-off), before the end state, which counts none.
+        for (int t = 0; t < shape.writers; ++t) mail[t].handles.clear();
+    } // if the moved-handle variant
     for (int t = 0; t < T; ++t) EXPECT_EQ(bad[t], 0u) << where << ", thread " << t << ": a determined result was wrong";
     if (shape.report) {
         std::printf("[   INFO   ] %s: advanced %zu, nothing_retired %zu, ring_full %zu, contended %zu, bags freed %zu; "
@@ -5311,6 +5791,12 @@ static void advance_stress_body(const StressShape& shape, const std::string& whe
             std::printf("[   INFO   ] %s: reclaim(): advanced %zu, nothing_retired %zu, ring_full %zu, contended %zu\n", where.c_str(),
                         w.reclaim_outcomes[1], w.reclaim_outcomes[0], w.reclaim_outcomes[2], w.reclaim_outcomes[3]);
         } // if reclaimers ran
+        if (shape.hand_over) {
+            std::printf("[   INFO   ] %s: handovers %zu, of them across shards %zu; swaps %zu, move assignments %zu, refreshes %zu, "
+                        "destroyed by the receiver %zu, handed on %zu; fresh handles given %zu\n",
+                        where.c_str(), w.handovers, w.handovers_cross_shard, w.handover_swaps, w.handover_move_assigns,
+                        w.handover_refreshes, w.handover_destroys, w.handover_passes, w.handover_gifts);
+        } // if the moved-handle variant
     } // report
 
     // The end state: every handle is gone (each thread released its own).
@@ -5395,9 +5881,9 @@ TEST_F(HashRcuHookTest, StressAdvanceYieldInWindows) {
 // yield_in_windows: every operation joins and leaves, and every join yields
 // between its load and its increment and between its increment and its
 // re-verify, so a joiner's stale increment meets the free pass's check of a
-// generation's count, and the slot's recycling, far more often than in either
+// generation's counts, and the slot's recycling, far more often than in either
 // of the two tests it combines. It is the stress that catches a free pass
-// storing 0 into the count of a slot it makes EMPTY (the wiped stale
+// storing 0 into the counts of a slot it makes EMPTY (the wiped stale
 // increment's undo drives the count negative, which the header asserts).
 // Witnesses: join retries, join-hook calls, after-publish calls, bags freed,
 // the advancers met at the flag.
@@ -5978,9 +6464,9 @@ TEST(ConcurrentHashSetRcuTest, CadenceTriggerLeavesStragglers) {
 // leaves no node unaccounted for.
 // Kills (measured; each also killed elsewhere): the trigger placed before the
 // retire push (bumps +0); a free pass that ignores the pins, a trigger whose free
-// pass takes refs <= 1 for unpinned, and a retire push that writes the list's
-// next pointer into the chain link (the sweep after the throw is inconsistent);
-// a flag never released (the sweep's flag assert).
+// pass takes counts summing to <= 1 for unpinned, and a retire push that writes
+// the list's next pointer into the chain link (the sweep after the throw is
+// inconsistent); a flag never released (the sweep's flag assert).
 TEST(ConcurrentHashSetRcuTest, CadenceThrowAfterTriggerKeepsItsEffects) {
     using Set = CadProbeSet<64>;
     ProbeKey::reset_counters();
@@ -6246,7 +6732,7 @@ TEST(ConcurrentHashSetRcuTest, CadenceCountsPerShard) {
 // generation its predecessor's trigger published. EXPECT_* only inside A.
 // Kills: a trigger whose free pass takes one pin for its own operation's (at
 // h2's trigger bag 0's one pin is the suspended reader's, ANOTHER operation of
-// the same thread: the defect frees bag 0 and bag 1 (refs 1, h2's own), and
+// the same thread: the defect frees bag 0 and bag 1 (its count 1, h2's own), and
 // the reader steps onto a freed S: ASan's use-after-poison in
 // ProbeKey::operator==, the required symptom; under TSan S's link leads into
 // the free list, a wrong miss); a free pass that ignores the pins (the same
@@ -6319,6 +6805,134 @@ TEST_F(HashRcuHookTest, CadenceSuspendedReaderPinsItsGenerationK2) { ASSERT_NO_F
 TEST_F(HashRcuHookTest, CadenceSuspendedReaderPinsItsGenerationK3) { ASSERT_NO_FATAL_FAILURE(cadence_suspended_reader_body<3>()); }
 TEST_F(HashRcuHookTest, CadenceSuspendedReaderPinsItsGenerationK4) { ASSERT_NO_FATAL_FAILURE(cadence_suspended_reader_body<4>()); }
 TEST_F(HashRcuHookTest, CadenceSuspendedReaderPinsItsGenerationK64) { ASSERT_NO_FATAL_FAILURE(cadence_suspended_reader_body<64>()); }
+
+// The same script on TWO arena shards, in two placements of the pin relative
+// to the TRIGGERING thread (the thread whose erases' triggers do the work):
+//   - P1, PinOnTriggerShard: the pin h is joined on a helper placed on shard
+//     a = 1, and the three nested erases (h1, h2, h3 and their triggers) run
+//     on ANOTHER helper placed on the same shard b = 1, inside the action;
+//   - P2, PinOnOtherShard: h on shard a = 1, the erases on shard b = 0.
+// The test thread is the reader. Step 2 (h's release, then reclaim()) runs on
+// a helper placed on shard 1 - a = 0: a leave on another shard's thread than
+// the join's. Step 0's inserts run on a helper placed on shard b. Expected:
+// the one-shard script's values for every K (counters, tuples, the reclaim()
+// literal: all sums), plus h on shard a and slot 0's view one count on shard a,
+// before contains() and after it.
+// Kills, each with ASan's use-after-poison in ProbeKey::operator== REQUIRED in
+// the log (the reader steps onto a freed S; TSan: the wrong miss, `found`
+// false; the counters kill in both builds):
+//   - in both placements: a trigger whose passes take a bag whose counts SUM
+//     to <= 1 for unpinned ("the one pin is mine"), or that take EVERY count
+//     <= 1 for unpinned (P1 at h2's trigger, as in the one-shard script; P2
+//     already at h1's: h's count on shard 1 and h1's on shard 0, each 1); the
+//     free pass ignoring the counts; a free pass that frees when ANY count is
+//     0, or that skips the last shard's count (S = 2: reads shard 0 only), or
+//     that reads only shard 0's; the non-cumulative free pass at K >= 3;
+//   - in P1 only: a trigger that takes ITS OWN shard's count <= 1 for
+//     unpinned (the other counts 0), or that skips its own shard's count: at
+//     h2's trigger h's count on shard 1 is the triggering thread's shard's
+//     (h1's already left), so bag 0 {Y} is freed, then bag 1 {S} (h2's own
+//     count, 1). In P2 both are pre-declared SURVIVORS: h's count is on a
+//     shard the defect reads normally, and it stops (conservatively). These
+//     two die ONLY here, in P1: the pin must be on the triggering thread's
+//     shard, on another thread;
+//   - in P2 only: a free pass that reads only the flag holder's own count (the
+//     triggering thread's, 0): h's count on shard 1 is invisible, so h2's
+//     trigger frees {Y} and h3's (or, at K = 2 and 3, the in-wrap pass) {S}.
+//     In P1 it survives by construction (the triggering thread's count is h's
+//     shard's);
+//   - in both: a leave on the LEAVING thread's shard: h's release on shard
+//     1 - a decrements that shard's count of slot 0, 0 (the view says so):
+//     the header's "count went negative at a leave" assert at step 2.
+// Not vacuous: as the one-shard script (R = 1 on two shards: every push
+// crosses on every shard, so the per-shard cadence phase plays no part), plus:
+// in P1 the pin and the triggers are different handles of different threads
+// of one shard (the trigger's own operation's handle is h1, h2, h3, never h);
+// the helpers inside the action see hook_depth > 0, as the nested calls of the
+// one-shard script do.
+template <size_t K>
+static void per_shard_cadence_suspended_reader_body(size_t a, size_t b) {
+    using Set = CadProbeSet<K>;
+    constexpr size_t SH = 2;   // arena shards
+    const int KEY = 3, S = 259, X = 515, Y = 4, Z = 5;
+    {
+        Set set = cadenced_set<Set>(256, SH, 1);
+        ASSERT_EQ(set.get_internal_arena_shards(), SH) << "test precondition: the shard mask on_shard() places by";
+        on_shard(SH, b, [&]() {
+            const typename Set::handle hs = set.new_handle();
+            for (int k : {KEY, S, X, Y, Z}) EXPECT_TRUE(set.insert(hs, k));
+        }); // step 0, on shard b
+        expect_tuple(set, "step 0", 5, 0, 0, 0, 0, 0, 0);
+        int ran = 0, stepped_on_s = 0;
+        typename Set::handle h;
+        on_shard(SH, a, [&]() { h = set.new_handle(); });
+        ASSERT_TRUE(h) << "test precondition: the pin was not placed";
+        EXPECT_EQ(Set::get_internal_handle_shard(h), a) << "the pin's count is its joining thread's shard's";
+        EXPECT_EQ(set.get_internal_slot_counts(0), view_e(SH, a)) << "step 1, before contains(): the pin alone";
+        const typename Set::InternalCounters c0 = set.get_internal_counters();
+        ProbeKey::arm(ProbeKey::equal_hook, X, 1, [&]() {
+            ++ran;
+            on_shard(SH, b, [&]() {
+                {
+                    const typename Set::handle h1 = set.new_handle();
+                    EXPECT_TRUE(set.erase(h1, Y));
+                }
+                {
+                    const typename Set::handle h2 = set.new_handle();
+                    EXPECT_TRUE(set.erase(h2, S));
+                }
+                {
+                    const typename Set::handle h3 = set.new_handle();
+                    EXPECT_TRUE(set.erase(h3, Z));
+                }
+            }); // the triggering thread, on shard b
+            ProbeKey::arm(ProbeKey::equal_hook, S, 1, [&]() { ++stepped_on_s; });
+        }); // the equal_hook action on X
+        const bool found = set.contains(h, KEY);
+        ProbeKey::disarm_hooks();
+        const typename Set::InternalCounters c1 = set.get_internal_counters();
+        ASSERT_EQ(ran, 1) << "test precondition: the reader was not suspended at X";
+        EXPECT_EQ(stepped_on_s, 1) << "the reader did not step onto S";
+        EXPECT_TRUE(found) << "the suspended reader lost KEY";
+        EXPECT_EQ(c1.auto_reclaims - c0.auto_reclaims, 3u);
+        EXPECT_EQ(c1.bags_freed - c0.bags_freed, 0u) << "a trigger freed a bag the suspended reader pins";
+        if constexpr (K >= 4) {
+            EXPECT_EQ(c1.bumps - c0.bumps, 3u);
+            expect_tuple(set, "step 1", 2, 0, 0, 3, 0, 0, 1);
+        } else if constexpr (K == 3) {
+            EXPECT_EQ(c1.bumps - c0.bumps, 2u);
+            EXPECT_EQ(c1.ring_full - c0.ring_full, 1u);
+            expect_tuple(set, "step 1", 2, 0, 1, 2, 0, 0, 1);
+        } else {
+            EXPECT_EQ(c1.bumps - c0.bumps, 1u);
+            EXPECT_EQ(c1.ring_full - c0.ring_full, 2u);
+            expect_tuple(set, "step 1", 2, 0, 2, 1, 0, 0, 1);
+        } // K
+        EXPECT_EQ(set.get_internal_slot_counts(0), view_e(SH, a)) << "step 1, after contains(): the pin alone, on shard a";
+        AdvanceResult r{};
+        on_shard(SH, 1 - a, [&]() {
+            h = {};   // a leave on shard 1 - a's thread of a count on shard a
+            r = set.reclaim();
+        }); // step 2, on shard 1 - a
+        if constexpr (K >= 4) {
+            EXPECT_EQ(r, (AdvanceResult{3, 3, 0, 0, 0, Advance::nothing_retired})) << "step 2";
+        } else if constexpr (K == 3) {
+            EXPECT_EQ(r, (AdvanceResult{3, 3, 0, 0, 0, Advance::advanced})) << "step 2";
+        } else {
+            EXPECT_EQ(r, (AdvanceResult{3, 2, 0, 0, 0, Advance::advanced})) << "step 2";
+        } // K
+    } // the set's lifetime
+    EXPECT_EQ(ProbeKey::corrupt.load(), 0);
+} // per_shard_cadence_suspended_reader_body()
+
+TEST_F(HashRcuHookTest, PerShardCadenceSuspendedReaderPinOnTriggerShardK2) { ASSERT_NO_FATAL_FAILURE(per_shard_cadence_suspended_reader_body<2>(1, 1)); }
+TEST_F(HashRcuHookTest, PerShardCadenceSuspendedReaderPinOnTriggerShardK3) { ASSERT_NO_FATAL_FAILURE(per_shard_cadence_suspended_reader_body<3>(1, 1)); }
+TEST_F(HashRcuHookTest, PerShardCadenceSuspendedReaderPinOnTriggerShardK4) { ASSERT_NO_FATAL_FAILURE(per_shard_cadence_suspended_reader_body<4>(1, 1)); }
+TEST_F(HashRcuHookTest, PerShardCadenceSuspendedReaderPinOnTriggerShardK64) { ASSERT_NO_FATAL_FAILURE(per_shard_cadence_suspended_reader_body<64>(1, 1)); }
+TEST_F(HashRcuHookTest, PerShardCadenceSuspendedReaderPinOnOtherShardK2) { ASSERT_NO_FATAL_FAILURE(per_shard_cadence_suspended_reader_body<2>(1, 0)); }
+TEST_F(HashRcuHookTest, PerShardCadenceSuspendedReaderPinOnOtherShardK3) { ASSERT_NO_FATAL_FAILURE(per_shard_cadence_suspended_reader_body<3>(1, 0)); }
+TEST_F(HashRcuHookTest, PerShardCadenceSuspendedReaderPinOnOtherShardK4) { ASSERT_NO_FATAL_FAILURE(per_shard_cadence_suspended_reader_body<4>(1, 0)); }
+TEST_F(HashRcuHookTest, PerShardCadenceSuspendedReaderPinOnOtherShardK64) { ASSERT_NO_FATAL_FAILURE(per_shard_cadence_suspended_reader_body<64>(1, 0)); }
 
 // The cadence 0 IS the two-parameter form, with erases and literal
 // results: on each, the effective cadence reads 0; { h; insert 1; erase 1; },
@@ -6563,7 +7177,7 @@ TEST(ConcurrentHashSetRcuTest, CadenceStressManyTinySets) {
 // refused; joins retried; the after-publish hook ran.
 // Kills, probabilistically: reclaim() ignoring the flag (the only stress with
 // a reclaim() caller); a trigger releasing the flag before its final free
-// pass; a trigger whose free pass takes refs <= 1 for unpinned.
+// pass; a trigger whose free pass takes counts summing to <= 1 for unpinned.
 // The bump's exchanges moved into the publish window are left to the cadence
 // stresses above: here most explicit calls and triggers are refused or find
 // the ring full.
@@ -6620,6 +7234,533 @@ TEST_F(HashRcuHookTest, CadenceStressMixedHandlesAndCallers) {
     EXPECT_GT(all.join_retries, 0u) << "witness: no join ever retried";
     EXPECT_GT(TestHooks::after_publish.calls.load(), 0) << "witness: no publish entered its publish-to-free-pass window";
 } // CadenceStressMixedHandlesAndCallers
+
+// ===========================================================================
+// PER-SHARD HANDLE COUNTS, white-box.
+//
+// Each generation's live-handle count is one count per arena shard; a join
+// increments the joining thread's shard's count, the handle records that count
+// and carries it through moves and swaps, every leave of it decrements it
+// wherever the leave runs, a refresh() that returns true is a new join on the
+// refreshing thread's shard, and the free pass frees a bag only when every one
+// of its counts reads 0 (PER-SHARD PLACEMENT, above the hook scripts, says how
+// these tests place roles on shards and read the per-shard views; the
+// per-shard copies of the hook scripts and of the two suspended-reader
+// scripts sit beside their one-shard originals).
+// The tests below put a pin, a joiner, an advancer, a mover, a refresher and a
+// destroyer on DIFFERENT shards, every one on a placed helper thread (the test
+// thread runs no per-shard role), and read the per-shard views where a sum
+// would be blind. Every test with a pin has an advancer on a shard other than
+// the pin's (in PerShardPinSweep, the pairs with p != a; it also runs p == a),
+// so that a free pass reading only the flag holder's own count dies there too.
+// Each test says which defects it kills and
+// by which oracle; defects that misplace a -1 die by the per-shard view, by
+// get_internal_handle_shard(), by "freed after the release" counts, or by the
+// header's "count went negative at a leave" assert at that -1 (each view is
+// asserted before the leave that would expose it).
+// ===========================================================================
+
+// The deletable int set every test below uses (the ring of 64 generations).
+using PerShardSet = ConcurrentResizableHashSetRCU<int, true>;
+
+// Retires key `k` on the calling thread: an insert and an erase under a handle
+// of its own, released before the return (so the caller's next advance() sees
+// no handle of this thread).
+template <typename SetT>
+static void per_shard_retire(SetT& set, int k) {
+    const typename SetT::handle h = set.new_handle();
+    EXPECT_TRUE(set.insert(h, k));
+    EXPECT_TRUE(set.erase(h, k));
+} // per_shard_retire()
+
+// The free pass against a pin on every shard, from an advancer on every shard:
+// S = 4, a fresh Set(256, 4) per pair (p, a). P is joined on a helper of shard
+// p (generation 0); on a helper of shard a, one node is retired and advance()
+// runs: {0,0,0,advanced} (the bag is pinned), slot 0's view one count on shard
+// p; then, on a helper of shard a, P is released and advance() runs:
+// {1,1,0,nothing_retired} (freed after the release), slot 0's view all zero.
+// Kills: a free pass that reads only shard 0's count (p != 0), only the
+// advancer's own shard's (p != a), skips the last shard's count (p = 3), or
+// frees when ANY count is 0 (every pair: the other three are 0), or that
+// ignores the counts (every pair): the first call frees the pinned bag; a leave
+// on the LEAVING thread's shard instead of the recorded one (p != a: shard a's
+// count of slot 0 is 0 at P's release, the "count went negative at a leave"
+// assert). The pairs with p >= 1 are the free pass stopping at a nonzero count
+// on a shard after the first.
+TEST(ConcurrentHashSetRcuTest, PerShardPinSweep) {
+    constexpr size_t SH = 4;   // arena shards
+    for (size_t p = 0; p < SH; ++p) {
+        for (size_t a = 0; a < SH; ++a) {
+            const std::string where = "pin on shard " + std::to_string(p) + ", advancer on shard " + std::to_string(a);
+            PerShardSet set(256, SH);
+            ASSERT_EQ(set.get_internal_arena_shards(), SH) << "test precondition: the shard mask on_shard() places by";
+            PerShardSet::handle P;
+            on_shard(SH, p, [&]() { P = set.new_handle(); });
+            AdvanceResult r1{}, r2{};
+            on_shard(SH, a, [&]() {
+                per_shard_retire(set, 1);
+                r1 = set.advance();
+            }); // retire and advance on shard a
+            expect_advance(r1, 0, 0, 0, Advance::advanced, where + ": the bag P pins must be kept");
+            EXPECT_EQ(set.get_internal_slot_counts(0), view_e(SH, p)) << where << ": P's count is shard p's";
+            on_shard(SH, a, [&]() {
+                P = {};
+                r2 = set.advance();
+            }); // release and advance on shard a
+            EXPECT_EQ(set.get_internal_slot_counts(0), view_0(SH)) << where << ": P's release must leave its own count";
+            expect_advance(r2, 1, 1, 0, Advance::nothing_retired, where + ": freed after the release");
+        } // advancer shards
+    } // pin shards
+} // PerShardPinSweep
+
+// The minimum ring (K = 2) on two shards, filled under a never-refreshed pin on
+// the shard the advancer is not on: P joined on a helper of shard 1; on a
+// helper of shard 0, retire and advance() ({0,0,0,advanced}: bag 0 kept), then
+// retire and advance() again: {0,0,0,ring_full} -- the next slot is bag 0's,
+// and the in-wrap pass stops on P's count on shard 1 --, tuple (0,0,1,1,0,0,1),
+// ring [S1/1 C0] o=0 c=1, slot 0's view one count on shard 1. Then, on shard 0,
+// P released and advance(): {2,2,0,advanced} (the in-wrap pass frees bag 0, the
+// bump bags the second node, the final pass frees it).
+// Kills, through the in-wrap pass (ring_full is decided there): a free pass that
+// reads only shard 0's count, only the advancer's (0), skips the last shard's
+// (S = 2: reads shard 0 only), or frees on ANY zero count (the first call frees
+// bag 0, and the second is `advanced`, not ring_full); a leave on the leaving
+// thread's shard (P released on shard 0: shard 0's count of slot 0 is 0, the
+// "count went negative at a leave" assert).
+TEST(ConcurrentHashSetRcuTest, PerShardRingFullUnderPinOnOtherShardK2) {
+    using Set = ConcurrentResizableHashSetRCU<int, true, std::hash<int>, 2>;
+    constexpr size_t SH = 2, PIN = 1, ADV = 0;   // shards; the pin's shard; the advancer's
+    Set set(256, SH);
+    ASSERT_EQ(set.get_internal_arena_shards(), SH) << "test precondition: the shard mask on_shard() places by";
+    Set::handle P;
+    on_shard(SH, PIN, [&]() { P = set.new_handle(); });
+    AdvanceResult r1{}, r2{}, r3{};
+    on_shard(SH, ADV, [&]() {
+        per_shard_retire(set, 1);
+        r1 = set.advance();
+        per_shard_retire(set, 2);
+        r2 = set.advance();
+    }); // the two calls that fill the ring, on shard ADV
+    expect_advance(r1, 0, 0, 0, Advance::advanced, "r1: bag 0 pinned by P's count on shard 1");
+    expect_advance(r2, 0, 0, 0, Advance::ring_full, "r2: the in-wrap pass stops on P's count on shard 1");
+    expect_tuple(set, "after r2", 0, 0, 1, 1, 0, 0, 1);
+    EXPECT_EQ(ring_string(set), ring_expect(2, "S1/1 C0", 0, 1)) << "after r2";
+    EXPECT_EQ(set.get_internal_slot_counts(0), view_e(SH, PIN)) << "after r2: P alone pins bag 0, on shard 1";
+    on_shard(SH, ADV, [&]() {
+        P = {};
+        r3 = set.advance();
+    }); // release and advance on shard ADV
+    expect_advance(r3, 2, 2, 0, Advance::advanced, "r3: the in-wrap pass frees bag 0, the bump bags the second node, the final pass frees it");
+    expect_tuple(set, "after r3", 0, 0, 0, 0, 2, 0, 0);
+} // PerShardRingFullUnderPinOnOtherShardK2
+
+// The positive oracle of the join counters, which are sums over the shards'
+// per-shard counters: every other test asserts only that `joins` did NOT move.
+// S = 4, a fresh set: advance() on a helper of shard 3 (the last) returns
+// nothing_retired (it walked) with `joins` +1 (its walk's handle joined, on the
+// advancer's shard) and `join_retries` +0; then a new_handle() and its release
+// on a helper of shard 3 and on one of shard 1: `joins` +2.
+// Kills: `joins` summed over shard 0 only, or without the last shard (every
+// join here is on shard 3 or 1: the deltas read 0); advance()'s walk without a
+// handle (`joins` +0 at the first step); the walk's handle holding its block
+// with a null count (the header's "both null or both set" assert at the walk's
+// end).
+TEST(ConcurrentHashSetRcuTest, PerShardAdvanceJoinsOnAdvancerShard) {
+    constexpr size_t SH = 4;   // arena shards
+    PerShardSet set(256, SH);
+    ASSERT_EQ(set.get_internal_arena_shards(), SH) << "test precondition: the shard mask on_shard() places by";
+    const PerShardSet::InternalCounters c0 = set.get_internal_counters();
+    AdvanceResult r{};
+    on_shard(SH, SH - 1, [&]() { r = set.advance(); });
+    EXPECT_EQ(r.advance, Advance::nothing_retired) << "a fresh set's advance(): it walked";
+    const PerShardSet::InternalCounters c1 = set.get_internal_counters();
+    EXPECT_EQ(c1.joins - c0.joins, 1u) << "advance()'s walk joins once, on the advancer's shard (3)";
+    EXPECT_EQ(c1.join_retries - c0.join_retries, 0u);
+    on_shard(SH, SH - 1, [&]() { const PerShardSet::handle h = set.new_handle(); });
+    on_shard(SH, 1, [&]() { const PerShardSet::handle h = set.new_handle(); });
+    const PerShardSet::InternalCounters c2 = set.get_internal_counters();
+    EXPECT_EQ(c2.joins - c1.joins, 2u) << "one join on shard 3, one on shard 1";
+    EXPECT_EQ(c2.join_retries - c1.join_retries, 0u);
+} // PerShardAdvanceJoinsOnAdvancerShard
+
+// A handle has no thread affinity, across shards: the two-shard copy of
+// ContractHandleUsedAndDestroyedOnOtherThreads. S = 2, 4096 buckets: h made on
+// a helper of shard 0; used for 100 insert/contains/erase triples on a helper
+// of shard 1 (100 retirements, nothing left live); advance() on shard 1:
+// {0,0,0,advanced} (h pins the bag), slot 0's view one count on shard 0; h
+// destroyed on a helper of shard 1: handle_refs 0, slot 0's view all zero;
+// advance() on shard 1: {100,1,0,nothing_retired}.
+// Kills: a leave on the LEAVING thread's shard instead of the recorded one (h's
+// destruction on shard 1 decrements shard 1's count of slot 0, which is 0: the
+// "count went negative at a leave" assert); a join that records another shard's
+// count than the one it incremented (the view stays one count on shard 0, and
+// the destruction decrements shard 1's, 0: the same assert); a move constructor
+// that drops the count (make_unique moves the handle: the "both null or both
+// set" assert, or the operation's membership assert); a free pass that reads
+// only the advancer's own count (shard 1: the first call frees under h).
+TEST(ConcurrentHashSetRcuTest, PerShardContractHandleUsedAndDestroyedOnOtherThreads) {
+    constexpr int kKeys = 100;
+    constexpr size_t SH = 2;   // arena shards
+    PerShardSet set(4096, SH);
+    ASSERT_EQ(set.get_internal_arena_shards(), SH) << "test precondition: the shard mask on_shard() places by";
+    std::unique_ptr<PerShardSet::handle> h;
+    on_shard(SH, 0, [&]() { h = std::make_unique<PerShardSet::handle>(set.new_handle()); });
+    ASSERT_TRUE(h && *h) << "test precondition: h was not made";
+    int errors = 0;
+    on_shard(SH, 1, [&]() {
+        for (int k = 0; k < kKeys; ++k) {
+            if (!set.insert(*h, k)) ++errors;
+            if (!set.contains(*h, k)) ++errors;
+            if (!set.erase(*h, k)) ++errors;
+        } // loop over the keys
+    }); // the user, on shard 1
+    EXPECT_EQ(errors, 0);
+    AdvanceResult r{};
+    on_shard(SH, 1, [&]() { r = set.advance(); });
+    expect_advance(r, 0, 0, 0, Advance::advanced, "the bag h pins must be kept");
+    EXPECT_EQ(set.get_internal_slot_counts(0), view_e(SH, 0)) << "h's count is its joining thread's shard's (0)";
+    on_shard(SH, 1, [&]() { h.reset(); });
+    EXPECT_EQ(set.get_internal_accounting().handle_refs, 0);
+    EXPECT_EQ(set.get_internal_slot_counts(0), view_0(SH)) << "h's destruction on shard 1 must leave shard 0's count";
+    on_shard(SH, 1, [&]() { r = set.advance(); });
+    expect_advance(r, kKeys, 1, 0, Advance::nothing_retired, "freed after the destruction");
+} // PerShardContractHandleUsedAndDestroyedOnOtherThreads
+
+// A handle moved to another shard's thread and refreshed there. S = 2: h joined
+// on a helper of shard 0; on a helper of shard 1 it is move-constructed into
+// `moved`: moved's count is still shard 0's, slot 0's view one count on shard
+// 0; on shard 1, a retire and advance(): {0,0,0,advanced} (moved pins bag 0);
+// on shard 1, moved->refresh() returns true: moved is now of generation 1 with
+// its count on shard 1 (the refresh joined on the refreshing thread's shard and
+// left the old count, shard 0's), slot 0's view all zero, slot 1's one count
+// on shard 1; advance() on shard 1: {1,1,0,nothing_retired} (bag 0 freed after
+// the refresh); moved destroyed on a helper of shard 0: slot 1's view all zero,
+// handle_refs 0.
+// Kills: a move constructor that recomputes the count on the moving thread's
+// shard instead of carrying it (moved's shard reads 1 at once; the refresh's
+// leave of the old membership then decrements shard 1's count of slot 0, 0:
+// the "count went negative at a leave" assert); one that drops the count (the
+// "both null or both set" assert, or the membership assert at the refresh); a
+// refresh() that keeps the old recorded count after its join (slot 0's view
+// stays one count on shard 0 and bag 0 is not freed); one whose leave of the
+// old membership decrements the NEW count (slot 1's view is all zero under
+// moved, and moved's destruction drives it negative: the assert); a swap that
+// exchanges the blocks only (refresh() swaps the new membership in: moved holds
+// the new block with the old count, the same symptoms); a leave on the
+// LEAVING thread's shard (the refresh's leave runs on shard 1: shard 1's count
+// of slot 0 is 0, the assert); a free pass that reads only the advancer's own
+// count (shard 1: the first call frees under moved).
+TEST(ConcurrentHashSetRcuTest, PerShardMovedHandleRefreshedOnOtherShard) {
+    constexpr size_t SH = 2;   // arena shards
+    PerShardSet set(256, SH);
+    ASSERT_EQ(set.get_internal_arena_shards(), SH) << "test precondition: the shard mask on_shard() places by";
+    PerShardSet::handle h;
+    on_shard(SH, 0, [&]() { h = set.new_handle(); });
+    std::unique_ptr<PerShardSet::handle> moved;
+    on_shard(SH, 1, [&]() { moved = std::make_unique<PerShardSet::handle>(std::move(h)); });
+    EXPECT_FALSE(h) << "a moved-from handle is empty";
+    ASSERT_TRUE(moved && *moved) << "test precondition: the move did not happen";
+    EXPECT_EQ(PerShardSet::get_internal_handle_shard(*moved), 0u) << "the move constructor carries the count";
+    EXPECT_EQ(set.get_internal_slot_counts(0), view_e(SH, 0));
+    AdvanceResult r{};
+    on_shard(SH, 1, [&]() {
+        per_shard_retire(set, 1);
+        r = set.advance();
+    }); // retire and advance on shard 1
+    expect_advance(r, 0, 0, 0, Advance::advanced, "bag 0 pinned by the moved handle's count on shard 0");
+    bool refreshed = false;
+    on_shard(SH, 1, [&]() { refreshed = moved->refresh(); });
+    EXPECT_TRUE(refreshed) << "the generation moved: the refresh must take the slow path";
+    EXPECT_EQ(PerShardSet::get_internal_handle_generation(*moved), 1u);
+    EXPECT_EQ(PerShardSet::get_internal_handle_shard(*moved), 1u) << "the refresh joined on the refreshing thread's shard";
+    EXPECT_EQ(set.get_internal_slot_counts(0), view_0(SH)) << "the refresh must leave the old count (shard 0's)";
+    EXPECT_EQ(set.get_internal_slot_counts(1), view_e(SH, 1)) << "the refreshed membership, on shard 1";
+    on_shard(SH, 1, [&]() { r = set.advance(); });
+    expect_advance(r, 1, 1, 0, Advance::nothing_retired, "bag 0 freed after the refresh");
+    on_shard(SH, 0, [&]() { moved.reset(); });
+    EXPECT_EQ(set.get_internal_slot_counts(1), view_0(SH)) << "the destruction on shard 0 must leave shard 1's count";
+    EXPECT_EQ(set.get_internal_accounting().handle_refs, 0);
+} // PerShardMovedHandleRefreshedOnOtherShard
+
+// Move assignment over a LIVE handle, across shards. S = 4, so that the target,
+// the source and the assigning thread are three different shards: T joined on
+// a helper of shard 1 (generation 0); on shard 0, a retire and advance():
+// {0,0,0,advanced} (T pins bag 0); X joined on a helper of shard 2 (generation
+// 1): slot 0's view one count on shard 1, slot 1's one on shard 2; on a helper
+// of shard 3, `*T = std::move(X)`: X empty, T of generation 1 with X's count
+// (shard 2), slot 0's view all zero (T's old membership left), slot 1's still
+// one count on shard 2; advance() on shard 0: {1,1,0,nothing_retired}; T
+// destroyed on a helper of shard 0: slot 1's view all zero.
+// Kills: move assignment that recomputes the taken count on the assigning
+// thread's shard (T's shard reads 3; T's destruction decrements shard 3's
+// count of slot 1, 0: the "count went negative at a leave" assert); one that
+// leaves the target's old membership with the SOURCE's count (slot 0's view
+// stays one count on shard 1, slot 1's drops to zero under T, bag 0 is not
+// freed; then the assert at T's destruction); one that drops the count (the
+// "both null or both set" assert at T's destruction); a leave on the LEAVING
+// thread's shard (the assignment's leave of T's old count runs on shard 3:
+// shard 3's count of slot 0 is 0, the assert); a free pass that reads only the
+// advancer's own count (shard 0: the first call frees under T).
+TEST(ConcurrentHashSetRcuTest, PerShardMoveAssignOverLiveHandleAcrossShards) {
+    constexpr size_t SH = 4;   // arena shards
+    PerShardSet set(256, SH);
+    ASSERT_EQ(set.get_internal_arena_shards(), SH) << "test precondition: the shard mask on_shard() places by";
+    std::unique_ptr<PerShardSet::handle> T;
+    on_shard(SH, 1, [&]() { T = std::make_unique<PerShardSet::handle>(set.new_handle()); });
+    ASSERT_TRUE(T && *T) << "test precondition: T was not made";
+    AdvanceResult r{};
+    on_shard(SH, 0, [&]() {
+        per_shard_retire(set, 1);
+        r = set.advance();
+    }); // retire and advance on shard 0
+    expect_advance(r, 0, 0, 0, Advance::advanced, "bag 0 pinned by T's count on shard 1");
+    PerShardSet::handle X;
+    on_shard(SH, 2, [&]() { X = set.new_handle(); });
+    EXPECT_EQ(set.get_internal_slot_counts(0), view_e(SH, 1)) << "T's membership";
+    EXPECT_EQ(set.get_internal_slot_counts(1), view_e(SH, 2)) << "X's membership";
+    on_shard(SH, 3, [&]() { *T = std::move(X); });
+    EXPECT_FALSE(X) << "a moved-from handle is empty";
+    EXPECT_EQ(PerShardSet::get_internal_handle_generation(*T), 1u);
+    EXPECT_EQ(PerShardSet::get_internal_handle_shard(*T), 2u) << "the assignment carries the source's count";
+    EXPECT_EQ(set.get_internal_slot_counts(0), view_0(SH)) << "the target must leave its own old count (shard 1's)";
+    EXPECT_EQ(set.get_internal_slot_counts(1), view_e(SH, 2)) << "the source's membership, now T's";
+    on_shard(SH, 0, [&]() { r = set.advance(); });
+    expect_advance(r, 1, 1, 0, Advance::nothing_retired, "bag 0 freed after the assignment left it");
+    on_shard(SH, 0, [&]() { T.reset(); });
+    EXPECT_EQ(set.get_internal_slot_counts(1), view_0(SH)) << "the destruction on shard 0 must leave shard 2's count";
+    EXPECT_EQ(set.get_internal_accounting().handle_refs, 0);
+} // PerShardMoveAssignOverLiveHandleAcrossShards
+
+// swap() of two live handles that differ in generation AND in shard. S = 2: a
+// joined on a helper of shard 0 (generation 0); on shard 1, a retire and
+// advance(): {0,0,0,advanced}; b joined on a helper of shard 1 (generation
+// 1); on shard 1, a retire and advance(): {0,0,0,advanced} (bag 1 behind the
+// pinned bag 0); a->swap(*b) on the test thread (a swap reads no thread's
+// shard): a is of generation 1 with its count on shard 1, b of generation 0 on
+// shard 0, slot 0's view one count on shard 0, slot 1's one on shard 1. b (now
+// generation 0's holder) destroyed on a helper of shard 1, advance() on shard
+// 1: {1,1,0,nothing_retired} (bag 0 only: bag 1 is a's); a destroyed on a
+// helper of shard 0, advance() on shard 0: {1,1,0,nothing_retired}.
+// Kills: a swap that exchanges the blocks but not the counts (each count stays
+// balanced, but the pins move with the wrong handle: after b's release bag 0's
+// count on shard 0 is still 1 (a's), so bag 0 is NOT freed after its holder's
+// release; a's shard reads 0); a swap that leaves the target's count null
+// ("both null or both set" at a leave); a leave on the LEAVING thread's shard
+// (b's release on shard 1 decrements shard 1's count of slot 0, 0: the "count
+// went negative at a leave" assert); a free pass that reads only the
+// advancer's own count (shard 1: the first call frees bag 0 under a).
+TEST(ConcurrentHashSetRcuTest, PerShardSwapAcrossGenerationsAndShards) {
+    constexpr size_t SH = 2;   // arena shards
+    PerShardSet set(256, SH);
+    ASSERT_EQ(set.get_internal_arena_shards(), SH) << "test precondition: the shard mask on_shard() places by";
+    std::unique_ptr<PerShardSet::handle> a, b;
+    on_shard(SH, 0, [&]() { a = std::make_unique<PerShardSet::handle>(set.new_handle()); });
+    AdvanceResult r{};
+    on_shard(SH, 1, [&]() {
+        per_shard_retire(set, 1);
+        r = set.advance();
+    }); // retire and advance on shard 1
+    expect_advance(r, 0, 0, 0, Advance::advanced, "bag 0 pinned by a's count on shard 0");
+    on_shard(SH, 1, [&]() { b = std::make_unique<PerShardSet::handle>(set.new_handle()); });
+    on_shard(SH, 1, [&]() {
+        per_shard_retire(set, 2);
+        r = set.advance();
+    }); // retire and advance on shard 1
+    expect_advance(r, 0, 0, 0, Advance::advanced, "bag 1 behind the pinned bag 0");
+    ASSERT_TRUE(a && *a && b && *b) << "test precondition: a and b were not made";
+    a->swap(*b);
+    EXPECT_EQ(PerShardSet::get_internal_handle_generation(*a), 1u);
+    EXPECT_EQ(PerShardSet::get_internal_handle_shard(*a), 1u) << "the swap exchanges the counts with the blocks";
+    EXPECT_EQ(PerShardSet::get_internal_handle_generation(*b), 0u);
+    EXPECT_EQ(PerShardSet::get_internal_handle_shard(*b), 0u) << "the swap exchanges the counts with the blocks";
+    EXPECT_EQ(set.get_internal_slot_counts(0), view_e(SH, 0));
+    EXPECT_EQ(set.get_internal_slot_counts(1), view_e(SH, 1));
+    on_shard(SH, 1, [&]() {
+        b.reset();   // the holder of generation 0 now
+        r = set.advance();
+    }); // release and advance on shard 1
+    expect_advance(r, 1, 1, 0, Advance::nothing_retired, "bag 0 freed after its holder's release");
+    on_shard(SH, 0, [&]() {
+        a.reset();
+        r = set.advance();
+    }); // release and advance on shard 0
+    expect_advance(r, 1, 1, 0, Advance::nothing_retired, "bag 1 freed after its holder's release");
+    EXPECT_EQ(set.get_internal_accounting().handle_refs, 0);
+} // PerShardSwapAcrossGenerationsAndShards
+
+// THE RESUME INDEX. The free pass checks a bag's counts starting at the shard
+// that stopped the previous scan of the same bag (the flag holder's resume
+// index), wrapping over all S shards; a nonzero count stores its shard as the
+// index and stops the pass; the index goes back to 0 when the oldest bag is
+// freed. No accessor reads the index, so these tests see it only through what
+// each scan frees. Each step's advance() runs on a placed helper.
+
+// A stop on shard 2, then a scan resumed at shard 2. S = 4, P joined on a
+// helper of shard 2 (generation 0); on shard 0, a retire and advance():
+// {0,0,0,advanced} (the scan stops at shard 2, the index becomes 2); on shard 0,
+// a retire and advance() again: {0,0,0,advanced} (the scan resumes at shard 2
+// and stops there), slot 0's view one count on shard 2; on shard 0, P released
+// and advance(): {2,2,0,nothing_retired} (both bags).
+// Kills: a resumed scan that starts one shard AFTER the index (it never reads
+// shard 2's count, and the second call frees bag 0 under P: {1,1,0,advanced});
+// a free pass that reads only shard 0's count, only the advancer's own (0), or
+// frees when ANY count is 0, or ignores the counts (the first call frees under
+// P); the non-cumulative free pass (the second call frees bag 1 past the pinned
+// bag 0).
+TEST(ConcurrentHashSetRcuTest, PerShardResumeRepeatedStop) {
+    constexpr size_t SH = 4;   // arena shards
+    PerShardSet set(256, SH);
+    ASSERT_EQ(set.get_internal_arena_shards(), SH) << "test precondition: the shard mask on_shard() places by";
+    PerShardSet::handle P;
+    on_shard(SH, 2, [&]() { P = set.new_handle(); });
+    AdvanceResult r1{}, r2{}, r3{};
+    on_shard(SH, 0, [&]() {
+        per_shard_retire(set, 1);
+        r1 = set.advance();
+        per_shard_retire(set, 2);
+        r2 = set.advance();
+    }); // two retire-and-advance steps on shard 0
+    expect_advance(r1, 0, 0, 0, Advance::advanced, "the first scan stops at P's count on shard 2");
+    expect_advance(r2, 0, 0, 0, Advance::advanced, "the scan resumed at shard 2 stops there again");
+    EXPECT_EQ(set.get_internal_slot_counts(0), view_e(SH, 2)) << "P alone pins bag 0, on shard 2";
+    on_shard(SH, 0, [&]() {
+        P = {};
+        r3 = set.advance();
+    }); // release and advance on shard 0
+    expect_advance(r3, 2, 2, 0, Advance::nothing_retired, "both bags freed after the release");
+} // PerShardResumeRepeatedStop
+
+// The index across bags: the reset when the oldest bag is freed, and the wrap.
+// S = 2: P1 joined on a helper of shard 1 (generation 0); on shard 0, a retire
+// and advance(): {0,0,0,advanced} (bag 0 stopped by shard 1: the index is 1);
+// P0 joined on a helper of shard 0 (generation 1); on shard 0, a retire and
+// advance(): {0,0,0,advanced} (bag 0 still stopped by shard 1, the scan
+// resumed there); on shard 1, P1 released and advance():
+// {1,1,0,nothing_retired} (bag 0 freed -- its scan reads shard 1, then wraps
+// to shard 0 --, the index reset, bag 1 stopped by P0's count on shard 0), slot
+// 1's view one count on shard 0; on shard 0, P0 released and advance():
+// {1,1,0,nothing_retired}.
+// Kills: a pass with neither the reset nor the wrap (bag 1's scan starts at the
+// stale index 1 and never reads shard 0: it frees bag 1 under P0,
+// {2,2,0,nothing_retired}); this test is that defect's ONLY killer (either
+// guard alone keeps the pass sound: within one bag's life a count that read 0
+// stays 0 for live memberships). Also a resumed scan that starts after the
+// index, or that wraps one shard short (the first scan of bag 0 never reads
+// shard 1), and the free pass reading only shard 0's count, only the
+// advancer's, skipping the last shard's, or freeing on any zero count.
+TEST(ConcurrentHashSetRcuTest, PerShardResumeIndexAcrossBags) {
+    constexpr size_t SH = 2;   // arena shards
+    PerShardSet set(256, SH);
+    ASSERT_EQ(set.get_internal_arena_shards(), SH) << "test precondition: the shard mask on_shard() places by";
+    PerShardSet::handle P1, P0;
+    AdvanceResult r{};
+    on_shard(SH, 1, [&]() { P1 = set.new_handle(); });
+    on_shard(SH, 0, [&]() {
+        per_shard_retire(set, 1);
+        r = set.advance();
+    }); // retire and advance on shard 0
+    expect_advance(r, 0, 0, 0, Advance::advanced, "bag 0 stopped by P1's count on shard 1");
+    on_shard(SH, 0, [&]() { P0 = set.new_handle(); });
+    ASSERT_TRUE(P0) << "test precondition: P0 was not made";
+    EXPECT_EQ(PerShardSet::get_internal_handle_generation(P0), 1u) << "test precondition: P0 pins bag 1, not bag 0";
+    on_shard(SH, 0, [&]() {
+        per_shard_retire(set, 2);
+        r = set.advance();
+    }); // retire and advance on shard 0
+    expect_advance(r, 0, 0, 0, Advance::advanced, "bag 0 still stopped by shard 1 (the resumed scan)");
+    on_shard(SH, 1, [&]() {
+        P1 = {};
+        r = set.advance();
+    }); // release and advance on shard 1
+    expect_advance(r, 1, 1, 0, Advance::nothing_retired, "bag 0 freed; bag 1 stopped by P0's count on shard 0");
+    EXPECT_EQ(set.get_internal_slot_counts(1), view_e(SH, 0)) << "P0 alone pins bag 1, on shard 0";
+    on_shard(SH, 0, [&]() {
+        P0 = {};
+        r = set.advance();
+    }); // release and advance on shard 0
+    expect_advance(r, 1, 1, 0, Advance::nothing_retired, "bag 1 freed after the release");
+} // PerShardResumeIndexAcrossBags
+
+// A pin moving between shards across scans of one bag. S = 4: P1 joined on a
+// helper of shard 1 and P3 on one of shard 3 (generation 0); on shard 0, a
+// retire and advance(): {0,0,0,advanced} (stop at shard 1); P1 released on
+// shard 1; on shard 0, a retire and advance(): {0,0,0,advanced} (the scan
+// resumes at shard 1 and moves on to stop at shard 3), slot 0's view one count
+// on shard 3; P3 released on shard 3; advance() on shard 0:
+// {2,2,0,nothing_retired}.
+// Kills: a free pass that skips the last shard's count (P3's, after P1 left:
+// the second call frees bag 0 under P3), reads only shard 0's count, only the
+// advancer's, frees on any zero count, or ignores the counts; the
+// non-cumulative free pass (the second call frees bag 1 past the pinned bag
+// 0). No resume-index defect is designated here: within one bag's life pins
+// only leave, so every resumed order is sound; the test covers the index
+// moving to a later shard.
+TEST(ConcurrentHashSetRcuTest, PerShardResumePinMovesAcrossScans) {
+    constexpr size_t SH = 4;   // arena shards
+    PerShardSet set(256, SH);
+    ASSERT_EQ(set.get_internal_arena_shards(), SH) << "test precondition: the shard mask on_shard() places by";
+    PerShardSet::handle P1, P3;
+    AdvanceResult r{};
+    on_shard(SH, 1, [&]() { P1 = set.new_handle(); });
+    on_shard(SH, 3, [&]() { P3 = set.new_handle(); });
+    on_shard(SH, 0, [&]() {
+        per_shard_retire(set, 1);
+        r = set.advance();
+    }); // retire and advance on shard 0
+    expect_advance(r, 0, 0, 0, Advance::advanced, "the first scan stops at P1's count on shard 1");
+    on_shard(SH, 1, [&]() { P1 = {}; });
+    on_shard(SH, 0, [&]() {
+        per_shard_retire(set, 2);
+        r = set.advance();
+    }); // retire and advance on shard 0
+    expect_advance(r, 0, 0, 0, Advance::advanced, "the scan resumed at shard 1 stops at P3's count on shard 3");
+    EXPECT_EQ(set.get_internal_slot_counts(0), view_e(SH, 3)) << "P3 alone pins bag 0, on shard 3";
+    on_shard(SH, 3, [&]() { P3 = {}; });
+    on_shard(SH, 0, [&]() { r = set.advance(); });
+    expect_advance(r, 2, 2, 0, Advance::nothing_retired, "both bags freed after the releases");
+} // PerShardResumePinMovesAcrossScans
+
+// Moved handles under stress (advance_stress_body() with
+// StressShape::hand_over): four writers, numbered one at a time so that they
+// sit on the four DISTINCT shards of a four-shard set, hand live handles to one
+// another through mailboxes beside a reader and an advancer, for one second.
+// Every iteration a writer takes at most one handle another writer left for it,
+// runs a lookup of a stable key under it (an exact oracle under a membership
+// joined on another thread), and then swaps it with its own long-lived handle,
+// move-assigns it over that live handle, refreshes it on its own thread, or
+// keeps it as is; then it hands the handle on to another writer or destroys it
+// on its own thread; and on average every fourth iteration it gives a fresh
+// handle, joined on its own shard, to another writer. Its own inserts and
+// erases run under whatever membership its long-lived handle holds by then
+// (often one joined on another shard), refreshed every iteration on its own
+// thread. So joins, moves, swaps, refreshes and leaves of one membership run on
+// different shards' threads all the time, beside free passes.
+// Witnesses: handovers whose received handle's count is on another shard than
+// the receiving writer's (get_internal_handle_shard() against the receiver's
+// shard); a received handle was swapped with a live one, move-assigned over a
+// live one, refreshed with a true result (the slow path), and destroyed by its
+// receiver (the disposal after the receiving action, when it is not handed on);
+// bags were freed during the run.
+// Oracles: advance_stress_body()'s (every writer's and reader's determined
+// booleans, the exact end state with every handle gone, membership), the
+// header's "count went negative" asserts at every -1, and the destructor's
+// every-count-0 assert. Not a designated killer of any one defect: the
+// deterministic tests above are; this is a rates test for the defects that only
+// a race can show (a count reset when a slot is recycled, a relaxed leave under
+// TSan).
+TEST(ConcurrentHashSetRcuTest, PerShardStressMovedHandles) {
+    using Set = ConcurrentResizableHashSetRCU<int, true>;
+    StressShape shape{4, 1, 1, false, 4, 1024, 64, 256, std::chrono::milliseconds(1000), true};
+    shape.hand_over = true;
+    StressWitness w;
+    ASSERT_NO_FATAL_FAILURE(advance_stress_body<Set>(shape, "moved handles", w));
+    EXPECT_GT(w.handovers_cross_shard, 0u) << "witness: no handle was received on another shard than the one it was joined on";
+    EXPECT_GT(w.handover_swaps, 0u) << "witness: no received handle was swapped with a live one";
+    EXPECT_GT(w.handover_move_assigns, 0u) << "witness: no received handle was move-assigned over a live one";
+    EXPECT_GT(w.handover_refreshes, 0u) << "witness: no received handle was refreshed (slow path) by its receiver";
+    EXPECT_GT(w.handover_destroys, 0u) << "witness: no received handle was destroyed by its receiver";
+    EXPECT_GT(w.bags_freed, 0u) << "witness: no bag was freed during the run";
+} // PerShardStressMovedHandles
 
 // ===========================================================================
 // CONTRACT TESTS: handles, generations and advance() through the public
@@ -6947,7 +8088,8 @@ static size_t contract_pending_bags(const SetT& set) {
 } // contract_pending_bags()
 
 // The live-handle count of generation `gen` in the ring (the ring-state
-// view), or -1 if no non-EMPTY slot has that generation.
+// view's, the sum of the slot's per-shard counts), or -1 if no non-EMPTY slot
+// has that generation.
 template <typename SetT>
 static long contract_refs_of(const SetT& set, uint64_t gen) {
     const typename SetT::InternalRingState ring = set.get_internal_ring_state();
@@ -7143,7 +8285,7 @@ TEST(ConcurrentHashSetRcuTest, ContractHandleSpecialMembersDeclared) {
     static_assert(!std::is_same_v<H, ContractSetK<3>::handle>);                         // a type per instantiation
     static_assert(!std::is_constructible_v<H, ContractSetK<3>::handle&&>);
 #ifdef NDEBUG
-    static_assert(sizeof(H) == sizeof(void*));                                          // one pointer, release builds only
+    static_assert(sizeof(H) == 2*sizeof(void*));                                        // two pointers (the block and the per-shard count), release builds only
 #endif
     SUCCEED();
 } // ContractHandleSpecialMembersDeclared

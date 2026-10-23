@@ -100,13 +100,13 @@
 
 namespace concurrent_hash_rcu_detail {
 // Process-wide sequential thread numbering, shared by every instantiation of
-// ConcurrentResizableHashSetRCU: a thread gets its number at its first join or
-// first shard use, whichever comes first -- a join being new_handle(),
-// refresh()'s slow path or advance()'s walk, a shard use an allocation, a
-// retire or limbo push, or a split's or an unlink's counters (or a direct call
-// of this function) -- and the number never changes. Every per-shard choice of
-// the set is `thread_number() & arena_mask_`: the arena shard a thread appends
-// to and pops from first, and the per-shard live-handle count its join
+// ConcurrentResizableHashSetRCU: a thread gets its number at its first join
+// (new_handle(), refresh()'s slow path or advance()'s walk) or its first shard
+// use (an allocation, a retire or limbo push, or a split's or an unlink's
+// counters), whichever comes first, or at a direct call of this function
+// before either; the number never changes. Every per-shard choice of the set
+// is `thread_number() & arena_mask_`: the arena shard a thread appends to and
+// pops from before it steals, and the per-shard live-handle count its join
 // increments (THE RING in the class overview). Sequential (not hashed) on
 // purpose: threads started together get consecutive numbers, so `number mod
 // shards` spreads a batch of up to `shards` threads over distinct arena shards
@@ -423,23 +423,23 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   apply to it as to any other throw. What CAN throw here is the user's
 //   code -- T's copy constructor, copy assignment and operator==, and
 //   Hash{} -- and allocation (bad_alloc): the deques' storage, the
-//   constructor's shard array, the generation ring's bag slots and scratch
-//   and the per-shard count rows (in the constructor, before any handle
-//   exists), and the vectors of get_internal_accounting(),
-//   get_internal_ring_state(), get_internal_slot_counts() and
-//   get_internal_retire_nodes_per_shard(); nothing else in this class
-//   throws. new_handle(), refresh(), the handle's special
-//   members and the join and leave are noexcept. An operation that throws
-//   leaves its handle live and usable: the handle's debug in-flight count is
-//   undone on the throwing path too (by RAII), and release builds touch
-//   nothing of the handle. An arena address the word
-//   encoding cannot represent is not an exception either: alloc_node()
-//   calls std::abort(), as the constructor does on an initial capacity
-//   above 2^63. A Hooks action that throws terminates (the hooks are
-//   noexcept: TEST SEAMS). reclaim() and the automatic trigger throw
-//   nothing: the bump, the free pass and the hook are noexcept, and nothing
-//   in them hashes, compares, copies or allocates; an operation that throws
-//   AFTER its trigger ran leaves the trigger's effects standing.
+//   constructor's shard array, its initial sizing of the bucket deque, the
+//   generation ring's bag slots and scratch, the per-shard count rows (these
+//   four in the constructor, before any handle exists), and the vectors of
+//   get_internal_accounting(), get_internal_ring_state(),
+//   get_internal_slot_counts() and get_internal_retire_nodes_per_shard();
+//   nothing else in this class throws. new_handle(), refresh(), the handle's
+//   special members and the join and leave are noexcept. An operation that
+//   throws leaves its handle live and usable: the handle's debug in-flight
+//   count is undone on the throwing path too (by RAII), and release builds
+//   touch nothing of the handle. An arena address the word encoding cannot
+//   represent is not an exception either: alloc_node() calls std::abort(),
+//   as the constructor does on an initial capacity above 2^63. A Hooks
+//   action that throws terminates (the hooks are noexcept: TEST SEAMS).
+//   reclaim() and the automatic trigger throw nothing: the bump, the free
+//   pass and the hook are noexcept, and nothing in them hashes, compares,
+//   copies or allocates; an operation that throws AFTER its trigger ran
+//   leaves the trigger's effects standing.
 //   The one deliberate guarantee: NO ARENA SLOT IS LOST TO A THROW. Every
 //   private node an operation holds when an exception passes through it is
 //   pushed to limbo before the exception leaves, so get_internal_accounting()
@@ -645,25 +645,26 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   (debug builds count the operations in flight on a handle and assert
 //   zero at each of these), and with nothing else: not with other handles,
 //   with new_handle(), advance() or reclaim(). THE HAND-OFF RULE: a handle
-//   may be created on one thread and used on another, and its session may
-//   be ended or moved on another thread than the one that used it last --
-//   destroyed, refreshed, assigned over, moved from or swapped -- only
-//   after a SYNCHRONIZING hand-off between the threads (a mutex, a thread
-//   join, a release store read by an acquire load, or any other
-//   happens-before edge): every use of the handle, its creation included,
-//   must happen-before the call that ends or moves its session, as its
-//   creation must happen-before its first use elsewhere. Not overlapping
-//   in time is not enough: the leave's release orders for the free pass
-//   only the accesses that happen before it (THE PER-NODE REUSE CHAIN),
-//   so with a relaxed hand-off the free pass can reuse a node a reader on the
-//   other thread is still reading. The handle records the per-shard count its
-//   join incremented, never a thread id, so a leave on any thread decrements
-//   that count. An operation runs under a handle of ANY live generation, the
-//   current one or one a bump has closed since the join, with its full
-//   contract: the generation decides only which bags a free pass may
-//   free while the handle lives, and only refresh() or a release changes
-//   it. A temporary is a handle too: `set.contains(set.new_handle(), k)`
-//   joins, and leaves at the end of the full expression. The precondition
+//   may be used on another thread than the one that created it, and its
+//   session may be ended or moved (the handle destroyed, refreshed,
+//   assigned over, moved from or swapped) on another thread than the one
+//   that used it last, but each only after a SYNCHRONIZING hand-off between
+//   the two threads (a mutex, a thread join, a release store read by an
+//   acquire load, or any other happens-before edge): every use of the
+//   handle, its creation included, must happen-before the call that ends or
+//   moves its session, as its creation must happen-before its first use
+//   elsewhere. Not overlapping in time is not enough: the leave's release
+//   orders for the free pass only the accesses that happen before it (THE
+//   PER-NODE REUSE CHAIN), so with a relaxed hand-off the free pass can free
+//   a node for reuse while a reader on the other thread is still reading it.
+//   The handle records the per-shard count its join incremented, never a
+//   thread id, so a leave on any thread decrements that count. An operation
+//   runs under a handle of ANY live generation, the current one or one a
+//   bump has closed since the join, with its full contract: the generation
+//   decides only which bags a free pass may free while the handle lives,
+//   and only refresh() or a release changes it. A temporary is a handle
+//   too: `set.contains(set.new_handle(), k)` joins, and leaves at the end
+//   of the full expression. The precondition
 //   violations debug builds diagnose, by assertion: an operation with an
 //   empty handle or with a handle of another set; refresh() of an empty
 //   handle; refresh(), a move, swap or destruction of a handle while an
@@ -686,14 +687,14 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   currently represents) and the BAG: one pair of slots per arena shard,
 //   the shard's retired sublist head and limbo sublist head as exchanged at
 //   the bump -- and a pointer to the owning set (how a handle finds its set
-//   to refresh). Its live-handle count is SPLIT BY ARENA SHARD: S counts per
-//   slot, S = the number of arena shards, `c[i][s]` being shard s's count of
-//   ring slot i. They live outside the blocks, in one row per shard
-//   (`rows_[s]`: shard s's count of every slot, then shard s's join
-//   counters), so that a join and a leave write only lines of the joining
-//   thread's shard and never a line every thread writes. A join increments
-//   the count of the JOINING thread's shard (`thread_number() &
-//   arena_mask_`); the handle records which count it incremented and its
+//   to refresh). A block's live-handle count is SPLIT BY ARENA SHARD: S
+//   counts per slot, S = the number of arena shards, `c[i][s]` being shard
+//   s's count of ring slot i. The counts live outside the blocks, in one row
+//   per shard (`rows_[s]`: shard s's count of every slot, then shard s's
+//   join counters), so that a join and a leave write only lines of the
+//   joining thread's shard and never a line every thread writes. A join
+//   increments the count of the JOINING thread's shard (`thread_number() &
+//   arena_mask_`); the handle records which count it incremented, and its
 //   leave decrements THAT count, from whatever thread runs the leave; the
 //   free pass reads every count of a slot. The counts are atomic and
 //   RMW-only (J2 below) and, like the blocks, never deallocated or moved
@@ -724,40 +725,49 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   old block, the advancer sees 0 on C) and the bag is freed under the
 //   handle. seq_cst on all FOUR operations -- the increment, the re-verify
 //   load, the publish store and the advancer's load of each count in the
-//   free pass -- puts them in one total order S. A member's re-verify reads
-//   B, so it precedes the publish that closes B in S (else it would read
-//   that publish or a later one), and the increment, sequenced before the
-//   re-verify, precedes it too; every free-pass load of a count of B
-//   follows that publish in S (FACT 2, below); so the free pass's load of C
-//   follows C's +1 in S, and a seq_cst load that follows a seq_cst RMW of
-//   the same object in S reads that RMW's value or a later one in C's
-//   modification order (coherence-ordered-before agrees with S). By J2,
-//   while the member has not left, every such value is >= 1; reading 0
-//   needs the member's leave at or before the value read, and then (every
+//   free pass -- puts them in the single total order of seq_cst operations
+//   (the standard's S; called SC here, S being the shard count). A
+//   member's re-verify reads B, so it precedes in SC the publish that
+//   closes B (else it would read that publish or a later one), and the
+//   increment, sequenced before the re-verify, precedes that publish too;
+//   every free-pass load of a count of B follows that publish in SC
+//   (FACT 2, below); so the free pass's load of C follows C's +1 in SC, and
+//   a seq_cst load that follows a seq_cst RMW of the same object in SC
+//   reads that RMW's value or a later one in C's modification order
+//   (coherence-ordered-before agrees with SC). By J2, while the member has
+//   not left, every such value is >= 1; reading 0 needs the member's leave
+//   at or before the value read in C's modification order, and then (every
 //   later modification being an RMW) the value read is in the release
-//   sequence the leave heads, so the leave synchronizes with the load. The
-//   S counts change nothing in this pair: each runs it on its own, and the
-//   free pass loads EVERY count of the bag (ONE ADVANCER). The argument
-//   rests on three facts. FACT 1: a member's count is fixed from its join
-//   to its leave: a move or swap carries the count with the block, and
-//   refresh() is a new join plus the leave of the old membership; nothing
-//   recomputes a recorded count. FACT 2: every free-pass load of a count
-//   of a closed block follows, in S, the publish that closed it: in the
-//   flag holder that published, the load is sequenced after the publish;
-//   in a later holder, the publish is sequenced before the earlier
-//   holder's release of the flag, which the later holder's acquire
-//   exchange reads (or a later exchange in its release sequence), which is
-//   sequenced before the load -- sequenced-before, then synchronizes-with,
-//   then sequenced-before, which makes the publish strongly happen before
-//   the load, and two seq_cst operations so ordered are ordered so in S.
+//   sequence the leave heads, so the leave synchronizes with the load.
+//   Splitting the count S ways changes nothing in this pair: each count
+//   forms its own pair, and the free pass loads EVERY count of the bag (the
+//   FREE PASS under ONE ADVANCER). The argument rests on three facts.
+//   FACT 1: a member's count is fixed from its join to its leave: a move or
+//   swap carries the count with the block, and refresh() is a new join plus
+//   the leave of the old membership; nothing recomputes a recorded count.
+//   FACT 2: every free-pass load of a count of a closed block follows, in
+//   SC, the publish that closed it: in the flag holder that published, the
+//   load is sequenced after the publish; in a later holder, the publish is
+//   sequenced before the publishing holder's release of the flag, which the
+//   next holder's acquire exchange reads (every exchange on the flag writes
+//   true, so an exchange that takes the flag reads a release store
+//   directly, never another exchange), which is sequenced before that
+//   holder's load and release in turn, and so on to the loading holder --
+//   sequenced-before, then synchronizes-with, then sequenced-before, through
+//   as many holders as lie between, which makes the publish strongly happen
+//   before the load, and two seq_cst operations so ordered are ordered so
+//   in SC.
 //   FACT 3 is J2. The publish is a STORE, not a read-modify-write: FACT 2's
 //   step across two holders is the standard's rule for seq_cst operations
 //   ordered by strongly-happens-before; a seq_cst RMW would be
 //   expected-equivalent. Two invariants make a stale increment harmless.
 //   J1: between its `fetch_add` and a successful re-verify a joiner
 //   touches NO node, head, bag slot, plain block field or plain field of
-//   the count rows (it has read only `current_` and the rows pointer, which
-//   is constant after construction), so a count it leaves on a just-closed
+//   the count rows (the whole attempt reads `current_`, before the
+//   increment and at the re-verify, and otherwise only values constant
+//   after construction -- the rows pointer, the arena mask and the thread's
+//   number -- from which the count's address is computed; nothing it reads
+//   belongs to a block), so a count it leaves on a just-closed
 //   or recycled block can delay that block's freeing but never is the
 //   count that protects a dereference. The undo decrements the count the
 //   attempt incremented, which is why the attempt holds C rather than
@@ -782,11 +792,11 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   re-verify fails after its +1 landed on a recycled block's count only
 //   delays that generation's free pass until its undo. The leave is a
 //   release `fetch_sub` on the recorded count, from whatever thread runs
-//   it: it heads the per-node reuse chain (below), whose first link -- the
+//   it: it heads THE PER-NODE REUSE CHAIN (below), whose first link -- the
 //   last access made under the handle, then the leave -- is a
-//   happens-before edge, sequenced on one thread or ordered by the caller's
-//   synchronizing hand-off when the handle is left on another (THE HAND-OFF
-//   RULE under HANDLES).
+//   happens-before edge: sequenced-before when both run on one thread, or
+//   ordered by the caller's synchronizing hand-off when the leave runs on
+//   another (THE HAND-OFF RULE under HANDLES).
 //   refresh()'s fast path is a relaxed load of `current_` compared with the
 //   handle's block: it changes no membership, so it has nothing to
 //   synchronize with, and its only stale answer is "same", which keeps the
@@ -819,11 +829,12 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   `oldest_`, the free pass's resume index, the dealing cursor, the bump's
 //   scratch and the steal hint's stamp counter, and it orders one holder's
 //   publish before a later holder's count loads (the store-buffering
-//   argument across calls: FACT 2 of THE JOIN). `gen` is also read outside the flag, through the publish that made
-//   its block current: by a handle's own diagnostic (its successful re-verify
-//   read that publish) and by get_internal_generation() (an acquire load of
-//   `current_`). Inside, sequentially (A0-A5 and the free pass for every
-//   holder; the walk for advance() alone):
+//   argument across calls: FACT 2 of THE JOIN). `gen` is also read outside
+//   the flag, through the publish that made its block current: by a
+//   handle's own diagnostic (its successful re-verify read that publish) and
+//   by get_internal_generation() (an acquire load of `current_`). Inside,
+//   sequentially (A0-A5 and the free pass for every holder; the walk for
+//   advance() alone):
 //   (A0) load every shard's retired head and limbo head (relaxed; a push
 //        racing a load is seen by the next call): all EMPTY -> the result is
 //        `nothing_retired`, no exchange is made, no slot is consumed and
@@ -854,11 +865,11 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   (A5) publish: `current_.store(next, seq_cst)`; the hook
 //        in_advance_after_publish() fires here (TEST SEAMS).
 //   Then the FREE PASS (free_oldest()): while ring_[oldest_] is SEALED and
-//   EVERY one of its S per-shard counts reads 0 -- one seq_cst load per
-//   count, in shard order starting from the RESUME INDEX (the shard whose
-//   count stopped the last scan of this bag; 0 for a bag no scan stopped
-//   at) and wrapping, the first count that is not 0 ending the pass and
-//   becoming the resume index -- free its bag -- every retired sublist
+//   EVERY one of its S per-shard counts reads 0 (one seq_cst load per
+//   count, in shard order, starting from the RESUME INDEX and wrapping; the
+//   first count that is not 0 ends the pass and becomes the resume index,
+//   the shard the next scan of this bag starts from; a bag no scan has
+//   stopped at starts from shard 0), free its bag -- every retired sublist
 //   through `retire_link` (read, never written here) and every limbo
 //   sublist through `link`, each node's next word read BEFORE push_free()
 //   rewrites `link` into the free list's next pointer -- dealing the nodes
@@ -870,16 +881,16 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   bag are not one snapshot, and need not be: after the publish that
 //   closed the block no join of it succeeds (THE JOIN) and no membership
 //   moves from one count to another (FACT 1), so its members only leave,
-//   and a count read 0 had every member on it left, its leave acquired by
-//   that load. For the same reason the order of the loads, or comparing
-//   their sum with 0 (the counts are never negative), would do as well for
-//   this protocol, which is what lets each scan start where the last one
-//   stopped: with an early exit a pin that stays put costs one load per
-//   scan. Then the WALK, under
-//   a handle of advance()'s own (joined through the hook-free join path):
-//   every published bucket, with the split winner's cleanup pass's shape --
-//   head load with acquire, one unlink attempt per dead run, never retried,
-//   UNINITIALIZED buckets skipped, no split and no allocation -- retiring
+//   and when a load reads a count 0, every member on that count has left
+//   and the load acquired its leave. For the same reason the loads may come
+//   in any order (comparing their sum with 0 would do as well, the counts
+//   being never negative), which is what lets each scan start where the
+//   last one stopped: with the early exit, a pin that stays put costs one
+//   load per scan. Then the WALK, under a handle of advance()'s own (joined
+//   through the hook-free join path): every published bucket, with the
+//   split winner's cleanup pass's shape -- head load with acquire, one
+//   unlink attempt per dead run, never retried, UNINITIALIZED buckets
+//   skipped, no split and no allocation -- retiring
 //   what it bypasses onto the shard's retired lists of the generation that
 //   is current AFTER the bump (after the publish, when there is one: a
 //   `nothing_retired` call publishes nothing). A walk retiree is therefore
@@ -952,10 +963,10 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //           an operation is in flight (HANDLES; debug-asserted), and the
 //           trigger has no handle in scope -- push_retired(), unlink_run()
 //           and the walk state carry none -- so no refresh, leave or move
-//           is reachable from it. Its +1 on the count its join
+//           is reachable from it. The handle's +1 on the count its join
 //           incremented -- generation g's count for the shard of the thread
 //           that joined the handle or ran its last refresh() that returned
-//           true (moved it), which need not be the
+//           true (that moved it to a new generation), which need not be the
 //           triggering thread's shard -- therefore stands (FACT 1), and the
 //           trigger's own free pass reads it, since that pass loads EVERY
 //           count of block g: the pass's seq_cst load of the handle's count
@@ -1015,12 +1026,13 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   trigger that refreshes or releases the operation's handle before its free
 //   pass (its own bag, holding nodes the walk still continues from, would be
 //   freed under it: a use after free on the same thread); a free pass that
-//   takes a count of 1 for "only my pin" -- the sum of the block's counts <= 1,
-//   each count <= 1, or the triggering thread's own shard's count <= 1 -- or
-//   that skips the triggering thread's own shard's count (the one pin may be
-//   another thread's, on any count; the thread itself holds nodes of its own
-//   generation's bag; and the operation's handle may sit on another shard's
-//   count than the triggering thread's); a trigger placed before the push
+//   takes a count of 1 for "only my pin" -- that frees when the sum of the
+//   block's counts is <= 1, when each count is <= 1, or when the triggering
+//   thread's own shard's count is <= 1 -- or that skips the triggering
+//   thread's own shard's count (the one pin may be another thread's, on any
+//   count; the thread itself holds nodes of its own generation's bag; and the
+//   operation's handle may sit on another shard's count than the triggering
+//   thread's); a trigger placed before the push
 //   (safe, since a push that lands after its shard's exchange goes to the next
 //   generation, but the crossing run would then not be in the trigger's bag); a
 //   trigger without the flag's acquire exchange (two holders on the plain ring
@@ -1147,12 +1159,13 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //        from `oldest_` -- stop at the first block that is not SEALED or
 //        at the first of its counts that is not 0 -- delivers it by
 //        construction: bag G is examined only after every bag < G was
-//        freed, each after all of its counts read 0, possibly by an
-//        earlier flag holder (FACT 2 of THE JOIN covers any holder). For a
-//        handle h of generation g <= G: when bag g was freed, the load of
-//        h's own count read 0 only after h's leave, which that load
-//        acquired (THE JOIN), and that free pass precedes the one that
-//        frees bag G (in one holder, or through the flag).
+//        freed, each after all of its counts read 0, possibly in an
+//        earlier flag holder's free pass (FACT 2 of THE JOIN covers any
+//        holder). For a handle h of generation g <= G: when bag g was
+//        freed, the load of h's own count read 0 only after h's leave,
+//        which that load acquired (THE JOIN), and that free pass is, or
+//        precedes, the one that frees bag G (in one holder, or through the
+//        flag).
 //   Together: every node address a handle of generation g can observe -- in
 //   a chain, by EXIT through a dead node's link, or in a free-list head --
 //   is either not bagged or in a bag of generation >= g, and that bag
@@ -1203,17 +1216,18 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   bagged in some G*, be freed and be pushed back, restoring the head's
 //   address while A holds M -- a stale next. B's pop CAS read the value A's
 //   load read, or a later one; B's push_N happens-before the exchange of bag
-//   G*. If G* < g, that exchange happens-before A's join (the chain of (I)),
-//   which happens before A's load of the head (A's operation runs under the
-//   handle after its join: sequenced on one thread, or through the
-//   synchronizing hand-off that gave A the handle: THE HAND-OFF RULE under
-//   HANDLES), so B's pop (sequenced before B's push) happens- before A's load,
-//   and by write-read coherence A's load reads B's pop's write or a later value
-//   -- not the N-headed value B consumed. Contradiction; hence G* >= g, and
-//   freeing bag G* needs every count of every generation <= G* read 0, g's
-//   among them (II), while the count A's live handle recorded reads at least 1
-//   until A leaves (THE JOIN). So N is not back on the free list while A's CAS
-//   runs, and the CAS fails. The counter bits add nothing to this. THE UNLINK
+//   G*. If G* < g, that exchange happens-before the join of A's handle (the
+//   chain of (I)), which happens before A's load of the head (A's operation
+//   runs under the handle after its join: sequenced-before when A's thread
+//   joined it, or through the synchronizing hand-off that gave A the handle:
+//   THE HAND-OFF RULE under HANDLES), so B's pop (sequenced before B's push)
+//   happens-before A's load, and by write-read coherence A's load reads B's
+//   pop's write or a later value -- not the N-headed value B consumed.
+//   Contradiction; hence G* >= g, and freeing bag G* needs every count of
+//   every generation <= G* read 0, g's among them (II), while the count A's
+//   live handle recorded reads at least 1 until that handle leaves (THE
+//   JOIN). So N is not back on the free list while A's CAS runs, and the CAS
+//   fails. The counter bits add nothing to this. THE UNLINK
 //   CAS. An operation E of generation g read its pred word with X's address and
 //   recorded the run X.. through acquire loads; for its CAS to succeed wrongly,
 //   X must be unlinked by another thread, retired, bagged, freed, popped and
@@ -1280,11 +1294,10 @@ inline void PrintTo(const AdvanceResult& r, std::ostream* os) {
 //   reclaim()'s or a trigger's -- refuses with `ring_full` while retired
 //   nodes pile up on the retired lists and every insert that finds no
 //   free node grows the arena (GROWTH UNDER LAGGING HANDLES, under THE
-//   TRIGGER). This is
-//   the trade of epoch-based reclamation, accepted here; refresh(),
-//   `ring_full` and the diagnostics (live-handle counts and bagged counts
-//   per generation, the counts as sums over the shards or per shard) are
-//   what a caller has to see a stall. Latency of the
+//   TRIGGER). This is the trade of epoch-based reclamation, accepted here;
+//   refresh(), `ring_full` and the diagnostics (live-handle counts and
+//   bagged counts per generation, the live-handle counts summed over the
+//   shards or per shard) are what a caller has to see a stall. Latency of the
 //   explicit calls (under the cadence: THE TRIGGER): with a long-lived
 //   handle refreshed before each advance() or reclaim(), a node retired
 //   between two calls is freed TWO calls after its retirement (the first
@@ -2068,14 +2081,14 @@ private:
     // A bag of generation >= g is freed only after the opener's handle
     // leaves (THE HANDLE INVARIANT, direction (II)), and that leave happens
     // after the +256 (sequenced after it on the opener's thread, or ordered
-    // by the caller's synchronizing hand-off when the opener's handle is
-    // left on another thread: THE HAND-OFF RULE under HANDLES) and is
-    // acquired by the free pass's load of the count the
-    // opener's handle recorded (THE JOIN):
-    // the +256 happens-before the -1, and coherence puts it first in the
-    // count's modification order. Every free is thus preceded in that order
-    // by the increment of the batch that covers its node's life, each batch
-    // covers at most 256 lives, and the count stays at or above zero. The
+    // by the caller's synchronizing hand-off when the opener's handle
+    // leaves on another thread: THE HAND-OFF RULE under HANDLES) and is
+    // acquired by the free pass's load of the per-shard handle count the
+    // opener's handle recorded (THE JOIN): the +256 happens-before the
+    // node's -1, and coherence puts it first in node_count_'s modification
+    // order. Every free is thus preceded in that order by the increment of
+    // the batch that covers its node's life, each batch covers at most 256
+    // lives, and the count stays at or above zero. The
     // argument never asks which shard the popper maps to, so a stolen pop
     // is covered as an own-shard pop is. The accounting sweep's conjunct C5
     // checks the quiescent bound, and a churn test under stress checks that
@@ -3105,7 +3118,8 @@ public:
         ring_[0].state = GenerationState::CURRENT;
         limbo_loaded_ = std::make_unique<word_t[]>(arena_shards);
         // The per-shard count rows, every count 0 (value-initialized; an
-        // over-aligned array new). Before the release below, like the ring.
+        // over-aligned array new). Allocated before the table_size_ release
+        // below, like the ring.
         rows_ = std::make_unique<CountRow[]>(arena_shards);
         table_size_.store(initial_capacity, std::memory_order_release);
     } // ConcurrentResizableHashSetRCU(const Options&)
@@ -3711,19 +3725,20 @@ public:
     //     happen-before the call (the caller made it, or joined the thread
     //     that did). get_internal_handle_generation(h) and
     //     get_internal_handle_shard(h) need only a live h.
-    //   THE LIVE-HANDLE COUNTS in these views are per shard underneath (THE
-    //   RING): `InternalRingSlot::refs` and `InternalAccounting::handle_refs`
-    //   are SUMS of relaxed loads of the S per-shard counts, and the join
-    //   counters of InternalCounters are sums of the shards' join counters,
-    //   so with joins or leaves running a sum is not one instant's value (as
-    //   for every shard sum above); at a quiescent point they are exact.
-    //   get_internal_slot_counts(i) gives the S counts of ring slot i
-    //   themselves, keyed by SLOT INDEX because it reads only atomics (no
-    //   `gen`, no `state`); the slot of a CURRENT or SEALED generation g is g
-    //   % kGenerations (the bump makes the slot after the current one CURRENT
-    //   with `gen + 1`, from slot 0 with generation 0), so a test addresses a
-    //   handle's counts by get_internal_handle_generation(h) % kGenerations
-    //   and the count it recorded by get_internal_handle_shard(h).
+    //   THE LIVE-HANDLE COUNTS in the diagnostics above are per shard
+    //   underneath (THE RING): `InternalRingSlot::refs` and
+    //   `InternalAccounting::handle_refs` are SUMS of relaxed loads of the S
+    //   per-shard counts, and the join counters of InternalCounters are sums
+    //   of the shards' join counters, so with joins or leaves running a sum
+    //   is not one instant's value (as for every shard sum above); at a
+    //   quiescent point they are exact. get_internal_slot_counts(i) gives the
+    //   S counts of ring slot i themselves, keyed by SLOT INDEX because it
+    //   reads only atomics (no `gen`, no `state`); the slot of a CURRENT or
+    //   SEALED generation g is `g % kGenerations` (the bump makes the slot
+    //   after the current one CURRENT with `gen + 1`, from slot 0 with
+    //   generation 0), so a test addresses a handle's counts by
+    //   get_internal_handle_generation(h) % kGenerations and the count it
+    //   recorded by get_internal_handle_shard(h).
     //
     // Diagnostic accessor: total nodes ever appended to the arena (reachable,
     // free, limbo, retired and bagged alike): the sum of the shards' sizes,
@@ -3987,7 +4002,7 @@ public:
         if (reclaiming_.load(std::memory_order_relaxed)) acc.consistent = false;
         for (size_t i = 0; i < kGenerations; ++i) {   // every slot's state and counts, and the bags of the SEALED ones
             const GenerationBlock& block = ring_[i];
-            const SlotCounts counts = slot_counts(i);   // the slot's S per-shard counts: every one >= 0, and every one 0 on an EMPTY slot (min >= 0 and sum 0)
+            const SlotCounts counts = slot_counts(i);   // the slot's S per-shard counts: every one >= 0 (min >= 0), and every one 0 on an EMPTY slot (there, sum == 0)
             acc.handle_refs += counts.sum;
             const size_t behind = (current + kGenerations - i) % kGenerations;   // 0 for the CURRENT slot, 1 for the slot before it, ...
             const GenerationState expected = behind == 0 ? GenerationState::CURRENT : behind <= sealed ? GenerationState::SEALED : GenerationState::EMPTY;
@@ -4032,13 +4047,11 @@ private:
     // adjacent-line prefetcher does not couple neighbours): adjacent blocks
     // would otherwise share lines. The live-handle counts are not in the block
     // but in the per-shard count rows (CountRow, `rows_`); the alignment is
-    // REQUIRED all the same: without it a block is four words, `ring_` a
-    // quarter of its size, and every set member declared after the ring moves,
-    // among them steal_hint_ and auto_reclaim_mask_, which the operations read
-    // (an operation's object code would change); and `set`, which refresh()
-    // loads on every call, would share a line with neighbouring blocks'
-    // advancer-written fields. `state`, `gen` and the bag slots are PLAIN
-    // fields written only by the holder of `reclaiming_` (and the constructor).
+    // kept for `set`: without it a block is four words, and `set`, which
+    // refresh() loads on every call, would share a line with neighbouring
+    // blocks' advancer-written fields. `state`, `gen` and the bag slots are
+    // PLAIN fields written only by the holder of `reclaiming_` (and the
+    // constructor).
     // They are read by the flag holder, whose synchronization with earlier
     // holders is the flag's acquire/release; by the destructor and the
     // quiescent accounting sweep, under their quiescence; and, for `gen` alone,
@@ -4058,26 +4071,32 @@ private:
     }; // struct GenerationBlock
     // One arena shard's row of the live-handle counts (THE RING in the class
     // overview): the shard's count of EVERY ring slot, then the shard's join
-    // counters. The rows (`rows_`, one per shard, allocated by the constructor,
-    // never moved or freed before the set) hold the counts per shard rather
-    // than one count per block, so that a join and a leave write only lines of
-    // the joining thread's shard and the operations of threads on different
-    // shards never write a common line to take or drop a handle. Layout: the
-    // counts come first, 16 per 128-byte pair of 64-byte lines (so a multi-bag
-    // free pass reads a shard's pair once per 16 consecutive bags), then the
-    // two join counters; when kGenerations is a multiple of 16 (the default 64
-    // included: four pairs of counts) the join counters start a pair of their
-    // own, otherwise they share the last pair with the highest slots' counts.
-    // Why a pair of their own is wanted: a join writes its count (the CURRENT
-    // slot's line) and `joins`, while the free pass reads the OLDEST slot's
-    // count, which under `ring_full` sits just after the current slot and so
-    // usually on the same line; a join counter on that line would add a writer
-    // the pass does not need. The row's stride is its contents rounded up to
-    // 128 bytes, and no further: it is a power of two only for some
-    // kGenerations (for example 128 or 256 bytes up to 30 counts, 512 from 47
-    // to 62), not at the default 64 (640 bytes). Padding it to a power of two
-    // would put the free pass's S loads of one slot, one per row at the same
-    // offset, into a few L1 sets.
+    // counters. The rows (`rows_`, one per shard, allocated by the
+    // constructor, never moved, and freed only with the set) hold the counts
+    // per shard rather than one count per block, so that a join and a leave
+    // write only lines of the joining thread's shard and the operations of
+    // threads on different shards never write a common line to take or drop
+    // a handle. Layout: the counts come first, 16 per 128-byte pair of
+    // 64-byte lines (so a multi-bag free pass reads a shard's pair once per
+    // 16 consecutive bags), then the two join counters; when kGenerations is
+    // a multiple of 16 (the default 64 included: four pairs of counts) the
+    // join counters start a pair of their own, otherwise they follow the
+    // highest slots' counts in that pair (`joins` alone when kGenerations is
+    // 15 modulo 16, since `join_retries` then begins the next pair).
+    // Why a pair of their own is wanted: a line of counts is written only by
+    // the joins and leaves of the slots on it, and the free pass reads the
+    // OLDEST slot's count; whenever the oldest slot is on another line than
+    // the current one (a SEALED run of a line's worth of slots or more,
+    // except when the run wraps to within a line of the current slot, as
+    // under `ring_full`), that is a line no join writes, and a join counter on
+    // it would make every join of the shard a writer of the line the pass
+    // reads. (Under `ring_full` the oldest slot is the one after the current
+    // slot, usually on the same line, which every join writes anyway.) The
+    // row's stride is its contents rounded up to 128 bytes, and no further:
+    // it is a power of two only for some kGenerations (for example 128 or 256
+    // bytes up to 30 counts, 512 from 47 to 62), not at the default 64 (640
+    // bytes). Padding it to a power of two would put the free pass's S loads
+    // of one slot, one per row at the same offset, into a few L1 sets.
     struct alignas(128) CountRow {
         std::atomic<long> refs[kGenerations];   // refs[i]: memberships of the generation slot i currently represents joined through this shard, plus transient join attempts; RMW-only (J2): never stored after construction, never reset when the slot is recycled; value-initialized to 0
         std::atomic<size_t> joins{0};           // successful join attempts on this shard (summed into InternalCounters::joins)
@@ -4107,12 +4126,14 @@ private:
     size_t slot_index(const GenerationBlock* block) const noexcept { return static_cast<size_t>(block - ring_); }
     // The count of ring slot `block` for arena shard `shard`: the one place
     // that names a count by (block, shard). Never called with a slot
-    // recomputed from a reloaded `current_` for an undo (THE JOIN, J1).
+    // recomputed from a reloaded `current_` for an undo (THE JOIN says why,
+    // just after J1).
     std::atomic<long>& count_of(const GenerationBlock* block, size_t shard) const noexcept { return rows_[shard].refs[slot_index(block)]; }
-    // The arena shard whose row holds `count`, and whether `count` is one of
-    // `block`'s S counts at all (debug checks and the white-box shard
-    // accessor). Address arithmetic on integers, so a foreign or null pointer
-    // gives `false` rather than an unspecified pointer comparison; O(1),
+    // shard_of_count(): the arena shard whose row holds `count`;
+    // is_count_of(): whether `count` is one of `block`'s S counts at all (the
+    // debug checks and the white-box shard accessor). is_count_of() does its
+    // address arithmetic on integers, so a foreign or null pointer gives
+    // `false` rather than an unspecified pointer comparison; it is O(1),
     // which matters because HandleUse runs it on every operation in debug
     // builds.
     static size_t shard_of_count(const ConcurrentResizableHashSetRCU& set, const std::atomic<long>* count) noexcept {
@@ -4152,7 +4173,7 @@ public:
     // move assignment first ENDS the target's session if it has one (a
     // leave on the target's own count), then transfers; the moved-from
     // handle is empty. `block_` is the LIVENESS word: every decision to
-    // leave tests it, and the count pointer is set exactly when it is. A
+    // leave tests it, and the count pointer is non-null exactly when it is. A
     // default-constructed handle is EMPTY. On an empty handle the only
     // valid operations are destruction, moving from and to it,
     // `operator bool` and `swap`; refresh() or any operation of the set
@@ -4166,8 +4187,8 @@ public:
     // in the class overview (concurrent use in operations is fine;
     // refresh(), moving from the handle, move assignment over it, swap and
     // destruction are exclusive with every other use of it, debug-asserted
-    // at each; on another thread they need THE HAND-OFF RULE's
-    // synchronizing hand-off).
+    // at each; on another thread than the handle's last use they need THE
+    // HAND-OFF RULE's synchronizing hand-off).
     class handle {
     public:
         // Postcondition: empty. nothrow.
@@ -4200,9 +4221,10 @@ public:
         handle& operator=(const handle&) = delete;
         // Ends the session (leaves the generation: a release decrement of the
         // recorded count) if live. `block_` is the liveness word: the count
-        // pointer is dereferenced under that test without a test of its own,
-        // so a count dropped by a defective move crashes here instead of
-        // silently skipping the leave and pinning the generation forever.
+        // pointer is dereferenced (in leave()) under the test of `block_`,
+        // without a test of its own, so a count dropped by a defective move
+        // crashes here instead of silently skipping the leave and pinning the
+        // generation forever.
         // Preconditions: if live, the set is still alive; no operation in
         // flight on this handle (debug-asserted). nothrow.
         ~handle() noexcept {
@@ -4385,12 +4407,12 @@ private:
     // (sequenced before it, or ordered by the caller's synchronizing hand-off,
     // which THE HAND-OFF RULE under HANDLES requires of a leave on another
     // thread), and the advancer's seq_cst load of THIS count that reads the
-    // resulting 0 (or a later value in the release sequence) acquires it before
-    // the free pass rewrites a node's `link` and a popper assigns its value --
-    // the first link of THE PER-NODE REUSE CHAIN; relaxed here lets the reuse
-    // race the reader's last read. Precondition: `block` is non-null (the
-    // caller tested the liveness word); debug builds check that `count` is set
-    // and is one of `block`'s counts.
+    // resulting 0 (or a later value in the release sequence) acquires this
+    // decrement before the free pass rewrites a node's `link` and a popper
+    // assigns its value -- the first link of THE PER-NODE REUSE CHAIN;
+    // relaxed here lets the reuse race the reader's last read. Precondition:
+    // `block` is non-null (the caller tested the liveness word); debug builds
+    // check that `count` is set and is one of `block`'s counts.
     static void leave([[maybe_unused]] const GenerationBlock* block, std::atomic<long>* count) noexcept {
         assert(count != nullptr && "a live handle without its count (a move or swap dropped it)");   // both null or both set
         assert(is_count_of(block, count) && "a handle's count is not one of its block's counts (a move or swap crossed it)");
@@ -4550,22 +4572,22 @@ private:
     // indexes the oldest SEALED slot, or the CURRENT slot when nothing is
     // sealed, so the loop stops when ring_[oldest_] is CURRENT (nothing
     // sealed is left; the `!= SEALED` test also covers EMPTY defensively,
-    // which the index never points at) or at the first of its S per-shard
-    // counts that is not 0 (a handle of that generation on that count -- or
-    // a join attempt's stale increment, J2 -- pins it and, by direction
-    // (II) of THE HANDLE INVARIANT, every younger bag: a block is never
-    // skipped). The counts are read one seq_cst load each, before the bag
-    // is touched, in shard order starting from the RESUME INDEX
-    // (`scan_start_`: the shard whose count stopped the last scan of this
-    // bag, 0 for a bag no scan stopped at) and wrapping; the loop below says
-    // why each load is seq_cst, why they need not be one snapshot, and why
-    // any order, hence any start, is sound. A freed block's
-    // counts are left untouched (J2) and its bag slots are walked IN PLACE,
-    // each slot holding the sublist's next head until it reads EMPTY, so a bag is
-    // EMPTY the moment its last node is pushed. Per node: the next word --
-    // `retire_link` on a retired sublist, `link` on a limbo sublist -- is
-    // read BEFORE push_free() rewrites `link` into the free list's next
-    // pointer (a limbo sublist's next IS `link`); the node is dealt
+    // which the index never points at) or at the first of that block's S
+    // per-shard counts that is not 0 (a handle of that generation on that
+    // count -- or a join attempt's stale increment, J2 -- pins the block
+    // and, by direction (II) of THE HANDLE INVARIANT, every younger bag: a
+    // block is never skipped). The counts are read one seq_cst load each,
+    // before the bag is touched, in shard order starting from the RESUME
+    // INDEX (`scan_start_`: the shard whose count stopped the last scan of
+    // this bag, 0 for a bag no scan stopped at) and wrapping; the comment
+    // inside the loop says why each load is seq_cst, why they need not be
+    // one snapshot, and why any order, hence any start, is sound. A freed
+    // block's counts are left untouched (J2) and its bag slots are walked
+    // IN PLACE, each slot holding the sublist's next head until it reads
+    // EMPTY, so a bag is EMPTY the moment its last node is pushed. Per node:
+    // the next word -- `retire_link` on a retired sublist, `link` on a limbo
+    // sublist -- is read BEFORE push_free() rewrites `link` into the free
+    // list's next pointer (a limbo sublist's next IS `link`); the node is dealt
     // round-robin over the shards' free lists with the one cursor `deal_`,
     // on top of whatever those lists hold, for every bag and every sublist
     // alike: a shard whose threads lost many splits or erased many keys does
@@ -4605,12 +4627,13 @@ private:
             // free for the protocol (any order, or a sum, would do: the
             // counts are never negative); the early exit is why this is a
             // loop of its own and not the diagnostics' relaxed sum
-            // (slot_counts()). THE RESUME INDEX: the scan starts at `scan_start_`, the shard whose count
-            // stopped the previous scan of this same bag, and wraps, so it
-            // still reads all S counts before a free; a pin that stays put
-            // then costs one load per scan instead of up to S. Any start is
-            // sound for the reason just given (any order would do); the
-            // index is a cost hint only, reset when `oldest_` moves on.
+            // (slot_counts()). THE RESUME INDEX: the scan starts at
+            // `scan_start_`, the shard whose count stopped the previous scan
+            // of this same bag, and wraps, so it still reads all S counts
+            // before a free; a pin that stays put then costs one load per
+            // scan instead of up to S. Any start is sound for the reason just
+            // given (any order would do); the index is a cost hint only,
+            // reset when `oldest_` moves on.
             for (size_t i = 0, s = scan_start_; i <= arena_mask_; ++i, s = (s + 1) & arena_mask_) {   // every shard's count of this generation, from the resume index, wrapping
                 if (rows_[s].refs[oldest_].load(std::memory_order_seq_cst) != 0) {   // pinned: the next scan of this bag starts here
                     scan_start_ = s;
@@ -5019,8 +5042,8 @@ public:
     // flag assert, so a test may call it inside in_advance_after_publish()):
     // the S per-shard counts of ring slot `slot` (< kGenerations), in shard
     // order. With joins or leaves running, each value is one its count had,
-    // not one instant's set. The slot of generation g is g % kGenerations
-    // (DIAGNOSTICS).
+    // but together they are not one instant's values. The slot of generation
+    // g is `g % kGenerations` (DIAGNOSTICS).
     std::vector<long> get_internal_slot_counts(size_t slot) const {
         assert(slot < kGenerations && "get_internal_slot_counts() of a slot outside the ring");
         std::vector<long> counts;
@@ -5075,15 +5098,17 @@ private:
     // thread that took the counted step, exact at a quiescent point, a
     // snapshot otherwise; summed into InternalCounters, which says what each
     // counts. Every writer is a non-const member (the join, which is
-    // const, counts in the rows instead), so the member is not `mutable`.
+    // const, counts in the rows instead), so `advance_counters_` is not
+    // `mutable`.
     // The join counters are not here: they are per shard in the count rows
     // (CountRow), so a join writes no set-wide line.
     // Field ORDER is part of the layout: the two cold counters of the
     // automatic trigger (written only in the noinline auto_reclaim()) come
     // first, and the two counters an operation writes, `pops_raced_push`
-    // and `limbo_pushes`, sit at offsets 64 and 72, the offsets the
-    // operations' code addresses (an order that moved them would change an
-    // operation's object code for no gain); 80 bytes of fields, sizeof 128.
+    // and `limbo_pushes`, sit at offsets 64 and 72, on the second line, with
+    // the counters of advance(), reclaim() and the trigger on the first (the
+    // offsets are immediates in the operations' object code); 80 bytes of
+    // fields, sizeof 128.
     struct alignas(64) AdvanceCounters {
         std::atomic<size_t> auto_reclaims{0};   // automatic triggers that acquired the flag (THE TRIGGER in the class overview)
         std::atomic<size_t> auto_skipped{0};    // automatic triggers that found the flag held
@@ -5107,9 +5132,10 @@ private:
     // every allocating thread) and from the flag.
     alignas(128) std::atomic<GenerationBlock*> current_{&ring_[0]};
     // The single-advancer try-flag: set while an advance(), a reclaim() or
-    // an automatic trigger is in progress (ONE ADVANCER). On a line of its
-    // own; the plain fields owned by the flag holder share it: `oldest_`,
-    // `deal_`, the `limbo_loaded_` pointer and `scan_start_`.
+    // an automatic trigger is in progress (ONE ADVANCER). On a line apart
+    // from every other atomic; only the plain fields owned by the flag
+    // holder share it: `oldest_`, `deal_`, the `limbo_loaded_` pointer and
+    // `scan_start_`.
     alignas(128) std::atomic<bool> reclaiming_{false};
     size_t oldest_ = 0;   // index of the oldest SEALED slot, or of the CURRENT slot when nothing is sealed; owned by the flag holder
     size_t deal_ = 0;     // the free pass's round-robin cursor: the shard the next freed node goes to; owned by the flag holder
@@ -5124,8 +5150,8 @@ private:
     // pin that stays put costs one load per scan, not up to S. A cost hint
     // only: the free pass is sound from any start. Owned by the flag holder
     // (synchronized between holders by the flag, as `oldest_` is); reset
-    // when `oldest_` moves on. After `limbo_loaded_`, in the flag's block, so
-    // no member moves.
+    // when `oldest_` moves on. Placed after `limbo_loaded_`, in the flag's
+    // block, where it displaces no other member.
     size_t scan_start_ = 0;
     // The steal's set-wide hint (THE HINT at steal_scan()): a stamp in bits
     // 63..1 and STEAL_HINT_EMPTY in bit 0, "a scan found every free list
@@ -5159,22 +5185,23 @@ private:
     // The cadence mask (auto_reclaim_mask() above), read by every retire push
     // and written never: `const`, set in the Options constructor's
     // mem-initializer. A 128-byte block shared only with the
-    // constructor-written rows pointer below, so nothing writes it after
-    // construction: the retire path reads it on every push, and the block
-    // before it is written by the free pass.
+    // constructor-written rows pointer below, so nothing writes that block
+    // after construction: the retire path reads the mask on every push, and
+    // the block before it is written by the free pass.
     alignas(128) const size_t auto_reclaim_mask_;
     // The per-shard count rows (CountRow; THE RING in the class overview):
     // arena_shards rows, allocated by the constructor before its table_size_
-    // release and never moved or freed before the set (a stale join increment
-    // must land on live memory). Written once, by the constructor; read by
-    // every join (the row of the joining thread's shard), by the free pass
-    // (every row) and by the diagnostics. Placed last, so that no member an
-    // operation reads is displaced by it (the word fits in the last block's
-    // padding: the set's size does not grow), on the line nothing writes after
-    // construction -- never in the flag's block, where `deal_` is written once
-    // per freed node, and never in Shard, whose size is the stride of shards_[]
-    // on every operation. No `mutable`: unique_ptr<T[]>::operator[] is const
-    // and yields T&.
+    // release, never moved, and freed only with the set (a stale join
+    // increment must land on live memory). The pointer is written once, by
+    // the constructor; the rows are read by every join (the row of the
+    // joining thread's shard), by the free pass (every row) and by the
+    // diagnostics. Placed last, so that no member an operation reads is
+    // displaced by it (the word fits in the padding of auto_reclaim_mask_'s
+    // block, so it adds nothing to the set's size), on the line that nothing
+    // writes after construction -- never in the flag's block, where `deal_`
+    // is written once per freed node, and never in Shard, whose size is the
+    // stride of shards_[] on every operation. No `mutable`:
+    // unique_ptr<T[]>::operator[] is const and yields T&.
     std::unique_ptr<CountRow[]> rows_;
 }; // class ConcurrentResizableHashSetRCU
 

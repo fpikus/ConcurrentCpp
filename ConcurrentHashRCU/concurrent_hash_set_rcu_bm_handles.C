@@ -63,6 +63,20 @@
  *                                 generation" costs when the lines it reads
  *                                 are being written, per call and by the
  *                                 call's outcome.
+ *                                 HASH_CHECK_SHARDS=<n> runs its cells at
+ *                                 S = n alone (check_shards_from_env()):
+ *                                 at n = 1 every handle count is in one
+ *                                 count row, and at P = 1 every joiner
+ *                                 writes the line the free pass's test
+ *                                 reads, so the row measures what the
+ *                                 per-shard rows cost with one shard: what
+ *                                 remains of the work that grows with S
+ *                                 (the bump's 2S head loads and S
+ *                                 exchanges or stores, and the test's reads
+ *                                 of the counts of every shard), and the
+ *                                 test reading a line being written.
+ *                                 The row's S comes from its own argument,
+ *                                 not from HASH_ARENA_SHARDS.
  *
  * Every thread these rows run -- the measured threads and the helper threads
  * of Reclaim_FreePassCheck -- is a new thread (FreshThreadRunner below), and
@@ -179,12 +193,11 @@ static size_t distinct_shards(const std::vector<unsigned>& numbers, size_t shard
 // a row's iterations (and so its name) are fixed then.
 static benchmark::IterationCount join_leave_total() {
     constexpr benchmark::IterationCount kDefault = benchmark::IterationCount(1) << 27;
-    const char* s = getenv("HASH_BM_JOIN_LEAVE_TOTAL");
-    if (s == nullptr) return kDefault;
-    char* end = nullptr;
-    const long long n = strtoll(s, &end, 10);   // strtoll, not atol: an out-of-range value is clamped, not undefined
-    if (end != s && *end == '\0' && n >= (1LL << 10) && n <= (1LL << 30) && (n & (n - 1)) == 0) return n;
-    fprintf(stderr, "HASH_BM_JOIN_LEAVE_TOTAL=\"%s\" is not a power of two from 2^10 to 2^30: Handle_JoinLeave uses 2^27\n", s);
+    const EnvCount c = count_from_env("HASH_BM_JOIN_LEAVE_TOTAL");
+    if (c.text == nullptr) return kDefault;
+    const long long n = c.value;
+    if (c.valid && n >= (1LL << 10) && n <= (1LL << 30) && (n & (n - 1)) == 0) return n;
+    fprintf(stderr, "HASH_BM_JOIN_LEAVE_TOTAL=\"%s\" is not a power of two from 2^10 to 2^30: Handle_JoinLeave uses 2^27\n", c.text);
     return kDefault;
 } // join_leave_total()
 
@@ -614,14 +627,38 @@ BENCHMARK_DEFINE_F(FreePassCheckFixture, Reclaim_FreePassCheck)(benchmark::State
     } // the pin's witnesses
 } // Reclaim_FreePassCheck
 
+// The S values of Reclaim_FreePassCheck's cells: {16, 256}, or {n} alone
+// when the environment sets HASH_CHECK_SHARDS=<n> with n a decimal integer
+// above 0 (capped at 2^16, the header's own cap). Unset, it is {16, 256} and
+// nothing is printed; set, one stderr line names the S values the row runs.
+// A value of 0 or below, or one that is not a whole decimal integer ("one",
+// "0x10", "1x"), gives {16, 256}. The set rounds S up to a power of two, so
+// n should be one: the row's name carries n, the pin_shard witness the
+// rounded count's S - 1. Read once, when the rows are registered. Exists so
+// that one binary measures the check at a shard count the default cells do
+// not have (S = 1: every handle count in one row) without a change of this
+// file per run.
+static std::vector<int64_t> check_shards_from_env() {
+    const EnvCount c = count_from_env("HASH_CHECK_SHARDS");
+    if (c.text == nullptr) return {16, 256};
+    if (!c.valid || c.value <= 0) {
+        fprintf(stderr, "HASH_CHECK_SHARDS=\"%s\" is not a decimal integer above 0: Reclaim_FreePassCheck runs S = 16 and S = 256\n", c.text);
+        return {16, 256};
+    } // if not a shard count
+    const int64_t n = std::min<long long>(c.value, 1LL << 16);   // the header's own cap
+    fprintf(stderr, "HASH_CHECK_SHARDS=\"%s\": Reclaim_FreePassCheck runs S = %lld only\n", c.text, static_cast<long long>(n));
+    return {n};
+} // check_shards_from_env()
+
 // Registers the row's cells: W in {0, 7, 15} (no joiners; 7 joiners; 15,
 // which with the measured thread fill a 16-thread machine) and, on a machine
 // with more than 16 hardware threads, also num_cpu - 1 (one joiner per
 // hardware thread besides the measured thread's: at S = 16 more joiners than
 // shards, several to a shard's row; at S = 256 on a machine of at most 256
 // hardware threads, one thread to a shard's row at most); S in {16, 256} (a
-// laptop's default shard count; a large server's); P in {0, 1}. Fixed calls
-// per run, one measured thread, every thread a new one, manual time (each
+// laptop's default shard count; a large server's), or the S of
+// HASH_CHECK_SHARDS (check_shards_from_env()); P in {0, 1}. Fixed calls per
+// run, one measured thread, every thread a new one, manual time (each
 // iteration's time is its reclaim() call alone). The registration call is
 // the one BENCHMARK_REGISTER_F() expands to, with the W list built here
 // because it depends on num_cpu.
@@ -630,7 +667,7 @@ static void register_free_pass_check() {
     if (num_cpu > 16) joiners.push_back(num_cpu - 1);
     benchmark::internal::RegisterBenchmarkInternal(std::make_unique<BENCHMARK_PRIVATE_CONCAT_NAME(FreePassCheckFixture, Reclaim_FreePassCheck)>())
         ->ArgNames({"W", "S", "P"})
-        ->ArgsProduct({joiners, {16, 256}, {0, 1}})
+        ->ArgsProduct({joiners, check_shards_from_env(), {0, 1}})
         ->Threads(1)->Iterations(kCheckCalls)->UseManualTime()->ThreadRunner(fresh_thread_runner);
 } // register_free_pass_check()
 [[maybe_unused]] static const bool free_pass_check_registered = (register_free_pass_check(), true);

@@ -589,10 +589,13 @@ where it leaves the laptop.
   the pre-sized erases 0.67-1.15 at 2-32 (on the EPYC the churn row without
   reclamation read 0.91 at 128 on identical code: a cell that moved between
   two runs of the same binary). One row whose timed body the compiler did not
-  change is slower, though the `advance()` it calls out of line moved: on the
-  EPYC the pre-sized erases followed by one `advance()` per thread
-  (`Erase_Presized_Del_Rcu`) run 3-5% slower at 1-32 threads with the count
-  per shard, within noise at 64 and 128.
+  change is slower: on the EPYC the pre-sized erases followed by one
+  `advance()` per thread (`Erase_Presized_Del_Rcu`) run 3-5% slower at 1-32
+  threads with the count per shard, within noise at 64 and 128. A profile puts
+  all of the difference in the table walk inside that `advance()`, whose
+  source is the same in both builds but whose loop gcc compiled with a
+  different register allocation; the per-shard free pass and its resume index
+  take no measurable time on this row.
 - **On the servers** (the 2-socket Xeon, the EPYC and the Grace, gcc 16.2, `-O3
   -march=native`, 256, 128 and 256 arena shards, threads unpinned, from one
   thread to the machine's), the handle and the generation protocol against the

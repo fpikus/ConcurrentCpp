@@ -183,8 +183,8 @@ list's `reclaim()`. The hash has two such calls: `reclaim()`, the same bump and
 free pass under the same name, and `advance()`, which is `reclaim()` plus a
 walk of the table; and a set constructed with a cadence does `reclaim()`'s work
 by itself. Where the hash differs — it hands out no iterators, its retired
-lists are per arena shard, and its collector walks the table — the text says
-so.
+lists and its handle counts are per arena shard, and its collector walks the
+table — the text says so.
 
 **Handles.** Every operation runs under a handle, its first argument:
 `set.contains(h, key)`, `set.insert(h, key)`, `set.erase(h, key)`.

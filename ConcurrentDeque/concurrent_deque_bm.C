@@ -21,6 +21,37 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 //
+// ConcurrentAppendDeque benchmarks: the cost of wait-free element access and
+// growth under a spinlock, against SpinlockDeque, a std::deque behind one
+// spinlock, which is the baseline of scenarios 1-3. Every row is one cell of an
+// ArgsProduct, a work size (arg 0) by a thread count doubling from 1 to the
+// machine's threads (arg 1), run on the file's own jthread pool (not Google
+// Benchmark's state.threads()) and timed in real time.
+//
+// Table of contents (each scenario's comment gives the detail):
+//
+//  Scenario 1, BM_AccessNoGrowth: element writes to disjoint ranges of a deque
+//      that is already sized. Measured because this is the structure's claim:
+//      once the room exists, access writes no shared word (it reads the
+//      directory pointer, which nobody writes) and must scale linearly, while
+//      the baseline serializes every access on its lock.
+//  Scenario 2, BM_AccessWithSizeCheck: the same writes, with one size() check
+//      per thread per iteration before they start, as a real reader checks
+//      before indexing. Measured because the check is an acquire load of the
+//      shared `size_` line, and the row shows what one touch of that line per
+//      iteration costs on top of scenario 1.
+//  Scenario 3, BM_ResizeAndWrite: every thread resizes an empty deque to the
+//      capacity it needs, then writes a hundred times as many elements.
+//      Measured because growth is the locked path where the threads collide,
+//      and the row shows the throughput of the write workload with a
+//      double-checked resize amortized into it against the baseline's locked
+//      resize.
+//  Scenario 4, BM_WriterVsPollingReaders: one writer pushing while reader
+//      threads poll size(). Only the lock-free deque runs here. Measured as an
+//      A/B probe of false sharing between `size_` and the write-path members:
+//      the same source built padded and with -DCONCURRENT_DEQUE_UNPADDED, the
+//      difference being the cost of the layout.
+//
 #include <benchmark/benchmark.h>
 #include "concurrent_deque.h"
 #include "spinlock.h"

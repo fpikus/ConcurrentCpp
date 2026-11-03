@@ -150,8 +150,8 @@ inline unsigned thread_number() {
 // EXCEPTIONS: WHAT IS AND IS NOT HANDLED (the one place that says it all)
 //   Exception behavior is mostly out of scope for this class, as it is for
 //   the arena: concurrent_deque.h declares exception safety out of scope in
-//   the comment on its resize(), and its reallocate_directory() can leak a
-//   retired directory if the vector push after the directory swap throws.
+//   the comment on its resize() (its reallocate_directory() itself gives the
+//   strong guarantee).
 //   Hash{} is expected not to throw; where it can, the limbo pushes below
 //   apply to it as to any other throw. What CAN throw here is the user's
 //   code -- T's copy constructor, copy assignment and operator==, and

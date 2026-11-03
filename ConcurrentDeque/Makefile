@@ -81,7 +81,7 @@ benchmarks: $(BENCHMARKS)
 tests: $(TESTS)
 
 # Build benchmark (SpinlockDeque vs ConcurrentAppendDeque: access, size-check,
-# resize-and-write scaling)
+# resize-and-write scaling; the writer vs polling readers false-sharing probe)
 $(TARGET_BM): concurrent_deque_bm.C $(HEADERS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_BM) $< $(LIBS_BM) $(CXX_RPATH) -o $@
 

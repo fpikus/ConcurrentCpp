@@ -548,17 +548,24 @@ private:
 
     /**
      * @brief Allocates a new directory, copies existing block pointers, and retires the old directory.
-     * 
+     *
      * We never delete the old directory immediately because a concurrent reader thread
      * might have just loaded the old directory pointer but hasn't accessed it yet.
-     * 
-     * @pre The caller MUST hold `spinlock_` to ensure thread-safe modification of 
+     *
+     * Flow: the new directory is filled in private memory, the old one is registered as
+     * retired, and only then is the new one published. Registering the old directory is
+     * the one step after the allocation that can throw (the vector may grow), and it
+     * comes before the publication, so a throw leaves the container exactly as it was:
+     * `directory_` and `directory_capacity_` are untouched and the owning pointer
+     * deletes the new array.
+     *
+     * @pre The caller MUST hold `spinlock_` to ensure thread-safe modification of
      * `directory_capacity_` and to prevent concurrent overlapping reallocations.
      */
     void reallocate_directory(size_t new_capacity) {
-        T** new_dir = new T*[new_capacity];
+        std::unique_ptr<T*[]> new_dir = std::make_unique_for_overwrite<T*[]>(new_capacity);
         T** old_dir = directory_.load(std::memory_order_relaxed);
-        
+
         for (size_t i = 0; i < directory_capacity_; ++i) {
             new_dir[i] = old_dir[i];
         }
@@ -566,11 +573,13 @@ private:
             new_dir[i] = nullptr;
         }
 
-        // Store new directory with release semantics so readers loading it see the populated pointers.
-        directory_.store(new_dir, std::memory_order_release);
+        // Retire the old directory before publishing the new one (see above): readers may
+        // still hold it, and the destructor frees it.
         if (old_dir) {
             retired_directories_.push_back(old_dir);
         }
+        // Store new directory with release semantics so readers loading it see the populated pointers.
+        directory_.store(new_dir.release(), std::memory_order_release);
         directory_capacity_ = new_capacity;
     } // reallocate_directory()
 

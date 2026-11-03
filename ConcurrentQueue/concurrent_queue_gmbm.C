@@ -94,8 +94,8 @@
 // --benchmark_min_time and --benchmark_min_warmup_time, which this binary
 // therefore ignores. --benchmark_min_time=<N>x with N >= 1 still works: an
 // explicit iteration count wins over MinTime(), and fixes the number of
-// iterations EACH thread runs (N = 0 is not supported: timed_loop()'s batch
-// loop never ends at zero iterations). The run names carry min_time: and
+// iterations EACH thread runs (N = 0 runs the barriers and no iteration, and
+// the row reports zero counters). The run names carry min_time: and
 // min_warmup_time: fields that grow with the thread count.
 //
 // THROUGHPUT ACCOUNTING
@@ -469,8 +469,19 @@ void BM_MP_MC(benchmark::State& state) {
     OpCounts counts;
     const size_t key_stride = static_cast<size_t>(nthreads) + 1;
     const size_t key_offset = static_cast<size_t>(tid) + 1;
-    if (producer) timed_loop<Q, K, V, true, BALANCE>(state, q, stats, tid, v.data(), mask, key_stride, key_offset, counts);
-    else timed_loop<Q, K, V, false, BALANCE>(state, q, stats, tid, v.data(), mask, key_stride, key_offset, counts);
+    // A run of zero iterations (--benchmark_min_time=0x; the Release library
+    // passes it through) does not enter timed_loop(): its batch call with 0
+    // would never return false. The framework's own range-for runs both
+    // barriers and no iteration instead; every record stays unstamped and the
+    // counts stay zero. The guard is here, not in timed_loop(), so that the
+    // loop's code stays what the disassembly checks compare.
+    if (state.max_iterations == 0) {
+        for (auto _ : state) {}
+    } else if (producer) {
+        timed_loop<Q, K, V, true, BALANCE>(state, q, stats, tid, v.data(), mask, key_stride, key_offset, counts);
+    } else {
+        timed_loop<Q, K, V, false, BALANCE>(state, q, stats, tid, v.data(), mask, key_stride, key_offset, counts);
+    } // if zero iterations, else producer or consumer
 
     state.SetItemsProcessed(counts.p + counts.c);
     state.counters["push"] = benchmark::Counter(static_cast<double>(counts.p), benchmark::Counter::kIsRate);
@@ -495,10 +506,9 @@ void BM_MP_MC(benchmark::State& state) {
             else pop_finish = std::max(pop_finish, stats[i].last);
             items += stats[i].items;
         } // loop over the threads' records
-        // The span is empty when no record is stamped, which this benchmark
-        // does not produce (every thread runs timed_loop() to the end), and
-        // otherwise only in a run of one iteration per thread in which every
-        // stamp coincides; such runs are calibration rounds, which are not
+        // The span is empty when no record is stamped (a zero-iteration run,
+        // above), and otherwise only in a run of one iteration per thread in
+        // which every stamp coincides; such runs are calibration rounds, which are not
         // reported, and they get zeros, here and in set_wall_counters().
         const auto fraction = [&ws](Clock::time_point t) {
             return ws.seconds > 0 ? std::chrono::duration<double>(t - ws.start).count()/ws.seconds : 0.0;

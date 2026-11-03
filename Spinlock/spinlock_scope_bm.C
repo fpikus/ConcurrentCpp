@@ -31,8 +31,8 @@
 // --benchmark_min_warmup_time, which this binary therefore ignores.
 // --benchmark_min_time=<N>x with N >= 1 still works: an explicit iteration
 // count wins over MinTime(), and fixes the number of iterations EACH thread
-// runs (N = 0 is not supported: timed_loop()'s batch loop never ends at zero
-// iterations). The run names carry min_time: and min_warmup_time: fields that
+// runs (N = 0 runs the barriers and no iteration, and the row reports zero
+// counters). The run names carry min_time: and min_warmup_time: fields that
 // grow with the thread count.
 //
 // THROUGHPUT ACCOUNTING
@@ -247,7 +247,17 @@ void BM_scope(benchmark::State& state) {
     s.core.slot_idx = 0;
   } // thread 0 setup
 
-  timed_loop<Slot, store, ptr_line>(state, tid);
+  // A run of zero iterations (--benchmark_min_time=0x; the Release library
+  // passes it through) does not enter timed_loop(): its batch call with 0
+  // would never return false. The framework's own range-for runs both
+  // barriers and no iteration instead, and every record stays unstamped (zero
+  // counters, below). The guard is here, not in timed_loop(), so that the
+  // loop's code stays what the disassembly checks compare.
+  if (state.max_iterations == 0) {
+    for (auto _ : state) {}
+  } else {
+    timed_loop<Slot, store, ptr_line>(state, tid);
+  } // if zero iterations
 
   // Past the end-of-loop barrier: no thread touches the arrays any more, and
   // every thread's record is written. Thread 0 turns them into the three
@@ -256,10 +266,9 @@ void BM_scope(benchmark::State& state) {
   // They are plain values, not rates, because Google Benchmark would divide a
   // rate by the mean loop time again; only thread 0 sets them, so summing the
   // counters over threads leaves them unchanged. The span is empty when no
-  // record is stamped, which this harness does not produce (every thread
-  // runs timed_loop() to the end), and otherwise only in a run of one
-  // iteration per thread in which every stamp coincides; such runs are
-  // calibration rounds, which are not reported, and set_wall_counters() gives
+  // record is stamped (a zero-iteration run, above), and otherwise only in a
+  // run of one iteration per thread in which every stamp coincides; such runs
+  // are calibration rounds, which are not reported, and set_wall_counters() gives
   // them zeros. The arrays are freed when their owners go out of scope.
   if (tid == 0) {
     const int threads = state.threads();

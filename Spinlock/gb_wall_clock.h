@@ -157,7 +157,8 @@
 //   - state.iterations() is read before or after the loop only: inside it, the
 //     batch form of the loop makes it read max_iterations.
 //
-// ORDERING (Google Benchmark's default thread runner; no custom runner here)
+// ORDERING (Google Benchmark's default thread runner, or any ThreadRunnerBase
+// whose RunThreads() returns only after every thread of the run has finished)
 //
 // StartKeepRunning() runs the start barrier, FinishKeepRunning() the end
 // barrier; both are a mutex and a condition variable, so everything a thread
@@ -420,9 +421,9 @@ namespace gb_wall_clock_detail {
 //   at      -- int -> const WallStamps&, the record of thread i;
 //   threads -- how many.
 // Records with `first` or `last` unset are skipped: they belong to threads
-// that did not run (an early return, a per-thread SkipWithError(), a rerun of
-// the row by a memory manager with thread 0 alone while threads() still says
-// N). The span and the spread are the ones every wall-timed benchmark in this
+// that did not run (a zero-iteration run, an early return, a per-thread
+// SkipWithError(), a rerun of the row by a memory manager with thread 0 alone
+// while threads() still says N). The span and the spread are the ones every wall-timed benchmark in this
 // repository reports; the arithmetic is written out exactly so.
 template <typename At>
 WallSpan wall_span_at(At at, int threads) {

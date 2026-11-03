@@ -499,7 +499,7 @@ template <typename SetType> SetType* MostlyOldFixture<SetType>::set = nullptr;
 // shard, so every timed thread starts with free/shards nodes to pop regardless
 // of the thread count, and appends after that:
 //   insert fixtures: kChurnPairs = 2^21 victims (plus the growth fixture's split
-//     copies, ~0.4 per prefilled key) over S shards, against kNewIters = 2^18
+//     copies, a fraction of one per prefilled key) over S shards, against kNewIters = 2^18
 //     inserts per thread: S = 16 -> 2^17 pops, half the run; S = 32 -> a quarter;
 //     S = 128 -> 6%; S = 256 -> 3%. On a machine whose default shard count is
 //     large, run the Del benchmarks again with HASH_ARENA_SHARDS=16 to get the

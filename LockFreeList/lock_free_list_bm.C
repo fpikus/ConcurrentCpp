@@ -21,6 +21,57 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 //
+// PURPOSE
+//
+// Throughput of LockFreeList<int, Ptr> under its three atomic shared-pointer
+// policies, on workloads chosen so that the policies' mechanisms separate:
+// the cost of a protected pointer load on every traversal step, what a
+// contended anchor does to a policy that locks, and what deferred reclamation
+// does to allocator locality. The list, not the pointer, is the subject
+// (atomic_shared_ptr_bm.C in ../SharedPtr measures the pointers alone).
+//
+// TABLE OF CONTENTS
+//
+// Every workload runs once per policy (row suffix StdAtomic, IntrPtr,
+// IntrPtrHP; see "Pointer policies" below), at 1, 2, 4, ... threads up to the
+// machine's hardware threads, all threads sharing one list. Each mixed row
+// draws its operation per iteration, and every row its inserted values, from
+// a per-thread deterministic RNG.
+//
+// 1. ReadHeavy: a 1000-node list; 90% traversals of the first 50 nodes, 5%
+//    head inserts, 5% head erases. The common case for a list that is mostly
+//    read: every traversal step is one protected load, and all threads read
+//    the same few nodes, so this is where the readers of a locking policy
+//    convoy on each other and the fairness measures (below) say how much of
+//    the run some thread was locked out.
+// 2. WriteHeavy: a 1000-node list; 45% head inserts, 45% head erases, 10%
+//    traversals of 10 nodes. The anchor (the dummy head) is contended by
+//    every thread, and nearly every erase retires a node: the cost of the
+//    publishing CAS and of releasing a node, and, for the deferred policy, of
+//    the node being freed later and cold instead of at once and hot for the
+//    next insert.
+// 3. Graveyard: 70% head erases, 30% head inserts, no reads, so the list
+//    shrinks to the dummy head and most erases find nothing. The most erase
+//    calls per iteration of any row, most of them on an empty list: the
+//    empty-list erase path, and the allocator churn of the inserts into what
+//    the batches freed; its retirements per iteration, at most the inserts',
+//    are fewer than WriteHeavy's.
+// 4. MassiveHeadInsert: inserts only, at the head. Nothing is retired or
+//    freed during the run, so the gap between the policies here, against
+//    WriteHeavy, separates the per-operation pointer cost from the
+//    reclamation and allocator effects.
+// 5. ReadDispersed: a 100k-node list; each thread starts at its own position,
+//    reads 50-node windows and resumes where it left off, with 5% inserts
+//    and 5% erases anchored mid-window. Threads rarely touch the same nodes,
+//    so this is the list nearly without contention: the pointer's
+//    uncontended per-step cost on a footprint beyond the L2. It is also the
+//    only row
+//    whose mutation anchors are erasable nodes (see its comment for what
+//    that means for the StdAtomic policy).
+//
+// Every row reports Google Benchmark's rate, the wall-clock rate and the
+// finish spread ("Pointer policies" below says why both rates are needed).
+
 #include <benchmark/benchmark.h>
 #include <thread>
 #include <vector>
@@ -451,9 +502,9 @@ BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, MassiveHeadInsert_IntrPtr, IntrPtrWrapp
 // - WriteHeavy: allocator locality, against HP. intr frees an erased node at
 //   once and the next insert's `new` reuses that just-freed, cache-hot chunk;
 //   HP frees it in a batch much later, so the next `new` gets a cold chunk.
-// - Graveyard: 70% erases, the most retirements per iteration, so the most
-//   scans on the erase path (and the inserts allocate into what the batches
-//   freed).
+// - Graveyard: 70% erases on a list that is nearly always empty, so the most
+//   erase calls per iteration, most of them the empty-list path (and the
+//   inserts allocate into what the batches freed).
 // - MassiveHeadInsert: inserts only, so nothing is retired and nothing is
 //   freed during the run. HP's gap to intr here versus in WriteHeavy separates,
 //   roughly, the per-load and CAS cost from the reclamation and allocator

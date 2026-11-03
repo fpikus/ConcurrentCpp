@@ -366,9 +366,8 @@ TYPED_TEST(LockFreeListTest, StressTest) {
         t.join();
     }
 
-#ifndef NDEBUG
-    // Debug-only invariant check: with all threads joined, a drain loop must
-    // empty the list completely, dead nodes included. This is the regression
+    // Invariant check: with all threads joined, a drain loop must empty the
+    // list completely, dead nodes included. This is the regression
     // check for the helping path in erase_after(): without helping, a marked
     // node whose unlink CAS lost to a concurrent insert stays linked forever,
     // and erase_after() over that edge keeps returning false while live nodes
@@ -377,8 +376,7 @@ TYPED_TEST(LockFreeListTest, StressTest) {
     // `lock_free_list_bugs.md`, bug 1).
     while (list.erase_after(list.before_begin())) {}
     EXPECT_EQ(list.begin(), list.end());
-#endif // NDEBUG
-}
+} // StressTest
 
 // Regression hammer for the helping path in erase_after(): one pure inserter and
 // one pure eraser collide on the same anchor, maximizing the chance that an
@@ -405,12 +403,10 @@ TYPED_TEST(LockFreeListTest, InsertEraseHammer) {
     stop.store(true);
     eraser.join();
 
-#ifndef NDEBUG
     // Same invariant as in StressTest: the drain must empty the list, dead
     // nodes included; a wedged erase_after() leaves reachable nodes behind.
     while (list.erase_after(list.before_begin())) {}
     EXPECT_EQ(list.begin(), list.end());
-#endif // NDEBUG
 } // InsertEraseHammer
 
 // Leak check under concurrency for every policy: threads insert, erase and

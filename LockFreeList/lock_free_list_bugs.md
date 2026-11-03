@@ -129,8 +129,8 @@ this comparison silently benchmarked the fixed header twice.
   with the drain count exactly matching the live-node count (helped-out dead
   nodes are not reported as erasures).
 - `InsertEraseHammer` regression test in `lock_free_list_test.C`: the same
-  two-thread collision shape as the repro, plus a debug-only (`#ifndef
-  NDEBUG`) post-join drain assertion. Against the pre-fix header it fails for
+  two-thread collision shape as the repro, plus a post-join drain
+  assertion. Against the pre-fix header it fails for
   the marking pointer type (IntrPtr) and passes for the non-marking
   StdAtomic — exactly the expected selectivity, since bug 1 lives in the
   marking branch. The mixed-op StressTest carries the same drain assertion,

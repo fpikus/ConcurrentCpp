@@ -107,10 +107,8 @@ Benchmark's standard items/s (summed iterations over the mean per-thread
 time), in millions per second; each cell is the median of 5 repetitions,
 averaged over two processes run in ABBA order against `../LockFreeList`'s
 benchmark at the same thread count. The workloads are `LockFreeList`'s five,
-operation for operation. The first four columns are its pointer policies —
-`HazardPtr` is Daniel Anderson's `parlay::atomic_shared_ptr` (the name
-predates the hazard-pointer policy, whose column is `IntrPtrHP`) — and `RCU`
-is this list with a long-lived handle per thread, refreshed on every
+operation for operation. The first three columns are its pointer policies,
+and `RCU` is this list with a long-lived handle per thread, refreshed on every
 operation (once per lap in ReadDispersed), and `reclaim()` called by every
 thread after every 256 of its own successful erases. Shown: 1, 4 and 16
 threads and the `_RCU` rows; cells whose ABBA halves disagreed in the first
@@ -118,23 +116,23 @@ round were re-run, and the re-run is shown. The benchmark also runs 2 and 8
 threads and two more regimes, `_RCU_NoReclaim` and `_RCU_OpHandle` (see
 `lock_free_list_rcu_bm.C`).
 
-| Workload          | Threads | StdAtomic | IntrPtr | HazardPtr | IntrPtrHP |    RCU |
-|-------------------|--------:|----------:|--------:|----------:|----------:|-------:|
-| ReadHeavy         |       1 |      5.53 |    3.81 |      1.32 |      5.65 |  24.36 |
-| ReadHeavy         |       4 |     2.24† |    2.49 |     0.60† |      1.12 |  54.49 |
-| ReadHeavy         |      16 |     2.96† |    3.47 |      1.71 |      3.24 |  65.01 |
-| WriteHeavy        |       1 |     20.33 |   22.15 |    11.23† |     20.92 |  72.39 |
-| WriteHeavy        |       4 |     1.90† |   17.86 |     2.18† |     3.14† | 13.65† |
-| WriteHeavy        |      16 |      0.70 |   12.74 |      1.07 |      1.55 |   9.90 |
-| Graveyard         |       1 |    36.73† |  38.58† |     22.05 |     34.71 |  96.11 |
-| Graveyard         |       4 |     3.22† |   32.03 |     3.50† |     5.50† | 20.95† |
-| Graveyard         |      16 |      1.02 |   22.28 |      1.58 |      2.78 |  14.31 |
-| MassiveHeadInsert |       1 |    27.41† |  32.81† |    24.52† |    33.91† | 70.50† |
-| MassiveHeadInsert |       4 |     2.26† |  15.91† |     2.81† |     3.31† | 72.45† |
-| MassiveHeadInsert |      16 |     0.64† |   12.85 |      1.52 |      1.70 |  25.28 |
-| ReadDispersed     |       1 |     2.82† |   2.81† |     1.05† |     2.43† |   2.56 |
-| ReadDispersed     |       4 |     2.87† |   4.16† |     0.66† |     3.15† |   8.33 |
-| ReadDispersed     |      16 |    10.05† |   12.53 |      5.44 |    10.11† | 24.26† |
+| Workload          | Threads | StdAtomic | IntrPtr | IntrPtrHP |    RCU |
+|-------------------|--------:|----------:|--------:|----------:|-------:|
+| ReadHeavy         |       1 |      5.53 |    3.81 |      5.65 |  24.36 |
+| ReadHeavy         |       4 |     2.24† |    2.49 |      1.12 |  54.49 |
+| ReadHeavy         |      16 |     2.96† |    3.47 |      3.24 |  65.01 |
+| WriteHeavy        |       1 |     20.33 |   22.15 |     20.92 |  72.39 |
+| WriteHeavy        |       4 |     1.90† |   17.86 |     3.14† | 13.65† |
+| WriteHeavy        |      16 |      0.70 |   12.74 |      1.55 |   9.90 |
+| Graveyard         |       1 |    36.73† |  38.58† |     34.71 |  96.11 |
+| Graveyard         |       4 |     3.22† |   32.03 |     5.50† | 20.95† |
+| Graveyard         |      16 |      1.02 |   22.28 |      2.78 |  14.31 |
+| MassiveHeadInsert |       1 |    27.41† |  32.81† |    33.91† | 70.50† |
+| MassiveHeadInsert |       4 |     2.26† |  15.91† |     3.31† | 72.45† |
+| MassiveHeadInsert |      16 |     0.64† |   12.85 |      1.70 |  25.28 |
+| ReadDispersed     |       1 |     2.82† |   2.81† |     2.43† |   2.56 |
+| ReadDispersed     |       4 |     2.87† |   4.16† |     3.15† |   8.33 |
+| ReadDispersed     |      16 |    10.05† |   12.53 |    10.11† | 24.26† |
 
 † Not a conclusion: the repetitions' coefficient of variation exceeds 5% (at
 1–4 threads) or 10% (at 16 threads), or the medians of the two ABBA halves

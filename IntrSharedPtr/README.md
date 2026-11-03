@@ -455,10 +455,9 @@ git -C HazardPtr checkout b26e5ed
 cd ../IntrSharedPtr && make imports
 ```
 
-The rules are in `../third_party.mk`, shared with `../SharedPtr`, whose
-README ("Third-party code") describes them and lists the other clones that
-project needs: the content is taken from the pinned commit, never from the
-clone's working tree, the patch is applied without fuzz, a clone at another
+The rules are in `../third_party.mk`; `../SharedPtr`'s README ("Third-party
+code") describes them too: the content is taken from the pinned commit, never
+from the clone's working tree, the patch is applied without fuzz, a clone at another
 commit is refused, and on a machine without the clone a `mm_hp/` made
 elsewhere and copied in is kept with a warning. `../SharedPtr` and
 `../LockFreeList`, which use `intr_shared_ptr_hp`, get `mm_hp/` by asking this

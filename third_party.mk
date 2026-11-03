@@ -1,8 +1,8 @@
 # Third-party code: the rules that make a project's copies of other people's
-# code from their upstream clones. Included by IntrSharedPtr/Makefile and
-# SharedPtr/Makefile; each has an `imports` target that makes its OWN
-# directory's copy with the canned recipe below, and every build target there
-# depends on that copy, so a plain `make` makes it first.
+# code from their upstream clones. Included by IntrSharedPtr/Makefile, whose
+# `imports` target makes its OWN directory's copy with the canned recipe below;
+# every build target there depends on that copy, so a plain `make` makes it
+# first.
 #
 # Why: ThirdParty/<name> (the git clones at the top of the work tree) is the one
 # source of third-party code we depend on; what the build uses is derived from
@@ -14,22 +14,12 @@
 #                                (github.com/magedm/mm_hp), used by
 #                                intr_shared_ptr_hp and hp_drain.h; clone
 #                                HazardPtr, patch IntrSharedPtr/mm_hp.patch.
-#   SharedPtr/lock_free_shared_ptr/parlay/
-#                                Daniel Anderson's parlay::shared_ptr and hazard
-#                                pointers (github.com/DanielLiamAnderson/atomic_shared_ptr),
-#                                which our lock_free_shared_ptr/atomic_shared_ptr.hpp is
-#                                built on, plus ParlayLib's headers for its pool allocator
-#                                (github.com/cmuparlay/parlaylib), unmodified; clones
-#                                AtomicSharedPtr and ParlayLib, patch
-#                                SharedPtr/lock_free_shared_ptr/parlay.patch (folly
-#                                replaced by standard equivalents, the list's Harris mark
-#                                stripped in parlay's reference counting).
 # Each patch's header says what each change is for. A project that only USES
-# another project's copy (SharedPtr and LockFreeList use IntrSharedPtr/mm_hp/,
-# LockFreeList uses SharedPtr's parlay/) never makes it itself: its rule for the
-# copy's SOURCE.txt runs `$(MAKE) -C <that project> imports`. What mm_hp/ is to
-# a build (its source, headers and stamp) is written once, for its owner and
-# both consumers, in IntrSharedPtr/mm_hp.mk.
+# another project's copy (SharedPtr and LockFreeList use IntrSharedPtr/mm_hp/)
+# never makes it itself: its rule for the copy's SOURCE.txt runs
+# `$(MAKE) -C <that project> imports`. What mm_hp/ is to a build (its source,
+# headers and stamp) is written once, for its owner and both consumers, in
+# IntrSharedPtr/mm_hp.mk.
 #
 # When an output is remade. Its SOURCE.txt, written when it is made, is the
 # stamp the build targets depend on; the stamp depends on the patch and on this
@@ -62,10 +52,10 @@
 # stamps. Taken first, while this file is still the last word of MAKEFILE_LIST.
 THIRD_PARTY_MK := $(lastword $(MAKEFILE_LIST))
 
-# Where the clones live: HazardPtr, AtomicSharedPtr and ParlayLib under the top
-# of the work tree's ThirdParty/. `?=`, so that an environment variable or
-# `make THIRD_PARTY=...` can point elsewhere (it reaches the sibling makes too).
-# Absolute, because SOURCE.txt records it.
+# Where the clones live: HazardPtr under the top of the work tree's ThirdParty/.
+# `?=`, so that an environment variable or `make THIRD_PARTY=...` can point
+# elsewhere (it reaches the sibling makes too). Absolute, because SOURCE.txt
+# records it.
 THIRD_PARTY ?= $(abspath $(dir $(THIRD_PARTY_MK))ThirdParty)
 
 # Every clone an output is made from, by its directory name under THIRD_PARTY:
@@ -83,23 +73,6 @@ HazardPtr_COMMIT = b26e5edc779bf2afaea821549c04bf0a07b20f11
 HazardPtr_URL = https://github.com/magedm/mm_hp
 HazardPtr_PATHS =
 HazardPtr_STRIP = 0
-# ParlayLib: all of include/parlay/ (parlay/alloc.h pulls 12 more of its
-# headers; copying the whole directory needs no list), include/parlay/<file>
-# landing at <file>.
-ParlayLib_COMMIT = 51017699dcc421f80479cdb238d3092233ad0d26
-ParlayLib_URL = https://github.com/cmuparlay/parlaylib
-ParlayLib_PATHS = include/parlay
-ParlayLib_STRIP = 2
-# AtomicSharedPtr: the four upstream files the adapter needs -- not
-# basic_atomic_shared_ptr.hpp (needs folly's hazptr), fast_shared_ptr.hpp, or
-# upstream's atomic_shared_ptr.hpp (our adapter replaces it) -- landing beside
-# ParlayLib's headers. Extracted after ParlayLib (the order of the clones in
-# the import call).
-AtomicSharedPtr_COMMIT = 3c213ef8a437b419171f901e640ddfdd6056d905
-AtomicSharedPtr_URL = https://github.com/DanielLiamAnderson/atomic_shared_ptr
-AtomicSharedPtr_PATHS = $(addprefix include/parlay/,shared_ptr.hpp details/atomic_details.hpp \
-                        details/hazard_pointers.hpp details/wait_free_counter.hpp)
-AtomicSharedPtr_STRIP = 2
 
 # $(call third_party_check_clone,<clone>): a shell fragment (one line, ending in
 # `;`) that fails the recipe unless THIRD_PARTY/<clone> is the top of its own

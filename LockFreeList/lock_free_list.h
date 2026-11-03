@@ -76,10 +76,10 @@ private:
     // its pointee to derive from a base class (intr_shared_ptr_hp: the
     // hazard pointer base std::hazard_pointer_obj_base<Node>) declares a
     // nested alias `pointee_base`; pointee_base_of<ASP>::type yields it.
-    // For the other policies -- std adapter, intr_shared_ptr, parlay --
-    // which declare no such alias, it yields the empty struct below, and
-    // the empty-base optimization keeps their Node byte-identical to
-    // a Node without this base. Private: Node is the only user and no new
+    // For the other policies -- std adapter, intr_shared_ptr -- which
+    // declare no such alias, it yields the empty struct below, and the
+    // empty-base optimization keeps their Node byte-identical to a Node
+    // without this base. Private: Node is the only user and no new
     // global name is introduced. Detection is a constrained partial
     // specialization (one argument), which instantiates nothing beyond what
     // `AtomicPtr<Node> next;` already forces -- so it compiles while Node
@@ -90,10 +90,9 @@ private:
     struct pointee_base_of<ASP> { using type = typename ASP::pointee_base; };
 
 public:
-    // Node derives from the policy's pointee base (empty for three of the
-    // four policies; the hazard pointer base, 24 bytes, for
-    // intr_shared_ptr_hp -- sizeof(Node<int>) 32/24/24/48 for
-    // std/intr/parlay/hp).
+    // Node derives from the policy's pointee base (empty for two of the
+    // three policies; the hazard pointer base, 24 bytes, for
+    // intr_shared_ptr_hp -- sizeof(Node<int>) 32/24/48 for std/intr/hp).
     struct Node : pointee_base_of<AtomicPtr<Node>>::type {
         T value;
         AtomicPtr<Node> next;
@@ -111,9 +110,9 @@ public:
         // (semantics and memory orders) is stated once, in
         // ../IntrSharedPtr/intr_pointee.h; they are hand-written here rather
         // than inherited from intr_pointee_base<> because Node is one struct
-        // for four policies, and a count taken from a policy base would change
-        // the std and parlay Nodes' size and break the comparability of the
-        // benchmark rows.
+        // for three policies, and a count taken from a policy base would change
+        // the std Node's size and break the comparability of the benchmark
+        // rows.
         std::atomic<long> ref_count{0};
         void AddRef() noexcept { ref_count.fetch_add(1, std::memory_order_relaxed); }
         bool DelRef() noexcept { return ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1; }
@@ -170,16 +169,9 @@ public:
         // spinlock pointer satisfies (2) trivially (its loader holds the lock
         // across load and AddRef, so the word cannot move in between), as does
         // the std adapter (std::atomic<shared_ptr>::load is one atomic step).
-        // parlay's atomic_shared_ptr::load()
-        // (../SharedPtr/lock_free_shared_ptr/atomic_shared_ptr.hpp) is
-        // hazard-protect plus
-        // increment_strong_count_if_nonzero() with NO re-validation after the
-        // increment -- the same shape as the HP pointer without step (2) -- so
-        // whether this walk's exclusivity test holds under the parlay policy is
-        // NOT established here: no claim is made either way. The HP pointer's
-        // re-validation reload and its TryAddRef CAS success are acquire so
-        // that the re-validation sees the swing that released the word's
-        // reference; see its header.
+        // The HP pointer's re-validation reload and its TryAddRef CAS success
+        // are acquire so that the re-validation sees the swing that released
+        // the word's reference; see its header.
         //
         // Nulling curr->next *before* advancing is what keeps this iterative:
         // the `curr = ...` assignment deletes the old node, whose own ~Node()

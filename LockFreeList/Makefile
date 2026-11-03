@@ -34,8 +34,7 @@ BUILD_DIR = build/$(shell hostname)
 # Common configuration. -I../IntrSharedPtr -I../SharedPtr so the list's tests
 # and benchmark include the pointer policies from their projects instead of
 # copies: the intrusive pointers, the drain helper and mm_hp from
-# ../IntrSharedPtr, the concept header (with the std adapter) and the parlay
-# adapter from ../SharedPtr.
+# ../IntrSharedPtr, the concept header (with the std adapter) from ../SharedPtr.
 COMMON_FLAGS = -march=$(VEC) --std=$(STD) -g -Werror -Wall -Wextra -pedantic
 COMMON_INCLUDES = -I. -I../IntrSharedPtr -I../SharedPtr
 # `?=` so a machine's config.mk can override: macOS has no librt.
@@ -69,15 +68,8 @@ TESTS = $(TARGET_TEST_ASAN) $(TARGET_TEST_TSAN)
 # the same reason: a changed compiler or -march must rebuild everything, or
 # stale binaries get measured. The pointer headers from ../IntrSharedPtr and
 # ../SharedPtr are on the list for the same reason, by their real paths.
-# ../SharedPtr/lock_free_shared_ptr/atomic_shared_ptr.hpp needs
-# ../SharedPtr/lock_free_shared_ptr/parlay/, which is not in the repository:
-# SharedPtr's `make imports` makes it (rules below). PARLAY_STAMP (its
-# SOURCE.txt) is on the list so that remaking parlay/ rebuilds everything that
-# uses it: the generated files keep upstream's old dates.
-PARLAY_STAMP = ../SharedPtr/lock_free_shared_ptr/parlay/SOURCE.txt
 HEADERS = lock_free_list.h ../SharedPtr/atomic_shared_ptr_concept.h ../IntrSharedPtr/intr_shared_ptr.h \
-          ../IntrSharedPtr/intr_pointee.h ../IntrSharedPtr/intr_shared_ptr_common.h \
-          ../SharedPtr/lock_free_shared_ptr/atomic_shared_ptr.hpp $(PARLAY_STAMP) ../config.mk
+          ../IntrSharedPtr/intr_pointee.h ../IntrSharedPtr/intr_shared_ptr_common.h ../config.mk
 
 # Maged Michael's hazard pointers (../IntrSharedPtr/mm_hp/, made by `make
 # imports` there), used by the intr_shared_ptr_hp policy and the drain helper:
@@ -109,22 +101,17 @@ benchmarks: $(BENCHMARKS)
 
 tests: $(TESTS)
 
-# The generated third-party directories are their projects' to make
-# (../third_party.mk): ../IntrSharedPtr/mm_hp/ by IntrSharedPtr's `make
-# imports`, ../SharedPtr/lock_free_shared_ptr/parlay/ by SharedPtr's. Each owner
-# decides whether its directory is out of date, so these rules always ask it
-# (FORCE) and do not repeat its prerequisites here. The stamp's date after the
-# sub-make decides what is rebuilt here: nothing, unless the directory was just
-# remade.
+# The generated third-party directory ../IntrSharedPtr/mm_hp/ is IntrSharedPtr's
+# to make (../third_party.mk), by its `make imports`. The owner decides whether
+# its directory is out of date, so this rule always asks it (FORCE) and does not
+# repeat its prerequisites here. The stamp's date after the sub-make decides
+# what is rebuilt here: nothing, unless the directory was just remade.
 $(MM_HP_STAMP): FORCE
 	$(MAKE) --no-print-directory -C ../IntrSharedPtr imports
 
-$(PARLAY_STAMP): FORCE
-	$(MAKE) --no-print-directory -C ../SharedPtr imports
-
-# Both generated directories, made by asking their owners (the two rules above):
-# `make imports` here makes nothing of its own.
-imports: $(MM_HP_STAMP) $(PARLAY_STAMP)
+# The generated directory, made by asking its owner (the rule above): `make
+# imports` here makes nothing of its own.
+imports: $(MM_HP_STAMP)
 
 FORCE:
 
@@ -150,7 +137,7 @@ run_benchmarks: benchmarks
 	./$(TARGET_BM)
 
 # Clean build artifacts: this host's build directory only. The generated
-# third-party directories of ../IntrSharedPtr and ../SharedPtr are their
-# projects' inputs, not this host's build outputs, and are never removed here.
+# third-party directory of ../IntrSharedPtr is its project's input, not this
+# host's build output, and is never removed here.
 clean:
 	rm -rf $(BUILD_DIR) *.bak *~

@@ -1,22 +1,21 @@
 # SharedPtr
 
 Atomic reference-counted smart pointers brought to one interface and compared
-on it: the concepts that `../LockFreeList` is written against, the adapters
-that fit other people's pointers to those concepts, and the harness — one
-typed test suite and one benchmark — that runs every pointer through the same
-operations with no data structure in the way.
+on it: the concepts that `../LockFreeList` is written against, the adapter
+that fits the standard library's pointer to those concepts, and the harness —
+one typed test suite and one benchmark — that runs every pointer through the
+same operations with no data structure in the way.
 
 Everything in this directory is an adapter or a harness. The pointers
 themselves live elsewhere: the two intrusive pointers in `../IntrSharedPtr`
-(the released component, with its own README), `std::atomic<std::shared_ptr>`
-in the standard library, and Daniel Anderson's `parlay::atomic_shared_ptr` in
-his repository, from which the build makes a patched copy.
+(the released component, with its own README) and `std::atomic<std::shared_ptr>`
+in the standard library.
 
 An atomic shared pointer has one problem that a plain shared pointer does
 not. To copy the pointer, a thread must read it and then increment the count
 of the object it points to — and between the two, another thread may swing the
 pointer away and drop the last reference, so that the object dies in the gap
-and the increment lands on a corpse. The four pointers compared here differ,
+and the increment lands on a corpse. The three pointers compared here differ,
 above all, in how they close that gap.
 
 ## The concepts
@@ -31,13 +30,12 @@ concepts are a design reference and an opt-in conformance check
 (`static_assert(AtomicSharedPtr<MyPtr<Node>>)`), deliberately not constraints
 on the containers. A pointer may also declare a base class its pointee must
 derive from (`pointee_base`), that its pointees die late
-(`deferred_reclamation`), and a single-attempt `compare_exchange_weak`; the
-first two are declared by `intr_shared_ptr_hp` alone, the weak CAS by it and
-by the parlay adapter.
+(`deferred_reclamation`), and a single-attempt `compare_exchange_weak`; all
+three are declared by `intr_shared_ptr_hp` alone.
 
-## The four pointers: two adapted, two native
+## The three pointers: one adapted, two native
 
-Two pointers do not speak the concepts' language natively and are adapted:
+One pointer does not speak the concepts' language natively and is adapted:
 
 1. `StdAtomicSharedPtrAdapter<T>` (in the concept header) adapts
    `std::atomic<std::shared_ptr<T>>`: its `shared_ptr_type` is a
@@ -47,25 +45,16 @@ Two pointers do not speak the concepts' language natively and are adapted:
    forces a weaker deletion algorithm on the list built on it. Not lock-free:
    libstdc++ closes the gap with a lock bit hidden in its control-block
    pointer, and says so (`is_always_lock_free` is `false`).
-2. `parlay::atomic_shared_ptr<T>` (`lock_free_shared_ptr/atomic_shared_ptr.hpp`)
-   adapts Daniel Anderson's `parlay::shared_ptr` and hazard pointers: our
-   class of that name keeps the Harris mark in bit 0 of the control-block
-   pointer, and a patch of ours (`lock_free_shared_ptr/parlay.patch`) makes his
-   reference counting ignore it and replaces his folly dependency with
-   standard equivalents. Genuinely lock-free, with hazard pointers demoted to
-   an implementation detail inside the pointer. His code is not in this
-   repository: it is built from his repository (see "Third-party code" below
-   and [lock_free_shared_ptr/README.md](lock_free_shared_ptr/README.md)).
 
 The other two pointers model the concepts as written and need no adapter;
 they are the component in `../IntrSharedPtr` and are included from there
 (`-I../IntrSharedPtr`):
 
-3. `intr_shared_ptr` — intrusive: the count lives in the pointee, the Harris
+2. `intr_shared_ptr` — intrusive: the count lives in the pointee, the Harris
    mark in bit 0 of the pointer word, and a one-bit spinlock in bit 1 guards
    the gap. Not lock-free, and it does not pretend to be; a list built on it
    is still lock-free in the algorithmic sense.
-4. `intr_shared_ptr_hp` — the intrusive pointer with the lock taken out: the
+3. `intr_shared_ptr_hp` — the intrusive pointer with the lock taken out: the
    gap is closed by a hazard pointer (Maged Michael's `mm_hp`), and the
    increment is conditional, so a dying object is never revived. Lock-free
    after a thread's first `load()`. The price is deferred reclamation: an
@@ -77,7 +66,7 @@ Their contract, their pointee requirements and `mm_hp` are documented in
 
 ## The harness
 
-`atomic_shared_ptr_test.C` is one GoogleTest suite typed over the four
+`atomic_shared_ptr_test.C` is one GoogleTest suite typed over the three
 pointers: the same contract tests — loads, stores, compare-exchanges, marks,
 counts, reclamation, stress — run on each, with the pointer-specific pointee
 each needs and a drain of `mm_hp` (`../IntrSharedPtr/hp_drain.h`) before every
@@ -85,18 +74,18 @@ each needs and a drain of `mm_hp` (`../IntrSharedPtr/hp_drain.h`) before every
 means "at some later scan"; the hazard pointer policy's own clauses have their
 tests in the same file. Built with ASan and with TSan.
 
-`atomic_shared_ptr_bm.C` runs the four head to head on one shared pointer
+`atomic_shared_ptr_bm.C` runs the three head to head on one shared pointer
 word with a payload behind it: read-heavy and write-heavy mixes, CAS rows,
 and a readers-plus-one-writer row driven by a stop flag (so that a slow writer
 is measured rather than averaged into its readers' time). The benchmark build
 carries event counters — every compare-exchange's outcome, every
 destruction, the hazard pointer policy's load retries — whose identities
 (destructions against compare-exchange outcomes, for one) cross-check each
-row. Rows are suffixed `_StdAtomic`, `_IntrShared`, `_LockFree` (parlay) and
-`_IntrSharedHP`. A second build of the same source,
-`atomic_shared_ptr_bursts_bm`, adds timing of the hazard pointer policy's
-destruction bursts (made on demand, below). No numbers are quoted here: the
-harness is one `make run_benchmarks` away from being yours.
+row. Rows are suffixed `_StdAtomic`, `_IntrShared` and `_IntrSharedHP`. A
+second build of the same source, `atomic_shared_ptr_bursts_bm`, adds timing of
+the hazard pointer policy's destruction bursts (made on demand, below). No
+numbers are quoted here: the harness is one `make run_benchmarks` away from
+being yours.
 
 ## Building and testing
 
@@ -119,47 +108,36 @@ and C++23; the code also builds with `g++-16`).
 ### Third-party code
 
 Other people's code is used from their repositories, never copied into this
-one. Clone each into `ThirdParty/` at the top of this repository, at the
-commit our patches were made against; the build then makes the directories it
+one. Clone it into `ThirdParty/` at the top of this repository, at the
+commit our patch was made against; the build then makes the directory it
 uses. From `SharedPtr/`:
 
 ```sh
 mkdir -p ../ThirdParty && cd ../ThirdParty
 git clone https://github.com/magedm/mm_hp HazardPtr
 git -C HazardPtr checkout b26e5ed
-git clone https://github.com/DanielLiamAnderson/atomic_shared_ptr AtomicSharedPtr
-git -C AtomicSharedPtr checkout 3c213ef
-git clone https://github.com/cmuparlay/parlaylib ParlayLib
-git -C ParlayLib checkout 5101769
 cd ../SharedPtr && make
 ```
 
-`make imports` here makes `lock_free_shared_ptr/parlay/` (Daniel Anderson's
-`parlay::shared_ptr` and hazard pointers plus `lock_free_shared_ptr/parlay.patch`,
-with ParlayLib's headers for its pool allocator); `make imports` in
-`../IntrSharedPtr` makes `../IntrSharedPtr/mm_hp/` (Maged Michael's hazard
-pointers plus `../IntrSharedPtr/mm_hp.patch`). Each patch begins with what each
-change is for. Every binary here needs both, so every build here asks both
-projects' `imports` first (this directory's own, and
-`make -C ../IntrSharedPtr imports`), and a plain `make` is enough; LockFreeList
-does the same. A user of `../IntrSharedPtr` alone needs only the first clone.
-Either directory is made again at the next build after its patch changes, or
-after `../third_party.mk` does (the rules, the pinned commits and what is
-taken from each clone). The rules take the content from the pinned commit,
-never from the clone's working tree, apply the patch without fuzz, and refuse
-a clone at any commit other than the pinned one, since a patch may not fit
-other code; set `THIRD_PARTY` if the clones live elsewhere. On a machine
-without the clones, a build keeps the directories already there (made
-elsewhere and copied in) with a warning; their `SOURCE.txt` records what they
-were made from.
+`make imports` in `../IntrSharedPtr` makes `../IntrSharedPtr/mm_hp/` (Maged
+Michael's hazard pointers plus `../IntrSharedPtr/mm_hp.patch`). The patch
+begins with what each change is for. Every binary here needs it, so every
+build here asks `make -C ../IntrSharedPtr imports` first, and a plain `make` is
+enough; LockFreeList does the same. The directory is made again at the next
+build after its patch changes, or after `../third_party.mk` does (the rules,
+the pinned commit and what is taken from the clone). The rules take the
+content from the pinned commit, never from the clone's working tree, apply the
+patch without fuzz, and refuse a clone at any commit other than the pinned
+one, since a patch may not fit other code; set `THIRD_PARTY` if the clone
+lives elsewhere. On a machine without the clone, a build keeps the directory
+already there (made elsewhere and copied in) with a warning; its `SOURCE.txt`
+records what it was made from.
 
 - `atomic_shared_ptr_concept.h` — the concepts, and the `std::atomic` adapter
-- `lock_free_shared_ptr/` — our adapter over Daniel Anderson's pointer, and
-  `parlay.patch`; its `parlay/` is made by `make imports` (above)
-- `atomic_shared_ptr_test.C` — unit tests, run on all four pointers (built
+- `atomic_shared_ptr_test.C` — unit tests, run on all three pointers (built
   with ASan and TSan)
-- `atomic_shared_ptr_bm.C` — the four pointers head to head; rows are suffixed
-  `_StdAtomic`, `_IntrShared`, `_LockFree` (parlay) and `_IntrSharedHP`
+- `atomic_shared_ptr_bm.C` — the three pointers head to head; rows are suffixed
+  `_StdAtomic`, `_IntrShared` and `_IntrSharedHP`
 
 The intrusive pointers, `mm_hp/`, the drain helper and their own tests and
 microbenchmark are in `../IntrSharedPtr`

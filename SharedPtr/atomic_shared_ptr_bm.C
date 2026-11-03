@@ -11,9 +11,6 @@
  *   _StdAtomic     std::atomic<std::shared_ptr> (StdAtomicSharedPtrAdapter)
  *   _IntrShared    intr_shared_ptr: intrusive count; a one-bit spinlock in the pointer
  *                  word covers the gap between reading the word and the AddRef
- *   _LockFree      parlay::atomic_shared_ptr (Daniel Anderson's, lock_free_shared_ptr/).
- *                  The suffix names that pointer, not a property the other rows lack:
- *                  _IntrSharedHP is lock-free too
  *   _IntrSharedHP  intr_shared_ptr_hp: intrusive count; the gap is covered by a hazard
  *                  pointer (Maged Michael's mm_hp) and a released pointee is destroyed
  *                  later, in a batch, by whichever thread's retire crosses mm_hp's
@@ -59,7 +56,6 @@
 #include "intr_shared_ptr.h"
 #include "intr_shared_ptr_hp.h"
 #include "hp_drain.h"
-#include "lock_free_shared_ptr/atomic_shared_ptr.hpp"
 #include "gb_wall_clock.h"   // WallRecords, WallTimed, report_wall() (../Spinlock)
 
 static const int num_cpu = sysconf(_SC_NPROCESSORS_CONF);
@@ -93,13 +89,13 @@ static const int num_cpu = sysconf(_SC_NPROCESSORS_CONF);
 //   pointee and, in the end, destroys one (the one it replaced, or its own
 //   unused `desired`); the pointee created in SetUp() dies inside the run and
 //   the last one installed survives it. Hence, for the pointers that destroy
-//   the pointee at strong-count zero (std, intr, and parlay, which defers only
-//   the release of its control block): destroyed == cas_ok + cas_fail on the
-//   CAS rows, destroyed == stores on ReadersOneWriter. intr_shared_ptr_hp
-//   destroys in mm_hp scans, so the difference is what is still pending in
-//   mm_hp's retired list when the run ends: 0 <= cas_ok + cas_fail - destroyed
-//   <= about the scan threshold (max(1000, 2 x hazard records)) plus one per
-//   thread (objects found protected).
+//   the pointee at strong-count zero (std and intr): destroyed == cas_ok +
+//   cas_fail on the CAS rows, destroyed == stores on ReadersOneWriter.
+//   intr_shared_ptr_hp destroys in mm_hp scans, so the difference is what is
+//   still pending in mm_hp's retired list when the run ends:
+//   0 <= cas_ok + cas_fail - destroyed <= about the scan threshold
+//   (max(1000, 2 x hazard records)) plus one per thread (objects found
+//   protected).
 // - validation_mismatch, zero_count, revalidation_mismatch (intr_shared_ptr_hp
 //   rows): load()'s three retry paths (see the pointer's header). A lock-free
 //   load can retry under contention; these separate retries from per-load cost.
@@ -316,7 +312,7 @@ private:
 // Pointee types
 // ---------------------------------------------------------------------------
 
-// The pointee of the std, intr and parlay rows. intr_shared_ptr_hp's base
+// The pointee of the std and intr rows. intr_shared_ptr_hp's base
 // class would change its layout, hence the separate DataHP below.
 struct Data {
     int value;
@@ -384,8 +380,6 @@ typename PtrType::shared_ptr_type make_shared_data(int v) {
         return typename PtrType::shared_ptr_type(std::make_shared<Data>(v));
     } else if constexpr (std::is_same_v<PtrType, intr_shared_ptr<Data>>) {
         return typename PtrType::shared_ptr_type(new Data(v));
-    } else if constexpr (std::is_same_v<PtrType, parlay::atomic_shared_ptr<Data>>) {
-        return typename PtrType::shared_ptr_type(parlay::make_shared<Data>(v));
     } else if constexpr (std::is_same_v<PtrType, intr_shared_ptr_hp<DataHP>>) {
         return typename PtrType::shared_ptr_type(new DataHP(v));
     }
@@ -498,7 +492,6 @@ PtrType* AtomicPtrFixture<PtrType>::ptr = nullptr;
 
 DEFINE_BM_READHEAVY(ReadHeavy_StdAtomic, StdAtomicSharedPtrAdapter<Data>)
 DEFINE_BM_READHEAVY(ReadHeavy_IntrShared, intr_shared_ptr<Data>)
-DEFINE_BM_READHEAVY(ReadHeavy_LockFree, parlay::atomic_shared_ptr<Data>)    // _LockFree = parlay
 // ReadHeavy, HP: the fairness axis. 90% loads on one word is where the
 // spinlock's readers convoy on the lock bit (and its occasional CAS waits
 // behind them) while HP's loads never wait on each other. Neither rate of this
@@ -534,7 +527,6 @@ DEFINE_BM_READHEAVY(ReadHeavy_IntrSharedHP, intr_shared_ptr_hp<DataHP>)
 
 DEFINE_BM_WRITEHEAVY(WriteHeavy_StdAtomic, StdAtomicSharedPtrAdapter<Data>)
 DEFINE_BM_WRITEHEAVY(WriteHeavy_IntrShared, intr_shared_ptr<Data>)
-DEFINE_BM_WRITEHEAVY(WriteHeavy_LockFree, parlay::atomic_shared_ptr<Data>)  // _LockFree = parlay
 // WriteHeavy, HP: 90% load + allocate + CAS, so every iteration retires one
 // DataHP (the replaced one or the unused `desired`): the batched reclamation
 // and the allocator-locality effect are at their largest here (see above).
@@ -559,24 +551,8 @@ DEFINE_BM_WRITEHEAVY(WriteHeavy_IntrSharedHP, intr_shared_ptr_hp<DataHP>)
     } \
     BENCHMARK_REGISTER_F(AtomicPtrFixture, Name)->Threads(16)->UseRealTime();
 
-// g++ -O3 reports -Warray-bounds and -Wstringop-overflow in this one row, from
-// libstdc++ and parlay code: it speculatively devirtualizes the release of the
-// shared_ptr<Data> control block to the other in-place control block of this
-// translation unit (parlay's ThreadIdPool), and checks that never-taken path
-// against the Data control block that make_shared allocated. A false
-// positive (-fno-devirtualize-speculatively removes it); the pragma silences
-// these two kinds of warning for this row alone and changes no generated code.
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Warray-bounds"
-#pragma GCC diagnostic ignored "-Wstringop-overflow"
-#endif
 DEFINE_BM_HIGHCONTENTION(HighContention_StdAtomic, StdAtomicSharedPtrAdapter<Data>)
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC diagnostic pop
-#endif
 DEFINE_BM_HIGHCONTENTION(HighContention_IntrShared, intr_shared_ptr<Data>)
-DEFINE_BM_HIGHCONTENTION(HighContention_LockFree, parlay::atomic_shared_ptr<Data>)  // _LockFree = parlay
 // HighContention, HP: 16 threads in a load-CAS loop on one word. A failed CAS
 // re-reads `expected` through the hazard-pointer load and retries; under the
 // spinlock every step queues on the lock bit. Fairness again: cas_ok/cas_fail
@@ -619,7 +595,7 @@ DEFINE_BM_HIGHCONTENTION(HighContention_IntrSharedHP, intr_shared_ptr_hp<DataHP>
 // operations of two very different kinds by a time that includes the no-op
 // tail. The Time column of these rows is meaningless for the same reason.
 // The instrumentation counters (destroyed etc.) are reported as for the other
-// rows; on these rows destroyed == stores for the std, intr and parlay pointers.
+// rows; on these rows destroyed == stores for the std and intr pointers.
 
 // The fixture adds the stop flag to AtomicPtrFixture.
 template <typename PtrType>
@@ -731,7 +707,6 @@ private:
 
 DEFINE_BM_READERSONEWRITER(ReadersOneWriter_StdAtomic, StdAtomicSharedPtrAdapter<Data>)
 DEFINE_BM_READERSONEWRITER(ReadersOneWriter_IntrShared, intr_shared_ptr<Data>)
-DEFINE_BM_READERSONEWRITER(ReadersOneWriter_LockFree, parlay::atomic_shared_ptr<Data>)  // _LockFree = parlay
 DEFINE_BM_READERSONEWRITER(ReadersOneWriter_IntrSharedHP, intr_shared_ptr_hp<DataHP>)
 
 BENCHMARK_MAIN();

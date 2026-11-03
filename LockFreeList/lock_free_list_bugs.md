@@ -1,9 +1,9 @@
 # LockFreeList — Bug Record (Review of 2026-07-16)
 
 Findings of a correctness review of `lock_free_list.h`, kept for future
-reference. Scope: the list algorithm itself, treating the three atomic shared
-pointers (`StdAtomicSharedPtrAdapter`, `intr_shared_ptr`,
-`parlay::atomic_shared_ptr`) as black-box atomics per the design contract.
+reference. Scope: the list algorithm itself, treating the atomic shared
+pointers (`StdAtomicSharedPtrAdapter`, `intr_shared_ptr`) as black-box atomics
+per the design contract.
 
 | # | Severity | Mode | Status |
 |---|----------|------|--------|
@@ -131,12 +131,12 @@ this comparison silently benchmarked the fixed header twice.
 - `InsertEraseHammer` regression test in `lock_free_list_test.C`: the same
   two-thread collision shape as the repro, plus a debug-only (`#ifndef
   NDEBUG`) post-join drain assertion. Against the pre-fix header it fails for
-  both marking pointer types (IntrPtr, Parlay) and passes for the non-marking
+  the marking pointer type (IntrPtr) and passes for the non-marking
   StdAtomic — exactly the expected selectivity, since bug 1 lives in the
   marking branch. The mixed-op StressTest carries the same drain assertion,
   but its diffuse workload (8 threads, RNG-mixed ops with traversals) does not
   reliably produce the mark-vs-insert interleaving on its own.
-- Full gtest suite (all three pointer types) passes under ASan and TSan.
+- Full gtest suite (both pointer types) passes under ASan and TSan.
 
 ---
 

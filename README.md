@@ -28,7 +28,7 @@ version printed in the book.
   exception, `reclaim()`, runs when the caller has quiesced the set).
 - **[LockFreeList](LockFreeList/)** — a Harris-style lock-free singly-linked
   list that reclaims memory for real, with never-invalidated iterators,
-  parameterized over four atomic shared pointer implementations.
+  parameterized over three atomic shared pointer implementations.
 
 Supporting components shared by the projects above:
 
@@ -39,11 +39,10 @@ Supporting components shared by the projects above:
   hazard pointers; the pointee supplies the count through a base class or
   hand-written hooks checked by a concept.
 - **[SharedPtr](SharedPtr/)** — the atomic shared pointer concepts
-  LockFreeList is written against, adapters that fit
-  `std::atomic<std::shared_ptr>` and Daniel Anderson's genuinely lock-free
-  `atomic_shared_ptr` to them, and the harness that tests and benchmarks all
-  four pointers side by side. Maged Michael's and Daniel Anderson's code are
-  built from their upstream repositories with small patches of ours (see
+  LockFreeList is written against, an adapter that fits
+  `std::atomic<std::shared_ptr>` to them, and the harness that tests and
+  benchmarks all three pointers side by side. Maged Michael's code is built
+  from his upstream repository with a small patch of ours (see
   [SharedPtr](SharedPtr/), "Third-party code").
 - **[Spinlock](Spinlock/)** — the TTAS spinlock with a two-tier back-off
   used throughout, with the benchmarks that tuned it.
@@ -98,10 +97,9 @@ IntrSharedPtr and LockFreeListRCU, for the wall-clock accounting in
 IntrSharedPtr, SharedPtr and LockFreeList build on Linux only: the hazard
 pointers they link issue `membarrier(2)`. Before their first build, clone the
 third-party code they use (SharedPtr's README, "Third-party code"); their
-first `make` then makes the patched copies the build uses. `make imports` makes
-only those copies: in IntrSharedPtr its `mm_hp/`, in SharedPtr its
-`lock_free_shared_ptr/parlay/`, and in LockFreeList both (by asking those two
-projects).
+first `make` then makes the patched copy the build uses. `make imports` makes
+only that copy, `mm_hp/`: in IntrSharedPtr, and in LockFreeList by asking
+IntrSharedPtr.
 Thread builds on Linux with glibc and libstdc++ only (any other C or C++
 library stops the build with an `#error`), and needs GoogleTest but not
 Google Benchmark: it has no benchmark yet.

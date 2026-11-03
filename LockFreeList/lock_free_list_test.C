@@ -32,7 +32,6 @@
 #include "hp_drain_gtest.h"
 #include "intr_shared_ptr.h"
 #include "intr_shared_ptr_hp.h"
-#include "lock_free_shared_ptr/atomic_shared_ptr.hpp"
 #include "lock_free_list.h"
 
 // Element type that counts live instances, so reclamation tests can confirm every
@@ -60,18 +59,15 @@ struct StdAtomicWrapper {
 struct IntrPtrWrapper {
     template <typename U> using ptr_type = intr_shared_ptr<U, U>;
 };
-struct ParlayWrapper {
-    template <typename U> using ptr_type = parlay::atomic_shared_ptr<U>;
-};
 struct IntrPtrHPWrapper {
     template <typename U> using ptr_type = intr_shared_ptr_hp<U, U>;
 };
 
 // Uniform node factory: the pointer families construct their shared_ptr_type
 // differently (std adapter: from make_shared; the two intrusive pointers:
-// adopting a raw new, since the count lives in the node; parlay: from
-// parlay::make_shared). Tests funnel all node creation through this one
-// callable, which dispatches on the concrete shared_ptr_type at compile time.
+// adopting a raw new, since the count lives in the node). Tests funnel all
+// node creation through this one callable, which dispatches on the concrete
+// shared_ptr_type at compile time.
 template <typename Wrapper>
 struct Factory {
     template <typename Node>
@@ -82,8 +78,6 @@ struct Factory {
         } else if constexpr (std::is_same_v<SharedPtr, typename intr_shared_ptr<Node, Node>::shared_ptr_type> ||
                              std::is_same_v<SharedPtr, typename intr_shared_ptr_hp<Node, Node>::shared_ptr_type>) {
             return SharedPtr(new Node(v));
-        } else {
-            return SharedPtr(parlay::make_shared<Node>(v));
         }
     }
 };
@@ -141,7 +135,6 @@ protected:
 using PtrWrappers = ::testing::Types<
     StdAtomicWrapper,
     IntrPtrWrapper,
-    ParlayWrapper,
     IntrPtrHPWrapper
 >;
 

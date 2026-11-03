@@ -33,8 +33,7 @@
 // These concepts document the contract that lock-free data structures (e.g.
 // LockFreeList) are designed against; pointer implementations -- the
 // std::atomic<std::shared_ptr> adapter below, intr_shared_ptr (intrusive
-// count, one-bit spinlock), parlay's atomic_shared_ptr
-// (lock_free_shared_ptr/) and intr_shared_ptr_hp (intrusive count, hazard
+// count, one-bit spinlock) and intr_shared_ptr_hp (intrusive count, hazard
 // pointers; lock-free after a thread's first load) -- are then plugged in
 // through a template parameter. They are deliberately *not* enforced as
 // constraints on the containers: they serve as the design reference, and as

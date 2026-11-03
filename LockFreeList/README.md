@@ -52,12 +52,12 @@ Stated here, earned in the book:
   already torn down. The hooks' contract, orders included, is stated once in
   `../IntrSharedPtr/intr_pointee.h`; `Node` here writes the hooks by hand
   rather than inheriting the component's `intr_pointee_base`, because one
-  `Node` serves all four policies, and a count supplied by a policy base
-  would change the size of the `std::atomic` and parlay policies' nodes,
-  which do not use it.
+  `Node` serves all three policies, and a count supplied by a policy base
+  would change the size of the `std::atomic` policy's nodes, which do not use
+  it.
 
 The honest summary: this is not really a lock-free list at all — it is an
-atomic shared pointer written four different ways, with one simple list
+atomic shared pointer written three different ways, with one simple list
 balanced on top. The `AtomicPtr` policy parameter selects among:
 
 1. `std::atomic<std::shared_ptr<T>>` — the standard's answer, with a hidden
@@ -66,10 +66,7 @@ balanced on top. The `AtomicPtr` policy parameter selects among:
 2. An intrusive pointer (`intr_shared_ptr.h`) — count embedded in the node,
    an explicit one-bit lock with deliberately asymmetric reader/writer
    backoff, and the Harris mark in bit 0.
-3. Daniel Anderson's `parlay::atomic_shared_ptr`
-   (`lock_free_shared_ptr/`) — genuinely lock-free, hazard pointers demoted
-   to an implementation detail inside the pointer.
-4. A hazard-pointer intrusive pointer (`intr_shared_ptr_hp.h`) — the
+3. A hazard-pointer intrusive pointer (`intr_shared_ptr_hp.h`) — the
    intrusive pointer with the lock taken out: Maged Michael's hazard pointers
    (`mm_hp/`) close the gap between reading a link and counting it, which
    makes it lock-free once a thread has made its first load. The price is
@@ -95,7 +92,7 @@ right lens for everything below.
 ## Performance
 
 Five workloads (read-heavy, write-heavy, graveyard, insertion-at-head,
-dispersed) were benchmarked across the first three pointer policies, on
+dispersed) were benchmarked across the first two pointer policies, on
 hardware from a 16-core Ryzen desktop to a 72-core NVIDIA Grace server; the
 trends are remarkably consistent.
 
@@ -103,17 +100,12 @@ trends are remarkably consistent.
   the list, the design's true fast path — perform excellently: full
   concurrent insertion, deletion, and never-dangling traversal, with
   throughput that keeps scaling as threads are added, for the standard and
-  intrusive pointers. The parlay pointer is the exception: measured on a Zen 4
-  laptop, its throughput falls by more than two thirds as soon as a second
-  thread joins, for reasons not yet understood.
+  intrusive pointers.
 - **Read-heavy workloads**: the intrusive pointer (`intr_shared_ptr`) scales
   best at moderate thread counts — not by a better algorithm (it and the
   standard pointer both hide a one-bit spinlock) but by a leaner
   implementation and a backoff policy with manners; the difference between a
-  spinlock with manners and one without is two orders of magnitude. At high
-  thread counts the genuinely lock-free parlay pointer keeps scaling after
-  both spinlock-based pointers collapse — it is bottlenecked by a per-core
-  resource (the store buffer) rather than the global coherency mesh.
+  spinlock with manners and one without is two orders of magnitude.
 - **Insertion at the head** funnels every thread through one pointer and will
   never scale, on any implementation; there the simplest, tightest pointer
   (the intrusive one, `intr_shared_ptr`) wins.
@@ -136,17 +128,16 @@ Requires Linux, clang (`../config.mk` selects `clang++-22` and C++23), Google
 Benchmark and GoogleTest; point `GBENCH_DIR` and `GTEST_DIR` at your
 installations if they are not in `$HOME/GoogleBench` and `$HOME/GoogleTest`.
 Linux because every binary links Maged Michael's hazard pointers, which issue
-`membarrier(2)`. Those, and Daniel Anderson's pointer, are made from their
-upstream repositories by the `make imports` targets of `../IntrSharedPtr` and
-`../SharedPtr`, which the first build here runs; clone the upstream
-repositories first (see SharedPtr's README, "Third-party code").
+`membarrier(2)`. Those are made from their upstream repository by the
+`make imports` target of `../IntrSharedPtr`, which the first build here runs;
+clone the upstream repository first (see SharedPtr's README, "Third-party
+code").
 
 - `lock_free_list.h` — the list
 - `lock_free_list_test.C` — unit tests (built with ASan and TSan)
 - `lock_free_list_bm.C` — the benchmarks described above; the row suffixes
-  `_StdAtomic`, `_IntrPtr`, `_HazardPtr` and `_IntrPtrHP` are the four
-  policies in the order listed above — `_HazardPtr` is the parlay pointer, a
-  name older than the hazard-pointer policy, whose rows are `_IntrPtrHP`
+  `_StdAtomic`, `_IntrPtr` and `_IntrPtrHP` are the three policies in the
+  order listed above
 - `lock_free_list_bugs.md` — the record of a correctness review of the list
   algorithm: what broke, why, and what was done about it
 
@@ -164,8 +155,6 @@ The pointer policies come from two sibling projects, through
 - `../IntrSharedPtr/hp_drain.h`, `../IntrSharedPtr/hp_drain_gtest.h` — drain
   the hazard pointers' pending reclamations, so that a test can assert that a
   node is gone
-- `../SharedPtr/lock_free_shared_ptr/` — Daniel Anderson's lock-free atomic
-  shared pointer (its `parlay/` made by `make imports` in `../SharedPtr`)
 - `../SharedPtr/atomic_shared_ptr_concept.h` — the concept the pointer
   policies model
 

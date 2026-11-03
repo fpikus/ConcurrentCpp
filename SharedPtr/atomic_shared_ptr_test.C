@@ -13,7 +13,6 @@
 #include "hp_drain_gtest.h"
 #include "intr_shared_ptr.h"
 #include "intr_shared_ptr_hp.h"
-#include "lock_free_shared_ptr/atomic_shared_ptr.hpp"
 
 // The one pointee type shared by every TypeParam. Its hazard pointer base is
 // UNCONDITIONAL: intr_shared_ptr_hp requires it, and a policy-conditional base
@@ -22,12 +21,11 @@
 struct Data : std::hazard_pointer_obj_base<Data> {
     // Counts currently-alive Data objects so tests can assert that no instance is
     // leaked and that the managed object is reclaimed when its last strong
-    // reference is dropped. The std adapter, intr_shared_ptr and parlay (which
-    // only *defers* control-block memory) destroy the object synchronously at
-    // strong-count zero; intr_shared_ptr_hp only retires it, and it is destroyed
-    // at a later mm_hp scan. So tests compare live_count against a base captured
-    // after a drain, and drain again before every "object gone" assertion
-    // (hp_drain.h).
+    // reference is dropped. The std adapter and intr_shared_ptr destroy the
+    // object synchronously at strong-count zero; intr_shared_ptr_hp only
+    // retires it, and it is destroyed at a later mm_hp scan. So tests compare
+    // live_count against a base captured after a drain, and drain again before
+    // every "object gone" assertion (hp_drain.h).
     static std::atomic<int> live_count;
 
     // Resurrection checker. A 0 -> 1 increment is legal exactly once, when the
@@ -100,8 +98,6 @@ typename PtrType::shared_ptr_type make_shared_data(int v) {
     } else if constexpr (std::is_same_v<PtrType, intr_shared_ptr<Data>> ||
                          std::is_same_v<PtrType, intr_shared_ptr_hp<Data>>) {
         return typename PtrType::shared_ptr_type(new Data(v));   // intrusive: adopt a raw new
-    } else if constexpr (std::is_same_v<PtrType, parlay::atomic_shared_ptr<Data>>) {
-        return typename PtrType::shared_ptr_type(parlay::make_shared<Data>(v));
     }
 }
 
@@ -138,7 +134,6 @@ protected:
 using PtrTypes = ::testing::Types<
     StdAtomicSharedPtrAdapter<Data>,
     intr_shared_ptr<Data>,
-    parlay::atomic_shared_ptr<Data>,
     intr_shared_ptr_hp<Data>
 >;
 static_assert(AtomicSharedPtr<intr_shared_ptr_hp<Data>>);
@@ -242,9 +237,8 @@ TYPED_TEST(AtomicSharedPtrTest, MarkedPointerLoadCrash) {
         ptr.store(marked_null);
         
         // 2. Load the marked nullptr.
-        // Stripping the mark bit leaves a null control block, which the load
-        // must not pass to increment_strong_count_if_nonzero(): that is a
-        // SEGV.
+        // Stripping the mark bit leaves a null pointer, whose count the load
+        // must not try to increment: that is a SEGV.
         auto loaded_null = ptr.load();
         EXPECT_TRUE(loaded_null.is_marked());
         EXPECT_FALSE(loaded_null); // should still evaluate to false (nullptr)
@@ -255,10 +249,9 @@ TYPED_TEST(AtomicSharedPtrTest, MarkedPointerLoadCrash) {
         ptr.store(marked_valid);
 
         // 4. Load the marked valid pointer.
-        // The copy constructor of parlay::shared_ptr must increment the
-        // reference count of the control block with the mark bit stripped;
-        // incrementing through the address with the mark bit still attached
-        // corrupts memory.
+        // The load must increment the reference count through the address
+        // with the mark bit stripped; incrementing through the address with
+        // the mark bit still attached corrupts memory.
         auto loaded_valid = ptr.load();
         EXPECT_TRUE(loaded_valid.is_marked());
         EXPECT_TRUE(loaded_valid);
@@ -298,8 +291,8 @@ TYPED_TEST(AtomicSharedPtrTest, StoreReplacesAndReclaims) {
         EXPECT_EQ(ptr.load()->value, 1);
 
         // Replace; with no outstanding loads the old object is released at once:
-        // destroyed synchronously by three of the policies, retired by
-        // intr_shared_ptr_hp and destroyed by the drain.
+        // destroyed synchronously by the std adapter and intr_shared_ptr, retired
+        // by intr_shared_ptr_hp and destroyed by the drain.
         ptr.store(make_shared_data<TypeParam>(2));
         drain_reclamation();
         EXPECT_EQ(Data::live_count.load(), base + 1);
@@ -414,8 +407,8 @@ TYPED_TEST(AtomicSharedPtrTest, NoRefDriftUnderStress) {
 //   - Helpers used by both groups below.
 //   - Typed tests: properties every pointer of the AtomicSharedPtr concept
 //     promises (std compare_exchange_strong semantics, ownership, value
-//     reclamation), written against the concept only and run over all four
-//     pointers (std adapter, intr_shared_ptr, parlay, intr_shared_ptr_hp);
+//     reclamation), written against the concept only and run over all three
+//     pointers (std adapter, intr_shared_ptr, intr_shared_ptr_hp);
 //     mark-dependent parts are guarded by `supports_marking`, like the marking
 //     tests above.
 //   - intr_shared_ptr_hp-only tests (fixture IntrSharedPtrHpTest): the value

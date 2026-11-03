@@ -4,10 +4,6 @@
 # this include is machine-independent and ships unchanged.
 include ../config.mk
 
-# The rules that make lock_free_shared_ptr/parlay/ from its upstream clones
-# (`make imports`, below).
-include ../third_party.mk
-
 # Compilers and run-time library paths. The per-machine config may select a
 # toolset compiler whose libstdc++ is not on the default library path; a binary
 # it links then builds cleanly and fails at run time with "GLIBCXX_x.y.z not
@@ -72,12 +68,7 @@ TESTS = $(TARGET_TEST_ASAN) $(TARGET_TEST_TSAN)
 # are not passed to the compiler. The machine configuration and the intrusive
 # pointer from ../IntrSharedPtr are on the list for the same reason: a change to
 # either must rebuild what uses it.
-# lock_free_shared_ptr/atomic_shared_ptr.hpp needs lock_free_shared_ptr/parlay/,
-# which is not in the repository: `make imports` (below) makes it. PARLAY_STAMP
-# (its SOURCE.txt) is on the list so that remaking parlay/ rebuilds everything
-# that uses it: the generated files keep upstream's old dates.
-PARLAY_STAMP = lock_free_shared_ptr/parlay/SOURCE.txt
-HEADERS = atomic_shared_ptr_concept.h ../IntrSharedPtr/intr_shared_ptr.h ../IntrSharedPtr/intr_pointee.h ../IntrSharedPtr/intr_shared_ptr_common.h lock_free_shared_ptr/atomic_shared_ptr.hpp $(PARLAY_STAMP) ../config.mk
+HEADERS = atomic_shared_ptr_concept.h ../IntrSharedPtr/intr_shared_ptr.h ../IntrSharedPtr/intr_pointee.h ../IntrSharedPtr/intr_shared_ptr_common.h ../config.mk
 
 # Maged Michael's hazard pointers (../IntrSharedPtr/mm_hp/, made by `make
 # imports` there), used by intr_shared_ptr_hp and the drain helper: HP_SOURCES,
@@ -109,22 +100,16 @@ benchmarks: $(BENCHMARKS)
 
 tests: $(TESTS)
 
-# Make lock_free_shared_ptr/parlay/ from the ParlayLib and AtomicSharedPtr
-# clones and parlay.patch (../third_party.mk says how, when it is remade, and
-# what happens on a host without the clones). Every target depends on its stamp,
-# so a fresh tree makes it at the first build; LockFreeList gets it by
-# `make -C ../SharedPtr imports`.
-imports: $(PARLAY_STAMP)
-
-$(PARLAY_STAMP): lock_free_shared_ptr/parlay.patch $(THIRD_PARTY_MK)
-	$(call third_party_import,ParlayLib AtomicSharedPtr)
-
 # ../IntrSharedPtr/mm_hp/ is IntrSharedPtr's to make: its own `imports` decides
 # whether it is out of date, so this rule always asks it (FORCE) and does not
 # repeat its prerequisites here. The stamp's date after the sub-make decides
 # what is rebuilt here: nothing, unless mm_hp/ was just remade.
 $(MM_HP_STAMP): FORCE
 	$(MAKE) --no-print-directory -C ../IntrSharedPtr imports
+
+# The generated directory, made by asking its owner (the rule above): `make
+# imports` here makes nothing of its own.
+imports: $(MM_HP_STAMP)
 
 FORCE:
 
@@ -163,10 +148,8 @@ run_benchmarks: benchmarks
 	./$(TARGET_BM)
 
 # Clean build artifacts: this host's build directory only. The generated
-# third-party directories stay (lock_free_shared_ptr/parlay/ here, and
-# ../IntrSharedPtr/mm_hp/): they are not build outputs of this host but the
-# shared inputs of every host building in this tree, and a host without the
-# clones (a fleet host) could not make them again. `make -B imports` remakes
-# parlay/ from the clones.
+# ../IntrSharedPtr/mm_hp/ stays: it is not a build output of this host but a
+# shared input of every host building in this tree, and a host without the
+# clone (a fleet host) could not make it again.
 clean:
 	rm -rf $(BUILD_DIR) *.bak *~

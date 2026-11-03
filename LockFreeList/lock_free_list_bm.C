@@ -31,10 +31,6 @@
 // - StdAtomic: std::atomic<std::shared_ptr> (StdAtomicSharedPtrAdapter).
 // - IntrPtr: intr_shared_ptr, intrusive count; a one-bit spinlock in the
 //   pointer word covers the gap between reading the word and the AddRef.
-// - HazardPtr: parlay::atomic_shared_ptr (Daniel Anderson's,
-//   lock_free_shared_ptr/), which protects its loads with its own hazard
-//   pointers. The suffix does NOT mean intr_shared_ptr_hp, the hazard-pointer
-//   policy below.
 // - IntrPtrHP: intr_shared_ptr_hp, intrusive count; the gap is covered by a
 //   hazard pointer (Maged Michael's mm_hp), and a released node is destroyed
 //   later, in a batch, by whichever thread's retire crosses mm_hp's scan
@@ -65,7 +61,6 @@
 #include "intr_shared_ptr.h"
 #include "intr_shared_ptr_hp.h"
 #include "hp_drain.h"
-#include "lock_free_shared_ptr/atomic_shared_ptr.hpp"
 #include "lock_free_list.h"
 
 #include "gb_wall_clock.h"              // WallRecords, WallTimed, report_wall()
@@ -80,14 +75,11 @@ struct StdAtomicWrapper {
 struct IntrPtrWrapper {
     template <typename U> using ptr_type = intr_shared_ptr<U, U>;
 };
-struct ParlayWrapper {
-    template <typename U> using ptr_type = parlay::atomic_shared_ptr<U>;
-};
 struct IntrPtrHPWrapper {
     template <typename U> using ptr_type = intr_shared_ptr_hp<U, U>;
 };
 
-// Uniform node factory (see lock_free_list_test.C): hides the three different
+// Uniform node factory (see lock_free_list_test.C): hides the two different
 // shared_ptr_type construction idioms behind one compile-time-dispatched callable
 // (both intrusive policies adopt a raw `new`).
 template <typename Wrapper>
@@ -100,8 +92,6 @@ struct Factory {
         } else if constexpr (std::is_same_v<SharedPtr, typename intr_shared_ptr<Node, Node>::shared_ptr_type> ||
                              std::is_same_v<SharedPtr, typename intr_shared_ptr_hp<Node, Node>::shared_ptr_type>) {
             return SharedPtr(new Node(v));
-        } else {
-            return SharedPtr(parlay::make_shared<Node>(v));
         }
     }
 };
@@ -407,63 +397,6 @@ BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, Graveyard_IntrPtr, IntrPtrWrapper)(benc
     report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
 }
 
-BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, ReadHeavy_HazardPtr, ParlayWrapper)(benchmark::State& state) {
-    SETUP_RNG;
-    using Node = LockFreeList<int, ParlayWrapper::template ptr_type>::Node;
-    for (auto _ : WallTimed(state, records)) {
-        int op = dist(rng);
-        if (op < 90) { // 90% read
-            int count = 0;
-            for (auto it = list->begin(); it != list->end() && count < 50; ++it) {
-                benchmark::DoNotOptimize(*it);
-                count++;
-            }
-        } else if (op < 95) { // 5% insert
-            list->insert_after(list->before_begin(), factory.template operator()<Node>(dist(rng)));
-        } else { // 5% erase
-            list->erase_after(list->before_begin());
-        }
-    }
-    state.SetItemsProcessed(state.iterations());
-    report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
-}
-
-BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, WriteHeavy_HazardPtr, ParlayWrapper)(benchmark::State& state) {
-    SETUP_RNG;
-    using Node = LockFreeList<int, ParlayWrapper::template ptr_type>::Node;
-    for (auto _ : WallTimed(state, records)) {
-        int op = dist(rng);
-        if (op < 10) { // 10% read
-            int count = 0;
-            for (auto it = list->begin(); it != list->end() && count < 10; ++it) {
-                benchmark::DoNotOptimize(*it);
-                count++;
-            }
-        } else if (op < 55) { // 45% insert
-            list->insert_after(list->before_begin(), factory.template operator()<Node>(dist(rng)));
-        } else { // 45% erase
-            list->erase_after(list->before_begin());
-        }
-    }
-    state.SetItemsProcessed(state.iterations());
-    report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
-}
-
-BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, Graveyard_HazardPtr, ParlayWrapper)(benchmark::State& state) {
-    SETUP_RNG;
-    using Node = LockFreeList<int, ParlayWrapper::template ptr_type>::Node;
-    for (auto _ : WallTimed(state, records)) {
-        int op = dist(rng);
-        if (op < 70) { // 70% erase
-            list->erase_after(list->before_begin());
-        } else { // 30% insert
-            list->insert_after(list->before_begin(), factory.template operator()<Node>(dist(rng)));
-        }
-    }
-    state.SetItemsProcessed(state.iterations());
-    report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
-}
-
 BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, MassiveHeadInsert_StdAtomic, StdAtomicWrapper)(benchmark::State& state) {
     SETUP_RNG;
     using Node = LockFreeList<int, StdAtomicWrapper::template ptr_type>::Node;
@@ -484,17 +417,7 @@ BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, MassiveHeadInsert_IntrPtr, IntrPtrWrapp
     report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
 }
 
-BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, MassiveHeadInsert_HazardPtr, ParlayWrapper)(benchmark::State& state) {
-    SETUP_RNG;
-    using Node = LockFreeList<int, ParlayWrapper::template ptr_type>::Node;
-    for (auto _ : WallTimed(state, records)) {
-        list->insert_after(list->before_begin(), factory.template operator()<Node>(dist(rng)));
-    }
-    state.SetItemsProcessed(state.iterations());
-    report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
-}
-
-// The IntrPtrHP rows: intr_shared_ptr_hp, the fourth policy. Their bodies are
+// The IntrPtrHP rows: intr_shared_ptr_hp, the third policy. Their bodies are
 // copies of the IntrPtr rows' with the wrapper replaced, so that the two
 // intrusive policies run the same code and differ only in the pointer. Why
 // measure it, workload by workload (mechanisms to look for, not results):
@@ -519,9 +442,6 @@ BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, MassiveHeadInsert_HazardPtr, ParlayWrap
 //   chunks; "per line" assumes consecutive nodes are adjacent in memory, as
 //   they are when prepopulated):
 //     intr    Node::ref_count; 24-byte Node, 32-byte chunk: two counts per line
-//     parlay  strong_count of control_block_inplace<Node> (vptr, strong and
-//             weak counts, then the 24-byte Node: 40 bytes), 48-byte chunk:
-//             about half of the lines hold two counts
 //     std     the make_shared control block's use count (48 bytes with the
 //             32-byte Node), 64-byte chunk: one count per line
 //     HP      Node::ref_count; 48-byte Node (the 24-byte hazard pointer
@@ -538,10 +458,10 @@ BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, MassiveHeadInsert_HazardPtr, ParlayWrap
 //   freed during the run. HP's gap to intr here versus in WriteHeavy separates,
 //   roughly, the per-load and CAS cost from the reclamation and allocator
 //   effects above.
-// - ReadDispersed (below): the list is 100k nodes: 3.2 MB for intr, 4.8 MB for
-//   parlay, 6.4 MB for std and HP (all beyond a 1 MB L2, within the 16 MB L3
-//   of a Ryzen 7940HS), so HP's dispersed reads touch twice the lines intr's
-//   do; threads are far apart, so neighbour false sharing is rare there.
+// - ReadDispersed (below): the list is 100k nodes: 3.2 MB for intr, 6.4 MB for
+//   std and HP (all beyond a 1 MB L2, within the 16 MB L3 of a Ryzen 7940HS),
+//   so HP's dispersed reads touch twice the lines intr's do; threads are far
+//   apart, so neighbour false sharing is rare there.
 BENCHMARK_TEMPLATE_DEFINE_F(ListFixture, ReadHeavy_IntrPtrHP, IntrPtrHPWrapper)(benchmark::State& state) {
     SETUP_RNG;
     using Node = LockFreeList<int, IntrPtrHPWrapper::template ptr_type>::Node;
@@ -712,42 +632,6 @@ BENCHMARK_TEMPLATE_DEFINE_F(DispersedListFixture, ReadDispersed_IntrPtr, IntrPtr
     report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
 }
 
-BENCHMARK_TEMPLATE_DEFINE_F(DispersedListFixture, ReadDispersed_HazardPtr, ParlayWrapper)(benchmark::State& state) {
-    SETUP_RNG;
-    using Node = LockFreeList<int, ParlayWrapper::template ptr_type>::Node;
-    using Iterator = LockFreeList<int, ParlayWrapper::template ptr_type>::iterator;
-    constexpr int window = 50; // elements read per pass
-    constexpr int mid = window / 2; // offset within the window where writes are anchored
-    Iterator cursor; // this thread's staggered start, assigned on the first pass (see ReadDispersed_StdAtomic)
-    bool first_pass = true;
-    for (auto _ : WallTimed(state, records)) {
-        if (first_pass) {
-            cursor = start_positions[state.thread_index()];
-            first_pass = false;
-        }
-        int op = dist(rng);
-        Iterator it = cursor;
-        Iterator anchor = cursor; // falls back to the window start if the list is too short to reach `mid`
-        for (int count = 0; it != list->end() && count < window; ++count) {
-            benchmark::DoNotOptimize(*it);
-            if (count == mid - 1) {
-                anchor = it; // predecessor of the mutation target, mid-way through the window
-            }
-            ++it;
-        }
-        if (op >= 90) {
-            if (op < 95) { // 5% insert, anchored mid-window instead of at the head
-                list->insert_after(anchor, factory.template operator()<Node>(dist(rng)));
-            } else { // 5% erase, anchored mid-window instead of at the head
-                list->erase_after(anchor);
-            }
-        }
-        cursor = (it == list->end()) ? list->begin() : it; // wrap at the tail, otherwise resume here next pass
-    }
-    state.SetItemsProcessed(state.iterations());
-    report_wall(state, records, static_cast<double>(state.iterations())*state.threads());
-}
-
 // ReadDispersed for intr_shared_ptr_hp (see the IntrPtrHP rows above for why).
 // The cursor is declared outside the state loop, so it is released after the
 // loop's end barrier, possibly after thread 0's TearDown() has deleted the list
@@ -811,7 +695,6 @@ static const int num_cpu = sysconf(_SC_NPROCESSORS_CONF);
 
 REGISTER_BMS(StdAtomic)
 REGISTER_BMS(IntrPtr)
-REGISTER_BMS(HazardPtr)  // parlay::atomic_shared_ptr, not intr_shared_ptr_hp
 REGISTER_BMS(IntrPtrHP)
 
 BENCHMARK_MAIN();

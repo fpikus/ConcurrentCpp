@@ -105,8 +105,8 @@ Under concurrency the baseline collapses first — down to 10 million lookups/s
 at 4 threads (400 ns each) as the reader count bounces between cores, and it
 stays between 8 and 11 million per second at every thread count up to 128 —
 while this set reaches 275 million lookups per second at 16 threads of the
-EPYC and **1.1 billion lookups per second** on a large Granite Rapids server
-(July 2026, before the key mixer was added). The EPYC's 64- and 128-thread lookup cells are not quoted: the
+EPYC and **2.0 billion lookups per second** at 128 of the 256 hardware threads
+of a two-socket Granite Rapids server (2026-11-04)†. The EPYC's 64- and 128-thread lookup cells are not quoted: the
 threads finish far apart there, and a run-wide rate mixes the contended phase
 with a tail in which few threads still run.
 
@@ -135,9 +135,11 @@ single-threaded, 54 million at 4 threads and 90 million at 16, against the
 baseline's 10, 2.0 and 1.0 million; with the table doubling live during the
 run (`Insert_MostlyNew`), 20 million per second at one thread and 77 million
 at 128, against the baseline's 17 and 0.5 million. On a 256-thread Granite
-Rapids server one shard collapses to 3 million per second at 256 threads and
-the default shard count reaches about 300 million (2026-09-25). The bucket
-table is still doubled under one lock, once per doubling.
+Rapids server one shard collapses to about a fiftieth of the default shard
+count's rate at 256 threads (2026-09-25); today the default shard count
+inserts between 75 and 89 million random keys per second at 256 threads, the
+table doubling twice during the run (2026-11-04). The bucket table is still
+doubled under one lock, once per doubling.
 
 | Workload                    | Threads | This set | Baseline |
 |-----------------------------|--------:|---------:|---------:|
@@ -166,6 +168,21 @@ span apart (see above). The 128-thread pre-sized cell also contains a table
 doubling, so it is not the pre-sized workload; the baseline's pre-sized cells
 at 64 and 128 threads rehash as well. The prose above quotes daggered cells
 too; their direction holds in every process of the run.
+
+The same benchmark on a two-socket Granite Rapids server (256 hardware
+threads, two NUMA nodes; GCC 16.2 `-O3 -march=native`, 2026-11-04, the same
+statistic and marks): 32.5 ns per lookup at one thread against the baseline's
+63.4 ns; the baseline falls to 6.1 million lookups per second at 4 threads†
+and stays at 4.5–5 million at every thread count from 8 to 256, while this
+set reaches 451 million at 16 threads†, between 0.9 and 1.7 billion at 64
+(varying from run to run with where the unpinned threads land), and 2.0
+billion at 128†; at 256 the threads finish far apart and the cell is not
+quoted. Pre-sized random inserts: 33† million per second at one thread, 104†
+at 4 and 243† at 16, against the baseline's 17†, 2.5† and 1.1†; with the
+table doubling live, 10.8 million per second at one thread and 85† at 128
+threads, against 8.9† and 0.47†. The pre-sized row is not quoted from 64 threads up: at 64 its
+rate varies from run to run, and from 128 the threads finish far apart and
+the table doubles during the run.
 
 While these benchmarks run, the CPU fans rev up. Under the reader-writer-lock
 baseline, the machine stays quiet: at 32 threads its threads spend over 95% of

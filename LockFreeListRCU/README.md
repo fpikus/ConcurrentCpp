@@ -99,45 +99,85 @@ that neighboring generations' counts never share a cache line, plus five
 a release build a node is 24 bytes for `int` (value, next, retire link) and a
 handle is one pointer; debug builds add checking fields to both.
 
-## Performance (2026-10-04)
+## Performance (2026-11-02)
 
-Measured on a 16-thread laptop (Ryzen 9 7940HS, 8 cores) under WSL2, both
-benchmarks built with clang++-22 `-O3 -march=native`. Rates are Google
-Benchmark's standard items/s (summed iterations over the mean per-thread
-time), in millions per second; each cell is the median of 5 repetitions,
-averaged over two processes run in ABBA order against `../LockFreeList`'s
-benchmark at the same thread count. The workloads are `LockFreeList`'s five,
-operation for operation. The first three columns are its pointer policies,
-and `RCU` is this list with a long-lived handle per thread, refreshed on every
-operation (once per lap in ReadDispersed), and `reclaim()` called by every
-thread after every 256 of its own successful erases. Shown: 1, 4 and 16
-threads and the `_RCU` rows; cells whose ABBA halves disagreed in the first
-round were re-run, and the re-run is shown. The benchmark also runs 2 and 8
-threads and two more regimes, `_RCU_NoReclaim` and `_RCU_OpHandle` (see
-`lock_free_list_rcu_bm.C`).
+Measured on a two-socket EPYC 9555 (Zen 5; 128 hardware threads, 8 NUMA
+nodes), both benchmarks built with GCC 16.2 `-O3 -march=native`. Rates are
+wall-clock: every thread's items summed over the span from the first thread's
+start to the last thread's finish, in millions per second. (Google Benchmark's
+own items/s divides by the mean per-thread time; it agrees at one thread and
+runs higher wherever threads finish apart.) Each cell is the median over four
+processes per binary (two rounds, each run in ABBA order against
+`../LockFreeList`'s benchmark at the same thread count), 5 repetitions per
+process, unpinned. The workloads
+are `LockFreeList`'s five, operation for operation. The first three columns
+are its pointer policies, and `RCU` is this list with a long-lived handle per
+thread, refreshed on every operation (once per lap in ReadDispersed), and
+`reclaim()` called by every thread after every 256 of its own successful
+erases. Shown: 1, 4, 16, 64 and 128 threads and the `_RCU` rows. The benchmark
+also runs 2, 8 and 32 threads and two more regimes, `_RCU_NoReclaim` and
+`_RCU_OpHandle` (see `lock_free_list_rcu_bm.C`).
 
 | Workload          | Threads | StdAtomic | IntrPtr | IntrPtrHP |    RCU |
 |-------------------|--------:|----------:|--------:|----------:|-------:|
-| ReadHeavy         |       1 |      5.53 |    3.81 |      5.65 |  24.36 |
-| ReadHeavy         |       4 |     2.24† |    2.49 |      1.12 |  54.49 |
-| ReadHeavy         |      16 |     2.96† |    3.47 |      3.24 |  65.01 |
-| WriteHeavy        |       1 |     20.33 |   22.15 |     20.92 |  72.39 |
-| WriteHeavy        |       4 |     1.90† |   17.86 |     3.14† | 13.65† |
-| WriteHeavy        |      16 |      0.70 |   12.74 |      1.55 |   9.90 |
-| Graveyard         |       1 |    36.73† |  38.58† |     34.71 |  96.11 |
-| Graveyard         |       4 |     3.22† |   32.03 |     5.50† | 20.95† |
-| Graveyard         |      16 |      1.02 |   22.28 |      2.78 |  14.31 |
-| MassiveHeadInsert |       1 |    27.41† |  32.81† |    33.91† | 70.50† |
-| MassiveHeadInsert |       4 |     2.26† |  15.91† |     3.31† | 72.45† |
-| MassiveHeadInsert |      16 |     0.64† |   12.85 |      1.70 |  25.28 |
-| ReadDispersed     |       1 |     2.82† |   2.81† |     2.43† |   2.56 |
-| ReadDispersed     |       4 |     2.87† |   4.16† |     3.15† |   8.33 |
-| ReadDispersed     |      16 |    10.05† |   12.53 |    10.11† | 24.26† |
+| ReadHeavy         |       1 |      1.15 |    1.49 |      2.09 | 31.14† |
+| ReadHeavy         |       4 |     0.71† |   0.67† |     0.45† | 25.51† |
+| ReadHeavy         |      16 |     0.62† |   1.31† |     0.40† | 15.26† |
+| ReadHeavy         |      64 |         — |   1.25† |      0.86 | 10.46† |
+| ReadHeavy         |     128 |         — |       — |      0.98 |   8.16 |
+| WriteHeavy        |       1 |      7.89 |    9.18 |     10.04 |  69.14 |
+| WriteHeavy        |       4 |     0.67† |   7.92† |     1.28† |  4.83† |
+| WriteHeavy        |      16 |     0.18† |   5.13† |     0.35† |  2.25† |
+| WriteHeavy        |      64 |         — |   2.06† |     0.17† |  1.21† |
+| WriteHeavy        |     128 |     0.04† |   1.05† |      0.13 |  0.93† |
+| Graveyard         |       1 |     14.41 |   18.34 |     21.39 |  96.54 |
+| Graveyard         |       4 |     1.31† |  16.14† |     2.26† |  8.65† |
+| Graveyard         |      16 |     0.44† |   9.18† |     0.73† |  3.65† |
+| Graveyard         |      64 |     0.10† |       — |      0.27 |  1.70† |
+| Graveyard         |     128 |     0.06† |       — |      0.20 |  1.36† |
+| MassiveHeadInsert |       1 |      9.56 |   12.84 |     14.28 | 76.53† |
+| MassiveHeadInsert |       4 |     0.83† |  10.07† |     1.52† | 28.36† |
+| MassiveHeadInsert |      16 |     0.18† |   7.08† |     0.54† |      — |
+| MassiveHeadInsert |      64 |      0.06 |   2.81† |     0.25† |      — |
+| MassiveHeadInsert |     128 |         — |   1.23† |     0.21† |      — |
+| ReadDispersed     |       1 |      1.05 |    1.37 |      1.81 |  2.82† |
+| ReadDispersed     |       4 |     1.91† |   1.37† |     1.28† |  8.12† |
+| ReadDispersed     |      16 |     4.43† |   3.42† |     4.03† | 16.89† |
+| ReadDispersed     |      64 |     7.96† |   7.96† |     6.98† | 27.43† |
+| ReadDispersed     |     128 |    11.48† |  12.09† |     11.55 | 18.42† |
 
 † Not a conclusion: the repetitions' coefficient of variation exceeds 5% (at
-1–4 threads) or 10% (at 16 threads), or the medians of the two ABBA halves
-differ by more than the larger of their two coefficients of variation, in
-the re-run as well.
+1–4 threads) or 10% (at 16 threads and more); or the medians of the two ABBA
+halves of either round differ by more than 1% and by more than the larger
+of their two coefficients of variation; or the per-process medians fall into
+two levels more than 10% apart (an unpinned process can land on different
+chiplets or sockets from one run to the next, and so can its number).
+
+— Left out: the cell's threads finish more than half the run's span apart,
+so a run-wide rate mixes the contended phase with a tail in which few threads
+are still running; neither that rate nor the mean per-thread rate is the
+steady-state figure.
+
+Code placement alone moves the one-thread cells: rebuilding the same code
+with a 16-byte pad or a different loop alignment shifts the pointer policies'
+cells by up to 1.1% and the RCU cells by up to 4%.
+
+Two things the table says. At one thread, where nothing contends, the RCU
+list is 1.6× (ReadDispersed, which is bound by the memory walk) to 15×
+(ReadHeavy) faster than the fastest pointer policy: an operation costs it no
+atomic increment and decrement per node visited. Under contention the picture
+splits by workload. The read-heavy rate of the RCU list falls with the thread
+count, from 31 million operations per second at one thread to 8 million at
+128, but at 128 threads it is still 8× the rate of `IntrPtrHP`, the one
+pointer cell quotable there. On the write-heavy workloads (WriteHeavy,
+Graveyard) the spinlock-counted `IntrPtr` is ahead of the RCU list by
+1.6–2.5× from 4 to 16 threads, and the gap narrows to about 1.1× on
+WriteHeavy by 128 threads (Graveyard's `IntrPtr` cells are not quotable
+there). MassiveHeadInsert, which inserts at the head and reads nothing, keeps
+the RCU list ahead where its cell is quotable, 5.4× at one thread and 2.8× at
+four; from 16 threads up its threads finish too far apart for a rate. Most of
+these ratios come from daggered cells; their direction holds in every process
+of the run.
 
 ## Building and testing
 

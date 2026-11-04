@@ -92,15 +92,23 @@ The limits are as much a part of the design as the speed, and they are strict:
 ## Performance
 
 In its proper domain, the numbers are the argument. The baseline is the
-textbook answer: `std::unordered_set` behind a `std::shared_mutex`.
+textbook answer: `std::unordered_set` behind a `std::shared_mutex`. Unless a
+machine is named, the figures in the next two paragraphs and in the table were
+measured on 2026-11-02 on a two-socket EPYC 9555 (Zen 5; 128 hardware threads, 8 NUMA nodes), GCC 16.2
+`-O3 -march=native`, as wall-clock rates: every thread's operations summed
+over the span from the first thread's start to the last thread's finish, the
+median over 5 processes of 10 repetitions each (3 for the baseline), unpinned.
 
 Lookup-dominated workload (99% `contains()`, 1% `insert()`, half the lookups
-missing; measured before the key mixer, with keys that were already random):
-single-threaded, 19 ns per lookup against the baseline's 41 ns.
-Under concurrency the baseline collapses first — down to ~6 million lookups/s
-at 4 threads (750 ns each) as the reader count bounces between cores — while
-this set scales to **490 million lookups per second** on a 16-core desktop
-Ryzen and **1.1 billion lookups per second** on a large Granite Rapids server.
+missing): single-threaded, 33 ns per lookup against the baseline's 74 ns.
+Under concurrency the baseline collapses first — down to 10 million lookups/s
+at 4 threads (400 ns each) as the reader count bounces between cores, and it
+stays between 8 and 11 million per second at every thread count up to 128 —
+while this set reaches 275 million lookups per second at 16 threads of the
+EPYC and **1.1 billion lookups per second** on a large Granite Rapids server
+(July 2026, before the key mixer was added). The EPYC's 64- and 128-thread lookup cells are not quoted: the
+threads finish far apart there, and a run-wide rate mixes the contended phase
+with a tail in which few threads still run.
 
 Insert-dominated workload (all keys new, table doubling live mid-benchmark):
 the benchmark inserts each thread's keys through a bijective mixer, so that
@@ -119,13 +127,45 @@ deque per hardware thread, the count rounded up to a power of two, and each
 thread allocates from the shard its thread number selects, popping a node from
 that shard's free list when `reclaim()` has left one there and otherwise
 appending under the shard's lock, so the lock is contended only when thread
-numbers collide modulo the shard count. On a 16-thread laptop (Ryzen 7940HS) that took the pre-sized
-8M-bucket fixture (`Insert_MostlyNew_Presized`) from about 30 to 77-95
-million random inserts per second at 16 threads (two runs a day apart), against 12 to 14 million
-single-threaded; on a 256-thread Granite Rapids server one shard collapses to
-3 million per second at 256 threads and the default shard count reaches about
-300 million. The bucket table is still doubled under one lock, once per
-doubling.
+numbers collide modulo the shard count. On a 16-thread laptop (Ryzen 7940HS)
+the sharding took the pre-sized 8M-bucket fixture (`Insert_MostlyNew_Presized`)
+from about 30 to 77-95 million random inserts per second at 16 threads. On
+the EPYC that fixture runs at 19 million random inserts per second
+single-threaded, 54 million at 4 threads and 90 million at 16, against the
+baseline's 10, 2.0 and 1.0 million; with the table doubling live during the
+run (`Insert_MostlyNew`), 20 million per second at one thread and 77 million
+at 128, against the baseline's 17 and 0.5 million. On a 256-thread Granite
+Rapids server one shard collapses to 3 million per second at 256 threads and
+the default shard count reaches about 300 million (2026-09-25). The bucket
+table is still doubled under one lock, once per doubling.
+
+| Workload                    | Threads | This set | Baseline |
+|-----------------------------|--------:|---------:|---------:|
+| `Lookup_MostlyOld`          |       1 |    30.56 |   13.57† |
+| `Lookup_MostlyOld`          |       4 |  106.34† |   10.01† |
+| `Lookup_MostlyOld`          |      16 |  275.43† |   10.26† |
+| `Lookup_MostlyOld`          |      64 |        — |    8.78† |
+| `Lookup_MostlyOld`          |     128 |        — |    8.12† |
+| `Insert_MostlyNew_Presized` |       1 |   19.35† |   10.47† |
+| `Insert_MostlyNew_Presized` |       4 |   54.25† |    2.00† |
+| `Insert_MostlyNew_Presized` |      16 |   89.95† |    1.05† |
+| `Insert_MostlyNew_Presized` |      64 |        — |     0.60 |
+| `Insert_MostlyNew_Presized` |     128 |        — |     0.55 |
+| `Insert_MostlyNew`          |       1 |    19.88 |   17.41† |
+| `Insert_MostlyNew`          |       4 |   20.00† |    1.44† |
+| `Insert_MostlyNew`          |      16 |   33.71† |    0.81† |
+| `Insert_MostlyNew`          |      64 |   67.40† |     0.52 |
+| `Insert_MostlyNew`          |     128 |    76.68 |     0.51 |
+
+Millions of operations per second. † Not a conclusion: the repetitions'
+coefficient of variation exceeds 5% (at 1–4 threads) or 10% (at 16 threads
+and more), or the per-process medians fall into two levels more than 10%
+apart (an unpinned process can land on different chiplets or sockets from one
+run to the next). — Left out: the threads finish more than half the run's
+span apart (see above). The 128-thread pre-sized cell also contains a table
+doubling, so it is not the pre-sized workload; the baseline's pre-sized cells
+at 64 and 128 threads rehash as well. The prose above quotes daggered cells
+too; their direction holds in every process of the run.
 
 While these benchmarks run, the CPU fans rev up. Under the reader-writer-lock
 baseline, the machine stays quiet: at 32 threads its threads spend over 95% of

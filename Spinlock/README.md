@@ -45,10 +45,11 @@ directory:
 - Between sleeps, a burst of eight unrolled acquisition attempts — enough to
   catch a just-released lock within a few instructions of the release, cheap
   enough to precede every syscall. Eight to sixteen is the measured optimum.
-- Two tiers of sleep: eight rounds of ~1 ns sleeps (which the kernel rounds
-  up to the next scheduling opportunity — a cheap yield), then 1 ms of real
-  sleep, and the cycle repeats. A briefly contended lock stays hot; a
-  long-held lock costs its waiters nothing.
+- Two tiers of sleep: eight rounds of ~1 ns sleeps (which the kernel
+  lengthens by the thread's timer slack, 50 us by default, so each one parks
+  the waiter for about 50 us), then 1 ms of real sleep, and the cycle
+  repeats. A briefly contended lock stays hot; a long-held lock costs its
+  waiters nothing.
 
 The 1 ms is not folklore either. The second tier was swept at 0.1, 1, and
 10 ms (`spinlock_tune_bm.C`) across the full contention range on servers up

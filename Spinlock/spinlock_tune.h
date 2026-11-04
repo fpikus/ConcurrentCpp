@@ -117,7 +117,7 @@ struct BackOffParams {
   int nyield = 0;           // rounds ending in sched_yield()
   int nshort = 8;           // rounds ending in a short_sleep_ns nanosleep
   long long_sleep_ns = NS_1ms;  // the final, real sleep; 0 == no long tier
-  long short_sleep_ns = 1;  // ~1 ns rounds up to "deschedule until next tick"
+  long short_sleep_ns = 1;  // ~1 ns: the kernel adds the timer slack (50 us default)
 }; // struct BackOffParams
 
 // The four-tier back-off ladder described by P: the policy for acquiring a

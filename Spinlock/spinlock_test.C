@@ -69,7 +69,7 @@ TEST(SpinLockTest, StdGuardCompatibility) {
 
 // A waiter blocked in lock() must acquire the lock once the holder releases
 // it. The holder keeps the lock for ~50 ms -- long enough for the waiter to
-// exhaust its short-yield budget and reach the long (1 ms) sleep tier -- so
+// exhaust its short-park budget and reach the long (1 ms) sleep tier -- so
 // this also exercises the back-off escalation path.
 TEST(SpinLockTest, WaiterAcquiresAfterUnlock) {
   SpinLock lock;

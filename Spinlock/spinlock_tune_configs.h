@@ -67,8 +67,8 @@ TUNE_CONFIG("yield", 8, 0, 16, 8, NS_1ms);
 TUNE_CONFIG("yield", 8, 0, 32, 8, NS_1ms);
 TUNE_CONFIG("yield", 8, 0, 64, 8, NS_1ms);
 
-// NShortSleep -- how many ~1 ns sleeps (in practice, deschedule-until-next-
-// scheduling-opportunity) before escalating to the long sleep. 0 parks a
+// NShortSleep -- how many ~1 ns sleeps (in practice, ~50 us parks: the kernel
+// adds the thread's timer slack) before escalating to the long sleep. 0 parks a
 // waiter on the first failed round.
 //
 // 0 and 1 bracket whether the short tier earns its place at all; 4, 16 and 32

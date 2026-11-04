@@ -41,22 +41,24 @@
 // units must name the same entities in each of them, or the program violates
 // the ODR. The timespec format is {seconds, nanoseconds}; two escalating
 // tiers:
-//   short (~1 ns request): nanosleep rounds this up to the next scheduling
-//     opportunity, so in practice it just relinquishes the CPU -- a cheap yield
-//     used while the lock looks briefly contended.
-//   long  (~1 ms):         a real sleep, used once short yields have failed
+//   short (~1 ns request): the kernel lengthens the request by the thread's
+//     timer slack, 50 us by default, so this parks the waiter for about 50 us
+//     (longer under a hypervisor). Not a yield: a yield (sched_yield, well
+//     under a microsecond) would put the waiter straight back into the
+//     contention. Used while the lock looks briefly contended.
+//   long  (~1 ms):         a real sleep, used once short parks have failed
 //     enough times, so a thread waiting on a long-held lock stops burning a
 //     core and lets the OS schedule useful work instead.
 inline const struct timespec spin_wait_short = { 0, 1 };
 inline const struct timespec spin_wait_long  = { 0, 1000001 };
-// Relinquish the CPU briefly (short tier). No arguments, no result; the
+// Park the waiter for about 50 us (short tier). No arguments, no result; the
 // nanosleep return value is ignored: an early wake-up just retries sooner.
 inline void spin_wait_short_sleep() { nanosleep(&spin_wait_short, nullptr); }
 // Sleep for ~1 ms (long tier). Same contract as spin_wait_short_sleep().
 inline void spin_wait_long_sleep()  { nanosleep(&spin_wait_long,  nullptr); }
 
 // A test-and-test-and-set (TTAS) spinlock with escalating back-off: cheap and
-// fast under low contention, and it degrades gracefully (yielding, then
+// fast under low contention, and it degrades gracefully (short parks, then
 // sleeping) rather than melting a core when the lock is held for a long time.
 // The lock word is a single int: 0 == free, 1 == held.
 //
@@ -131,7 +133,7 @@ class SpinLock {
   // paying for a syscall -- so a just-released lock is grabbed within a few
   // instructions of the holder's unlock, without branching on the back-off
   // counter between attempts. Only if all eight attempts fail do we sleep, and
-  // the back-off escalates: eight rounds of near-zero yields (spin_count 0..7),
+  // the back-off escalates: eight rounds of short (~50 us) parks (spin_count 0..7),
   // then one ~1 ms sleep, resetting the counter and repeating -- so a
   // contended-but-brief lock stays busy-ish while a long-held lock lets the
   // waiter get out of the scheduler's way.
@@ -148,11 +150,11 @@ class SpinLock {
       if (!(lock_.load(std::memory_order_relaxed) || lock_.exchange(1, std::memory_order_acquire))) return;
       if (!(lock_.load(std::memory_order_relaxed) || lock_.exchange(1, std::memory_order_acquire))) return;
       if (spin_count < 8) {
-        spin_wait_short_sleep();        // 8 rounds per cycle: yield, stay hot
+        spin_wait_short_sleep();        // 8 rounds per cycle: short park, stay hot
       } else {
-        // Escalate to a real sleep and start the yield budget over. The reset
+        // Escalate to a real sleep and start the short-park budget over. The reset
         // is to -1, not 0, because the for-header's ++spin_count runs before
-        // the next round reads it: resetting to 0 would spend seven yields on
+        // the next round reads it: resetting to 0 would spend seven short parks on
         // every cycle after the first instead of the eight documented above --
         // and would also make lock() escalate sooner than try_lock() gives up,
         // when the two are meant to draw the line at the same place.
@@ -179,10 +181,10 @@ class SpinLock {
   // attempt would report "busy" for what is really just coherence latency,
   // not actual lock contention. Instead, this runs the same TTAS spin as
   // lock() -- the unrolled burst of eight attempts rides out the ownership
-  // transfer, and up to eight rounds of near-zero yields ride out a brief
+  // transfer, and up to eight rounds of short (~50 us) parks ride out a brief
   // holder -- and gives up only where lock() would escalate to the ~1 ms
   // long sleep. So false means the lock was genuinely held the whole time,
-  // but a "failed" try_lock() has already spun and yielded for a short while;
+  // but a "failed" try_lock() has already spun and parked for a short while;
   // callers that need a truly non-blocking (and correspondingly racy) probe
   // should use locked() instead.
   bool try_lock() {
@@ -198,7 +200,7 @@ class SpinLock {
       if (!(lock_.load(std::memory_order_relaxed) || lock_.exchange(1, std::memory_order_acquire))) return true;
       if (!(lock_.load(std::memory_order_relaxed) || lock_.exchange(1, std::memory_order_acquire))) return true;
       if (spin_count < 8) {
-        spin_wait_short_sleep();        // spin/yield through the short tier...
+        spin_wait_short_sleep();        // spin/park through the short tier...
       } else {
         return false;                   // ...then give up instead of long-sleeping
       }

@@ -33,6 +33,7 @@
 #include <bit>
 #include <vector>
 #include <memory>
+#include <new>
 #include "concurrent_deque.h"
 #include <thread>
 #include <mutex>
@@ -194,10 +195,12 @@ inline unsigned thread_number() {
 //     leaves the key as it was; the catch around the retry loop pushes the
 //     pending node, if one was allocated on an earlier attempt, to limbo and
 //     rethrows. new_node is nulled the moment its CAS publishes it, so that
-//     catch never pushes a published node. A throw from the doubling AFTER
-//     the publishing CAS succeeded leaves the key a member although the
-//     caller sees an exception and no return value; nothing is said about the
-//     state after a throw from inside buckets_.resize().
+//     catch never pushes a published node. The doubling AFTER the publishing
+//     CAS does not throw: a bad_alloc from buckets_.resize() is caught, the
+//     doubling is skipped (the deque keeps its old size and the blocks it did
+//     allocate; table_size_ is unchanged) and insert() returns true; every
+//     later insert() past the threshold retries the doubling. So once the CAS has
+//     published the key, the call returns true.
 //   - contains(), erase(): hold no private node; they throw only what
 //     Hash{}, T's operator== or a split_bucket() they fall into throws, and
 //     change no membership when they do. erase() can throw only before its
@@ -299,9 +302,8 @@ inline unsigned thread_number() {
 //   Consequently insert() and erase() have NO post-CAS geometry recheck and no
 //   recursion, a successful publishing CAS is THE insertion of the key, and a
 //   successful marking CAS is THE deletion of it: at most one insert() returns
-//   true per absent->present transition -- exactly one, unless the call whose
-//   CAS made the transition then exits by an exception (the doubling that
-//   follows the CAS can throw, see EXCEPTIONS) -- and exactly one erase()
+//   true per absent->present transition -- exactly one: the doubling that
+//   follows the CAS does not throw (see EXCEPTIONS) -- and exactly one erase()
 //   returns true per present->absent transition (nothing follows its marking
 //   CAS but the return).
 //   INVARIANT (key authority, AllowDelete == true): for every key, at any
@@ -428,7 +430,9 @@ inline unsigned thread_number() {
 //       allocation, under the bucket deque's own SpinLock, which after the
 //       constructor only the holder of resize_lock_ takes) and marks the new
 //       buckets UNINITIALIZED; otherwise another insert() has doubled first,
-//       and the holder releases the lock having allocated nothing. Only
+//       and the holder releases the lock having allocated nothing. If the
+//       allocation fails, the holder releases the lock without doubling and
+//       every later insert() past the threshold retries (EXCEPTIONS). Only
 //       another insert() past its own threshold waits on it; no other
 //       operation takes it.
 // The locks belong to the allocation, not to the hash: an allocator that
@@ -1035,8 +1039,8 @@ public:
 
     // Insertion. Returns true iff THIS call made the key a member: at most one
     // insert() returns true per absent->present transition of the key, across
-    // any number of concurrent resizes -- exactly one, unless the call that
-    // made the transition throws after its publishing CAS (EXCEPTIONS).
+    // any number of concurrent resizes -- exactly one: the doubling that
+    // follows the CAS does not throw (EXCEPTIONS).
     // Returns false only if the key was present at some instant during the
     // call. Not lock-free: every new node is allocated from its arena shard
     // (alloc_node(): a lock-free free-list pop, or an append under the
@@ -1164,7 +1168,19 @@ public:
                         size_t current_ts = table_size_.load(std::memory_order_relaxed);
                         if (current_ts == ts) {
                             size_t new_ts = ts*2;
-                            buckets_.resize(new_ts);
+                            // The key is already published, so the doubling must not
+                            // turn this call's `true` into an exception. The only throw
+                            // possible here is bad_alloc from the deque's storage growth:
+                            // it is caught and the doubling skipped. The deque stays
+                            // consistent (its size unchanged; blocks allocated before the
+                            // throw are kept for the next attempt: concurrent_deque.h,
+                            // resize()), table_size_ is not stored, and every later
+                            // insert() past the threshold retries.
+                            try {
+                                buckets_.resize(new_ts);
+                            } catch (const std::bad_alloc&) {
+                                return true;
+                            } // the doubling is best-effort
                             for (size_t i = ts; i < new_ts; ++i) {
                                 buckets_[i].store(UNINITIALIZED, std::memory_order_relaxed);
                             }

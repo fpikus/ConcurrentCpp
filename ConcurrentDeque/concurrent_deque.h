@@ -453,6 +453,11 @@ public:
      * pull the API in different directions, and a design that has both would obscure
      * the concurrency this example teaches; T is required not to throw on
      * value-initialization (trivially true for the scalar types used here).
+     * A bad_alloc from the directory or block allocation, however, leaves the
+     * container usable: `size_` is stored last, so it is unchanged; blocks
+     * allocated before the throw stay recorded in the directory, are reused by
+     * the next resize() and freed by the destructor; reallocate_directory()
+     * publishes the new directory only after every allocation it needs.
      */
     void resize(size_t new_size) {
         // First check (lock-free) with acquire semantics.

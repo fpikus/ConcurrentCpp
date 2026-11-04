@@ -35,10 +35,20 @@
 // produced and consumed it.
 //
 // Self-balancing roles (see run_once below): every thread prefers to consume
-// and only produces after an empty miss. This holds the queue near-empty, so
-// the measured interval is dominated by cross-core handoff, not by time the
-// item spends buffered in a full ring. Roles are DYNAMIC here, unlike the
-// static odd/even producer/consumer split in gmbm/mbm.
+// and only produces after an empty miss, pushing a batch of stamped items and
+// then going back to popping. This holds the queue near-empty (the ring never
+// fills), but it also makes the typical sample a SELF-HANDOFF: the ring is
+// FIFO and a thread's own batch is usually the only thing in it, so the thread
+// that pushed a batch is the thread that pops it back. The measured interval
+// is then that thread's own push-to-pop turnaround through both locks, with
+// the other threads contending: the first item of a batch waits for the rest
+// of the batch to be pushed and for the items ahead of it to be popped, so the
+// median scales with --batch. Samples that another thread pops (a true
+// cross-core handoff) are a minority that grows with --batch and with the
+// thread count; the percentiles do not separate them. Read the columns as
+// contended push+pop round-trip latency at near-empty depth, not as cross-core
+// handoff latency; ppmbm measures the latter. Roles are DYNAMIC here, unlike
+// the static odd/even producer/consumer split in gmbm/mbm.
 //
 // Measured interval = rdtsc_start() taken by the producer immediately before
 // push, to rdtsc_end() taken by the consumer immediately after pop. Samples
@@ -87,8 +97,9 @@ RunResult run_once(size_t capacity_hint, size_t n_threads,
 
             // Self-balancing roles: every thread prefers to consume; only on
             // an empty miss does it switch to producing a batch of stamped
-            // items. This keeps the queue near-empty, so the measured pop
-            // latency is push-to-pop handoff time, not time spent buffered.
+            // items. This keeps the queue near-empty; the thread usually pops
+            // its own batch back (see the file header), so the recorded
+            // latency is mostly its own push-to-pop turnaround under contention.
             while (!stop.load(std::memory_order_relaxed)) {
                 Tick ts = 0;
                 if (q.pop(ts) != 0) {

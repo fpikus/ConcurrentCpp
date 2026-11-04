@@ -42,11 +42,11 @@
 #include "spinlock.h"
 
 // ---------------------------------------------------------------------------
-// Simple CHECK macros (abort on failure, no messages).
+// CHECK_GE (abort on failure, no message) is this header's own and is
+// undefined at its end, so it does not leak into the including translation
+// unit (the gmbm benchmark defines its own CHECK macros under #ifndef).
 // ---------------------------------------------------------------------------
-#define CHECK(c) if (!(c)) std::abort();
 #define CHECK_GE(a, b) if ((a) < (b)) std::abort();
-#define CHECK_EQ(a, b) if ((a) != (b)) std::abort();
 
 // ---------------------------------------------------------------------------
 // RING_QUEUE_HOOK(point): TEST-ONLY interleaving hook. Expands to nothing
@@ -599,5 +599,6 @@ class RingAtomicMapQueueMPMC {
 #undef RING_QUEUE_HOOK
 #undef RING_QUEUE_HOOK_DEFAULT_
 #endif
+#undef CHECK_GE
 
 #endif // RING_ATOMIC_QUEUE_H_

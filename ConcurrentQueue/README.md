@@ -168,8 +168,9 @@ that start).
   finds the queue full pops and one that finds it empty pushes): run for the
   same time rather than the same number of operations, the role that is
   faster otherwise pins the queue full or empty
-- `concurrent_queue_lmbm.C` — push-to-pop handoff latency under MPMC
-  contention, using the hardware timestamp counter (x86 and ARM). Sweeps
+- `concurrent_queue_lmbm.C` — push-to-pop round-trip latency under MPMC
+  contention (mostly a thread popping its own batch back; the cross-core
+  handoff is `ppmbm`), using the hardware timestamp counter (x86 and ARM). Sweeps
   thread counts and all four slot alignments by default; `--threads=N` and
   `--align=A` pin one of each for long single-point runs
 - `concurrent_queue_ppmbm.C` — 1-producer/1-consumer ping-pong round-trip

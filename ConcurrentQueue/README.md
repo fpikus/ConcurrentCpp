@@ -80,26 +80,81 @@ before the push, and moved in.
 
 In its proper domain — a high-throughput MPMC queue moving pointers or
 integers between threads, the operating mode of most task queues and thread
-pool schedulers — this design outpaces five leading open-source MPMC queues
-on a large x86 Granite Rapids server, scaling almost perfectly linearly up to
-32 threads before NUMA takes over. Along the way, the benchmarks expose a
-hardware reality: on the newest Intel CPUs, aggressive prefetchers double the
-effective false-sharing range, and 128-byte slot alignment measurably beats
-the traditional 64.
+pool schedulers — this design outpaces five open-source MPMC queues on a
+two-socket Granite Rapids Xeon (256 hardware threads, measured November
+2026) at every thread count from 4 to 256, by 5x to 240x. At 2 threads the
+picture is mixed: with the default packed slots this queue beats four of the
+five but loses 2.5x to the best single-CAS ring (Rigtorp's); with 128-byte
+slots it beats all five there too, by 2.5x to 42x.
 
-Latency tells the other half of the story, and it is a genuine trade-off. At
-128 threads on the same machine, against a highly optimized lock-free CAS
-queue built for latency-sensitive work:
+What it does NOT do is scale with the thread count, and neither does anything
+else in the comparison. Every push and every pop here goes through one of
+two spinlocks whose holder batches work while the losers park, so the
+aggregate rate is set by what the two lock holders can do, not by the number
+of threads: with packed slots it is flat at about 42 M items/s from 2 to 64
+threads, 45 at 128 and 56 at 256; with 128-byte slots it starts at 264 M/s
+and declines gently to 163 M/s at 128 threads. The rivals fall roughly as
+1/threads — all but moodycamel, which stays within 4-8 M/s up to 32 threads
+— from 10-105 M items/s at 2 threads to 3-4 M/s at 8 and under 1 M/s at 128,
+where each role's one contended counter serializes every thread.
+Pinning the benchmark to one socket changes nothing up to 64 threads: the
+curve is the lock's, not the interconnect's.
 
-|                | RingAtomicMapQueueMPMC | Lock-free comparison queue |
-|----------------|-----------------------:|---------------------------:|
-| Median         | 320 ns                 | 82 µs                      |
-| 99.9%          | 410 µs                 | 546 µs                     |
-| Worst case     | ~10 ms outliers        | ~1 ms cutoff               |
+The two layouts above are the real alignment story. Slot padding matters
+enormously at low thread counts — 42 M/s packed against about 250 M/s at 64-
+or 128-byte slots with 2 to 16 threads — and the reason is a cache line
+travelling between two cores: put the producer and the consumer on the two
+SMT threads of one core and the packed queue runs at 173 M/s, as fast as the
+padded one there (165). Between 64- and 128-byte slots the machine does not
+distinguish in these rows: the ratio stays between 0.92 and 1.11 at every
+thread count but 128 as the benchmark's own code placement is varied, and
+the 1.27x at 128 threads, the one cell that looked like a win for 128 bytes,
+drops to 1.05-1.11x when nothing but the code placement changes.
 
-The strictly lock-free design buys a hard cap on the worst case and pays for
-it with a 250x worse median. Whether that trade is worth making depends
-entirely on your application; the numbers above are what you are trading.
+The numbers (M items/s: successful pushes plus pops per second of wall-clock
+time, the median of six rounds of five repetitions, key-only elements, 65536
+slots (moodycamel: its initial capacity), every thread pushing or popping and
+doing nothing else). A rival's cell at 128 and 256 threads is an upper bound
+over the rounds, and moodycamel's from 8 threads up a range over the rounds,
+because one role finishes its share long before the other there and the
+wall-clock rate mixes two regimes; the 2-thread cells depend on where the
+scheduler puts the two threads (here, two cores of one socket).
+
+| threads | this queue (packed) | this queue (128-byte slots) | lockfree (DN) | Rigtorp (ER) | DCAS (ES) | atomic_queue (ME) | moodycamel (MC) |
+|--:|--:|--:|--:|--:|--:|--:|--:|
+| 2 | 42 | 264 | 17 | 105 | 26 | 9.7 | 6.3 |
+| 8 | 42 | 244 | 2.8 | 3.5 | 4.3 | 3.0 | 5-8 |
+| 32 | 42 | 220 | 1.0 | 1.2 | 1.9 | 1.1 | 4-8 |
+| 128 | 45 | 163 | < 0.5 | < 0.8 | < 0.9 | < 0.7 | 2-3 |
+| 256 | 56 | 75 | < 0.8 | < 1.1 | < 0.3 | < 0.3 | 1-2 |
+
+Latency tells the other half of the story, and it is a genuine trade-off.
+The latency benchmark records, at 128 threads pinned one per core across
+both sockets, a thread's own push-to-pop round trip through the contended
+queue at near-empty depth (most samples are the thread popping what it
+pushed a moment earlier, with everyone else contending), in 60-second runs
+repeated three times, against a highly optimized DCAS queue built for
+latency-sensitive work:
+
+|                  | RingAtomicMapQueueMPMC | Lock-free DCAS queue |
+|------------------|-----------------------:|---------------------:|
+| Median           | 0.55 µs                | 84 µs                |
+| 99th percentile  | 0.30 ms                | 0.36 ms              |
+| 99.9th           | 1.57 ms                | 0.59 ms              |
+| Worst, 60 s run  | 12-19 ms               | 2-7 ms               |
+| Worst, 900 s run | 22 ms                  | 11 ms                |
+
+The lock-free design pays 150x at the median — and 3.6x at the 90th
+percentile, 2x at the 95th, 1.2x at the 99th — and gets back a 99.9th
+percentile 2.7x tighter and a worst case two to six times better over a
+minute and about half as bad over a quarter-hour. What it does not get is a
+hard cap: the DCAS queue's worst case grew to 19 ms in one five-minute run.
+Whether the trade is worth making depends entirely on your application; the
+numbers above are what you are trading.
+Uncontended, the two are the same queue: a 1-producer/1-consumer round trip
+through two queues costs 0.4-0.5 µs on two cores of one socket and 1.0-1.2 µs
+across sockets for this design, the DCAS queue and the single-CAS ring
+alike.
 
 One line in the file is worth more than any other: the store to the slot that
 every successful push and pop makes before releasing its lock. The key-value

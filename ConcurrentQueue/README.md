@@ -159,9 +159,10 @@ each, measured), the 99th percentile is about five of them, and every
 operation above the 99.9th percentile (1.56 ms) had gone through the
 ladder's full cycle of eight parks and its 1 ms sleep. At 16 threads the
 lock parks in one operation in a thousand and the tail begins at the 99.9th
-percentile. (The attribution was measured on the samples a thread pops back
-itself, 59% of all samples at 128 threads; the cross-thread samples show the
-same percentiles but were not classified.)
+percentile. (Measured on every sample at 128 threads, the 60% a thread pops
+back itself and the 40% popped by another thread alike: above the 90th
+percentile every sample of either kind had waited through at least one park,
+and above the 99.9th 99.3-99.7% through the 1 ms sleep.)
 
 Uncontended, the two are the same queue: a 1-producer/1-consumer round trip
 through two queues costs 0.4-0.5 µs on two cores of one socket and 1.0-1.2 µs

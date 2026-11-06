@@ -151,6 +151,18 @@ minute and about half as bad over a quarter-hour. What it does not get is a
 hard cap: the DCAS queue's worst case grew to 19 ms in one five-minute run.
 Whether the trade is worth making depends entirely on your application; the
 numbers above are what you are trading.
+
+Where this queue's tail comes from is no mystery: at 128 threads it is the
+lock's back-off ladder. Every sampled operation above the 90th percentile
+(57 µs) had waited through at least one of the lock's ~50 µs parks (58 µs
+each, measured), the 99th percentile is about five of them, and every
+operation above the 99.9th percentile (1.56 ms) had gone through the
+ladder's full cycle of eight parks and its 1 ms sleep. At 16 threads the
+lock parks in one operation in a thousand and the tail begins at the 99.9th
+percentile. (The attribution was measured on the samples a thread pops back
+itself, 59% of all samples at 128 threads; the cross-thread samples show the
+same percentiles but were not classified.)
+
 Uncontended, the two are the same queue: a 1-producer/1-consumer round trip
 through two queues costs 0.4-0.5 µs on two cores of one socket and 1.0-1.2 µs
 across sockets for this design, the DCAS queue and the single-CAS ring

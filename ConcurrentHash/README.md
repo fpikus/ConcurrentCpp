@@ -175,8 +175,10 @@ statistic and marks): 32.5 ns per lookup at one thread against the baseline's
 63.4 ns; the baseline falls to 6.1 million lookups per second at 4 threads†
 and stays at 4.5–5 million at every thread count from 8 to 256, while this
 set reaches 451 million at 16 threads†, between 0.9 and 1.7 billion at 64
-(varying from run to run with where the unpinned threads land), and 2.0
-billion at 128†; at 256 the threads finish far apart and the cell is not
+(varying from run to run with where the kernel places the unpinned threads:
+two threads sharing one core's hardware threads run at about three quarters
+of the one-per-core rate, and threads on the far socket at about half), and
+2.0 billion at 128†; at 256 the threads finish far apart and the cell is not
 quoted. Pre-sized random inserts: 33† million per second at one thread, 104†
 at 4 and 243† at 16, against the baseline's 17†, 2.5† and 1.1†; with the
 table doubling live, 10.8 million per second at one thread and 85† at 128

@@ -100,10 +100,13 @@
 // Erased churn cells measure what that buys the later walks; this row measures
 // what it costs the eraser.
 // Shape: thread 0's SetUp() prefills kErasePrefill mix()ed keys, untimed, into
-// kPresizedBuckets buckets (no doubling, no split: half a node per bucket);
-// thread t erases mix(t*n + i) for i < n, n = kErasePrefill/num_cpu, so the
+// kPresizedBuckets buckets (no doubling, no split: half a node per bucket at
+// a power-of-two thread count, less where the set rounds the bucket count up);
+// thread t erases mix(t*n + i) for i < n, n = kErasePerThread, so the
 // threads' keys are disjoint and all present, and every erase() must return
-// true (checked per thread, after the loop). The prefill is single-threaded, so
+// true (checked per thread, after the loop). Above 16 threads the prefill (and
+// the bucket count with it) grows with the thread count so that every thread
+// still has its n keys (PresizedErase). The prefill is single-threaded, so
 // every node lives in thread 0's shard; the retire push goes to the ERASING
 // thread's shard, not to the node's, so the timed erases do not all push onto one
 // retired head.
@@ -187,6 +190,7 @@
 // as often and the attempts are the same in total.
 // ---------------------------------------------------------------------------
 static constexpr int    kErasePrefill = 1 << 22;
+static constexpr int    kErasePerThread = kErasePrefill/16;   // the pre-sized rows' erases per thread (PresizedErase)
 static constexpr size_t kSmallBuckets = size_t(1) << 17;
 static constexpr int    kSmallPrefill = 1 << 16;
 // Erase_Small_Del_Rcu's cadence: one advance() per kSmallAdvanceEvery erases
@@ -212,15 +216,31 @@ struct SmallAutoCadence {
 }; // struct SmallAutoCadence
 
 // The two erase geometries, EraseFixture's second parameter: the table's
-// buckets, the prefilled keys, and the keys each thread erases.
+// buckets, the prefilled keys, and the keys each thread erases, each a
+// function of the row's thread count.
+// The pre-sized rows erase a FIXED number of keys per thread, the same on
+// every host and at every thread count, so that a thread's timed region does
+// not shrink with the host's CPU count (a per-thread count derived from the
+// CPU count gives a 256-CPU host a region of sixteen thousand erases, shorter
+// than the start-up skew of its threads, and the wall rate measures the skew).
+// The prefill holds every thread's keys: kErasePrefill keys up to 16 threads
+// and kErasePerThread*threads above, in twice as many buckets (kPresizedBuckets
+// at kErasePrefill: half a node per bucket, no doubling, no split), so the
+// expected chain length per erase is the same at every power-of-two thread
+// count (at a thread count that is not one, num_cpu on such a host, the set
+// rounds the bucket count up to a power of two and the load is lower); the
+// larger table's cache footprint is the one effect that grows with the
+// threads. The cost: at 256 threads the set holds 2^26 nodes in 2^27 buckets,
+// about 2 GB, prefilled single-threaded before every repetition.
 struct PresizedErase {
-    static constexpr size_t buckets = kPresizedBuckets;
-    static constexpr int    prefill = kErasePrefill;
-    static int keys_per_thread(const benchmark::State& /*state*/) { return kErasePrefill/num_cpu; }
+    static int prefill(const benchmark::State& state) { return std::max(kErasePrefill, kErasePerThread*state.threads()); }
+    static size_t buckets(const benchmark::State& state) { return size_t(prefill(state))*(kPresizedBuckets/kErasePrefill); }
+    static int keys_per_thread(const benchmark::State& /*state*/) { return kErasePerThread; }
 }; // struct PresizedErase
+// The small rows erase the whole prefill once per run, shared by the threads.
 struct SmallErase {
-    static constexpr size_t buckets = kSmallBuckets;
-    static constexpr int    prefill = kSmallPrefill;
+    static int prefill(const benchmark::State& /*state*/) { return kSmallPrefill; }
+    static size_t buckets(const benchmark::State& /*state*/) { return kSmallBuckets; }
     static int keys_per_thread(const benchmark::State& state) { return kSmallPrefill/state.threads(); }
 }; // struct SmallErase
 
@@ -240,8 +260,9 @@ public:
     static ReclaimSnapshot<SetType> before;   // the container's counters after the prefill (ReclaimSnapshot, shared header)
     void SetUp(const ::benchmark::State& state) override {
         if (state.thread_index() != 0) return;
-        set = make_prefilled<SetType>(state, "EraseFixture", Geometry::buckets, Cadence::auto_reclaim_every(state), [](auto insert) {
-            for (int k = 0; k < Geometry::prefill; ++k) insert(mix(k));
+        set = make_prefilled<SetType>(state, "EraseFixture", Geometry::buckets(state), Cadence::auto_reclaim_every(state), [&state](auto insert) {
+            const int prefill = Geometry::prefill(state);
+            for (int k = 0; k < prefill; ++k) insert(mix(k));
         });
         before.take(*set);
         handles.make(*set, state.threads());
@@ -290,8 +311,8 @@ template <typename SetType, typename Geom, typename Cadence> ReclaimSnapshot<Set
     }
 
 // The erase rows (see Erase_Presized_Del above): the two pre-sized rows over
-// ThreadRange(1, num_cpu) with kErasePrefill/num_cpu erases per thread at
-// every thread count, the two small rows with kSmallPrefill erases per run.
+// ThreadRange(1, num_cpu) with kErasePerThread erases per thread at every
+// thread count, the two small rows with kSmallPrefill erases per run.
 DEFINE_ERASE(Erase_Presized_Del,
     /* PRE */,
     /* ITERATION */
@@ -299,7 +320,7 @@ DEFINE_ERASE(Erase_Presized_Del,
     /* POST */,
     ConcurrentSetDel)
 BENCHMARK_REGISTER_F(EraseFixture, Erase_Presized_Del)
-    ->ThreadRange(1, num_cpu)->Iterations(kErasePrefill/num_cpu)->UseRealTime();
+    ->ThreadRange(1, num_cpu)->Iterations(kErasePerThread)->UseRealTime();
 
 DEFINE_ERASE(Erase_Presized_Del_Rcu,
     /* PRE */
@@ -312,7 +333,7 @@ DEFINE_ERASE(Erase_Presized_Del_Rcu,
     if (state.thread_index() == 0) before.report_set(state, *set);,
     ConcurrentSetDel)
 BENCHMARK_REGISTER_F(EraseFixture, Erase_Presized_Del_Rcu)
-    ->ThreadRange(1, num_cpu)->Iterations(kErasePrefill/num_cpu)->UseRealTime();
+    ->ThreadRange(1, num_cpu)->Iterations(kErasePerThread)->UseRealTime();
 
 DEFINE_ERASE(Erase_Small_Del,
     /* PRE */,

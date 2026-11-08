@@ -8,8 +8,9 @@ point. And its memory comes back while the operations run: every operation runs
 under a handle, and a caller-driven `advance()` frees what no handle can still
 see; `reclaim()` is that call without its walk of the table, and a set
 constructed with a cadence does that work by itself; there is no quiescent
-point. Everything else is the original's: the append-only sharded arena, the
-lazy copying split, inserts that publish with one CAS, and operations that are
+point. Everything else is the original's (the arena shard a thread uses is
+chosen by a thread number that is reused after the thread exits, where the
+original's never is): the append-only sharded arena, the lazy copying split, inserts that publish with one CAS, and operations that are
 lock-free except where they allocate: the hash's own protocol (walks, splits,
 unlinks, the publishing CAS) takes no lock; a node comes from a free list
 without a lock, or from an append under the arena shard's spinlock (a lookup
@@ -512,9 +513,25 @@ figure includes the cost of the 24-byte node against the original's 16.
   the 2-socket Xeon is up to 28% slower at high thread counts.
 - For erase-heavy workloads the original is 1.6-2.3x as fast (three CASes per
   erase against one) on the laptop, on the EPYC, and on the Xeon at low
-  thread counts, and 1.4x on the M3 Ultra at low thread counts; it gets worse
-  with threads on the big machines, up to 4.4x on the 2-socket Xeon and 2.6x
-  on the M3 Ultra.
+  thread counts, and 1.4x on the M3 Ultra at low thread counts, widening there
+  with threads to 2.6x. The 2-socket Xeon's figures from this set at 32-128
+  threads (the original up to 4.4x as fast) were inflated by the container's
+  thread numbering, not its unlinking: Google Benchmark creates new threads for
+  every repetition, the number that chose a thread's arena shard was never
+  reused, and every 256 threads it wrapped onto the shard of the main thread,
+  which had prefilled the table and erases with the others, so in fixed
+  repetitions of every run two threads pushed their retired nodes onto one
+  shard's list, several times slower per node. The M3 Ultra's widening was
+  measured with the same numbering and has not been re-checked. Thread numbers
+  now come from a pool that takes each one back at thread exit, and the copy's
+  row, measured again on the Xeon with 262144 erases per thread, runs at 20,
+  18, 13 and 6.7 million erases per second per thread at 16, 32, 64 and 128
+  threads over tables of 4, 8, 17 and 34 million nodes (the last about 1.3 GB,
+  beyond both sockets' caches together); the original was not measured again.
+  The wall-clock span of a repetition there is still set by one or two threads
+  that take about twice the others' time, in fixed repetition positions that
+  differ with where the threads are pinned, so the per-thread rate is the
+  figure to read; the straggler's cause is still open.
 - For inserts into a set with many deletions (half the keys erased, nothing
   reclaimed) the copy is 5-22% faster on the laptop, on the M3 Ultra and on
   the EPYC at low thread counts, but 16-43% slower on the 2-socket Xeon at 16

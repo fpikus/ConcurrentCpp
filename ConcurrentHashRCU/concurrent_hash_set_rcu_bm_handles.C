@@ -90,20 +90,29 @@
 //
 // The set stripes some per-thread state by the arena shard of the calling
 // thread: its process-wide thread number (concurrent_hash_rcu_detail::
-// thread_number(), assigned at the thread's first use, in increasing order)
-// modulo the shard count. Two threads of a row on one shard share that
+// thread_number(), taken from a pool at the thread's first use: the lowest
+// number no live thread holds, kept for the thread's life and returned at its
+// exit) modulo the shard count. Two threads of a row on one shard share that
 // shard's lines. Google Benchmark's default runner runs a row's thread 0 on
-// the main thread, which is numbered at its first join or other use of an
-// arena shard in the process (in a full run, during the first row's SetUp();
-// under a filter, in whichever row ran first, or not yet), and its other
-// threads on new threads, numbered consecutively from wherever the process's
-// count has reached; so whether thread 0 shares a shard with another thread
-// of the run depends on the rows that ran before in the same process. Here
-// every thread of a run is new (FreshThreadRunner), and each takes its number
-// before its loop, so a run of T threads holds T consecutive numbers and, for
-// T <= S, T distinct shards, whatever ran before. thread_number() numbers a
-// thread once, so the number a thread takes at the top of its body is the
-// one its joins use.
+// the main thread, which holds the number it took at its first join or other
+// use of an arena shard in the process (in a full run, during the first
+// row's SetUp(); under a filter, in whichever row ran first, or none yet),
+// and its other threads on new threads, which take the lowest free numbers;
+// so whether thread 0 shares a shard with another thread of the run depends
+// on the number the main thread holds. Here every thread of a run is new
+// (FreshThreadRunner), and each takes its number before its loop while every
+// other thread of the run is alive, so a run of T threads holds the T lowest
+// numbers free beside the main thread's (consecutive but for the gap at that
+// one) and, for T <= S, T distinct shards, whatever ran before: the threads
+// of the previous run returned their numbers when they exited. The
+// invariant behind both claims: when a row's threads take their numbers, the
+// only other number held in the process is the main thread's, 0 or none
+// (the main thread joins first, in a row's thread 0 SetUp(), before any
+// other thread of the process has taken a number, so it holds 0; under a
+// filter that runs only FreshThreadRunner rows it holds none). Nothing else
+// in the binary holds a number across rows.
+// thread_number() numbers a thread once, so the number a thread takes at the
+// top of its body is the one its joins use.
 // ---------------------------------------------------------------------------
 
 // A Google Benchmark thread runner that runs every thread of a run on a new
@@ -478,8 +487,8 @@ public:
                 } // join and leave until told to stop
             });
             // Wait for this joiner's number before starting the next, so
-            // that the measured thread and the joiners hold consecutive
-            // numbers: W + 1 distinct shards for W < S.
+            // that the measured thread and the joiners hold the lowest W + 1
+            // free numbers in order: W + 1 distinct shards for W < S.
             while (!helper.numbered.load(std::memory_order_acquire)) std::this_thread::yield();
         } // loop over the joiners
         // The pin last: its placement takes numbers after the joiners'
@@ -507,20 +516,28 @@ private:
     // Places the pin on arena shard `shards` - 1: starts threads one at a
     // time, each taking its thread number; the first whose number lands on
     // that shard joins the set and keeps its handle until `stop`, the others
-    // return at once and are joined here. Consecutive numbers reach every
-    // shard within `shards` tries (no other thread takes a number
-    // meanwhile); a placement that fails aborts the run.
+    // park until the placement ends (`placing` cleared) and are joined here.
+    // The others must stay alive meanwhile: a thread that exits returns its
+    // number to the pool and the next candidate would take it again. Held
+    // numbers reach every shard within `shards` tries when the numbers held
+    // beside them are consecutive from 0 (the main thread's, the measured
+    // thread's and the joiners'), and within 2*shards tries with one gap
+    // among them (no other thread takes a number meanwhile); a placement
+    // that fails aborts the run.
     static void place_pin(size_t shards) {
         const unsigned wanted = unsigned(shards - 1);
-        for (size_t attempt = 0; attempt < shards; ++attempt) {
+        std::atomic<bool> placing{true};   // cleared when the placement ends: the candidates that did not land exit
+        std::vector<std::unique_ptr<CheckHelper>> others;   // the candidates that did not land, parked until the end
+        for (size_t attempt = 0; attempt < 2*shards; ++attempt) {
             std::unique_ptr<CheckHelper> candidate = std::make_unique<CheckHelper>();
             CheckHelper& c = *candidate;
-            c.thread = std::thread([&c, wanted, shards] {
+            c.thread = std::thread([&c, &placing, wanted, shards] {
                 c.number = concurrent_hash_rcu_detail::thread_number();
                 if ((c.number & (shards - 1)) != wanted) {
                     c.numbered.store(true, std::memory_order_release);
+                    placing.wait(true, std::memory_order_relaxed);   // hold the number until the placement ends
                     return;
-                } // not the pin's shard: done
+                } // not the pin's shard: park
                 const ConcurrentSetDel::handle h = set->new_handle();
                 c.generation = ConcurrentSetDel::get_internal_handle_generation(h);
                 c.pinning.store(true, std::memory_order_relaxed);
@@ -530,10 +547,14 @@ private:
             while (!c.numbered.load(std::memory_order_acquire)) std::this_thread::yield();
             if (c.pinning.load(std::memory_order_relaxed)) {
                 pin = std::move(candidate);
-                return;
+                break;
             } // the pin is placed
-            c.thread.join();
+            others.push_back(std::move(candidate));
         } // loop over the candidates
+        placing.store(false, std::memory_order_relaxed);
+        placing.notify_all();
+        for (std::unique_ptr<CheckHelper>& other : others) other->thread.join();
+        if (pin) return;
         fprintf(stderr, "Reclaim_FreePassCheck: no thread landed on arena shard %zu\n", shards - 1);
         abort();
     } // FreePassCheckFixture::place_pin()

@@ -35,6 +35,7 @@
 #include <functional>
 #include <bit>
 #include <ostream>
+#include <type_traits>
 #include <utility>
 #include <vector>
 #include <memory>
@@ -99,23 +100,146 @@
 #endif
 
 namespace concurrent_hash_rcu_detail {
-// Process-wide sequential thread numbering, shared by every instantiation of
+// Process-wide thread numbering, shared by every instantiation of
 // ConcurrentResizableHashSetRCU: a thread gets its number at its first join
 // (new_handle(), refresh()'s slow path or advance()'s walk) or its first shard
 // use (an allocation, a retire or limbo push, or a split's or an unlink's
-// counters), whichever comes first, or at a direct call of this function
-// before either; the number never changes. Every per-shard choice of the set
-// is `thread_number() & arena_mask_`: the arena shard a thread appends to and
-// pops from before it steals, and the per-shard live-handle count its join
-// increments (THE RING in the class overview). Sequential (not hashed) on
-// purpose: threads started together get consecutive numbers, so `number mod
-// shards` spreads a batch of up to `shards` threads over distinct arena shards
-// with no collisions, however many earlier threads have come and gone.
-inline std::atomic<unsigned> next_thread_number{0};
-inline unsigned thread_number() {
-    static thread_local unsigned number = next_thread_number.fetch_add(1, std::memory_order_relaxed);
+// counters), whichever comes first, or at a direct call of thread_number()
+// before either; the number never changes for the life of the thread. Every
+// per-shard choice of the set is `thread_number() & arena_mask_`: the arena
+// shard a thread appends to and pops from before it steals, and the per-shard
+// live-handle count its join increments (THE RING in the class overview).
+//
+// THE POOL. Numbers come from one process-wide pool (ThreadNumberPool below,
+// one object for every set of every instantiation): a thread takes the LOWEST
+// number no live thread holds, keeps it while it runs, and returns it when it
+// exits, so that a number a thread has finished with is the next one handed
+// out. The point is the shard spread under thread churn: as long as the
+// threads holding numbers never exceed `shards` at any moment, every take
+// finds a free number below `shards` (the lowest free one is below it), so
+// every number ever held is below `shards`, and distinct live threads sit on
+// distinct arena shards, however many threads have come and gone before. A
+// program that creates and ends threads continually (a thread pool refilled
+// per task, a benchmark runner that starts fresh workers for every repetition)
+// therefore never stacks a new thread onto the shard of a long-lived one
+// while a free shard exists: two threads on one shard contend for that
+// shard's retired, limbo and free lists and its count row. A sequential,
+// never-reused number would walk past `shards` and wrap onto the live
+// threads' shards; a hash of the thread id would collide at random.
+//
+// The pool is a bitmap of kPooled bits (bit n set: number n is held) behind a
+// SpinLock, plus a counter for the numbers past the bitmap. A lock rather than
+// a lock-free bitmap because the take must be exact: with concurrent takers
+// and releasers, a scan that sets a bit by CAS can take a number while a lower
+// one, released after the scan passed its word, is free; under the lock the
+// lowest free number at the take is the one taken, and no two live threads
+// ever hold one number (the take and the release are critical sections of
+// the same lock). The lock costs nothing on any hot path: a thread takes and
+// releases once each, at its first call and at its exit, and every call in
+// between returns the cached thread_local number. Everything in the pool is
+// constant-initialized and trivially destructible (an atomic, plain words), so
+// a release during process teardown -- a thread exiting after main() has
+// returned, when objects with static storage duration may already be
+// destroyed -- finds the pool intact, with no destruction-order rule to keep.
+// A thread that takes while kPooled numbers are held gets a number past the
+// bitmap, from a counter that only grows: unique, never reused, and shared
+// shards for as long as it lives (a program with that many simultaneous
+// threads shares shards anyway: no set has that many). The bitmap is 64 words
+// (kPooled = 4096 numbers, 512 bytes); the scan under the lock is a few
+// dozen word loads at most, paid once per thread.
+//
+// THE RELEASE and the number's validity. The number lives in a plain
+// thread_local (`number` in thread_number()) that a thread_local guard object
+// (NumberSlot) takes at its construction and releases at its destruction;
+// both are constructed at the thread's first thread_number() call. Thread_local
+// destructors run in reverse order of construction completion, so every
+// thread_local the set constructs through a call of thread_number() -- a
+// thread_local handle created by new_handle() (its join calls thread_number())
+// -- is destroyed before the slot releases the number, and every set
+// operation the handle's destructor runs still runs under the thread's own
+// number. The number stays READABLE and FIXED after the release too: the
+// thread_local holding it is a trivial object that outlives the slot's
+// destructor, and the destructor does not change it; a call of thread_number()
+// after the release (a thread_local constructed BEFORE the thread's first set
+// call, using the set in its destructor) returns the same number and every
+// set operation it runs is correct, with one consequence: the pool may have
+// handed that number to a newer thread meanwhile, so the two share a shard
+// until the exiting thread ends. A set operation after the release is thus
+// defined and correct; only the shard spread is not promised for it. The set
+// relies on the number being fixed per thread (join_impl() computes a
+// thread's shard once per call; a handle records the count it incremented and
+// its leave decrements that count from any thread), never on a number being
+// held by one thread only: the pool's uniqueness serves the spread, not the
+// set's correctness.
+class ThreadNumberPool {
+  public:
+    static constexpr unsigned kPooled = 4096;   // numbers 0 .. kPooled - 1 are pooled: reusable, taken lowest-free
+
+    // Take the lowest number no live thread holds (a number past the bitmap
+    // if every pooled one is held), and mark it held. Called once per thread,
+    // at its first thread_number() call; noexcept: the set's noexcept members
+    // (the join) call thread_number().
+    unsigned take() noexcept {
+        std::lock_guard<SpinLock> guard(lock_);
+        for (unsigned w = 0; w < kWords; ++w) {
+            if (words_[w] == ~std::uint64_t{0}) continue;   // every number of this word is held
+            const unsigned bit = static_cast<unsigned>(std::countr_one(words_[w]));   // the lowest clear bit: the lowest free number of the word, below which every number is held
+            words_[w] |= std::uint64_t{1} << bit;
+            return w*64 + bit;
+        } // scan the bitmap, lowest word first
+        return overflow_++;   // every pooled number is held: a number past the bitmap, never reused
+    } // ThreadNumberPool::take()
+
+    // Return `number` to the pool: the next take finds it if it is the lowest
+    // free. A number past the bitmap is not pooled and stays taken. Called
+    // once per numbered thread, at its exit (NumberSlot's destructor), also
+    // for a thread whose first thread_number() call runs inside another
+    // thread_local's destructor: a thread_local whose construction completes
+    // during thread exit is still destroyed before the thread ends (the
+    // language orders every such destructor after the construction it
+    // undoes, and glibc's destructor loop runs destructors registered while
+    // it runs), so a number taken during thread exit is released too.
+    void release(unsigned number) noexcept {
+        if (number >= kPooled) return;
+        std::lock_guard<SpinLock> guard(lock_);
+        words_[number/64] &= ~(std::uint64_t{1} << (number%64));
+    } // ThreadNumberPool::release()
+
+  private:
+    static constexpr unsigned kWords = kPooled/64;   // the bitmap's words
+    SpinLock lock_;                                  // guards words_ and overflow_; taken at a thread's first call and at its exit, never on a hot path
+    std::uint64_t words_[kWords] = {};               // bit n of word w set: number w*64 + n is held by a live thread
+    unsigned overflow_ = kPooled;                    // the next number past the bitmap, handed out when every pooled number is held
+}; // class ThreadNumberPool
+inline constinit ThreadNumberPool thread_number_pool{};
+// The release after main() has returned relies on the pool having no
+// destructor; constinit checks only the initializer.
+static_assert(std::is_trivially_destructible_v<ThreadNumberPool>, "a release during process teardown needs an undestroyed pool");
+
+// The thread_local guard of a thread's number (THE RELEASE above): its
+// constructor takes the number from the pool into the thread_local it refers
+// to, its destructor, at thread exit, releases that number. The number itself
+// lives outside this object so that it stays readable after the release.
+class NumberSlot {
+  public:
+    explicit NumberSlot(unsigned& number) noexcept : number_(number) { number_ = thread_number_pool.take(); }
+    ~NumberSlot() { thread_number_pool.release(number_); }
+    NumberSlot(const NumberSlot&) = delete;
+    NumberSlot& operator=(const NumberSlot&) = delete;
+
+  private:
+    unsigned& number_;   // the thread's number: the thread_local `number` of thread_number()
+}; // class NumberSlot
+
+// The calling thread's number (THE POOL above): taken at the first call,
+// fixed for the life of the thread, released to the pool at thread exit. A
+// hot path's cost is the guard check of `slot` (constructed once) and a
+// thread_local load; the pool's lock is taken only inside that construction.
+inline unsigned thread_number() noexcept {
+    static thread_local unsigned number = 0;              // the number; a trivial object, readable after `slot` is destroyed
+    static thread_local const NumberSlot slot(number);    // takes the number now, releases it at thread exit
     return number;
-}
+} // thread_number()
 
 // TEST SEAMS: the `Hooks` template parameter of ConcurrentResizableHashSetRCU
 // (see TEST SEAMS under HANDLES AND GENERATIONS in the class overview). A

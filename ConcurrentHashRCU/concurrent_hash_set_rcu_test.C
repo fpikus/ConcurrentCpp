@@ -244,6 +244,84 @@ static void run_threads(int T, SetT& set, F fn) {
 } // run_threads()
 
 // ---------------------------------------------------------------------------
+// THREAD NUMBERS IN THESE TESTS. The header numbers threads from a
+// process-wide pool (concurrent_hash_rcu_detail::thread_number(), THE POOL):
+// a thread takes the lowest number no live thread holds at its first call,
+// keeps it for its life and returns it at exit. The tests make the numbers
+// predictable with two facts:
+//   - the test thread holds number 0: it takes it below, during static
+//     initialization, before any other thread exists, and keeps it for the
+//     process (a thread's number never changes), whatever --gtest_filter
+//     selected;
+//   - every thread a test starts is joined before the test ends, so at the
+//     start of a test the live numbers are {0}, and k threads numbered while
+//     all of them are alive take 1 .. k, consecutive: a batch of T <= S
+//     threads sits on T distinct shards of an S-shard set, 8 threads on a
+//     2-shard set split four and four, and so on, as the tests say where they
+//     rely on it. A thread numbered after another one EXITED takes that
+//     thread's number again, so a test that wants threads on distinct shards
+//     keeps them alive until all are numbered (HeldThreads below).
+// ---------------------------------------------------------------------------
+static const unsigned test_thread_number = concurrent_hash_rcu_detail::thread_number();   // 0: see above
+
+// Threads that stay alive, holding their thread numbers, until released:
+// run_and_hold(fn) starts a thread that runs fn() and then parks until
+// release(), and returns once fn() has returned, so that everything fn() did
+// happens-before the caller's next step (the hand-off the header's thread
+// rules ask of a handle created, used or destroyed on another thread) and
+// nothing of fn() runs concurrently with the caller. release(), and the
+// destructor, let every parked thread exit and join them all. A parked thread
+// does nothing but wait: it holds no handle and touches no set, so a caller
+// that needs a quiescent point has one while threads are parked. Used where a
+// test needs several threads on DISTINCT shards one after another: the parked
+// threads keep their numbers, so each new thread takes the next one (THREAD
+// NUMBERS IN THESE TESTS above). A gtest failure inside fn() is recorded in
+// the current test like any other; an ASSERT_* there returns from fn() only.
+class HeldThreads {
+  public:
+    HeldThreads() = default;
+    HeldThreads(const HeldThreads&) = delete;
+    HeldThreads& operator=(const HeldThreads&) = delete;
+    ~HeldThreads() { release(); }
+
+    // Start a thread that runs fn() then parks; return after fn() returned.
+    template <typename F>
+    void run_and_hold(F&& fn) {
+        held_.push_back(std::make_unique<Held>());
+        Held& held = *held_.back();   // outlives the thread: the thread's notify lands on live storage
+        held.thread = std::thread([&held, &go = go_, fn = std::forward<F>(fn)]() mutable {
+            fn();
+            held.done.store(true, std::memory_order_release);   // release: fn()'s effects before the caller's return
+            held.done.notify_one();
+            go.wait(false, std::memory_order_acquire);          // park until release()
+        }); // the held thread
+        held.done.wait(false, std::memory_order_acquire);       // acquire: pairs with the store above
+    } // HeldThreads::run_and_hold()
+
+    // Let every parked thread exit and join them all; idempotent.
+    void release() {
+        go_.store(true, std::memory_order_release);
+        go_.notify_all();
+        for (std::unique_ptr<Held>& held : held_) held->thread.join();
+        held_.clear();
+    } // HeldThreads::release()
+
+    // The threads started so far and not yet released.
+    size_t size() const { return held_.size(); }
+
+  private:
+    // One held thread and its done flag, in storage that lives until the
+    // thread is joined (a flag on the caller's stack could be gone by the
+    // time the thread notifies it).
+    struct Held {
+        std::atomic<bool> done{false};   // set by the thread when fn() has returned
+        std::thread thread;              // the held thread
+    }; // struct Held
+    std::vector<std::unique_ptr<Held>> held_;   // the held threads, in start order
+    std::atomic<bool> go_{false};               // set by release(): the parked threads exit
+}; // class HeldThreads
+
+// ---------------------------------------------------------------------------
 // Reclamation helpers. expect_consistent() and advance_and_check() call the
 // header's accounting sweep, get_internal_accounting(), and settle_writers()
 // calls get_internal_bucket_published(); both are diagnostics valid only at a
@@ -1184,11 +1262,10 @@ TEST(ConcurrentHashSetRcuTest, NoDoubleWinnerAcrossResize) {
 // shared keys has already taken the table to 128 buckets (rule 1), and from there
 // the resize hint grows by 256 whenever a thread's first allocation touches its
 // own arena shard, which is what takes the table through 256, 512 and 1024
-// buckets while the erases run, and to 2048 in the rounds in which no worker
-// shares the main thread's shard (a worker that does adds nothing to the hint:
-// thread numbers are assigned at a thread's first allocation, so each round's
-// workers take the next block of numbers and, modulo the shard count, alternate
-// between blocks that include the main thread's shard and blocks that do not).
+// buckets while the erases run, and to 2048 (every round's workers are numbered
+// 1 .. T while all alive, THREAD NUMBERS IN THESE TESTS, so with 2*T shards no
+// worker shares the main thread's shard 0; a worker that did would add nothing
+// to the hint).
 // The doubling itself is done by whichever thread next completes an insert. If
 // every thread allocated from its first step on, those doublings would all come
 // together in the first few operations of the round; so thread t inserts its
@@ -1775,9 +1852,9 @@ TEST(ConcurrentHashSetRcuTest, AdvanceStaleSplitCopiesNoDelete) {
 //     carry must fall off the top of the word, not into the address).
 //   - 2 threads, 8 shards (shards > threads): six lists are never popped.
 // The oracle: K freed slots are dealt evenly (K is a multiple of both shard
-// counts, so each shard gets exactly K/shards), threads started together get
-// consecutive thread numbers and so spread evenly over the shards (header,
-// concurrent_hash_rcu_detail), and each thread inserts exactly K/max(threads, shards)
+// counts, so each shard gets exactly K/shards), the T threads of run_threads()
+// are numbered 1 .. T while all alive (THREAD NUMBERS IN THESE TESTS) and so
+// spread evenly over the shards, and each thread inserts exactly K/max(threads, shards)
 // new keys: exactly what its shard's list can serve, shared with its shard mates,
 // so no thread's own list runs dry and no allocation needs another shard's.
 // So the arena must not grow at all, and the free count must drop by exactly the
@@ -2737,8 +2814,9 @@ TEST(ConcurrentHashSetRcuTest, AdvanceLimboPushesRaceFreeListPops) {
 //   - without advance(): every successful insert() allocates a node that is never
 //     reused, so the arena holds at least (R + 1)*T*W slots, which is more than
 //     BOUND*T*W: this half proves the bound above is not vacuous.
-// One arena shard per thread: T threads started together get T consecutive thread
-// numbers, one per shard, whatever round they run in; with fewer or more shards
+// One arena shard per thread: the T threads of run_threads() are numbered
+// 1 .. T while all alive (THREAD NUMBERS IN THESE TESTS), one per shard,
+// whatever round they run in; with fewer or more shards
 // than threads the bound would hold as well (a thread whose own list runs dry
 // takes nodes from other shards' lists before it appends), but each thread's
 // allocations would then mix its own and other shards' nodes.
@@ -4078,24 +4156,25 @@ static HookCounts hook_counts(const SetT& set) {
 
 // Runs fn() on a fresh thread whose arena shard is `s` of `S`: the shard a set
 // of S arena shards computes for that thread's joins, allocations and retire
-// pushes, thread_number() & (S - 1). Threads are started and joined ONE AT A
-// TIME until one lands on `s`: thread numbers are process-wide, sequential and
-// fixed per thread (taken at a thread's first join or shard use, or at its
-// first call of thread_number(), which is what each candidate thread does
-// first), so S consecutive candidates cover every shard, and at most S tries
-// land one on `s`, whatever tests ran before and whatever --gtest_filter
-// selected. A candidate that does not land calls thread_number() and nothing
-// else: it joins nothing, so it fires no TestHooks hook (which could consume
-// a slot a script armed) and takes no count. The landing test is the placement
-// precondition: fn() runs only on a thread of shard `s` (each placed role's
-// per-shard oracle confirms it independently: the view or the handle shard
-// its join produced). The thread is joined before on_shard() returns, so
-// everything fn() did happens-before the caller's next step -- the hand-off
+// pushes, thread_number() & (S - 1). Candidate threads are started ONE AT A
+// TIME and kept alive (HeldThreads) until one lands on `s`: the test thread
+// holds number 0 and nothing else is live (THREAD NUMBERS IN THESE TESTS), so
+// the candidates take 1, 2, ..., and the one numbered s (or S, for s = 0)
+// lands: at most S candidates, whatever tests ran before and whatever
+// --gtest_filter selected. A candidate that does not land calls
+// thread_number() and nothing else, then parks: it joins nothing, so it fires
+// no TestHooks hook (which could consume a slot a script armed) and takes no
+// count. The landing test is the placement precondition: fn() runs only on a
+// thread of shard `s` (each placed role's per-shard oracle confirms it
+// independently: the view or the handle shard its join produced). fn() has
+// returned before on_shard() returns, and every candidate is joined by then,
+// so everything fn() did happens-before the caller's next step -- the hand-off
 // the header's thread rules ask of a handle created, used or destroyed on
 // another thread -- and nothing runs concurrently with fn(): the caller is
-// blocked in the join, so fn() may touch ProbeKey's plain statics (hook_depth)
-// and the caller's locals. A gtest failure inside fn() is recorded in the
-// current test like any other; an ASSERT_* there returns from fn() only.
+// blocked until fn() returns and the other candidates are parked, so fn() may
+// touch ProbeKey's plain statics (hook_depth) and the caller's locals. A gtest
+// failure inside fn() is recorded in the current test like any other; an
+// ASSERT_* there returns from fn() only.
 // Precondition: S is a power of two and s < S (a failure is reported, and fn()
 // does not run).
 template <typename F>
@@ -4104,15 +4183,15 @@ static void on_shard(size_t S, size_t s, F&& fn) {
         ADD_FAILURE() << "on_shard(): shard " << s << " of " << S << " shards (S must be a power of two, s < S)";
         return;
     } // if the placement cannot exist
+    HeldThreads candidates;
     for (size_t tries = 0; tries < S; ++tries) {
         bool landed = false;
-        std::thread candidate([&]() {
+        candidates.run_and_hold([&]() {
             if ((concurrent_hash_rcu_detail::thread_number() & (S - 1)) != s) return;
             landed = true;
             fn();
-        }); // thread candidate
-        candidate.join();
-        if (landed) return;
+        }); // candidate thread
+        if (landed) return;   // every candidate is released and joined here
     } // one candidate thread at a time
     ADD_FAILURE() << "on_shard(): no thread landed on shard " << s << " of " << S << " in " << S << " tries";
 } // on_shard()
@@ -5000,11 +5079,12 @@ TEST_F(HashRcuHookTest, HookLatePushAfterPublishK3) { ASSERT_NO_FATAL_FAILURE(ho
 TEST_F(HashRcuHookTest, HookLatePushAfterPublishK64) { ASSERT_NO_FATAL_FAILURE(hook_late_push_after_publish_body<64>()); }
 
 // The same, on every shard: a set of S = 4 arena shards, and inside the hook S
-// helper threads started and joined ONE AT A TIME, each with a handle of its
-// own, each erasing one key L_s. Threads started one after another get
-// consecutive process-wide thread numbers, so their retire pushes land on all
-// four shards' retired lists (each helper records its shard, and the test
-// asserts the four are distinct: the witness that every shard was covered).
+// helper threads started ONE AT A TIME and kept alive until all have run
+// (HeldThreads), each with a handle of its own, each erasing one key L_s. The
+// helpers are numbered 1 .. S (THREAD NUMBERS IN THESE TESTS), so their retire
+// pushes land on all four shards' retired lists (each helper records its
+// shard, and the test asserts the four are distinct: the witness that every
+// shard was covered).
 // Kills the exchanges of only SOME shards moved past the hook: the late shards'
 // L_s would be bagged with A and freed by the same call.
 // HookLatePushAfterPublish cannot see that: on one shard, the one exchange is
@@ -5026,14 +5106,14 @@ static void hook_late_push_after_publish_every_shard_body() {
     std::vector<unsigned> shard_of(S, 0);
     TestHooks::arm(TestHooks::after_publish, [&]() {
         ++ran;
+        HeldThreads helpers;
         for (int s = 0; s < S; ++s) {
-            std::thread helper([&set, &shard_of, s]() {
+            helpers.run_and_hold([&set, &shard_of, s]() {
                 shard_of[s] = concurrent_hash_rcu_detail::thread_number() & (S - 1);
                 const typename Set::handle h = set.new_handle();
                 EXPECT_TRUE(set.erase(h, s + 1));
-            }); // thread helper
-            helper.join();
-        } // one helper at a time
+            }); // helper thread
+        } // one helper at a time, each kept alive
     }); // the in_advance_after_publish action
     const AdvanceResult r1 = set.advance();
     ASSERT_EQ(ran, 1) << "test precondition: the in_advance_after_publish action did not run";
@@ -5451,7 +5531,7 @@ struct StressShape {
     // mixed_handles false), 2 <= writers <= shards, shards a power of two, stable > 0,
     // and the cadence off (a cadenced run sweeps the accounting right after the run,
     // before the mailboxes' handles are released).
-    bool hand_over = false;   // true: the writers are numbered one at a time (so on distinct shards) and hand live handles to one another (advance_stress_body())
+    bool hand_over = false;   // true: the writers are numbered one at a time while all alive (so on distinct shards) and hand live handles to one another (advance_stress_body())
 }; // struct StressShape
 
 // What happened during the run (before the end-state calls), for the witnesses.
@@ -5501,8 +5581,9 @@ static int stress_never_key(int i) { return 0x38000000 | i; }                // 
 // counters after the join, readers record whether a trigger proceeded inside
 // their own contains(), and a runaway guard may end the run early.
 // The moved-handle variant (shape.hand_over) differs only in its writers: they
-// are started and numbered one at a time, so they take consecutive thread
-// numbers and sit on distinct arena shards (asserted after the run), and each
+// are started and numbered one at a time, and all live until the run ends, so
+// they take the consecutive numbers 1 .. writers (THREAD NUMBERS IN THESE
+// TESTS) and sit on distinct arena shards (asserted after the run), and each
 // runs a hand-over step every iteration before its operations: it receives at
 // most one live handle from its mailbox (where the other writers leave
 // handles for it, at most kMailboxCap at a time: each waiting handle pins its
@@ -5630,7 +5711,8 @@ static void advance_stress_body(const StressShape& shape, const std::string& whe
             if (shape.hand_over) {
                 // The writer's first call takes its thread number, while the
                 // test thread waits for it (below) before it starts the next
-                // writer: consecutive numbers, distinct shards.
+                // writer, and every writer lives until the run ends:
+                // consecutive numbers, distinct shards.
                 shard = concurrent_hash_rcu_detail::thread_number() & (set.get_internal_arena_shards() - 1);
                 writer_shard[t] = shard;
                 numbered.fetch_add(1, std::memory_order_release);
@@ -6666,17 +6748,17 @@ TEST(ConcurrentHashSetRcuTest, CadenceLimboDoesNotCount) {
 
 // The count is PER SHARD, not set-wide. R = 2, TWO arena shards. Inserts
 // 0, 1, 2 on the test thread (inserts retire nothing). Two helper threads,
-// each started and JOINED before the next starts, each erasing one key under
-// its own handle: the header numbers threads sequentially on first use, so
-// the two get consecutive numbers and therefore distinct shards (asserted
-// through the per-shard counts {1, 1}: the script's precondition, not an
-// oracle); each shard is at 1 = R-1: no attempt. A third helper erases 2: its
-// number is the first helper's plus 2, the same shard, which reaches 2 = R:
-// one attempt (the positive control).
+// each started after the previous one has run and kept alive until the end
+// (HeldThreads), each erasing one key under its own handle: they are numbered
+// 1 and 2 (THREAD NUMBERS IN THESE TESTS), distinct shards (asserted through
+// the per-shard counts {1, 1}: the script's precondition, not an oracle);
+// each shard is at 1 = R-1: no attempt. A third helper erases 2: its number is
+// 3, the first helper's shard, which reaches 2 = R: one attempt (the positive
+// control).
 // Kills, ONLY here: the crossing decided on the set-wide count (the second
 // helper's push takes the set-wide sum to 2: one attempt after two helpers).
-// Not a contract test: it relies on the sequential thread numbering, which
-// the contract does not promise.
+// Not a contract test: it relies on the pool's thread numbering, which the
+// contract does not promise.
 TEST(ConcurrentHashSetRcuTest, CadenceCountsPerShard) {
     using Set = IntSetDel;
     Set set = cadenced_set<Set>(256, 2, 2);
@@ -6684,13 +6766,14 @@ TEST(ConcurrentHashSetRcuTest, CadenceCountsPerShard) {
         const Set::handle h = set.new_handle();
         for (int k = 0; k < 3; ++k) ASSERT_TRUE(set.insert(h, k));
     }
-    // One erase of `k` on a fresh thread, under a handle of its own, joined
-    // before this returns.
-    auto erase_on_new_thread = [&set](int k) {
-        std::thread([&set, k]() {
+    // One erase of `k` on a fresh thread, under a handle of its own, run
+    // before this returns; the thread then stays alive, holding its number.
+    HeldThreads helpers;
+    auto erase_on_new_thread = [&set, &helpers](int k) {
+        helpers.run_and_hold([&set, k]() {
             const Set::handle h = set.new_handle();
             EXPECT_TRUE(set.erase(h, k)) << "helper's erase of " << k;
-        }).join();
+        });
     }; // erase_on_new_thread()
     erase_on_new_thread(0);
     erase_on_new_thread(1);
@@ -10952,3 +11035,231 @@ TEST(ConcurrentHashSetRcuTest, ContractCadenceDestroySetWithPendingBags) {
     } // the set's scope
     EXPECT_EQ(contract_destruction_errors(first, ContractCountedKey::next_serial.load()), 0);
 } // ContractCadenceDestroySetWithPendingBags
+
+// ---------------------------------------------------------------------------
+// THE THREAD NUMBER POOL (header, concurrent_hash_rcu_detail, THE POOL): a
+// thread takes the lowest number no live thread holds at its first
+// thread_number() call, keeps it for its life and returns it at exit. The
+// tests below check the pool itself (reuse, lowest-free, uniqueness under
+// churn) and its effect on a set (retires of threads that come and go stay on
+// numbers below the shard count). They rely on THREAD NUMBERS IN THESE TESTS:
+// the test thread holds 0, and nothing else is live when a test starts.
+// ---------------------------------------------------------------------------
+
+// A thread that takes its number as its first act, publishes it, and parks
+// until released (or destroyed): one live holder of one number, for the
+// lowest-free scenarios. number() waits for the thread to have taken it.
+class NumberedThread {
+  public:
+    static constexpr unsigned kNone = ~0u;   // number_ before the thread took its number
+
+    NumberedThread()
+        : thread_([this]() {
+              number_.store(concurrent_hash_rcu_detail::thread_number(), std::memory_order_release);
+              number_.notify_one();
+              go_.wait(false, std::memory_order_acquire);   // park until release()
+          }) {}
+    NumberedThread(const NumberedThread&) = delete;
+    NumberedThread& operator=(const NumberedThread&) = delete;
+    ~NumberedThread() { release(); }
+
+    // The thread's number, once it has taken it.
+    unsigned number() {
+        unsigned n = number_.load(std::memory_order_acquire);
+        while (n == kNone) {
+            number_.wait(kNone, std::memory_order_acquire);
+            n = number_.load(std::memory_order_acquire);
+        } // until the thread has published its number
+        return n;
+    } // NumberedThread::number()
+
+    // Let the thread exit (releasing its number to the pool) and join it; idempotent.
+    void release() {
+        go_.store(true, std::memory_order_release);
+        go_.notify_one();
+        if (thread_.joinable()) thread_.join();
+    } // NumberedThread::release()
+
+  private:
+    std::atomic<unsigned> number_{kNone};   // the number the thread took, kNone until then
+    std::atomic<bool> go_{false};           // set by release(): the thread exits
+    std::thread thread_;                    // last: its body reads the two atomics above
+}; // class NumberedThread
+
+// The precondition of every pool test: the test thread holds 0 (THREAD
+// NUMBERS IN THESE TESTS) and nothing else holds a number, so a short-lived
+// thread gets 1. A holder leaked by another test fails here, by name, rather
+// than as a wrong number inside a scenario.
+static ::testing::AssertionResult pool_holds_only_the_test_thread() {
+    if (test_thread_number != 0 || concurrent_hash_rcu_detail::thread_number() != 0) {
+        return ::testing::AssertionFailure() << "the test thread holds number " << concurrent_hash_rcu_detail::thread_number() << ", not 0";
+    }
+    unsigned number = NumberedThread::kNone;
+    std::thread([&number]() { number = concurrent_hash_rcu_detail::thread_number(); }).join();
+    if (number != 1) return ::testing::AssertionFailure() << "a fresh thread got number " << number << ": some other thread holds 1";
+    return ::testing::AssertionSuccess();
+} // pool_holds_only_the_test_thread()
+
+// A thread that takes a number and exits returns it: a few hundred threads
+// started one after another all get 1, the lowest free number; the numbers
+// never grow with the threads that came and went.
+// Kills: a number that is never returned, or a return that does not make the
+// number the next one taken.
+TEST(ConcurrentHashSetRcuTest, ThreadNumberPoolReusesAnExitedThreadsNumber) {
+    ASSERT_TRUE(pool_holds_only_the_test_thread());
+    const int kRounds = 300;
+    for (int i = 0; i < kRounds; ++i) {
+        unsigned number = NumberedThread::kNone;
+        std::thread([&number]() { number = concurrent_hash_rcu_detail::thread_number(); }).join();
+        ASSERT_EQ(number, 1u) << "round " << i << ": the thread did not get the lowest free number";
+    } // one short-lived thread after another
+} // ThreadNumberPoolReusesAnExitedThreadsNumber
+
+// Lowest-free: four parked threads hold 1 .. 4 (taken one after another while
+// all stay alive); a thread started after the holder of 2 exits gets 2, after
+// the holders of 1 and 3 exit the next two get 1 then 3, and once every
+// holder is gone a new thread gets 1 again. Deterministic: each holder is
+// joined before the next thread starts, and each new thread's number is
+// read before another starts.
+// Kills: a take that is not the lowest free number (a free-list order, a
+// highest-free take), a release that frees the wrong number.
+TEST(ConcurrentHashSetRcuTest, ThreadNumberPoolTakesTheLowestFreeNumber) {
+    ASSERT_TRUE(pool_holds_only_the_test_thread());
+    std::vector<std::unique_ptr<NumberedThread>> holders;
+    for (unsigned i = 1; i <= 4; ++i) {
+        holders.push_back(std::make_unique<NumberedThread>());
+        ASSERT_EQ(holders.back()->number(), i) << "holder " << i << ": the test thread holds 0 and the holders before it 1 .. " << i - 1;
+    } // four holders, numbered 1 .. 4
+    holders[1]->release();   // number 2 is free; 1, 3, 4 are held
+    NumberedThread took_two;
+    EXPECT_EQ(took_two.number(), 2u) << "the gap at 2 is the lowest free number";
+    holders[0]->release();   // 1 is free
+    holders[2]->release();   // 1 and 3 are free
+    NumberedThread took_one;
+    EXPECT_EQ(took_one.number(), 1u) << "1 is the lowest of the two gaps";
+    NumberedThread took_three;
+    EXPECT_EQ(took_three.number(), 3u) << "3 is the lowest gap left";
+    NumberedThread took_five;
+    EXPECT_EQ(took_five.number(), 5u) << "0 .. 4 are held: the lowest free number is 5";
+    took_two.release();
+    took_one.release();
+    took_three.release();
+    took_five.release();
+    holders[3]->release();
+    NumberedThread took_one_again;
+    EXPECT_EQ(took_one_again.number(), 1u) << "every holder is gone: 1 again";
+} // ThreadNumberPoolTakesTheLowestFreeNumber
+
+// Uniqueness under churn: M spawner threads (which take no number themselves)
+// each start, one after another, a few hundred short-lived children; a child
+// takes its number, claims the number's slot in a shared owner table, holds
+// it briefly and clears it before it exits. At most M children live at once
+// beside the test thread's 0, so every take finds a free number among 1 .. M
+// (the pool's bound: as long as the live holders never exceed N, every number
+// taken is below N), and a claim of a slot already claimed means two live
+// threads held one number. TSan sees every access: the owner table is
+// atomic, the children's numbers are their own thread_locals.
+// Kills: two live threads on one number (a release before the thread's last
+// use, a take that does not mark the number held, a lost update of the
+// bitmap under concurrent takes and releases), a take past the live count.
+TEST(ConcurrentHashSetRcuTest, ThreadNumberPoolNumbersAreUniqueUnderChurn) {
+    ASSERT_TRUE(pool_holds_only_the_test_thread());
+    const int kSpawners = 8, kChildren = 250;
+    std::vector<std::atomic<int>> owner(kSpawners + 1);   // owner[n]: the spawner (1-based) whose live child holds number n; 0 = free
+    for (std::atomic<int>& o : owner) o.store(0, std::memory_order_relaxed);
+    owner[0].store(-1, std::memory_order_relaxed);   // the test thread's own number
+    std::atomic<int> too_high{0};        // children whose number exceeded kSpawners
+    std::atomic<int> double_owned{0};    // children whose number's slot was already claimed
+    std::atomic<int> children{0};        // children that ran
+    std::vector<std::thread> spawners;
+    for (int s = 1; s <= kSpawners; ++s) {
+        spawners.emplace_back([&, s]() {
+            for (int i = 0; i < kChildren; ++i) {
+                std::thread([&, s]() {
+                    const unsigned n = concurrent_hash_rcu_detail::thread_number();
+                    children.fetch_add(1, std::memory_order_relaxed);
+                    if (n > unsigned(kSpawners)) {
+                        too_high.fetch_add(1, std::memory_order_relaxed);
+                        return;
+                    } // if the pool handed out a number no live set would need
+                    int expected = 0;
+                    if (!owner[n].compare_exchange_strong(expected, s, std::memory_order_acq_rel)) {
+                        double_owned.fetch_add(1, std::memory_order_relaxed);
+                        return;
+                    } // if another live child holds n
+                    for (int k = 0; k < 8; ++k) std::this_thread::yield();   // hold the number while other children take theirs
+                    owner[n].store(0, std::memory_order_release);   // cleared BEFORE the thread exits and the pool reuses n
+                }).join();
+            } // one child after another
+        }); // spawner s
+    } // kSpawners spawners
+    for (std::thread& t : spawners) t.join();
+    EXPECT_EQ(children.load(), kSpawners*kChildren);
+    EXPECT_EQ(double_owned.load(), 0) << "two live threads held one number";
+    EXPECT_EQ(too_high.load(), 0) << "a take returned a number above the live count";
+    for (int n = 1; n <= kSpawners; ++n) EXPECT_EQ(owner[n].load(), 0) << "number " << n << " is still claimed after every child exited";
+} // ThreadNumberPoolNumbersAreUniqueUnderChurn
+
+// The pool at the set: the retires of threads that come and go. S = 4 arena
+// shards, pre-sized (no splits: an erase retires exactly its own node and
+// nothing else allocates). Phase A: S threads started one at a time and kept
+// alive (HeldThreads), each inserting and erasing E keys of its own under its
+// own handle: they are numbered 1 .. S, so each shard's retire count grows by
+// E (shard 0 through number S). Phase B: 3*S short-lived threads, one after
+// another, each doing the same: every one takes number 1 (the lowest free,
+// the test thread holding 0), so only shard 1's count grows, by 3*S*E, and
+// every number is below S. Every thread records its number, and the per-shard
+// deltas are compared with the tally of E per thread on shard
+// `number & (S - 1)`: the retires of a thread land on its number's shard, and
+// no thread of the churn landed past the shard count (numbers 1 .. S, then 1:
+// at most S + 1 threads live at once, the test thread included). Then two
+// advance() calls free everything (advance_and_check()).
+// Kills: a number that is never returned, a take that is not the lowest
+// free.
+TEST(ConcurrentHashSetRcuTest, ThreadNumberPoolKeepsChurningThreadsBelowTheShardCount) {
+    using Set = ConcurrentResizableHashSetRCU<int, true>;
+    ASSERT_TRUE(pool_holds_only_the_test_thread());
+    const size_t S = 4, E = 16;
+    Set set(4096, S);
+    const std::vector<size_t> before = set.get_internal_retire_nodes_per_shard();
+    ASSERT_EQ(before.size(), S);
+    std::vector<size_t> tally(S, 0);   // E per thread on shard number & (S - 1), from the recorded numbers
+    std::vector<unsigned> numbers;     // every thread's number, in start order (phase A first)
+    std::mutex record;                 // guards numbers and tally (written by the threads, read after they are joined)
+    int next_key = 1;                  // phase-wide: distinct keys per thread
+    // One thread's work: take the number (recorded), insert E fresh keys and erase them.
+    auto work = [&](int first_key) {
+        const unsigned number = concurrent_hash_rcu_detail::thread_number();
+        {
+            std::lock_guard<std::mutex> guard(record);
+            numbers.push_back(number);
+            tally[number & (S - 1)] += E;
+        }
+        const Set::handle h = set.new_handle();
+        for (size_t i = 0; i < E; ++i) EXPECT_TRUE(set.insert(h, first_key + int(i)));
+        for (size_t i = 0; i < E; ++i) EXPECT_TRUE(set.erase(h, first_key + int(i)));
+    }; // work()
+    {
+        HeldThreads batch;
+        for (size_t t = 0; t < S; ++t) {
+            const int first_key = next_key;
+            next_key += int(E);
+            batch.run_and_hold([&work, first_key]() { work(first_key); });
+        } // S threads, each kept alive
+        EXPECT_EQ(numbers, (std::vector<unsigned>{1, 2, 3, 4})) << "phase A: the S live threads take 1 .. S";
+        const std::vector<size_t> after_a = set.get_internal_retire_nodes_per_shard();
+        for (size_t s = 0; s < S; ++s) EXPECT_EQ(after_a[s] - before[s], E) << "phase A, shard " << s << ": one thread per shard, E retires each";
+    } // the batch is released and joined here
+    for (size_t t = 0; t < 3*S; ++t) {
+        const int first_key = next_key;
+        next_key += int(E);
+        std::thread([&work, first_key]() { work(first_key); }).join();
+    } // 3*S threads one after another
+    ASSERT_EQ(numbers.size(), 4*S);
+    for (size_t t = S; t < 4*S; ++t) EXPECT_EQ(numbers[t], 1u) << "phase B, thread " << t << ": a thread started after every other exited takes 1";
+    const std::vector<size_t> after_b = set.get_internal_retire_nodes_per_shard();
+    for (size_t s = 0; s < S; ++s) EXPECT_EQ(after_b[s] - before[s], tally[s]) << "shard " << s << ": the retires of every thread landed on its number's shard";
+    EXPECT_EQ(after_b[1] - before[1], (3*S + 1)*E) << "shard 1 took phase B whole";
+    Set::handle h = set.new_handle();
+    ASSERT_NO_FATAL_FAILURE(advance_and_check(set, h, 0, "after the churn"));
+} // ThreadNumberPoolKeepsChurningThreadsBelowTheShardCount

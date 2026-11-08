@@ -22,7 +22,7 @@
 // The baseline: identical to SpinLock in spinlock.h. Every coordinate sweep
 // below differs from this line in exactly one parameter, and every run should
 // include it -- a sweep is only comparable against its baseline.
-TUNE_CONFIG("base", 8, 0, 0, 8, NS_1ms);
+TUNE_CONFIG("base", 8, 0, 0, 4, NS_1ms);
 
 // NTry -- attempts per round. Too few and a lock released mid-round is missed
 // until after a back-off; too many and every waiter is issuing exchanges into
@@ -32,11 +32,11 @@ TUNE_CONFIG("base", 8, 0, 0, 8, NS_1ms);
 // so whatever NTry gains or loses there is inlining and code layout on the
 // uncontended fast path, not waiting policy. Always read this group against
 // the threads:1 column -- it is the codegen control.
-TUNE_CONFIG("ntry", 1, 0, 0, 8, NS_1ms);
-TUNE_CONFIG("ntry", 2, 0, 0, 8, NS_1ms);
-TUNE_CONFIG("ntry", 4, 0, 0, 8, NS_1ms);
-TUNE_CONFIG("ntry", 16, 0, 0, 8, NS_1ms);
-TUNE_CONFIG("ntry", 32, 0, 0, 8, NS_1ms);
+TUNE_CONFIG("ntry", 1, 0, 0, 4, NS_1ms);
+TUNE_CONFIG("ntry", 2, 0, 0, 4, NS_1ms);
+TUNE_CONFIG("ntry", 4, 0, 0, 4, NS_1ms);
+TUNE_CONFIG("ntry", 16, 0, 0, 4, NS_1ms);
+TUNE_CONFIG("ntry", 32, 0, 0, 4, NS_1ms);
 
 // NPause -- rounds of PAUSE-hinted spinning inserted ahead of the sleeps. This
 // is the tier that keeps the waiter on its core.
@@ -48,12 +48,12 @@ TUNE_CONFIG("ntry", 32, 0, 0, 8, NS_1ms);
 // 128 and 256 are there because on a 2-socket Granite Rapids server, with
 // memory-streaming work at ~1% occupancy, the gain is still rising at 64
 // rounds. (With sin/cos work it plateaus by 16.)
-TUNE_CONFIG("pause", 8, 1, 0, 8, NS_1ms);
-TUNE_CONFIG("pause", 8, 4, 0, 8, NS_1ms);
-TUNE_CONFIG("pause", 8, 16, 0, 8, NS_1ms);
-TUNE_CONFIG("pause", 8, 64, 0, 8, NS_1ms);
-TUNE_CONFIG("pause", 8, 128, 0, 8, NS_1ms);
-TUNE_CONFIG("pause", 8, 256, 0, 8, NS_1ms);
+TUNE_CONFIG("pause", 8, 1, 0, 4, NS_1ms);
+TUNE_CONFIG("pause", 8, 4, 0, 4, NS_1ms);
+TUNE_CONFIG("pause", 8, 16, 0, 4, NS_1ms);
+TUNE_CONFIG("pause", 8, 64, 0, 4, NS_1ms);
+TUNE_CONFIG("pause", 8, 128, 0, 4, NS_1ms);
+TUNE_CONFIG("pause", 8, 256, 0, 4, NS_1ms);
 
 // NYield -- rounds of sched_yield() ahead of the sleeps. Unlike a nanosleep,
 // a yield only gives up the core if some other thread wants it, so at low
@@ -61,31 +61,33 @@ TUNE_CONFIG("pause", 8, 256, 0, 8, NS_1ms);
 // 32 and 64 extend the axis for the same reason as pause 128/256 above; the
 // sleep tiers stay as the backstop -- the yield-only shape still collapses at
 // scale, so the question is pre-park budget, not replacing the sleeps.
-TUNE_CONFIG("yield", 8, 0, 1, 8, NS_1ms);
-TUNE_CONFIG("yield", 8, 0, 4, 8, NS_1ms);
-TUNE_CONFIG("yield", 8, 0, 16, 8, NS_1ms);
-TUNE_CONFIG("yield", 8, 0, 32, 8, NS_1ms);
-TUNE_CONFIG("yield", 8, 0, 64, 8, NS_1ms);
+TUNE_CONFIG("yield", 8, 0, 1, 4, NS_1ms);
+TUNE_CONFIG("yield", 8, 0, 4, 4, NS_1ms);
+TUNE_CONFIG("yield", 8, 0, 16, 4, NS_1ms);
+TUNE_CONFIG("yield", 8, 0, 32, 4, NS_1ms);
+TUNE_CONFIG("yield", 8, 0, 64, 4, NS_1ms);
 
 // NShortSleep -- how many ~1 ns sleeps (in practice, ~50 us parks: the kernel
 // adds the thread's timer slack) before escalating to the long sleep. 0 parks a
 // waiter on the first failed round.
 //
-// 0 and 1 bracket whether the short tier earns its place at all; 4, 16 and 32
-// probe the knob around the baseline's 8. Park-eager configurations (S0
-// especially) are the most sensitive to per-process placement -- prefer means
-// over multiple invocations when reading them.
+// 0 and 1 bracket whether the short tier earns its place at all; 2 and 8 are
+// the baseline's nearest neighbours on either side, the two the queue's
+// latency tail was also measured against, and 16 is the far side of the axis.
+// Park-eager configurations (S0 especially) are the most sensitive to
+// per-process placement -- prefer means over multiple invocations when reading
+// them.
 TUNE_CONFIG("short", 8, 0, 0, 0, NS_1ms);
 TUNE_CONFIG("short", 8, 0, 0, 1, NS_1ms);
-TUNE_CONFIG("short", 8, 0, 0, 4, NS_1ms);
+TUNE_CONFIG("short", 8, 0, 0, 2, NS_1ms);
+TUNE_CONFIG("short", 8, 0, 0, 8, NS_1ms);
 TUNE_CONFIG("short", 8, 0, 0, 16, NS_1ms);
-TUNE_CONFIG("short", 8, 0, 0, 32, NS_1ms);
 
 // LongSleepNs -- the tier sweep behind the 1 ms long sleep of spinlock.h:
 // 0.1 ms and 10 ms against the baseline's 1 ms. This is the claim the README
 // makes, so it gets re-run on every machine.
-TUNE_CONFIG("long", 8, 0, 0, 8, NS_100us);
-TUNE_CONFIG("long", 8, 0, 0, 8, NS_10ms);
+TUNE_CONFIG("long", 8, 0, 0, 4, NS_100us);
+TUNE_CONFIG("long", 8, 0, 0, 4, NS_10ms);
 
 // Shape references: policies several axes away from the baseline, which is
 // where the interesting failures live. Each is a whole class of spinlock in
@@ -98,7 +100,7 @@ TUNE_CONFIG("long", 8, 0, 0, 8, NS_10ms);
 TUNE_CONFIG("shape.spin", 8, 0, 0, 0, NS_off);   // no back-off at all: pure TTAS
 TUNE_CONFIG("shape.pause", 8, 64, 0, 0, NS_off); // pause-only, never deschedules
 TUNE_CONFIG("shape.yield", 8, 0, 64, 0, NS_off); // sched_yield-only
-TUNE_CONFIG("shape.short", 8, 0, 0, 8, NS_off);  // single tier of short sleeps
-TUNE_CONFIG("shape.full", 8, 16, 4, 8, NS_1ms);  // all four tiers, cheapest first
+TUNE_CONFIG("shape.short", 8, 0, 0, 4, NS_off);  // single tier of short sleeps
+TUNE_CONFIG("shape.full", 8, 16, 4, 4, NS_1ms);  // all four tiers, cheapest first
 
 #endif // INCLUDED_SPINLOCK_TUNE_CONFIGS_H

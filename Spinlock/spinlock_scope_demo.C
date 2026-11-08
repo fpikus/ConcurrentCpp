@@ -29,7 +29,7 @@
 //
 // Under contention this lock's throughput comes from batching: a waiter that
 // does not get the lock within its burst of eight attempts parks in nanosleep
-// (eight rounds of a short sleep that the kernel stretches to tens of
+// (four rounds of a short sleep that the kernel stretches to tens of
 // microseconds, then a 1 ms sleep, and again), so most of the time one thread
 // holds the lock, finds its line already in its own cache, and runs a long
 // streak of operations. The lock only changes hands when a waiter's attempt

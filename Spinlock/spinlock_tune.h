@@ -115,7 +115,7 @@ struct BackOffParams {
   int ntry = 8;             // acquire attempts per round, unrolled
   int npause = 0;           // rounds ending in a PAUSE-class hint
   int nyield = 0;           // rounds ending in sched_yield()
-  int nshort = 8;           // rounds ending in a short_sleep_ns nanosleep
+  int nshort = 4;           // rounds ending in a short_sleep_ns nanosleep
   long long_sleep_ns = NS_1ms;  // the final, real sleep; 0 == no long tier
   long short_sleep_ns = 1;  // ~1 ns: the kernel adds the timer slack (50 us default)
 }; // struct BackOffParams

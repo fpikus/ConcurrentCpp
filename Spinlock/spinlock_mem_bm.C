@@ -118,7 +118,7 @@ void BM_memlock(benchmark::State& state) {
   ->UseRealTime()
 
 // The shared configuration list, under BM_mem naming:
-//   BM_mem/sweep:base/try:8/pause:0/yield:0/short:8/long:NS_1ms
+//   BM_mem/sweep:base/try:8/pause:0/yield:0/short:4/long:NS_1ms
 #define TUNE_CONFIG(sweep, ntry, npause, nyield, nshort, longns)          \
   BENCHMARK_TEMPLATE(BM_memlock,                                            \
                      LadderedLock<BackOffParams{ntry, npause, nyield,   \

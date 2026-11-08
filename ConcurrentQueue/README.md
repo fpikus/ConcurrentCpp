@@ -114,7 +114,9 @@ drops to 1.05-1.11x when nothing but the code placement changes.
 The numbers (M items/s: successful pushes plus pops per second of wall-clock
 time, the median of six rounds of five repetitions, key-only elements, 65536
 slots (moodycamel: its initial capacity), every thread pushing or popping and
-doing nothing else). A rival's cell at 128 and 256 threads is an upper bound
+doing nothing else; measured with the lock's previous back-off ladder,
+described below — only the 16- and 128-thread cells were re-measured with
+the current one, and those results are given with the latency). A rival's cell at 128 and 256 threads is an upper bound
 over the rounds, and moodycamel's from 8 threads up a range over the rounds,
 because one role finishes its share long before the other there and the
 wall-clock rate mixes two regimes; the 2-thread cells depend on where the
@@ -133,36 +135,50 @@ The latency benchmark records, at 128 threads pinned one per core across
 both sockets, a thread's own push-to-pop round trip through the contended
 queue at near-empty depth (most samples are the thread popping what it
 pushed a moment earlier, with everyone else contending), in 60-second runs
-repeated three times, against a highly optimized DCAS queue built for
-latency-sensitive work:
+repeated three times for the DCAS queue and four for this one, against a
+highly optimized DCAS queue built for latency-sensitive work:
 
 |                  | RingAtomicMapQueueMPMC | Lock-free DCAS queue |
 |------------------|-----------------------:|---------------------:|
-| Median           | 0.55 µs                | 84 µs                |
-| 99th percentile  | 0.30 ms                | 0.36 ms              |
-| 99.9th           | 1.57 ms                | 0.59 ms              |
-| Worst, 60 s run  | 12-19 ms               | 2-7 ms               |
-| Worst, 900 s run | 22 ms                  | 11 ms                |
+| Median           | 0.31 µs                | 84 µs                |
+| 99th percentile  | 0.17 ms                | 0.36 ms              |
+| 99.9th           | 1.40 ms                | 0.59 ms              |
+| Worst, 60 s run  | 19-26 ms               | 2-7 ms               |
+| Worst, 900 s run | 22 ms (previous ladder) | 11 ms               |
 
-The lock-free design pays 150x at the median — and 3.6x at the 90th
-percentile, 2x at the 95th, 1.2x at the 99th — and gets back a 99.9th
-percentile 2.7x tighter and a worst case two to six times better over a
-minute and about half as bad over a quarter-hour. What it does not get is a
+The lock-free design pays about 270x at the median — and 100x at the 90th
+percentile, 4.6x at the 95th, 2.1x at the 99th — and gets back a 99.9th
+percentile 2.4x tighter and a worst case three to thirteen times better over
+a minute and about half as bad over a quarter-hour (the quarter-hour row was
+measured with the lock's previous ladder, described below; the current
+ladder's worst case over a minute did not move against the previous one in
+the same runs, so that row is not contradicted). What it does not get is a
 hard cap: the DCAS queue's worst case grew to 19 ms in one five-minute run.
 Whether the trade is worth making depends entirely on your application; the
 numbers above are what you are trading.
 
 Where this queue's tail comes from is no mystery: at 128 threads it is the
-lock's back-off ladder. Every sampled operation above the 90th percentile
-(57 µs) had waited through at least one of the lock's ~50 µs parks (58 µs
-each, measured), the 99th percentile is about five of them, and every
-operation above the 99.9th percentile (1.56 ms) had gone through the
-ladder's full cycle of eight parks and its 1 ms sleep. At 16 threads the
-lock parks in one operation in a thousand and the tail begins at the 99.9th
+lock's back-off ladder, and knowing that changed the ladder. With the lock's
+previous ladder — eight ~50 µs parks per cycle, then a 1 ms sleep — every
+sampled operation above the 90th percentile (57 µs) had waited through at
+least one park (58 µs each, measured), the 99th percentile was about five of
+them, and every operation above the 99.9th percentile (1.57 ms) had gone
+through the full cycle of eight parks and the 1 ms sleep; at 16 threads the
+lock parked in one operation in a thousand and the tail began at the 99.9th
 percentile. (Measured on every sample at 128 threads, the 60% a thread pops
 back itself and the 40% popped by another thread alike: above the 90th
 percentile every sample of either kind had waited through at least one park,
-and above the 99.9th 99.3-99.7% through the 1 ms sleep.)
+and above the 99.9th 99.3-99.7% through the 1 ms sleep.) With four parks per
+cycle, which is what the lock now does, a waiter that loses four rounds
+sleeps for a millisecond, presumably fewer contenders stay awake, and nine
+operations in ten meet no park: the median fell from 0.54 to 0.31 µs, the
+90th percentile from 57 to 2.1 µs, the 99th from 0.30 to 0.17 ms and the
+99.9th from 1.57 to 1.40 ms (about four parks and the sleep), measured in
+the same runs against the previous ladder. The key-only queue's throughput on
+the packed layout at 128 threads did not move (within 1%); the padded rows
+and the balanced rows (where a thread that finds the queue full pops and one
+that finds it empty pushes) gained 2-54%; the one cost is the packed
+key-value row at 16 threads, about 4% slower.
 
 Uncontended, the two are the same queue: a 1-producer/1-consumer round trip
 through two queues costs 0.4-0.5 µs on two cores of one socket and 1.0-1.2 µs
@@ -189,8 +205,10 @@ result depends on where the two threads land, and the x86 ratios scatter from
 0.24x to 2.6x.
 Push-to-pop latency is unchanged. These are throughput ratios from
 `concurrent_queue_gmbm` with `<uint64_t, uint64_t>` elements, and every one of
-them belongs to this spinlock's back-off: retune the back-off and measure
-again.
+them belongs to this spinlock's back-off. They are the previous ladder's
+ratios: the back-off has since been retuned (the latency section above), and
+the key-value rows were re-measured against the previous ladder at 16 and 128
+threads only.
 
 ## Building and testing
 

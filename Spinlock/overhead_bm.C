@@ -111,12 +111,12 @@
 //   s1 -- the shipped ladder with the short-sleep tier cut to one round: the
 //         saturation choice of the development machine (16-core Ryzen 9
 //         9950X).
-//   s8 -- the shipped SpinLock ladder itself. On a 2-socket 128-core Granite
+//   s4 -- the shipped SpinLock ladder itself. On a 2-socket 128-core Granite
 //         Rapids server s1 is bistable at saturation and loses to this
 //         ladder, so the dev-machine choice does not transfer, and both
 //         configurations are measured everywhere.
 using OverheadSpinLockS1 = LadderedLock<BackOffParams{.nshort = 1}>;
-using OverheadSpinLockS8 = LadderedLock<BackOffParams{}>;
+using OverheadSpinLockS4 = LadderedLock<BackOffParams{}>;
 
 // The three update mechanisms, as interchangeable policies for BM_update below.
 // Each owns its shared total -- and its lock, when it has one -- with every
@@ -238,13 +238,13 @@ void BM_update(benchmark::State& state) {
 // Every mechanism under both kinds of work, over the same full (shared, work)
 // grid -- including the shared-heavy 100:1 and 10:1 ratios, which are where
 // the lock's domain lives. Both lock configurations run under both kinds of
-// work: comparing BM_spinlock_s1 against BM_spinlock_s8 in the same run also
+// work: comparing BM_spinlock_s1 against BM_spinlock_s4 in the same run also
 // measures the instantiation-level sensitivity s1 shows on the 2-socket
 // Granite Rapids server.
 BENCHMARK_TEMPLATE(BM_update, GuardedUpdate<OverheadSpinLockS1>, SinCosWork)
     ->Name("BM_spinlock_s1") OVERHEAD_ARGS;
-BENCHMARK_TEMPLATE(BM_update, GuardedUpdate<OverheadSpinLockS8>, SinCosWork)
-    ->Name("BM_spinlock_s8") OVERHEAD_ARGS;
+BENCHMARK_TEMPLATE(BM_update, GuardedUpdate<OverheadSpinLockS4>, SinCosWork)
+    ->Name("BM_spinlock_s4") OVERHEAD_ARGS;
 BENCHMARK_TEMPLATE(BM_update, FetchAddUpdate, SinCosWork)
     ->Name("BM_atomic") OVERHEAD_ARGS;
 BENCHMARK_TEMPLATE(BM_update, CasUpdate, SinCosWork)
@@ -253,8 +253,8 @@ BENCHMARK_TEMPLATE(BM_update, CasUpdate, SinCosWork)
 // The memory-work variants.
 BENCHMARK_TEMPLATE(BM_update, GuardedUpdate<OverheadSpinLockS1>, MemWork)
     ->Name("BM_spinlock_s1_mem") OVERHEAD_ARGS;
-BENCHMARK_TEMPLATE(BM_update, GuardedUpdate<OverheadSpinLockS8>, MemWork)
-    ->Name("BM_spinlock_s8_mem") OVERHEAD_ARGS;
+BENCHMARK_TEMPLATE(BM_update, GuardedUpdate<OverheadSpinLockS4>, MemWork)
+    ->Name("BM_spinlock_s4_mem") OVERHEAD_ARGS;
 BENCHMARK_TEMPLATE(BM_update, FetchAddUpdate, MemWork)
     ->Name("BM_atomic_mem") OVERHEAD_ARGS;
 BENCHMARK_TEMPLATE(BM_update, CasUpdate, MemWork)

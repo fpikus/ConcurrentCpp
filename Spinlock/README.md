@@ -45,11 +45,28 @@ directory:
 - Between sleeps, a burst of eight unrolled acquisition attempts — enough to
   catch a just-released lock within a few instructions of the release, cheap
   enough to precede every syscall. Eight to sixteen is the measured optimum.
-- Two tiers of sleep: eight rounds of ~1 ns sleeps (which the kernel
+- Two tiers of sleep: four rounds of ~1 ns sleeps (which the kernel
   lengthens by the thread's timer slack, 50 us by default, so each one parks
   the waiter for about 50 us), then 1 ms of real sleep, and the cycle
   repeats. A briefly contended lock stays hot; a long-held lock costs its
   waiters nothing.
+
+The four is measured too, and it is the sharpest knob in the ladder. The
+parks-per-cycle axis was swept at one, two, four, eight and sixteen — both
+through the tuning shim and by editing this header, in the lock's own
+benchmarks and in the queue's — on a two-socket Granite Rapids server with
+256 hardware threads. At saturation, 128 threads hammering one lock, one or
+two parks before the long sleep collapse the throughput to a quarter and to
+half of eight parks': the waiters are asleep and the lock idles between
+handoffs. Four parks gain about a fifth over eight parks; in the queue, four
+cut the median latency nearly in half, the 90th percentile twenty-seven-fold
+and the 99th by 40%, presumably because a waiter that loses four rounds
+leaves for a millisecond and the holder's streaks run longer, while sixteen
+buy a 99.9th percentile twice as tight at 12–19% of the queue's throughput.
+The price shows where the lock is held about 1% of the time: four parks cost
+7–11% of the throughput at 128 threads there, and the queue's packed
+key-value row loses about 4% at 16 threads. Four is the compromise that
+ships.
 
 The 1 ms is not folklore either. The second tier was swept at 0.1, 1, and
 10 ms (`spinlock_tune_bm.C`) across the full contention range on servers up

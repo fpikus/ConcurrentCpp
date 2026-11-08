@@ -133,10 +133,15 @@ class SpinLock {
   // paying for a syscall -- so a just-released lock is grabbed within a few
   // instructions of the holder's unlock, without branching on the back-off
   // counter between attempts. Only if all eight attempts fail do we sleep, and
-  // the back-off escalates: eight rounds of short (~50 us) parks (spin_count 0..7),
+  // the back-off escalates: four rounds of short (~50 us) parks (spin_count 0..3),
   // then one ~1 ms sleep, resetting the counter and repeating -- so a
   // contended-but-brief lock stays busy-ish while a long-held lock lets the
-  // waiter get out of the scheduler's way.
+  // waiter get out of the scheduler's way. Four parks per cycle is a
+  // balance: more parks keep waiters awake longer, which pays where the lock
+  // is held rarely (a waiter catches the release without a millisecond's
+  // sleep) and costs at saturation (more contenders awake, shorter holder
+  // streaks); fewer parks the reverse, down to a lock that idles between
+  // handoffs because most waiters are asleep at any moment.
   void lock() {
     for (int spin_count = 0;
         lock_.load(std::memory_order_relaxed) || lock_.exchange(1, std::memory_order_acquire);
@@ -149,13 +154,13 @@ class SpinLock {
       if (!(lock_.load(std::memory_order_relaxed) || lock_.exchange(1, std::memory_order_acquire))) return;
       if (!(lock_.load(std::memory_order_relaxed) || lock_.exchange(1, std::memory_order_acquire))) return;
       if (!(lock_.load(std::memory_order_relaxed) || lock_.exchange(1, std::memory_order_acquire))) return;
-      if (spin_count < 8) {
-        spin_wait_short_sleep();        // 8 rounds per cycle: short park, stay hot
+      if (spin_count < 4) {
+        spin_wait_short_sleep();        // 4 rounds per cycle: short park, stay hot
       } else {
         // Escalate to a real sleep and start the short-park budget over. The reset
         // is to -1, not 0, because the for-header's ++spin_count runs before
-        // the next round reads it: resetting to 0 would spend seven short parks on
-        // every cycle after the first instead of the eight documented above --
+        // the next round reads it: resetting to 0 would spend three short parks on
+        // every cycle after the first instead of the four documented above --
         // and would also make lock() escalate sooner than try_lock() gives up,
         // when the two are meant to draw the line at the same place.
         spin_count = -1;
@@ -181,7 +186,7 @@ class SpinLock {
   // attempt would report "busy" for what is really just coherence latency,
   // not actual lock contention. Instead, this runs the same TTAS spin as
   // lock() -- the unrolled burst of eight attempts rides out the ownership
-  // transfer, and up to eight rounds of short (~50 us) parks ride out a brief
+  // transfer, and up to four rounds of short (~50 us) parks ride out a brief
   // holder -- and gives up only where lock() would escalate to the ~1 ms
   // long sleep. So false means the lock was genuinely held the whole time,
   // but a "failed" try_lock() has already spun and parked for a short while;
@@ -199,7 +204,7 @@ class SpinLock {
       if (!(lock_.load(std::memory_order_relaxed) || lock_.exchange(1, std::memory_order_acquire))) return true;
       if (!(lock_.load(std::memory_order_relaxed) || lock_.exchange(1, std::memory_order_acquire))) return true;
       if (!(lock_.load(std::memory_order_relaxed) || lock_.exchange(1, std::memory_order_acquire))) return true;
-      if (spin_count < 8) {
+      if (spin_count < 4) {
         spin_wait_short_sleep();        // spin/park through the short tier...
       } else {
         return false;                   // ...then give up instead of long-sleeping

@@ -275,23 +275,57 @@ template <typename SetType, typename Geom, typename Cadence> SetType* EraseFixtu
 template <typename SetType, typename Geom, typename Cadence> ThreadHandles<SetType> EraseFixture<SetType, Geom, Cadence>::handles;
 template <typename SetType, typename Geom, typename Cadence> ReclaimSnapshot<SetType> EraseFixture<SetType, Geom, Cadence>::before;
 
+// Which keys a thread erases: its own contiguous range of the prefill (the
+// default: thread t of T erases keys t*n .. t*n + n - 1, n = its key count,
+// which the single-threaded prefill inserted in that order into one shard's
+// deque with its free list empty, so the thread's nodes are a run of
+// consecutive node slots of that deque: n/1024 consecutive blocks, each a
+// contiguous 24 KiB allocation, the blocks themselves placed by the
+// allocator), or, with HASH_BM_ERASE_LAYOUT=1, the keys t, t + T, t + 2T, ...
+// (interleaved: every thread's nodes spread over the whole arena). The keys
+// are disjoint and all present under both layouts. Exists so that a
+// per-thread effect of a thread's arena slots (their pages' placement, their
+// backing) can be told from an effect of the thread itself: under the
+// interleaved layout every thread walks every block. Read once per process; a
+// value that is not 0 or 1 is the default and is reported once on stderr
+// (count_from_env()); the counter erase_layout (0 or 1) records it per
+// repetition.
+inline bool erase_layout_interleaved() {
+    static const bool interleaved = [] {
+        const EnvCount c = count_from_env("HASH_BM_ERASE_LAYOUT");
+        if (c.text == nullptr) return false;
+        if (!c.valid || (c.value != 0 && c.value != 1)) {
+            fprintf(stderr, "HASH_BM_ERASE_LAYOUT=\"%s\" is not 0 or 1: the default layout (each thread its own key range) is used\n", c.text);
+            return false;
+        } // if not a layout
+        return c.value == 1;
+    }();
+    return interleaved;
+} // erase_layout_interleaved()
+
 // The body of the erase rows (see above), as a macro like the shared header's bodies, so
 // that every erase row runs the same code around its own regime. ITERATION is
-// the loop body: it erases the thread's next key into `ok` and does what the
-// row's regime adds; PRE declares what the regime needs before the loop and
-// POST reports it after; both are empty in the rows without reclamation. The
-// fixture's template arguments come last. Same accounting contract as the
-// macro bodies: allocate() before the loop; report_wall() then release()
-// after it; the per-thread SkipWithError() after the loop, never inside it.
+// the loop body: it erases the thread's next key, `key`, into `ok`, advances
+// `key` by `stride` (the layout above: 1 within the thread's own range, the
+// thread count when interleaved) and does what the row's regime adds; PRE
+// declares what the regime needs before the loop and POST reports it after;
+// both are empty in the rows without reclamation. The fixture's template
+// arguments come last. Same accounting contract as the macro bodies:
+// allocate() before the loop; report_wall() then release() after it; the
+// per-thread SkipWithError() after the loop, never inside it. Thread 0 takes
+// the fault snapshot before the loop and reports its deltas after it
+// (FaultSnapshot, shared header).
 #define DEFINE_ERASE(NAME, PRE, ITERATION, POST, ...)                         \
     BENCHMARK_TEMPLATE_DEFINE_F(EraseFixture, NAME, __VA_ARGS__)              \
     (benchmark::State& state) {                                               \
         static constinit WallRecords records;                                 \
-        const int base = state.thread_index()*Geometry::keys_per_thread(state); \
-        int next = 0;                                                         \
+        const int stride = erase_layout_interleaved() ? state.threads() : 1;  \
+        int key = erase_layout_interleaved() ? state.thread_index()           \
+                                             : state.thread_index()*Geometry::keys_per_thread(state); \
         int64_t ok = 0;                                                       \
         Handles::Own own(handles, state);                                     \
         PRE                                                                   \
+        const FaultSnapshot faults = FaultSnapshot::take(state);              \
         records.allocate(state);                                              \
         for (auto _ : WallTimed(state, records)) {                            \
             ITERATION                                                         \
@@ -301,10 +335,12 @@ template <typename SetType, typename Geom, typename Cadence> ReclaimSnapshot<Set
         }                                                                     \
         state.SetItemsProcessed(state.iterations());                          \
         report_wall(state, records, double(state.iterations())*state.threads()); \
-        if (state.thread_index() == 0) {   /* the container's diagnostic counter (see the fixture) */ \
+        if (state.thread_index() == 0) {   /* the container's diagnostic counter (see the fixture), the layout and the faults */ \
             const double erased = double(state.iterations())*state.threads(); \
             state.counters["retired_per_erase"] = benchmark::Counter(         \
                 double(set->get_internal_counters().retire_nodes - before.counters.retire_nodes)/erased); \
+            state.counters["erase_layout"] = benchmark::Counter(erase_layout_interleaved() ? 1.0 : 0.0); \
+            faults.report(state);                                             \
         }                                                                     \
         POST                                                                  \
         records.release(state);                                               \
@@ -316,7 +352,7 @@ template <typename SetType, typename Geom, typename Cadence> ReclaimSnapshot<Set
 DEFINE_ERASE(Erase_Presized_Del,
     /* PRE */,
     /* ITERATION */
-    ok += set->erase(own.get(), mix(base + next++));,
+    ok += set->erase(own.get(), mix(key)); key += stride;,
     /* POST */,
     ConcurrentSetDel)
 BENCHMARK_REGISTER_F(EraseFixture, Erase_Presized_Del)
@@ -326,7 +362,7 @@ DEFINE_ERASE(Erase_Presized_Del_Rcu,
     /* PRE */
     Tally tally;,
     /* ITERATION: after the last erase, the release, then the one advance() */
-    ok += set->erase(own.get(), mix(base + next++));
+    ok += set->erase(own.get(), mix(key)); key += stride;
     if (BM_UNLIKELY(own.finish_iteration())) tally.add(advance_out_of_line(*set));,
     /* POST */
     tally.report(state);
@@ -338,7 +374,7 @@ BENCHMARK_REGISTER_F(EraseFixture, Erase_Presized_Del_Rcu)
 DEFINE_ERASE(Erase_Small_Del,
     /* PRE */,
     /* ITERATION */
-    ok += set->erase(own.get(), mix(base + next++));,
+    ok += set->erase(own.get(), mix(key)); key += stride;,
     /* POST */,
     ConcurrentSetDel, SmallErase)
 [[maybe_unused]] static const bool Erase_Small_Del_registered =
@@ -349,7 +385,7 @@ DEFINE_ERASE(Erase_Small_Del_Rcu,
     Tally tally(small_cadence(state), state);,
     /* ITERATION: refresh, erase, advance() at the cadence */
     own.refresh();
-    ok += set->erase(own.get(), mix(base + next++));
+    ok += set->erase(own.get(), mix(key)); key += stride;
     if (tally.due()) tally.add(advance_out_of_line(*set));
     own.finish_iteration();,
     /* POST */
@@ -364,7 +400,7 @@ DEFINE_ERASE(Erase_Small_Del_RcuEach,
     Tally tally(small_cadence(state), state, Tally::Advancer::every_thread);,
     /* ITERATION: refresh, erase, advance() at this thread's cadence */
     own.refresh();
-    ok += set->erase(own.get(), mix(base + next++));
+    ok += set->erase(own.get(), mix(key)); key += stride;
     if (tally.due()) tally.add(advance_out_of_line(*set));
     own.finish_iteration();,
     /* POST */
@@ -381,7 +417,7 @@ DEFINE_ERASE(Erase_Small_Del_Auto,
     /* ITERATION: refresh, erase, the trigger detection */
     own.refresh();
     const size_t bump_before = timers.bump_ns;
-    ok += set->erase(own.get(), mix(base + next++));
+    ok += set->erase(own.get(), mix(key)); key += stride;
     if (BM_UNLIKELY(timers.bump_ns != bump_before)) tally.detected();
     own.finish_iteration();,
     /* POST */

@@ -47,6 +47,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <unistd.h>
+#include <sys/resource.h>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -156,6 +157,72 @@ inline size_t arena_shards_from_env() {
     if (n > (1LL << 16)) n = 1LL << 16;  // the header's own cap
     return static_cast<size_t>(n);
 } // arena_shards_from_env()
+
+// The page-fault state around a timed loop: the process's minor and major
+// faults (getrusage(RUSAGE_SELF): every thread's) and the kernel's NUMA-
+// balancing counters (/proc/vmstat's numa_hint_faults, numa_hint_faults_local,
+// numa_pages_migrated: SYSTEM-wide, the kernel keeps them per system; on a
+// host where nothing else runs the delta over a repetition is this process's).
+// Thread 0 takes a snapshot before the loop (before it enters the start
+// barrier: the other threads wait for it, untimed) and reports the deltas after
+// it as counters, so that a repetition whose wall time is set by one straggling
+// thread can be read against the faults its threads took meanwhile: a NUMA
+// hinting fault per page of a thread's working set, or a migration, is one
+// candidate mechanism of such a straggler; a repetition with no fault delta
+// excludes it. The minor-fault delta also counts the other threads' start-up
+// faults (their stacks and TLS: the snapshot precedes the start barrier, so
+// the helper threads start after it) and thread 0's records.allocate(); the
+// numa_* deltas are the load-bearing ones, the minflt delta a bound. On every
+// other thread take() returns zeros without touching
+// /proc, and report() is called by thread 0 only. Trivially destructible, so
+// that a snapshot may be a local of a body across its timed loop (see the
+// note above the benchmark bodies).
+struct FaultSnapshot {
+    long minflt = 0;                      // ru_minflt: minor faults of the process so far
+    long majflt = 0;                      // ru_majflt: major faults
+    long long numa_hint_faults = 0;       // /proc/vmstat numa_hint_faults (system-wide)
+    long long numa_hint_faults_local = 0; // /proc/vmstat numa_hint_faults_local
+    long long numa_pages_migrated = 0;    // /proc/vmstat numa_pages_migrated
+    int vmstat_fields = 0;                // how many of the three vmstat fields the file had (0 on a kernel without NUMA balancing)
+
+    // The snapshot now, on thread 0 of `state`; zeros on every other thread.
+    static FaultSnapshot take(const benchmark::State& state) {
+        FaultSnapshot s;
+        if (state.thread_index() != 0) return s;
+        rusage usage{};
+        if (getrusage(RUSAGE_SELF, &usage) == 0) {
+            s.minflt = usage.ru_minflt;
+            s.majflt = usage.ru_majflt;
+        } // if getrusage succeeded
+        if (FILE* f = fopen("/proc/vmstat", "r")) {
+            char line[128];
+            while (fgets(line, sizeof line, f)) {
+                long long v = 0;
+                if (sscanf(line, "numa_hint_faults %lld", &v) == 1) { s.numa_hint_faults = v; ++s.vmstat_fields; }
+                else if (sscanf(line, "numa_hint_faults_local %lld", &v) == 1) { s.numa_hint_faults_local = v; ++s.vmstat_fields; }
+                else if (sscanf(line, "numa_pages_migrated %lld", &v) == 1) { s.numa_pages_migrated = v; ++s.vmstat_fields; }
+            } // loop over the file's lines
+            fclose(f);
+        } // if /proc/vmstat is readable
+        return s;
+    } // FaultSnapshot::take()
+
+    // Thread 0, after the loop: the deltas since this snapshot as the counters
+    // minflt_delta, majflt_delta, numa_hint_faults_delta,
+    // numa_hint_faults_local_delta, numa_pages_migrated_delta, and
+    // vmstat_numa_fields (the field count, so that a 0 delta can be told from
+    // an absent counter).
+    void report(benchmark::State& state) const {
+        const FaultSnapshot now = take(state);
+        state.counters["minflt_delta"] = benchmark::Counter(double(now.minflt - minflt));
+        state.counters["majflt_delta"] = benchmark::Counter(double(now.majflt - majflt));
+        state.counters["numa_hint_faults_delta"] = benchmark::Counter(double(now.numa_hint_faults - numa_hint_faults));
+        state.counters["numa_hint_faults_local_delta"] = benchmark::Counter(double(now.numa_hint_faults_local - numa_hint_faults_local));
+        state.counters["numa_pages_migrated_delta"] = benchmark::Counter(double(now.numa_pages_migrated - numa_pages_migrated));
+        state.counters["vmstat_numa_fields"] = benchmark::Counter(double(now.vmstat_fields));
+    } // FaultSnapshot::report()
+}; // struct FaultSnapshot
+static_assert(std::is_trivially_destructible_v<FaultSnapshot>, "a body local with a destructor would be live across the state loop");
 
 // A new set for a fixture: `buckets` buckets, the arena shards of
 // arena_shards_from_env(), and the automatic cadence `auto_reclaim_every`
@@ -814,6 +881,7 @@ template <typename SetType> ThreadHandles<SetType> MostlyOldFixture<SetType>::ha
         int next = 0;                                                         \
         int64_t ok = 0;                                                       \
         Handles::Own own(handles, state);                                     \
+        const FaultSnapshot faults = FaultSnapshot::take(state);              \
         records.allocate(state);                                              \
         for (auto _ : WallTimed(state, records)) {                            \
             ok += set->insert(own.get(), mix(base + next++));                 \
@@ -829,11 +897,13 @@ template <typename SetType> ThreadHandles<SetType> MostlyOldFixture<SetType>::ha
         /* has left the loop (its end is a barrier): 1.0 means no waste;    */ \
         /* above it are split copies and subchains abandoned by splitters   */ \
         /* that lost the publishing CAS. Measures how redundant the         */ \
-        /* cooperative splits get as the thread count grows.                */ \
+        /* cooperative splits get as the thread count grows. Beside it the  */ \
+        /* fault deltas of the run (FaultSnapshot).                         */ \
         if (state.thread_index() == 0) {                                      \
             state.counters["arena_nodes_per_key"] = benchmark::Counter(       \
                 double(set->get_internal_node_count())/                       \
                 (double(state.iterations())*state.threads()));                \
+            faults.report(state);                                             \
         }                                                                     \
         records.release(state);                                               \
     }                                                                         \

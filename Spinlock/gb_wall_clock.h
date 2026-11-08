@@ -54,7 +54,11 @@
 //                            last thread's last iteration;
 //   finish_spread         -- (last finish - first finish)/(that span), between
 //                            0 and 1: 0 when all threads finish together, near
-//                            1 when some thread finished right at the start.
+//                            1 when some thread finished right at the start;
+//   start_spread          -- (latest first - earliest first)/(that span): the
+//                            share of the span that passed before every thread
+//                            had finished its first iteration, 0 when they all
+//                            started together.
 // Every thread stamps the end of its own first iteration, and the span starts
 // at the earliest of those stamps: a thread can start late (one that misses a
 // lock's first burst can sleep through other threads' whole streaks), so any
@@ -67,7 +71,7 @@
 // mixes contention levels; only a harness that runs every thread until a
 // common stop avoids that, and this header does not replace one.
 //
-// Both counters are plain values, not rates: Google Benchmark would divide a
+// The counters are plain values, not rates: Google Benchmark would divide a
 // rate by the mean loop time again. Thread 0 alone sets them, after its loop,
 // so that summing the counters over the threads, which the framework does,
 // leaves them unchanged; every other thread's record is complete by then (see
@@ -88,14 +92,25 @@
 //                       same iterations between the same barriers, and stamps
 //                       the end of the thread's first and last iteration.
 //   WallSpan            the aggregate of a run's records: the span and the
-//                       spread, with the three stamps they are made of.
+//                       two spreads, with the stamps they are made of, the
+//                       thread whose own loop time is the longest and its
+//                       share of the span, and how many threads ran.
 //   wall_span()         the aggregation, over a WallRecords or over an array
 //                       of any record type derived from WallStamps.
-//   set_wall_counters() the two counters from a WallSpan.
-//   report_wall()       the one-line aggregation and report for plain bodies.
+//   set_wall_counters() the three counters from a WallSpan.
+//   wall_thread_detail()  whether the environment variable GB_WALL_THREADS is
+//                       set: the per-thread detail below is wanted.
+//   report_wall_threads() the per-thread detail of a run from its WallRecords:
+//                       the counters slowest_thread and slowest_share, and one
+//                       `# threads` console line with every thread's first and
+//                       last stamp as offsets from the span's start.
+//   report_wall()       the one-line aggregation and report for plain bodies;
+//                       with GB_WALL_THREADS set it adds the per-thread detail.
 // A benchmark whose timed loop carries more per-thread state than the stamps
 // keeps its own loop and its own record type, derived from WallStamps and
-// aggregated by wall_span(const Rec*, int) like any other.
+// aggregated by wall_span(const Rec*, int) like any other; set_wall_counters()
+// gives it the three counters, and the per-thread detail is report_wall()'s
+// alone (it reads a WallRecords).
 //
 // USE
 //
@@ -207,6 +222,9 @@
 #include <chrono>
 #include <concepts>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 
 #include "benchmark/benchmark.h"
 
@@ -403,14 +421,20 @@ inline WallTimed::Iterator WallTimed::begin() {
   return Iterator(this, 1);
 } // WallTimed::begin()
 
-// The aggregate of a run's records: the three stamps the counters are made of,
-// the span and the spread. All zero when no record is stamped.
+// The aggregate of a run's records: the stamps the counters are made of, the
+// span and the spreads, and which thread took longest. All zero (slowest -1)
+// when no record is stamped.
 struct WallSpan {
   std::chrono::steady_clock::time_point start {};         // earliest `first` of any thread
+  std::chrono::steady_clock::time_point last_start {};    // latest `first`
   std::chrono::steady_clock::time_point first_finish {};  // earliest `last`
   std::chrono::steady_clock::time_point last_finish {};   // latest `last`
   double seconds = 0.0;                 // the span: last_finish - start
   double spread = 0.0;                  // finish_spread: (last_finish - first_finish)/seconds, 0 if seconds is 0
+  double start_spread = 0.0;            // (last_start - start)/seconds: the share of the span before every thread was running, 0 if seconds is 0
+  int slowest = -1;                     // the thread whose own loop time (last - first) is the longest; -1 if none stamped
+  double slowest_share = 0.0;           // that thread's own loop time over the span, 0 if seconds is 0
+  int stamped = 0;                      // records with both stamps (the threads that ran)
 }; // struct WallSpan
 
 namespace gb_wall_clock_detail {
@@ -428,25 +452,37 @@ namespace gb_wall_clock_detail {
 template <typename At>
 WallSpan wall_span_at(At at, int threads) {
   using TimePoint = std::chrono::steady_clock::time_point;
+  using Duration = std::chrono::steady_clock::duration;
   WallSpan s;
-  bool any = false;
+  Duration longest {};                  // the longest own loop time seen so far (slowest's)
   for (int i = 0; i != threads; ++i) {
     const WallStamps& rec = at(i);
     if (rec.first == TimePoint() || rec.last == TimePoint()) continue;   // did not run
-    if (!any) {
+    if (s.stamped == 0) {
       s.start = rec.first;
+      s.last_start = rec.first;
       s.first_finish = rec.last;
       s.last_finish = rec.last;
-      any = true;
     } else {
       s.start = std::min(s.start, rec.first);
+      s.last_start = std::max(s.last_start, rec.first);
       s.first_finish = std::min(s.first_finish, rec.last);
       s.last_finish = std::max(s.last_finish, rec.last);
     } // if the first stamped record
+    const Duration own = rec.last - rec.first;
+    if (s.stamped == 0 || own > longest) {
+      longest = own;
+      s.slowest = i;
+    } // if this thread's loop time is the longest so far
+    ++s.stamped;
   } // loop over the threads' records
-  if (!any) return s;                   // all zero
+  if (s.stamped == 0) return s;         // all zero
   s.seconds = std::chrono::duration<double>(s.last_finish - s.start).count();
-  s.spread = s.seconds > 0 ? std::chrono::duration<double>(s.last_finish - s.first_finish).count()/s.seconds : 0.0;
+  if (s.seconds > 0) {
+    s.spread = std::chrono::duration<double>(s.last_finish - s.first_finish).count()/s.seconds;
+    s.start_spread = std::chrono::duration<double>(s.last_start - s.start).count()/s.seconds;
+    s.slowest_share = std::chrono::duration<double>(longest).count()/s.seconds;
+  } // if the span is positive
   return s;
 } // wall_span_at()
 
@@ -470,7 +506,7 @@ inline WallSpan wall_span(const WallRecords& records) {
                                             records.threads());
 } // wall_span(const WallRecords&)
 
-// Set the two counters of this run from its aggregate. Plain values, not
+// Set the three counters of this run from its aggregate. Plain values, not
 // rates (see WHY). The caller is thread 0 -- not checked here, so that bodies
 // with their own aggregation can call it inside their own thread-0 block.
 //   state -- thread 0's state;
@@ -479,18 +515,69 @@ inline WallSpan wall_span(const WallRecords& records) {
 inline void set_wall_counters(benchmark::State& state, const WallSpan& s, double items) {
   state.counters["wall_items_per_second"] = benchmark::Counter(s.seconds > 0 ? items/s.seconds : 0.0);
   state.counters["finish_spread"] = benchmark::Counter(s.spread);
+  state.counters["start_spread"] = benchmark::Counter(s.start_spread);
 } // set_wall_counters()
 
+// Whether the per-thread detail of report_wall() is wanted: the environment
+// variable GB_WALL_THREADS set (to anything). Read once per process.
+inline bool wall_thread_detail() {
+  static const bool wanted = std::getenv("GB_WALL_THREADS") != nullptr;
+  return wanted;
+} // wall_thread_detail()
+
+// The per-thread detail of one run, on thread 0 after the loop, when
+// wall_thread_detail() says so: the counters slowest_thread (the index of the
+// thread whose own loop time is the longest) and slowest_share (its loop time
+// over the span), and one console line
+//   # threads <row> threads=<T> span_us=<span> start_spread=<..>
+//     finish_spread=<..> slowest=<tid> slowest_share=<..>
+//     first_us=<v0,v1,...> last_us=<v0,v1,...>
+// with every thread's two stamps as offsets from the span's start in
+// microseconds (`-` for a thread that did not run), in thread-index order, and
+// stamped=<n>, how many threads ran. Exists for reading which thread sets a run's span and when each one
+// started: a finish_spread alone says that some thread straggled, not which.
+//   state   -- thread 0's state;
+//   records -- the run's records;
+//   s       -- their aggregate (wall_span(records)).
+inline void report_wall_threads(benchmark::State& state, const WallRecords& records, const WallSpan& s) {
+  state.counters["slowest_thread"] = benchmark::Counter(static_cast<double>(s.slowest));
+  state.counters["slowest_share"] = benchmark::Counter(s.slowest_share);
+  using TimePoint = std::chrono::steady_clock::time_point;
+  const auto offset_us = [&s](TimePoint t) {
+    return static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(t - s.start).count());
+  };
+  std::string first_us;
+  std::string last_us;
+  for (int i = 0; i != records.threads(); ++i) {
+    const WallStamps& rec = records.of(i);
+    const bool ran = rec.first != TimePoint() && rec.last != TimePoint();
+    if (i != 0) {
+      first_us += ',';
+      last_us += ',';
+    } // the separator before every entry but the first
+    first_us += ran ? std::to_string(offset_us(rec.first)) : "-";
+    last_us += ran ? std::to_string(offset_us(rec.last)) : "-";
+  } // loop over the threads' records
+  std::printf("# threads %s threads=%d stamped=%d span_us=%lld start_spread=%.3f finish_spread=%.3f slowest=%d slowest_share=%.3f first_us=%s last_us=%s\n",
+              state.name().c_str(), records.threads(), s.stamped,
+              static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(s.last_finish - s.start).count()),
+              s.start_spread, s.spread, s.slowest, s.slowest_share, first_us.c_str(), last_us.c_str());
+  std::fflush(stdout);
+} // report_wall_threads()
+
 // The one-line report for plain bodies: on thread 0, aggregate the records
-// and set the counters; on every other thread, nothing. Does not release the
-// records: release() does. Call it after the loop, next to
-// SetItemsProcessed(), on every thread.
+// and set the counters (and the per-thread detail when GB_WALL_THREADS is
+// set); on every other thread, nothing. Does not release the records:
+// release() does. Call it after the loop, next to SetItemsProcessed(), on
+// every thread.
 //   state   -- the calling thread's state;
 //   records -- the body's records, allocated for this run;
 //   items   -- the run's total items, over all threads.
 inline void report_wall(benchmark::State& state, const WallRecords& records, double items) {
   if (state.thread_index() != 0) return;
-  set_wall_counters(state, wall_span(records), items);
+  const WallSpan s = wall_span(records);
+  set_wall_counters(state, s, items);
+  if (wall_thread_detail()) report_wall_threads(state, records, s);
 } // report_wall()
 
 #endif // INCLUDED_GB_WALL_CLOCK_H

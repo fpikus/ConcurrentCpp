@@ -528,6 +528,11 @@ figure includes the cost of the 24-byte node against the original's 16.
   18, 13 and 6.7 million erases per second per thread at 16, 32, 64 and 128
   threads over tables of 4, 8, 17 and 34 million nodes (the last about 1.3 GB,
   beyond both sockets' caches together); the original was not measured again.
+  Those rates erase each thread's keys in the order they were inserted, so
+  the nodes a thread marks sit in consecutive arena slots two or three to a
+  cache line, which the hardware prefetcher presumably follows; erasing keys
+  in an order unrelated to their insertion runs 1.4-1.6x slower per thread on
+  that machine.
   The wall-clock span of a repetition there is still set by one or two threads
   that take about twice the others' time, in fixed repetition positions that
   differ with where the threads are pinned, so the per-thread rate is the

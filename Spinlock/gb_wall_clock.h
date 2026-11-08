@@ -79,8 +79,11 @@
 //
 // WHAT IS HERE
 //
-//   WallStamps          one thread's two stamps, `first` and `last`; a record
-//                       with either unset means "this thread did not run".
+//   WallStamps          one thread's two stamps, `first` and `last`, and the
+//                       CPU it ran on at each (taken outside the iterations:
+//                       after the start barrier, after the last iteration); a
+//                       record with either stamp unset means "this thread did
+//                       not run".
 //   WallRecords         the per-run store of one record per thread, shared by
 //                       all threads of a run through a static instance (one
 //                       instance may serve several rows that never run at
@@ -225,19 +228,35 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <sched.h>
 
 #include "benchmark/benchmark.h"
 
+// The branch hint of the loop's hot test: the countdown is non-zero on every
+// iteration but two. __builtin_expect states the edge's weight, which the
+// standard attribute leaves to the compiler; a compiler without the builtin
+// drops the hint and the code is still correct.
+#if defined(__GNUC__) || defined(__clang__)
+#define GB_WALL_LIKELY(c) __builtin_expect(!!(c), 1)
+#else
+#define GB_WALL_LIKELY(c) (c)
+#endif
+
 // One thread's record of one run: the end of its first and of its last
-// iteration, steady-clock. Unstamped (default-constructed, the clock's zero)
-// means the thread did not reach that point: a record with either stamp unset
-// is ignored by wall_span(). No alignment of its own: the record type that
-// embeds or derives from it carries the 128-byte block (WallRecords::Rec, or a
+// iteration, steady-clock, and the CPU the thread was on at each: start_cpu
+// after the start barrier and before its first iteration, end_cpu after its
+// last iteration and before the end barrier (sched_getcpu(), -1 when not
+// taken). Unstamped (default-constructed, the clock's zero) means the thread
+// did not reach that point: a record with either stamp unset is ignored by
+// wall_span(). No alignment of its own: the record type that embeds or
+// derives from it carries the 128-byte block (WallRecords::Rec, or a
 // benchmark's own record with more fields), so that a record stays one block
 // whatever it adds.
 struct WallStamps {
   std::chrono::steady_clock::time_point first;  // end of this thread's first iteration
   std::chrono::steady_clock::time_point last;   // end of this thread's last iteration
+  int start_cpu = -1;                   // the CPU after the start barrier, before the first iteration
+  int end_cpu = -1;                     // the CPU after the last iteration, before the end barrier
 }; // struct WallStamps
 
 // The per-run store of one WallStamps per thread of a run. One instance per
@@ -348,7 +367,7 @@ class WallTimed {
     // stamps and either reloads the countdown (after the first iteration) or
     // finishes the run (after the last) and returns 0.
     [[gnu::always_inline]] bool operator!=(Sentinel) {
-      if (left_ != 0) [[likely]] return true;
+      if (GB_WALL_LIKELY(left_ != 0)) return true;
       left_ = range_->next_phase();
       return left_ != 0;
     } // WallTimed::Iterator::operator!=()
@@ -387,6 +406,7 @@ class WallTimed {
       // A one-iteration run: the first iteration is also the last; fall through.
     } // if the first zero crossing
     mine_->last = now;                    // end of the last iteration, before the end barrier
+    mine_->end_cpu = sched_getcpu();      // where this thread ended its loop (after the last iteration, not in it)
     finished_ = true;
     // The finishing batch call: nothing is left, so it returns false after
     // FinishKeepRunning(), which stops the timer and runs the end barrier.
@@ -418,6 +438,7 @@ inline WallTimed::Iterator WallTimed::begin() {
     return Iterator(this, 0);
   } // if skipped
   mine_ = &records_.of(state_.thread_index());  // after the start barrier
+  mine_->start_cpu = sched_getcpu();            // where this thread begins its loop (a vDSO call on x86-64; before the first iteration, not in it)
   return Iterator(this, 1);
 } // WallTimed::begin()
 
@@ -533,8 +554,10 @@ inline bool wall_thread_detail() {
 //     finish_spread=<..> slowest=<tid> slowest_share=<..>
 //     first_us=<v0,v1,...> last_us=<v0,v1,...>
 // with every thread's two stamps as offsets from the span's start in
-// microseconds (`-` for a thread that did not run), in thread-index order, and
-// stamped=<n>, how many threads ran. Exists for reading which thread sets a run's span and when each one
+// microseconds (`-` for a thread that did not run), in thread-index order,
+// stamped=<n>, how many threads ran, and cpu_first=<..> cpu_last=<..>, the
+// CPU each thread ran on after the start barrier and after its last iteration
+// (WallStamps). Exists for reading which thread sets a run's span and when each one
 // started: a finish_spread alone says that some thread straggled, not which.
 //   state   -- thread 0's state;
 //   records -- the run's records;
@@ -545,23 +568,29 @@ inline void report_wall_threads(benchmark::State& state, const WallRecords& reco
   using TimePoint = std::chrono::steady_clock::time_point;
   const auto offset_us = [&s](TimePoint t) {
     return static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(t - s.start).count());
-  };
+  }; // offset_us()
   std::string first_us;
   std::string last_us;
+  std::string cpu_first;
+  std::string cpu_last;
   for (int i = 0; i != records.threads(); ++i) {
     const WallStamps& rec = records.of(i);
     const bool ran = rec.first != TimePoint() && rec.last != TimePoint();
     if (i != 0) {
       first_us += ',';
       last_us += ',';
+      cpu_first += ',';
+      cpu_last += ',';
     } // the separator before every entry but the first
     first_us += ran ? std::to_string(offset_us(rec.first)) : "-";
     last_us += ran ? std::to_string(offset_us(rec.last)) : "-";
+    cpu_first += ran ? std::to_string(rec.start_cpu) : "-";
+    cpu_last += ran ? std::to_string(rec.end_cpu) : "-";
   } // loop over the threads' records
-  std::printf("# threads %s threads=%d stamped=%d span_us=%lld start_spread=%.3f finish_spread=%.3f slowest=%d slowest_share=%.3f first_us=%s last_us=%s\n",
+  std::printf("# threads %s threads=%d stamped=%d span_us=%lld start_spread=%.3f finish_spread=%.3f slowest=%d slowest_share=%.3f first_us=%s last_us=%s cpu_first=%s cpu_last=%s\n",
               state.name().c_str(), records.threads(), s.stamped,
               static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(s.last_finish - s.start).count()),
-              s.start_spread, s.spread, s.slowest, s.slowest_share, first_us.c_str(), last_us.c_str());
+              s.start_spread, s.spread, s.slowest, s.slowest_share, first_us.c_str(), last_us.c_str(), cpu_first.c_str(), cpu_last.c_str());
   std::fflush(stdout);
 } // report_wall_threads()
 

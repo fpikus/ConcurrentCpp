@@ -48,6 +48,7 @@
 #include <cstdlib>
 #include <unistd.h>
 #include <sys/resource.h>
+#include <sched.h>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -223,6 +224,195 @@ struct FaultSnapshot {
     } // FaultSnapshot::report()
 }; // struct FaultSnapshot
 static_assert(std::is_trivially_destructible_v<FaultSnapshot>, "a body local with a destructor would be live across the state loop");
+
+// The per-CPU busy time around a timed loop, from /proc/stat's per-CPU lines
+// (user, nice, system, idle, iowait, irq, softirq, steal jiffies, USER_HZ =
+// 10 ms each). Thread 0 takes a snapshot before the start barrier and, after
+// the loop, reports the deltas against the CPUs the run's threads reported
+// (WallStamps::start_cpu / end_cpu through the WallRecords): the counters
+//   own_cpus                 distinct CPUs some thread of the run ran on;
+//   own_cpus_busy_jiffies    user+nice+system+irq+softirq+steal over those
+//                            CPUs during the run;
+//   own_cpus_system_jiffies  the system share of it (a kernel thread's work);
+//   foreign_busy_jiffies     the busy jiffies of every CPU none of the run's
+//                            threads was observed on at either stamp (a
+//                            thread that passed through a third CPU between
+//                            its stamps leaves that CPU's time here too);
+// and, when GB_WALL_THREADS is set (wall_thread_detail()), the console line
+// `# cpustat <row> own=<cpu:user/system,...> foreign_busy=<n> cpus=<n>`.
+// Exists for telling a straggling thread that
+// shares its CPU with another thread of ours (the CPU appears in two threads'
+// records) from one that shares it with something else (the CPU's busy time
+// exceeds what one thread of ours can use, or system time appears), at the
+// clock's 10 ms resolution: a 20 ms repetition is 2 jiffies per busy CPU, so
+// the per-CPU figure says busy or not and the sharer's identity comes from the
+// threads' CPU records. Fixed storage for the per-CPU table (kMaxCpus lines),
+// trivially destructible, so that a snapshot may be a body local across the
+// timed loop. On every other thread take() returns an empty snapshot.
+struct CpuStatSnapshot {
+    static constexpr int kMaxCpus = 1024;   // per-CPU lines kept; a host with more reports its first kMaxCpus
+    int cpus = 0;                           // one past the highest CPU number read (0 on a non-zero thread or an unreadable /proc/stat)
+    bool seen[kMaxCpus] = {};               // per CPU: its line was read (an offline CPU has none)
+    unsigned long long busy[kMaxCpus] = {}; // per CPU: user+nice+system+irq+softirq+steal jiffies at the snapshot
+    unsigned long long system[kMaxCpus] = {};   // per CPU: system+irq+softirq jiffies
+
+    // The snapshot now, on thread 0 of `state`; empty (cpus 0) on every other
+    // thread. Only the per-CPU lines (`cpu<N> ...`) are read: the aggregate
+    // line (`cpu  ...`, no digit after `cpu`) is skipped, since a format that
+    // read its first field as the CPU number would file the aggregate as a
+    // CPU with every later field shifted.
+    static CpuStatSnapshot take(const benchmark::State& state) {
+        CpuStatSnapshot s;
+        if (state.thread_index() != 0) return s;
+        FILE* f = fopen("/proc/stat", "r");
+        if (f == nullptr) return s;
+        char line[512];
+        while (fgets(line, sizeof line, f)) {
+            if (line[0] != 'c' || line[1] != 'p' || line[2] != 'u' || line[3] < '0' || line[3] > '9') continue;   // a per-CPU line only
+            int cpu = -1;
+            unsigned long long user = 0, nice = 0, sys = 0, idle = 0, iowait = 0, irq = 0, softirq = 0, steal = 0;
+            if (sscanf(line + 3, "%d %llu %llu %llu %llu %llu %llu %llu %llu", &cpu, &user, &nice, &sys, &idle, &iowait, &irq, &softirq, &steal) < 4) continue;
+            if (cpu < 0 || cpu >= kMaxCpus) continue;
+            s.seen[cpu] = true;
+            s.busy[cpu] = user + nice + sys + irq + softirq + steal;
+            s.system[cpu] = sys + irq + softirq;
+            if (cpu + 1 > s.cpus) s.cpus = cpu + 1;
+        } // loop over the file's lines
+        fclose(f);
+        return s;
+    } // CpuStatSnapshot::take()
+
+    // Thread 0, after the loop: the counters and the console line above, from
+    // this snapshot to now, against the CPUs the records hold.
+    void report(benchmark::State& state, const WallRecords& records) const {
+        const CpuStatSnapshot now = take(state);
+        const int n = std::min(cpus, now.cpus);
+        bool own[kMaxCpus] = {};
+        for (int t = 0; t < records.threads(); ++t) {
+            const WallStamps& rec = records.of(t);
+            if (rec.start_cpu >= 0 && rec.start_cpu < n) own[rec.start_cpu] = true;
+            if (rec.end_cpu >= 0 && rec.end_cpu < n) own[rec.end_cpu] = true;
+        } // loop over the threads' records
+        unsigned long long own_busy = 0, own_sys = 0, foreign_busy = 0;
+        int own_count = 0;
+        std::string own_list;
+        for (int c = 0; c < n; ++c) {
+            if (!seen[c] || !now.seen[c]) continue;   // no line for this CPU in one of the snapshots
+            const unsigned long long b = now.busy[c] - busy[c];
+            const unsigned long long y = now.system[c] - system[c];
+            if (own[c]) {
+                ++own_count;
+                own_busy += b;
+                own_sys += y;
+                own_list += (own_list.empty() ? "" : ",") + std::to_string(c) + ":" + std::to_string(b - y) + "/" + std::to_string(y);
+            } else {
+                foreign_busy += b;
+            } // own or other CPU
+        } // loop over the CPUs
+        state.counters["own_cpus"] = benchmark::Counter(double(own_count));
+        state.counters["own_cpus_busy_jiffies"] = benchmark::Counter(double(own_busy));
+        state.counters["own_cpus_system_jiffies"] = benchmark::Counter(double(own_sys));
+        state.counters["foreign_busy_jiffies"] = benchmark::Counter(double(foreign_busy));
+        if (wall_thread_detail()) {
+            printf("# cpustat %s own=%s foreign_busy=%llu cpus=%d\n", state.name().c_str(), own_list.c_str(), foreign_busy, n);
+            fflush(stdout);
+        } // the console line, with the per-thread detail
+    } // CpuStatSnapshot::report()
+}; // struct CpuStatSnapshot
+static_assert(std::is_trivially_destructible_v<CpuStatSnapshot>, "a body local with a destructor would be live across the state loop");
+
+// The per-thread pinning knob: HASH_BM_PIN_CPUS=<comma-separated CPU list>.
+// When set, every thread of a run pins itself (sched_setaffinity on the
+// calling thread) to the list's entry at its thread index, before the start
+// barrier; a list with fewer entries than the run has threads pins nothing and
+// is reported once on stderr; unset, nothing is pinned. Exists as the control
+// for the wall-clock span of a repetition: with thread i alone on CPU i, no two
+// threads of the run can share a CPU's time, which a process-wide mask
+// (taskset) does not exclude. The main thread is Google Benchmark's thread 0
+// and lives for the whole process, so a pin on it would otherwise stay for
+// every later row and repetition (and the helper threads, created by it,
+// would inherit the one-CPU mask): the mask the process had at the first call
+// is captured once, and every call that pins nothing restores it on the
+// calling thread, so an outer `taskset` mask stays in force and a row without
+// the knob runs unpinned. Row names are unchanged; the counter pinned_threads
+// is set by every thread (1 when it pinned itself), so its sum over the
+// threads is the number of pinned threads of the run. The list is parsed once
+// per process.
+struct PinCpus {
+    static constexpr int kMaxEntries = 1024;   // list entries kept
+    int count = 0;                             // entries parsed (0 = unset or unusable)
+    int cpu[kMaxEntries];                      // the CPU for thread index i
+
+    // The parsed list (once per process).
+    static const PinCpus& list() {
+        static const PinCpus parsed = [] {
+            PinCpus p;
+            const char* text = getenv("HASH_BM_PIN_CPUS");
+            if (text == nullptr) return p;
+            const char* q = text;
+            while (*q != '\0' && p.count < kMaxEntries) {
+                char* end = nullptr;
+                const long v = strtol(q, &end, 10);
+                if (end == q || v < 0 || v >= CPU_SETSIZE) {
+                    fprintf(stderr, "HASH_BM_PIN_CPUS=\"%s\" is not a comma-separated CPU list: nothing is pinned\n", text);
+                    p.count = 0;
+                    return p;
+                } // if not a CPU number
+                p.cpu[p.count++] = int(v);
+                q = end;
+                if (*q == ',') ++q;
+            } // loop over the list
+            return p;
+        }();
+        return parsed;
+    } // PinCpus::list()
+
+    // The process's affinity mask at the first call of pin() in the process
+    // (the mask every thread inherits: an outer taskset's or the default),
+    // restored on the calling thread whenever pin() pins nothing.
+    static const cpu_set_t& original_mask() {
+        static const cpu_set_t mask = [] {
+            cpu_set_t m;
+            CPU_ZERO(&m);
+            if (sched_getaffinity(0, sizeof m, &m) != 0) {
+                for (int c = 0; c < CPU_SETSIZE; ++c) CPU_SET(c, &m);   // unreadable: every CPU
+            } // if the mask could not be read
+            return m;
+        }();
+        return mask;
+    } // PinCpus::original_mask()
+
+    // Pin the calling thread (thread_index() of `state`) to its entry; false
+    // when nothing was pinned (unset; a list shorter than the run's thread
+    // count, under which NO thread pins, so that a run is pinned whole or not
+    // at all; or sched_setaffinity failed; the last two reported once on
+    // stderr). On every such path the thread's mask is restored to the
+    // process's original one, so that an earlier pin of the same thread (the
+    // main thread's, from an earlier row) does not stay.
+    static bool pin(const benchmark::State& state) {
+        const cpu_set_t& original = original_mask();
+        const PinCpus& p = list();
+        if (p.count == 0 || p.count < state.threads()) {
+            if (p.count != 0) {
+                [[maybe_unused]] static const bool reported =
+                    (fprintf(stderr, "HASH_BM_PIN_CPUS has %d entries, the run %d threads: nothing is pinned\n", p.count, state.threads()), true);
+            } // if the list is too short
+            sched_setaffinity(0, sizeof original, &original);
+            return false;
+        } // if nothing is to be pinned
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(p.cpu[state.thread_index()], &set);
+        if (sched_setaffinity(0, sizeof set, &set) != 0) {
+            [[maybe_unused]] static const bool reported =
+                (fprintf(stderr, "HASH_BM_PIN_CPUS: sched_setaffinity to CPU %d failed: nothing is pinned\n", p.cpu[state.thread_index()]), true);
+            sched_setaffinity(0, sizeof original, &original);
+            return false;
+        } // if the pin failed
+        return true;
+    } // PinCpus::pin()
+}; // struct PinCpus
+static_assert(std::is_trivially_destructible_v<PinCpus>, "a process-wide constant");
 
 // A new set for a fixture: `buckets` buckets, the arena shards of
 // arena_shards_from_env(), and the automatic cadence `auto_reclaim_every`
@@ -881,7 +1071,9 @@ template <typename SetType> ThreadHandles<SetType> MostlyOldFixture<SetType>::ha
         int next = 0;                                                         \
         int64_t ok = 0;                                                       \
         Handles::Own own(handles, state);                                     \
+        const bool pinned = PinCpus::pin(state);                              \
         const FaultSnapshot faults = FaultSnapshot::take(state);              \
+        const CpuStatSnapshot cpustat = CpuStatSnapshot::take(state);         \
         records.allocate(state);                                              \
         for (auto _ : WallTimed(state, records)) {                            \
             ok += set->insert(own.get(), mix(base + next++));                 \
@@ -898,12 +1090,15 @@ template <typename SetType> ThreadHandles<SetType> MostlyOldFixture<SetType>::ha
         /* above it are split copies and subchains abandoned by splitters   */ \
         /* that lost the publishing CAS. Measures how redundant the         */ \
         /* cooperative splits get as the thread count grows. Beside it the  */ \
-        /* fault deltas of the run (FaultSnapshot).                         */ \
+        /* fault and per-CPU deltas of the run (FaultSnapshot,              */ \
+        /* CpuStatSnapshot) and the pinning regime (PinCpus).               */ \
+        state.counters["pinned_threads"] = benchmark::Counter(pinned ? 1.0 : 0.0); /* every thread: the sum is the pinned count */ \
         if (state.thread_index() == 0) {                                      \
             state.counters["arena_nodes_per_key"] = benchmark::Counter(       \
                 double(set->get_internal_node_count())/                       \
                 (double(state.iterations())*state.threads()));                \
             faults.report(state);                                             \
+            cpustat.report(state, records);                                   \
         }                                                                     \
         records.release(state);                                               \
     }                                                                         \

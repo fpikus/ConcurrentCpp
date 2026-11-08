@@ -312,9 +312,10 @@ inline bool erase_layout_interleaved() {
 // both are empty in the rows without reclamation. The fixture's template
 // arguments come last. Same accounting contract as the macro bodies:
 // allocate() before the loop; report_wall() then release() after it; the
-// per-thread SkipWithError() after the loop, never inside it. Thread 0 takes
-// the fault snapshot before the loop and reports its deltas after it
-// (FaultSnapshot, shared header).
+// per-thread SkipWithError() after the loop, never inside it. Every thread
+// pins itself first when HASH_BM_PIN_CPUS says so (PinCpus); thread 0 takes
+// the fault and per-CPU snapshots before the loop and reports their deltas
+// after it (FaultSnapshot, CpuStatSnapshot, shared header).
 #define DEFINE_ERASE(NAME, PRE, ITERATION, POST, ...)                         \
     BENCHMARK_TEMPLATE_DEFINE_F(EraseFixture, NAME, __VA_ARGS__)              \
     (benchmark::State& state) {                                               \
@@ -325,7 +326,9 @@ inline bool erase_layout_interleaved() {
         int64_t ok = 0;                                                       \
         Handles::Own own(handles, state);                                     \
         PRE                                                                   \
+        const bool pinned = PinCpus::pin(state);                              \
         const FaultSnapshot faults = FaultSnapshot::take(state);              \
+        const CpuStatSnapshot cpustat = CpuStatSnapshot::take(state);         \
         records.allocate(state);                                              \
         for (auto _ : WallTimed(state, records)) {                            \
             ITERATION                                                         \
@@ -341,7 +344,9 @@ inline bool erase_layout_interleaved() {
                 double(set->get_internal_counters().retire_nodes - before.counters.retire_nodes)/erased); \
             state.counters["erase_layout"] = benchmark::Counter(erase_layout_interleaved() ? 1.0 : 0.0); \
             faults.report(state);                                             \
+            cpustat.report(state, records);                                   \
         }                                                                     \
+        state.counters["pinned_threads"] = benchmark::Counter(pinned ? 1.0 : 0.0); /* every thread: the sum is the pinned count */ \
         POST                                                                  \
         records.release(state);                                               \
     }

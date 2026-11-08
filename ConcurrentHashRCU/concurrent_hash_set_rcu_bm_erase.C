@@ -314,8 +314,9 @@ inline bool erase_layout_interleaved() {
 // allocate() before the loop; report_wall() then release() after it; the
 // per-thread SkipWithError() after the loop, never inside it. Every thread
 // pins itself first when HASH_BM_PIN_CPUS says so (PinCpus); thread 0 takes
-// the fault and per-CPU snapshots before the loop and reports their deltas
-// after it (FaultSnapshot, CpuStatSnapshot, shared header).
+// the fault, per-CPU and per-core snapshots before the loop and reports their
+// deltas after it (FaultSnapshot, CpuStatSnapshot, CoreStateSnapshot, shared
+// header).
 #define DEFINE_ERASE(NAME, PRE, ITERATION, POST, ...)                         \
     BENCHMARK_TEMPLATE_DEFINE_F(EraseFixture, NAME, __VA_ARGS__)              \
     (benchmark::State& state) {                                               \
@@ -329,6 +330,7 @@ inline bool erase_layout_interleaved() {
         const bool pinned = PinCpus::pin(state);                              \
         const FaultSnapshot faults = FaultSnapshot::take(state);              \
         const CpuStatSnapshot cpustat = CpuStatSnapshot::take(state);         \
+        const CoreStateSnapshot corestate = CoreStateSnapshot::take(state);   \
         records.allocate(state);                                              \
         for (auto _ : WallTimed(state, records)) {                            \
             ITERATION                                                         \
@@ -345,6 +347,7 @@ inline bool erase_layout_interleaved() {
             state.counters["erase_layout"] = benchmark::Counter(erase_layout_interleaved() ? 1.0 : 0.0); \
             faults.report(state);                                             \
             cpustat.report(state, records);                                   \
+            corestate.report(state, records);                                 \
         }                                                                     \
         state.counters["pinned_threads"] = benchmark::Counter(pinned ? 1.0 : 0.0); /* every thread: the sum is the pinned count */ \
         POST                                                                  \

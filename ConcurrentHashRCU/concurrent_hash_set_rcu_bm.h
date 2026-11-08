@@ -321,6 +321,106 @@ struct CpuStatSnapshot {
 }; // struct CpuStatSnapshot
 static_assert(std::is_trivially_destructible_v<CpuStatSnapshot>, "a body local with a destructor would be live across the state loop");
 
+// The per-core clock state around a timed loop, from sysfs: per CPU
+// /sys/devices/system/cpu/cpu<N>/thermal_throttle/core_throttle_count (how
+// many times the core has been thermally throttled so far) and
+// cpufreq/scaling_cur_freq (the frequency the cpufreq driver reports for the
+// CPU, kHz; what it averages over depends on the kernel: on x86 from 4.13 to
+// 5.18 the APERF/MPERF ratio since the previous read of that CPU, so a read
+// after the loop averages over the repetition; from 5.19 the ratio over the
+// last scheduler tick, falling back to the governor's request; the host's
+// kernel is recorded with the run). A host without cpufreq (no driver bound,
+// as a server with the P-states left to firmware) has no frequency file: the
+// `khz` list is then empty and `files` counts the throttle file alone.
+// Thread 0 takes the throttle counts of every CPU before the start barrier,
+// and after the loop reads the throttle counts and the frequencies of the
+// CPUs the run's threads reported (WallStamps::start_cpu / end_cpu), setting
+// the counters
+//   corestate_files        how many of the two files CPU 0 has (0 on a kernel
+//                          without them, a VM among others: the line then
+//                          carries no values and nothing failed);
+//   own_throttle_events    the throttle-count delta summed over our CPUs;
+// and, with GB_WALL_THREADS set (wall_thread_detail()), the console line
+// `# corestate <row> files=<n> throttle=<cpu:delta,...> khz=<cpu:kHz,...>`.
+// Exists for telling a core that ran slowly because its clock was throttled
+// or lowered (a throttle delta on it, a frequency below the others') from one
+// that ran at the common clock. Taken only when the per-thread detail is
+// wanted: the reads are several hundred small files before the barrier,
+// outside the timed region but not free. Fixed storage, trivially
+// destructible, like CpuStatSnapshot. On every other thread take() returns an
+// empty snapshot.
+struct CoreStateSnapshot {
+    static constexpr int kMaxCpus = CpuStatSnapshot::kMaxCpus;   // CPUs covered
+    int files = -1;                          // files CPU 0 has (0..2); -1 = not taken (another thread, or the detail is off)
+    bool seen[kMaxCpus] = {};                // per CPU: its throttle count was read
+    unsigned long long throttle[kMaxCpus] = {};   // per CPU: core_throttle_count at the snapshot
+
+    // The first line of the file as an unsigned number; false when the file is
+    // absent or holds none.
+    static bool read_ull(const char* path, unsigned long long& v) {
+        FILE* f = fopen(path, "r");
+        if (f == nullptr) return false;
+        const bool ok = fscanf(f, "%llu", &v) == 1;
+        fclose(f);
+        return ok;
+    } // CoreStateSnapshot::read_ull()
+
+    // The snapshot now, on thread 0 of `state` when the per-thread detail is
+    // wanted; empty otherwise. Reads the throttle count of every CPU that has
+    // the file (sysconf's configured count bounds the search).
+    static CoreStateSnapshot take(const benchmark::State& state) {
+        CoreStateSnapshot s;
+        if (state.thread_index() != 0 || !wall_thread_detail()) return s;
+        unsigned long long v = 0;
+        s.files = read_ull("/sys/devices/system/cpu/cpu0/thermal_throttle/core_throttle_count", v)
+                + read_ull("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", v);
+        if (s.files == 0) return s;
+        const int n = std::min<int>(kMaxCpus, int(sysconf(_SC_NPROCESSORS_CONF)));
+        char path[128];
+        for (int c = 0; c < n; ++c) {
+            snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/thermal_throttle/core_throttle_count", c);
+            if (read_ull(path, v)) {
+                s.seen[c] = true;
+                s.throttle[c] = v;
+            } // if the CPU has the file
+        } // loop over the CPUs
+        return s;
+    } // CoreStateSnapshot::take()
+
+    // Thread 0, after the loop: the counters and the console line above, for
+    // the CPUs the records hold.
+    void report(benchmark::State& state, const WallRecords& records) const {
+        if (files < 0) return;
+        state.counters["corestate_files"] = benchmark::Counter(double(files));
+        bool own[kMaxCpus] = {};
+        for (int t = 0; t < records.threads(); ++t) {
+            const WallStamps& rec = records.of(t);
+            if (rec.start_cpu >= 0 && rec.start_cpu < kMaxCpus) own[rec.start_cpu] = true;
+            if (rec.end_cpu >= 0 && rec.end_cpu < kMaxCpus) own[rec.end_cpu] = true;
+        } // loop over the threads' records
+        unsigned long long events = 0;
+        std::string throttle_list, khz_list;
+        char path[128];
+        for (int c = 0; c < kMaxCpus; ++c) {
+            if (!own[c]) continue;
+            unsigned long long v = 0;
+            snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/thermal_throttle/core_throttle_count", c);
+            if (seen[c] && read_ull(path, v)) {
+                events += v - throttle[c];
+                throttle_list += (throttle_list.empty() ? "" : ",") + std::to_string(c) + ":" + std::to_string(v - throttle[c]);
+            } // if the CPU has a throttle count at both ends
+            snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", c);
+            if (read_ull(path, v)) {
+                khz_list += (khz_list.empty() ? "" : ",") + std::to_string(c) + ":" + std::to_string(v);
+            } // if the CPU reports a frequency
+        } // loop over our CPUs
+        state.counters["own_throttle_events"] = benchmark::Counter(double(events));
+        printf("# corestate %s files=%d throttle=%s khz=%s\n", state.name().c_str(), files, throttle_list.c_str(), khz_list.c_str());
+        fflush(stdout);
+    } // CoreStateSnapshot::report()
+}; // struct CoreStateSnapshot
+static_assert(std::is_trivially_destructible_v<CoreStateSnapshot>, "a body local with a destructor would be live across the state loop");
+
 // The per-thread pinning knob: HASH_BM_PIN_CPUS=<comma-separated CPU list>.
 // When set, every thread of a run pins itself (sched_setaffinity on the
 // calling thread) to the list's entry at its thread index, before the start
@@ -1074,6 +1174,7 @@ template <typename SetType> ThreadHandles<SetType> MostlyOldFixture<SetType>::ha
         const bool pinned = PinCpus::pin(state);                              \
         const FaultSnapshot faults = FaultSnapshot::take(state);              \
         const CpuStatSnapshot cpustat = CpuStatSnapshot::take(state);         \
+        const CoreStateSnapshot corestate = CoreStateSnapshot::take(state);   \
         records.allocate(state);                                              \
         for (auto _ : WallTimed(state, records)) {                            \
             ok += set->insert(own.get(), mix(base + next++));                 \
@@ -1090,8 +1191,9 @@ template <typename SetType> ThreadHandles<SetType> MostlyOldFixture<SetType>::ha
         /* above it are split copies and subchains abandoned by splitters   */ \
         /* that lost the publishing CAS. Measures how redundant the         */ \
         /* cooperative splits get as the thread count grows. Beside it the  */ \
-        /* fault and per-CPU deltas of the run (FaultSnapshot,              */ \
-        /* CpuStatSnapshot) and the pinning regime (PinCpus).               */ \
+        /* fault, per-CPU and per-core deltas of the run (FaultSnapshot,    */ \
+        /* CpuStatSnapshot, CoreStateSnapshot) and the pinning regime       */ \
+        /* (PinCpus).                                                       */ \
         state.counters["pinned_threads"] = benchmark::Counter(pinned ? 1.0 : 0.0); /* every thread: the sum is the pinned count */ \
         if (state.thread_index() == 0) {                                      \
             state.counters["arena_nodes_per_key"] = benchmark::Counter(       \
@@ -1099,6 +1201,7 @@ template <typename SetType> ThreadHandles<SetType> MostlyOldFixture<SetType>::ha
                 (double(state.iterations())*state.threads()));                \
             faults.report(state);                                             \
             cpustat.report(state, records);                                   \
+            corestate.report(state, records);                                 \
         }                                                                     \
         records.release(state);                                               \
     }                                                                         \

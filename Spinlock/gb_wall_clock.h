@@ -79,11 +79,12 @@
 //
 // WHAT IS HERE
 //
-//   WallStamps          one thread's two stamps, `first` and `last`, and the
+//   WallStamps          one thread's two stamps, `first` and `last`, the
 //                       CPU it ran on at each (taken outside the iterations:
-//                       after the start barrier, after the last iteration); a
-//                       record with either stamp unset means "this thread did
-//                       not run".
+//                       after the start barrier, after the last iteration),
+//                       its kernel thread id, and, with GB_WALL_PERF set, its
+//                       own hardware counters over the loop; a record with
+//                       either stamp unset means "this thread did not run".
 //   WallRecords         the per-run store of one record per thread, shared by
 //                       all threads of a run through a static instance (one
 //                       instance may serve several rows that never run at
@@ -103,12 +104,24 @@
 //   set_wall_counters() the three counters from a WallSpan.
 //   wall_thread_detail()  whether the environment variable GB_WALL_THREADS is
 //                       set: the per-thread detail below is wanted.
+//   wall_perf_wanted()  whether the environment variable GB_WALL_PERF is set:
+//                       every thread counts its own cycles, reference cycles,
+//                       instructions and scheduled time over its loop
+//                       (WallPerf, Linux perf_event_open on the thread itself,
+//                       user mode only) into its record. Independent of
+//                       GB_WALL_THREADS: either variable alone gives its line.
+//   WallPerf            the counter group: open before the start barrier, read
+//                       after the last iteration, both on the cold path.
 //   report_wall_threads() the per-thread detail of a run from its WallRecords:
 //                       the counters slowest_thread and slowest_share, and one
 //                       `# threads` console line with every thread's first and
-//                       last stamp as offsets from the span's start.
+//                       last stamp as offsets from the span's start, its CPUs
+//                       and its thread id.
+//   report_wall_perf()  the counter perf_threads and one `# perf` console
+//                       line with every thread's counters (GB_WALL_PERF).
 //   report_wall()       the one-line aggregation and report for plain bodies;
-//                       with GB_WALL_THREADS set it adds the per-thread detail.
+//                       with GB_WALL_THREADS set it adds the per-thread detail,
+//                       with GB_WALL_PERF set the counters.
 // A benchmark whose timed loop carries more per-thread state than the stamps
 // keeps its own loop and its own record type, derived from WallStamps and
 // aggregated by wall_span(const Rec*, int) like any other; set_wall_counters()
@@ -224,11 +237,19 @@
 #include <cassert>
 #include <chrono>
 #include <concepts>
+#include <cerrno>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <sched.h>
+#include <unistd.h>
+#ifdef __linux__
+#include <linux/perf_event.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
+#endif
 
 #include "benchmark/benchmark.h"
 
@@ -246,18 +267,156 @@
 // iteration, steady-clock, and the CPU the thread was on at each: start_cpu
 // after the start barrier and before its first iteration, end_cpu after its
 // last iteration and before the end barrier (sched_getcpu(), -1 when not
-// taken). Unstamped (default-constructed, the clock's zero) means the thread
-// did not reach that point: a record with either stamp unset is ignored by
-// wall_span(). No alignment of its own: the record type that embeds or
-// derives from it carries the 128-byte block (WallRecords::Rec, or a
-// benchmark's own record with more fields), so that a record stays one block
-// whatever it adds.
+// taken); its kernel thread id, taken with start_cpu (the id an external tool
+// such as perf names the thread by; -1 off Linux); and, when GB_WALL_PERF is
+// set, the thread's own hardware counters over its loop (WallPerf below:
+// counted from just before the start barrier to just after the last
+// iteration, user mode only; -1 for a counter that was not counted). Unstamped (default-constructed, the clock's
+// zero) means the thread did not reach that point: a record with either stamp
+// unset is ignored by wall_span(). No alignment of its own: the record type
+// that embeds or derives from it carries the 128-byte block (WallRecords::Rec,
+// or a benchmark's own record with more fields), so that a record stays one
+// block whatever it adds.
 struct WallStamps {
   std::chrono::steady_clock::time_point first;  // end of this thread's first iteration
   std::chrono::steady_clock::time_point last;   // end of this thread's last iteration
   int start_cpu = -1;                   // the CPU after the start barrier, before the first iteration
   int end_cpu = -1;                     // the CPU after the last iteration, before the end barrier
+  int tid = -1;                         // the kernel thread id (gettid), taken with start_cpu
+  long long cycles = -1;                // core cycles the thread executed in user mode over its loop
+  long long ref_cycles = -1;            // reference (TSC-rate) cycles over the same time: cycles/ref_cycles is the core's clock relative to the TSC
+  long long instructions = -1;          // instructions retired in user mode
+  long long task_ns = -1;               // ns the thread was scheduled on a CPU (task-clock), user and kernel
+  long long enabled_ns = -1;            // ns the group was enabled while the thread was on a CPU (a per-task event's clock runs only then: about task_ns, not the wall interval)
+  long long running_ns = -1;            // ns of those the group was on the PMU: below enabled_ns the group was multiplexed and the counts are partial
 }; // struct WallStamps
+
+// Whether every thread's own hardware counters over its loop are wanted: the
+// environment variable GB_WALL_PERF set (to anything). Read once per process.
+// Independent of GB_WALL_THREADS: report_wall() prints the `# perf` line and
+// sets perf_threads whenever this is set, with or without the `# threads`
+// line.
+inline bool wall_perf_wanted() {
+  static const bool wanted = std::getenv("GB_WALL_PERF") != nullptr;
+  return wanted;
+} // wall_perf_wanted()
+
+// A thread's own counter group (Linux perf_event_open on the calling thread,
+// no inheritance, every event user-only: at perf_event_paranoid 2 the kernel
+// refuses an event that includes kernel mode, software events included, and
+// the task clock counts the task's whole scheduled time whatever its exclusion
+// bits say): core cycles as the leader, then reference cycles, instructions
+// and the task clock (the thread's scheduled time, user and kernel). A member
+// the PMU lacks (reference cycles on an AMD core) is left out: its counter
+// stays -1 and the group counts without it; only a refused leader leaves every
+// counter -1. Either case is reported once on stderr. The group is read in
+// one read() with the enabled and running times, so that a multiplexed
+// (partially scheduled) group is visible as running_ns < enabled_ns. Exists
+// so that the counters are the thread's own over exactly its loop: an
+// external `perf stat --per-thread -p <pid>` folds the counts of threads
+// created after it attached into the parent thread's, and Google Benchmark
+// creates a run's helper threads per repetition. Opened by WallTimed before
+// the start barrier (the open and the enable are its only cost there) and
+// read right after the thread's last iteration, before the end barrier; the
+// read is one system call on the cold path, after the `last` stamp, so
+// neither the span nor the per-thread times include it. Not available off
+// Linux: open() returns false and every counter stays -1.
+struct WallPerf {
+  static constexpr int kEvents = 4;     // the leader and three members, in the order of WallStamps' counters
+  int fd[kEvents] = {-1, -1, -1, -1};   // per event: its descriptor while it counts, -1 when absent (each stays open while it counts: closing a member removes it from the group)
+
+  // Whether the group is open and counting on this thread.
+  bool active() const noexcept { return fd[0] >= 0; }
+  // Open the group on the calling thread, enabled. False, with every
+  // descriptor -1, when the kernel refused the leader (reported once on
+  // stderr with errno); a refused member is reported once and left absent.
+  bool open() noexcept;
+  // Read the group into `rec` (the counters of the open events; the absent
+  // ones stay -1) and close it. False (every counter left -1) when the read
+  // did not return the open events' values; closed either way.
+  bool read_and_close(WallStamps& rec) noexcept;
+  // Close whatever is open; no-op when nothing is.
+  void close_all() noexcept {
+    for (int& f : fd) {
+      if (f >= 0) close(f);
+      f = -1;
+    } // loop over the descriptors
+  } // WallPerf::close_all()
+}; // struct WallPerf
+
+#ifdef __linux__
+inline bool WallPerf::open() noexcept {
+  // One attribute per event; the leader is disabled until the whole group is
+  // open and then enabled with its group, so that the four start together.
+  const auto attr_for = [](unsigned int type, unsigned long long config, bool leader) {
+    perf_event_attr a{};
+    a.size = sizeof a;
+    a.type = type;
+    a.config = config;
+    a.disabled = leader ? 1 : 0;
+    a.exclude_kernel = 1;
+    a.exclude_hv = 1;
+    a.inherit = 0;
+    a.read_format = PERF_FORMAT_GROUP | PERF_FORMAT_TOTAL_TIME_ENABLED | PERF_FORMAT_TOTAL_TIME_RUNNING;
+    return a;
+  }; // attr_for()
+  const auto open_one = [](perf_event_attr& a, int group) {
+    return static_cast<int>(syscall(SYS_perf_event_open, &a, 0, -1, group, 0UL));   // pid 0 = the calling thread, any CPU
+  }; // open_one()
+  perf_event_attr leader = attr_for(PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES, true);
+  fd[0] = open_one(leader, -1);
+  if (fd[0] < 0) {
+    [[maybe_unused]] static const bool reported =
+        (std::fprintf(stderr, "GB_WALL_PERF: perf_event_open(cycles, the group leader) failed: %s; no per-thread counters\n", std::strerror(errno)), true);
+    fd[0] = -1;
+    return false;
+  } // if the leader failed
+  struct Member { const char* name; unsigned int type; unsigned long long config; };
+  const Member members[kEvents - 1] = {
+    {"ref-cycles", PERF_TYPE_HARDWARE, PERF_COUNT_HW_REF_CPU_CYCLES},
+    {"instructions", PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS},
+    {"task-clock", PERF_TYPE_SOFTWARE, PERF_COUNT_SW_TASK_CLOCK},
+  };
+  for (int i = 0; i != kEvents - 1; ++i) {
+    perf_event_attr a = attr_for(members[i].type, members[i].config, false);
+    fd[i + 1] = open_one(a, fd[0]);
+    if (fd[i + 1] < 0) {
+      [[maybe_unused]] static const bool reported =
+          (std::fprintf(stderr, "GB_WALL_PERF: perf_event_open(%s) failed: %s; that counter stays absent (-1)\n", members[i].name, std::strerror(errno)), true);
+      fd[i + 1] = -1;
+    } // if a member failed: absent, the group goes on without it
+  } // loop over the group's members
+  ioctl(fd[0], PERF_EVENT_IOC_RESET, PERF_IOC_FLAG_GROUP);
+  ioctl(fd[0], PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP);
+  return true;
+} // WallPerf::open()
+
+inline bool WallPerf::read_and_close(WallStamps& rec) noexcept {
+  // PERF_FORMAT_GROUP with both times: nr, time_enabled, time_running, then
+  // one value per OPEN event in the order they were opened, which is the
+  // order of fd[]; an absent event has no value and keeps -1.
+  unsigned long long buf[3 + kEvents] = {};
+  int open_count = 0;
+  for (const int f : fd) open_count += (f >= 0);
+  const ssize_t want = static_cast<ssize_t>((3 + open_count)*sizeof buf[0]);
+  const ssize_t got = read(fd[0], buf, sizeof buf);
+  const bool whole = got == want && buf[0] == static_cast<unsigned long long>(open_count);
+  if (whole) {
+    rec.enabled_ns = static_cast<long long>(buf[1]);
+    rec.running_ns = static_cast<long long>(buf[2]);
+    long long* const counters[kEvents] = {&rec.cycles, &rec.ref_cycles, &rec.instructions, &rec.task_ns};
+    int next = 3;
+    for (int i = 0; i != kEvents; ++i) {
+      if (fd[i] >= 0) *counters[i] = static_cast<long long>(buf[next++]);
+    } // loop over the events, taking a value for each open one
+  } // if the read returned the open events' values
+  close_all();
+  return whole;
+} // WallPerf::read_and_close()
+#else
+inline bool WallPerf::open() noexcept { return false; }
+inline bool WallPerf::read_and_close(WallStamps&) noexcept { return false; }
+#endif
 
 // The per-run store of one WallStamps per thread of a run. One instance per
 // set of runs that never overlap (a function-local `static constinit
@@ -407,6 +566,7 @@ class WallTimed {
     } // if the first zero crossing
     mine_->last = now;                    // end of the last iteration, before the end barrier
     mine_->end_cpu = sched_getcpu();      // where this thread ended its loop (after the last iteration, not in it)
+    if (perf_.active()) perf_.read_and_close(*mine_);   // the thread's counters over its loop, after the `last` stamp
     finished_ = true;
     // The finishing batch call: nothing is left, so it returns false after
     // FinishKeepRunning(), which stops the timer and runs the end barrier.
@@ -421,6 +581,7 @@ class WallTimed {
   WallStamps* mine_ = nullptr;          // this thread's record; resolved after the start barrier
   bool first_stamped_ = false;          // `first` is written: the next zero crossing is the last
   bool finished_ = false;               // the finishing batch call was made, or there was nothing to run
+  WallPerf perf_;                       // this thread's counter group while it counts (GB_WALL_PERF); closed otherwise
 }; // class WallTimed
 
 inline WallTimed::Iterator WallTimed::begin() {
@@ -432,13 +593,18 @@ inline WallTimed::Iterator WallTimed::begin() {
     finished_ = true;
     return Iterator(this, 0);
   } // if max_iterations == 0
+  if (wall_perf_wanted()) perf_.open();   // counting from here: before the start barrier
   if (!state_.KeepRunningBatch(n)) {
     // Skipped: both barriers have run inside this call; no second call.
+    perf_.close_all();
     finished_ = true;
     return Iterator(this, 0);
   } // if skipped
   mine_ = &records_.of(state_.thread_index());  // after the start barrier
   mine_->start_cpu = sched_getcpu();            // where this thread begins its loop (a vDSO call on x86-64; before the first iteration, not in it)
+#ifdef __linux__
+  mine_->tid = static_cast<int>(syscall(SYS_gettid));   // the id perf and /proc name this thread by (the syscall: glibc before 2.30 has no gettid())
+#endif
   return Iterator(this, 1);
 } // WallTimed::begin()
 
@@ -555,10 +721,11 @@ inline bool wall_thread_detail() {
 //     first_us=<v0,v1,...> last_us=<v0,v1,...>
 // with every thread's two stamps as offsets from the span's start in
 // microseconds (`-` for a thread that did not run), in thread-index order,
-// stamped=<n>, how many threads ran, and cpu_first=<..> cpu_last=<..>, the
-// CPU each thread ran on after the start barrier and after its last iteration
-// (WallStamps). Exists for reading which thread sets a run's span and when each one
-// started: a finish_spread alone says that some thread straggled, not which.
+// stamped=<n>, how many threads ran, cpu_first=<..> cpu_last=<..>, the
+// CPU each thread ran on after the start barrier and after its last iteration,
+// and tid=<..>, each thread's kernel thread id (WallStamps). Exists for
+// reading which thread sets a run's span and when each one started: a
+// finish_spread alone says that some thread straggled, not which.
 //   state   -- thread 0's state;
 //   records -- the run's records;
 //   s       -- their aggregate (wall_span(records)).
@@ -573,6 +740,7 @@ inline void report_wall_threads(benchmark::State& state, const WallRecords& reco
   std::string last_us;
   std::string cpu_first;
   std::string cpu_last;
+  std::string tid;
   for (int i = 0; i != records.threads(); ++i) {
     const WallStamps& rec = records.of(i);
     const bool ran = rec.first != TimePoint() && rec.last != TimePoint();
@@ -581,22 +749,58 @@ inline void report_wall_threads(benchmark::State& state, const WallRecords& reco
       last_us += ',';
       cpu_first += ',';
       cpu_last += ',';
+      tid += ',';
     } // the separator before every entry but the first
     first_us += ran ? std::to_string(offset_us(rec.first)) : "-";
     last_us += ran ? std::to_string(offset_us(rec.last)) : "-";
     cpu_first += ran ? std::to_string(rec.start_cpu) : "-";
     cpu_last += ran ? std::to_string(rec.end_cpu) : "-";
+    tid += ran ? std::to_string(rec.tid) : "-";
   } // loop over the threads' records
-  std::printf("# threads %s threads=%d stamped=%d span_us=%lld start_spread=%.3f finish_spread=%.3f slowest=%d slowest_share=%.3f first_us=%s last_us=%s cpu_first=%s cpu_last=%s\n",
+  std::printf("# threads %s threads=%d stamped=%d span_us=%lld start_spread=%.3f finish_spread=%.3f slowest=%d slowest_share=%.3f first_us=%s last_us=%s cpu_first=%s cpu_last=%s tid=%s\n",
               state.name().c_str(), records.threads(), s.stamped,
               static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(s.last_finish - s.start).count()),
-              s.start_spread, s.spread, s.slowest, s.slowest_share, first_us.c_str(), last_us.c_str(), cpu_first.c_str(), cpu_last.c_str());
+              s.start_spread, s.spread, s.slowest, s.slowest_share, first_us.c_str(), last_us.c_str(), cpu_first.c_str(), cpu_last.c_str(), tid.c_str());
   std::fflush(stdout);
 } // report_wall_threads()
 
+// The per-thread counters of one run, on thread 0 after the loop, when
+// wall_perf_wanted() says so: the counter perf_threads (how many threads have
+// a cycles count) and one console line
+//   # perf <row> counted=<n> cycles=<v0,...> ref_cycles=<..> instructions=<..>
+//     task_ns=<..> enabled_ns=<..> running_ns=<..>
+// with every thread's own counters over its loop (WallStamps, WallPerf), in
+// thread-index order, `-` for a counter the thread does not have.
+//   state   -- thread 0's state;
+//   records -- the run's records.
+inline void report_wall_perf(benchmark::State& state, const WallRecords& records) {
+  // The six counter lists, in WallStamps order.
+  std::string perf[6];
+  int counted = 0;
+  const auto field = [](long long v) { return v >= 0 ? std::to_string(v) : std::string("-"); };
+  for (int i = 0; i != records.threads(); ++i) {
+    const WallStamps& rec = records.of(i);
+    if (i != 0) {
+      for (std::string& p : perf) p += ',';
+    } // the separator before every entry but the first
+    perf[0] += field(rec.cycles);
+    perf[1] += field(rec.ref_cycles);
+    perf[2] += field(rec.instructions);
+    perf[3] += field(rec.task_ns);
+    perf[4] += field(rec.enabled_ns);
+    perf[5] += field(rec.running_ns);
+    if (rec.cycles >= 0) ++counted;
+  } // loop over the threads' records
+  state.counters["perf_threads"] = benchmark::Counter(static_cast<double>(counted));
+  std::printf("# perf %s counted=%d cycles=%s ref_cycles=%s instructions=%s task_ns=%s enabled_ns=%s running_ns=%s\n",
+              state.name().c_str(), counted, perf[0].c_str(), perf[1].c_str(), perf[2].c_str(), perf[3].c_str(), perf[4].c_str(), perf[5].c_str());
+  std::fflush(stdout);
+} // report_wall_perf()
+
 // The one-line report for plain bodies: on thread 0, aggregate the records
 // and set the counters (and the per-thread detail when GB_WALL_THREADS is
-// set); on every other thread, nothing. Does not release the records:
+// set, the per-thread counters when GB_WALL_PERF is); on every other thread,
+// nothing. Does not release the records:
 // release() does. Call it after the loop, next to SetItemsProcessed(), on
 // every thread.
 //   state   -- the calling thread's state;
@@ -607,6 +811,7 @@ inline void report_wall(benchmark::State& state, const WallRecords& records, dou
   const WallSpan s = wall_span(records);
   set_wall_counters(state, s, items);
   if (wall_thread_detail()) report_wall_threads(state, records, s);
+  if (wall_perf_wanted()) report_wall_perf(state, records);
 } // report_wall()
 
 #endif // INCLUDED_GB_WALL_CLOCK_H

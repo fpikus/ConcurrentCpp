@@ -521,7 +521,9 @@ using QueueTesterIntConcurrent = QueueTester<int, void, 1024>; // Larger capacit
 //   disjoint value range [i*items_per_producer+1 .. (i+1)*items_per_producer],
 //   so every value in the run is globally unique. Consumers union their
 //   consumed values into all_consumed_items; size == total_items proves no
-//   item was LOST. (This oracle cannot see pure duplication -- re-inserting a
+//   item was LOST. (The two multi-producer multi-consumer tests also push
+//   extra values from a shared counter above every producer's range, and
+//   expect total_items plus that count: StarvationGuard below.) (This oracle cannot see pure duplication -- re-inserting a
 //   value is idempotent; the stress tests use a sum-based oracle that can.)
 //   These tests assert exactly-once delivery, NOT FIFO order.
 //
@@ -533,6 +535,9 @@ using QueueTesterIntConcurrent = QueueTester<int, void, 1024>; // Larger capacit
 // the consumer would break with those items stranded and fail the size and
 // empty() checks. Draining after the 0 observation is complete because no
 // further push can ever occur.
+// The MultiProducerMultiConsumer tests' producers push extra items
+// (StarvationGuard below) after their quota, but still before their
+// decrement, so the argument covers those items too.
 TEST_F(QueueTesterIntConcurrent, SingleProducerSingleConsumer) {
     const size_t items_per_producer = 1000;
     const size_t producer_count = 1;
@@ -635,12 +640,103 @@ TEST_F(QueueTesterIntConcurrent, MultiProducerSingleConsumer) {
     EXPECT_TRUE(queue_.empty());
 } // QueueTesterIntConcurrent.MultiProducerSingleConsumer
 
+// Keeps the producers of a multi-consumer test supplying items until every
+// consumer has popped at least one, so that a per-consumer "popped something"
+// check fails only when a consumer is starved for the whole deadline, not
+// whenever one back-off sleep outlasts the run. The queue's
+// SpinLock is not fair: a consumer that keeps losing the head lock backs off
+// into a ~1 ms sleep, and on a loaded machine a run of a few thousand items
+// can end inside that sleep. With the guard the producers cannot finish
+// before the last consumer has popped, up to a deadline far above any
+// scheduling stall; a consumer that has popped nothing by then is starved for
+// real, and the check reports it.
+//
+// Use: a consumer calls consumer_popped() once, on its first successful pop
+// in its polling loop (pops in the final drain come after every producer has
+// stopped supplying, so they need not report). Each producer calls
+// supply_extra_items() after its quota and BEFORE its release decrement of
+// remaining_producers, so the extra items are covered by the termination
+// argument (the termination note above) exactly as the quota items are. The
+// extra values are unique and lie above every quota value, so the set-based
+// oracle counts them like any other item: the expected size of the union is
+// total_items + extra_items().
+//
+// A producer sleeps for extra_item_interval after each extra push. The extras
+// only give a lagging consumer something to pop; pacing them bounds their
+// number, and the consumers' sets, by time_limit/extra_item_interval per
+// producer when a consumer really is starved, where an unpaced flood would
+// grow the sets at full queue throughput until the deadline.
+//
+// Both counters are relaxed: consumers_popped_ is a progress signal that
+// guards no data, and next_extra_value_ needs only the atomicity of its RMW
+// (unique values) until it is read after the producers are joined.
+//   consumer_count_    - number of consumers that must each pop at least once
+//   first_extra_value_ - the first extra value handed out; above every quota value
+//   deadline_          - after it, producers stop supplying extras even if a consumer has not popped
+//   consumers_popped_  - number of consumers that have popped at least once
+//   next_extra_value_  - the next extra value to hand out; every value below it
+//                        (from first_extra_value_) was or is being pushed
+class StarvationGuard {
+    public:
+    // How long the producers keep supplying extras while a consumer has not
+    // popped. Far above any scheduling stall of a correct but loaded run, and
+    // reached only when a consumer is starved.
+    static constexpr std::chrono::seconds time_limit {10};
+    // Pause after each extra push (see the class comment).
+    static constexpr std::chrono::microseconds extra_item_interval {50};
+
+    // consumer_count: the consumers that must each pop at least once.
+    // first_extra_value: the first value supply_extra_items() pushes; it must
+    // lie above every quota value. The deadline starts now: construct the
+    // guard just before starting the threads.
+    StarvationGuard(size_t consumer_count, int first_extra_value)
+        : consumer_count_(consumer_count),
+          first_extra_value_(first_extra_value),
+          deadline_(std::chrono::steady_clock::now() + time_limit),
+          next_extra_value_(first_extra_value) {}
+
+    // Consumer side: one more consumer has popped. Called once per consumer,
+    // on its first successful pop.
+    void consumer_popped() { consumers_popped_.fetch_add(1, std::memory_order_relaxed); }
+
+    // Producer side: push extra items until every consumer has popped or the
+    // deadline has passed (if either already holds, it pushes nothing). push is the
+    // queue's push for one value, a callable bool(int) that returns false when
+    // the queue is full; it is retried until it succeeds, as the quota pushes
+    // are. Called after the producer's quota, before its release decrement of
+    // remaining_producers.
+    template <typename Push>
+    void supply_extra_items(Push push) {
+        while (consumers_popped_.load(std::memory_order_relaxed) < consumer_count_ &&
+               std::chrono::steady_clock::now() < deadline_) {
+            int value = next_extra_value_.fetch_add(1, std::memory_order_relaxed);
+            while (!push(value)) { std::this_thread::yield(); }
+            std::this_thread::sleep_for(extra_item_interval);
+        } // until every consumer has popped or the deadline has passed
+    } // StarvationGuard::supply_extra_items()
+
+    // Number of extra items pushed by all producers. Valid once the producers
+    // have been joined.
+    size_t extra_items() const {
+        return static_cast<size_t>(next_extra_value_.load(std::memory_order_relaxed) - first_extra_value_);
+    } // StarvationGuard::extra_items()
+
+    private:
+    const size_t consumer_count_;
+    const int first_extra_value_;
+    const std::chrono::steady_clock::time_point deadline_;
+    std::atomic<size_t> consumers_popped_ {0};
+    std::atomic<int> next_extra_value_;
+}; // StarvationGuard
+
 // Topology: 4 producers, 4 consumers (full MPMC). Both the tail (producers)
 // and head (consumers) locks are contended simultaneously -- the hardest case
 // for the slot-handoff protocol. Consumers merge their per-thread sets under a
-// mutex (the queue does not track who consumed what). The extra per-consumer
-// EXPECT_NE(0) checks that no consumer was completely starved (skipped under
-// CI, where uneven scheduling can legitimately starve one).
+// mutex (the queue does not track who consumed what). The per-consumer
+// EXPECT_NE(0) checks that no consumer was starved: a StarvationGuard keeps
+// the producers supplying extra items until every consumer has popped one, so
+// the check fails only for a consumer still empty at the guard's deadline
+// (skipped under CI, see running_under_TAP).
 TEST_F(QueueTesterIntConcurrent, MultiProducerMultiConsumer) {
     const size_t items_per_producer = 1000;
     const size_t producer_count = 4;
@@ -648,6 +744,7 @@ TEST_F(QueueTesterIntConcurrent, MultiProducerMultiConsumer) {
     const size_t total_items = producer_count*items_per_producer;
     std::atomic<int> barrier {producer_count + consumer_count};
     std::atomic<int> remaining_producers {producer_count};
+    StarvationGuard starvation_guard {consumer_count, static_cast<int>(total_items) + 1};
 
     std::vector<std::thread> producers(producer_count);
     for (size_t i = 0; i != producer_count; ++i) {
@@ -658,6 +755,7 @@ TEST_F(QueueTesterIntConcurrent, MultiProducerMultiConsumer) {
                 int value = items_per_producer*i + j + 1;
                 while (!queue_.push(value)) { std::this_thread::yield(); }
             }
+            starvation_guard.supply_extra_items([&](int value) { return queue_.push(value); });
             remaining_producers.fetch_sub(1, std::memory_order_release);
         });
     }
@@ -673,6 +771,7 @@ TEST_F(QueueTesterIntConcurrent, MultiProducerMultiConsumer) {
             while (true) {
                 int value = queue_.pop();
                 if (value != 0) {
+                    if (consumed_items.empty()) { starvation_guard.consumer_popped(); }
                     consumed_items.insert(value);
                 } else if (remaining_producers.load(std::memory_order_acquire)) { // Producers still running, keep trying
                     std::this_thread::yield();
@@ -692,7 +791,7 @@ TEST_F(QueueTesterIntConcurrent, MultiProducerMultiConsumer) {
     for (auto& producer : producers) producer.join();
     for (auto& consumer : consumers) consumer.join();
 
-    EXPECT_EQ(total_items, all_consumed_items.size());
+    EXPECT_EQ(total_items + starvation_guard.extra_items(), all_consumed_items.size());
     EXPECT_TRUE(queue_.empty());
 } // QueueTesterIntConcurrent.MultiProducerMultiConsumer
 
@@ -818,6 +917,10 @@ TEST_F(QueueTesterIntStringConcurrent, MultiProducerSingleConsumer) {
     EXPECT_TRUE(queue_.empty());
 } // QueueTesterIntStringConcurrent.MultiProducerSingleConsumer
 
+// Topology: 4 producers, 4 consumers, as the key-only MultiProducerMultiConsumer
+// above, with the same per-consumer check made deterministic by a
+// StarvationGuard; the extra items carry std::to_string(value) like the quota
+// items and are checked like them.
 TEST_F(QueueTesterIntStringConcurrent, MultiProducerMultiConsumer) {
     const size_t items_per_producer = 1000;
     const size_t producer_count = 4;
@@ -825,6 +928,7 @@ TEST_F(QueueTesterIntStringConcurrent, MultiProducerMultiConsumer) {
     const size_t total_items = producer_count*items_per_producer;
     std::atomic<int> barrier {producer_count + consumer_count};
     std::atomic<int> remaining_producers {producer_count};
+    StarvationGuard starvation_guard {consumer_count, static_cast<int>(total_items) + 1};
 
     std::vector<std::thread> producers(producer_count);
     for (size_t i = 0; i != producer_count; ++i) {
@@ -835,6 +939,7 @@ TEST_F(QueueTesterIntStringConcurrent, MultiProducerMultiConsumer) {
                 int value = items_per_producer*i + j + 1;
                 while (!queue_.push(value, std::to_string(value))) { std::this_thread::yield(); }
             }
+            starvation_guard.supply_extra_items([&](int value) { return queue_.push(value, std::to_string(value)); });
             remaining_producers.fetch_sub(1, std::memory_order_release);
         });
     }
@@ -852,6 +957,7 @@ TEST_F(QueueTesterIntStringConcurrent, MultiProducerMultiConsumer) {
                 int value = queue_.pop(s);
                 if (value != 0) {
                     EXPECT_EQ(value, std::stoi(s));
+                    if (consumed_items.empty()) { starvation_guard.consumer_popped(); }
                     consumed_items.insert(value);
                 } else if (remaining_producers.load(std::memory_order_acquire)) { // Producers still running, keep trying
                     std::this_thread::yield();
@@ -874,7 +980,7 @@ TEST_F(QueueTesterIntStringConcurrent, MultiProducerMultiConsumer) {
     for (auto& producer : producers) producer.join();
     for (auto& consumer : consumers) consumer.join();
 
-    EXPECT_EQ(total_items, all_consumed_items.size());
+    EXPECT_EQ(total_items + starvation_guard.extra_items(), all_consumed_items.size());
     EXPECT_TRUE(queue_.empty());
 } // QueueTesterIntStringConcurrent.MultiProducerMultiConsumer
 

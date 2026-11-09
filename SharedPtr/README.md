@@ -101,7 +101,8 @@ Binaries go to `build/<hostname>/`. Requires Linux (every binary links
 `GBENCH_DIR` and `GTEST_DIR` at your installations if they are not in
 `$HOME/GoogleBench` and `$HOME/GoogleTest`. The benchmark also includes
 `../Spinlock/gb_wall_clock.h` (through `-I../Spinlock`), the wall-clock
-accounting behind its `wall_items_per_second` and `finish_spread` counters.
+accounting behind its `wall_items_per_second`, `finish_spread` and
+`start_spread` counters.
 The compiler, `-march` target and C++ standard come from `../config.mk` (the reference one selects `clang++-22`
 and C++23; the code also builds with `g++-16`).
 

@@ -442,8 +442,8 @@ machine-independent. The reference `config.mk` uses `clang++-22`,
 GoogleTest; point `GBENCH_DIR` and `GTEST_DIR` at your installations if they
 are not in `$HOME/GoogleBench` and `$HOME/GoogleTest`. The microbenchmark also
 includes `../Spinlock/gb_wall_clock.h` (through `-I../Spinlock`), the
-wall-clock accounting behind its `wall_items_per_second` and `finish_spread`
-counters.
+wall-clock accounting behind its `wall_items_per_second`, `finish_spread`
+and `start_spread` counters.
 
 Before the first build, clone Maged Michael's repository where the build
 looks for it, at the commit our patch was made against:

@@ -83,7 +83,9 @@ make                 # benchmarks + unit tests: ASan/TSan, some also optimized
 make run_tests
 ```
 
-Requirements: a recent clang (the Makefiles use `clang++-22`, C++23),
+Requirements: a recent clang (the per-machine `config.mk` at the top of the
+tree sets the compiler and the C++ standard: `clang++-22` and C++23 as
+shipped),
 [Google Benchmark](https://github.com/google/benchmark) and
 [GoogleTest](https://github.com/google/googletest); set `GBENCH_DIR` and
 `GTEST_DIR` if they are not in `$HOME/GoogleBench` and `$HOME/GoogleTest`.
@@ -98,8 +100,8 @@ IntrSharedPtr, SharedPtr and LockFreeList build on Linux only: the hazard
 pointers they link issue `membarrier(2)`. Before their first build, clone the
 third-party code they use (SharedPtr's README, "Third-party code"); their
 first `make` then makes the patched copy the build uses. `make imports` makes
-only that copy, `mm_hp/`: in IntrSharedPtr, and in LockFreeList by asking
-IntrSharedPtr.
+only that copy, `mm_hp/`: in IntrSharedPtr, and in SharedPtr and LockFreeList
+by asking IntrSharedPtr.
 Thread builds on Linux with glibc and libstdc++ only (any other C or C++
 library stops the build with an `#error`), and needs GoogleTest but not
 Google Benchmark: it has no benchmark yet.

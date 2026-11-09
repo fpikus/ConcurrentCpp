@@ -51,9 +51,13 @@
 //                            iteration to the end of the latest thread's last;
 //   finish_spread         -- (latest finish - earliest finish)/span, 0 when all
 //                            threads finish together;
-// both defined and stamped by ../Spinlock/gb_wall_clock.h. Every thread runs
-// the same number of iterations, so where a contended lock or word lets some
-// threads finish early, the mean loop time is shorter than the run and
+//   start_spread          -- (latest first - earliest first)/span: the share
+//                            of the span that passed before every thread had
+//                            finished its first iteration, 0 when all threads
+//                            start together;
+// all three defined and stamped by ../Spinlock/gb_wall_clock.h. Every thread
+// runs the same number of iterations, so where a contended lock or word lets
+// some threads finish early, the mean loop time is shorter than the run and
 // items_per_second overstates the throughput; the wall rate is the throughput
 // the run delivered. The never rows of the CAS_BM and DCLP_BM families
 // (BM_cas*_never, BM_dclp*_never) keep Google Benchmark's own loop and report

@@ -115,6 +115,9 @@
 //                            wall-clock span;
 //   finish_spread         -- how unevenly the threads finished, between 0
 //                            (all together) and 1;
+//   start_spread          -- how late, after the span's start, the last
+//                            thread finished its first operation, as a
+//                            fraction of the span: 0 when all start together;
 //   push_end, pop_end     -- the end of the last producer's (consumer's) loop,
 //                            measured from the start of the span, as a
 //                            fraction of the span: 1 for the role that
@@ -123,21 +126,23 @@
 //                            (consumers) at all. A producer here is an odd
 //                            thread, also in the balanced rows, where it
 //                            pops too.
-// The first two are the counters of ../Spinlock/gb_wall_clock.h, which
-// defines the span and finish_spread exactly and says why the span starts
+// The first three are the counters of ../Spinlock/gb_wall_clock.h, which
+// defines the span and the two spreads exactly and says why the span starts
 // where it does; this benchmark keeps its own per-thread record (ThreadStats,
 // derived from the header's WallStamps) and its own timed loop (timed_loop()),
 // and aggregates the records with the header's wall_span() and
-// set_wall_counters(). Every finish is at or after its own thread's first
-// stamp, the earliest of which starts the span, so no finish precedes the
-// span start, which is what keeps push_end and pop_end within [0, 1]. The
-// item count includes at most one operation per thread from before the span
-// starts, which is negligible. These counters are plain values, set by
+// set_wall_counters(), so it has the three counters but not what report_wall()
+// adds from a WallRecords: the per-thread detail (GB_WALL_THREADS) and the
+// per-thread hardware counters (GB_WALL_PERF). Every finish is at or after its
+// own thread's first stamp, the earliest of which starts the span, so no finish
+// precedes the span start, which is what keeps push_end and pop_end within
+// [0, 1]. The item count includes at most one operation per thread from before
+// the span starts, which is negligible. These counters are plain values, set by
 // thread 0 alone. The time stamps cost one compare per iteration, after the
-// operation. Where finish_spread is large, even
-// wall_items_per_second mixes contention levels; concurrent_queue_mbm.C runs
-// the same operation with every thread contending until a common stop, and its
-// items_per_s does not have this problem.
+// operation. Where finish_spread is large, even wall_items_per_second mixes
+// contention levels; concurrent_queue_mbm.C runs the same operation with every
+// thread contending until a common stop, and its items_per_s does not have this
+// problem.
 //
 // Two counters need care of their own: in the unbalanced rows, with equal
 // iteration counts and equal numbers of producers and consumers,
@@ -490,7 +495,7 @@ void BM_MP_MC(benchmark::State& state) {
     state.counters["pop_fail"] = benchmark::Counter(static_cast<double>(counts.cmiss), benchmark::Counter::kIsRate);
     // Past the end-of-loop barrier: no thread touches the queue any more, and
     // every thread's record is written. Thread 0 turns the records into the
-    // counters of THROUGHPUT ACCOUNTING above: the span and the spread by
+    // counters of THROUGHPUT ACCOUNTING above: the span and the two spreads by
     // gb_wall_clock.h's wall_span() and set_wall_counters(), the item total
     // and the per-role ends here. They are plain values, not rates, because
     // Google Benchmark would divide a rate by the mean loop time again; only

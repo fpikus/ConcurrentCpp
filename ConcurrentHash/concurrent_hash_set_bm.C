@@ -98,8 +98,8 @@
  * in /real_time/threads:N), so the rates are over real time: the default CPU
  * time leaves out the time a thread spends blocked -- in the baseline's
  * std::shared_mutex, in the back-off sleeps of the arena's SpinLock -- which
- * is part of what each container costs. Every row reports two rates and a
- * fairness measure (../Spinlock/gb_wall_clock.h defines them and does the
+ * is part of what each container costs. Every row reports two rates and two
+ * fairness measures (../Spinlock/gb_wall_clock.h defines them and does the
  * stamping):
  *   items_per_second      -- Google Benchmark's own: the operations of all
  *                            threads over the MEAN of the threads' loop times;
@@ -107,7 +107,11 @@
  *                            run, from the end of the earliest thread's first
  *                            operation to the end of the latest thread's last;
  *   finish_spread         -- (latest finish - earliest finish)/span, 0 when
- *                            all threads finish together.
+ *                            all threads finish together;
+ *   start_spread          -- (latest first - earliest first)/span: the share
+ *                            of the span that passed before every thread had
+ *                            finished its first operation, 0 when all threads
+ *                            start together.
  * With fixed iteration counts every thread runs the same number of operations,
  * so a thread that gets through them faster waits for the others at the end
  * of the loop, the mean loop time is shorter than the run, and

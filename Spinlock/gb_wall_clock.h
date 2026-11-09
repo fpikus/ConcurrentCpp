@@ -694,8 +694,9 @@ namespace gb_wall_clock_detail {
 // Records with `first` or `last` unset are skipped: they belong to threads
 // that did not run (a zero-iteration run, an early return, a per-thread
 // SkipWithError(), a rerun of the row by a memory manager with thread 0 alone
-// while threads() still says N). The span and the spread are the ones every wall-timed benchmark in this
-// repository reports; the arithmetic is written out exactly so.
+// while threads() still says N). The span and the two spreads are the ones
+// every wall-timed benchmark in this repository reports; the arithmetic is
+// written out exactly so.
 template <typename At>
 WallSpan wall_span_at(At at, int threads) {
   using TimePoint = std::chrono::steady_clock::time_point;

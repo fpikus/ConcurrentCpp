@@ -8,8 +8,9 @@
 // See spinlock_bm_common.h for the benchmark body and the contention dial;
 // tuning of the back-off tiers themselves lives in spinlock_tune_bm.C.
 //
-// Every row reports wall_items_per_second and finish_spread next to Google
-// Benchmark's items_per_second (defined at the top of spinlock_bm_common.h):
+// Every row reports wall_items_per_second, finish_spread and start_spread next
+// to Google Benchmark's items_per_second (defined at the top of
+// spinlock_bm_common.h):
 // the standard rate divides by the threads' mean loop time, which overstates
 // the throughput of a mechanism that lets some threads finish early, and the
 // mechanisms here can differ in that kind of fairness. BM_atomic and BM_cas

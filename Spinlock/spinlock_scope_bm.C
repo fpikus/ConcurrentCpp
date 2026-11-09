@@ -49,26 +49,31 @@
 //                            run's wall-clock span;
 //   finish_spread         -- how unevenly the threads finished, between 0
 //                            (all together) and 1;
+//   start_spread          -- how late, after the span's start, the last
+//                            thread finished its first operation, as a
+//                            fraction of the span: 0 when all start together;
 //   handoffs_per_op       -- the handoffs of all threads (see HANDOFFS in
 //                            spinlock_scope_common.h) divided by the total
 //                            items: 0 at 1 thread. Like wall_items_per_second,
 //                            an average over the whole run, the tail with
 //                            fewer threads included (see below).
-// The first two are the counters of gb_wall_clock.h, which defines the span
-// and finish_spread exactly and says why the span starts where it does; this
+// The first three are the counters of gb_wall_clock.h, which defines the span
+// and the two spreads exactly and says why the span starts where it does; this
 // harness keeps its own per-thread record (ThreadStats, derived from the
 // header's WallStamps) and its own timed loop (timed_loop()), and aggregates
-// the records with the header's wall_span() and set_wall_counters(). All
-// three are plain values, set by thread 0 alone, and they stay next to
-// items_per_second, which is kept for comparison with the other benchmarks in
-// this directory. The time stamps cost one compare per iteration and the loop
-// itself one more (the iteration count against the next stamp's and against
-// the last), placed after the unlock, the variant's post-unlock store and the
-// handoff comparison in every variant; both only read (in the builds checked,
-// both compilers read the two bounds from stack slots). The rest of the loop
-// bookkeeping is the compiler's to schedule, and some of it lands inside the
-// critical section (register increments of the loop counter and of the
-// previous index).
+// the records with the header's wall_span() and set_wall_counters(), so it has
+// the three counters but not what report_wall() adds from a WallRecords: the
+// per-thread detail (GB_WALL_THREADS) and the per-thread hardware counters
+// (GB_WALL_PERF). All four are plain values, set by thread 0 alone, and they
+// stay next to items_per_second, which is kept for comparison with the other
+// benchmarks in this directory. The time stamps cost one compare per iteration
+// and the loop itself one more (the iteration count against the next stamp's
+// and against the last), placed after the unlock, the variant's post-unlock
+// store and the handoff comparison in every variant; both only read (in the
+// builds checked, both compilers read the two bounds from stack slots). The
+// rest of the loop bookkeeping is the compiler's to schedule, and some of it
+// lands inside the critical section (register increments of the loop counter
+// and of the previous index).
 //
 // A large finish_spread means that the tail of the run had fewer threads
 // contending than its start, so even wall_items_per_second mixes contention
@@ -260,9 +265,10 @@ void BM_scope(benchmark::State& state) {
   } // if zero iterations
 
   // Past the end-of-loop barrier: no thread touches the arrays any more, and
-  // every thread's record is written. Thread 0 turns them into the three
-  // counters (see THROUGHPUT ACCOUNTING above): the span and the spread by
-  // gb_wall_clock.h's wall_span() and set_wall_counters(), the handoffs here.
+  // every thread's record is written. Thread 0 turns them into the four
+  // counters (see THROUGHPUT ACCOUNTING above): the span and the two spreads
+  // by gb_wall_clock.h's wall_span() and set_wall_counters(), the handoffs
+  // here.
   // They are plain values, not rates, because Google Benchmark would divide a
   // rate by the mean loop time again; only thread 0 sets them, so summing the
   // counters over threads leaves them unchanged. The span is empty when no

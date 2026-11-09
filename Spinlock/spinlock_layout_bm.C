@@ -21,8 +21,9 @@
 // wins everywhere; if the hypothesis is right, x0 loses at saturation and the
 // x1/x2 columns show how far the disturbance reaches past the line itself.
 //
-// Every row reports wall_items_per_second and finish_spread next to Google
-// Benchmark's items_per_second (defined at the top of spinlock_bm_common.h):
+// Every row reports wall_items_per_second, finish_spread and start_spread next
+// to Google Benchmark's items_per_second (defined at the top of
+// spinlock_bm_common.h):
 // the standard rate divides by the threads' mean loop time, which overstates
 // the throughput when some threads finish early, and the same lock need not
 // be equally fair under the four layouts.

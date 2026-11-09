@@ -82,8 +82,7 @@ positions, memory must actually be returned, and iterators must survive
 concurrent surgery. The cost is stated plainly: because of the reference
 counting, even a read-only traversal is a write at the hardware level, so
 read-side throughput does not scale the way the hash set's does. If your
-workload does not need real reclamation, this design is roughly a thirty-fold
-overpayment — use the hash set's arena approach, or partition the data and
+workload does not need real reclamation, this design overpays for it — use the hash set's arena approach, or partition the data and
 skip shared structures entirely. Manipulating shared data is a way to enforce
 synchronization boundaries, not the program itself; the realistic goal for a
 hot shared structure is flat performance under concurrency, and that is the
@@ -93,27 +92,73 @@ right lens for everything below.
 
 Five workloads (read-heavy, write-heavy, graveyard, insertion-at-head,
 dispersed) were benchmarked across the first two pointer policies, on
-hardware from a 16-core Ryzen desktop to a 72-core NVIDIA Grace server; the
-trends are remarkably consistent.
+hardware from a 16-core Ryzen desktop to a 144-core NVIDIA Grace server; the
+trends are remarkably consistent. All three policies were then measured
+together on a two-socket EPYC 9555 (Zen 5; 128 hardware threads, 8 NUMA
+nodes), GCC 16.2 `-O3 -march=native`, on 2026-11-02, and the figures below
+come from that run. They are wall-clock rates in millions of operations per
+second: every thread's operations summed over the span from the first
+thread's start to the last thread's finish, the median over four processes
+of 5 repetitions each, unpinned. The whole table, at 1, 4, 16, 64 and 128
+threads, is in [../LockFreeListRCU/README.md](../LockFreeListRCU/README.md),
+beside the RCU list that the same run measured against these three. The
+one-thread figures are firm: their repetitions agree within a fraction of a
+percent, and code placement alone moves them by at most 1.1%. From four
+threads up, an unpinned process can land on different chiplets or sockets
+from one run to the next, most cells' repetitions scatter by more than
+5–10%, and those figures are not conclusions by themselves; the direction
+of every ratio between two policies stated below, though, holds in every
+process of the run, and the ranges are over the thread counts shown.
+Where the threads finish more than half the run's span apart, a run-wide
+rate mixes the contended phase with a tail in which few threads still run,
+and the cell is not quoted.
+
+At one thread, where nothing contends, the hazard-pointer policy is the
+fastest of the three on every workload, 9–40% ahead of the intrusive pointer
+(14.3 against 12.8 million head inserts per second, 2.1 against 1.5 million
+read-heavy operations), and the standard pointer is the slowest. Under
+contention the order changes:
 
 - **Dispersed workloads** — threads working on mostly separate sections of
   the list, the design's true fast path — perform excellently: full
   concurrent insertion, deletion, and never-dangling traversal, with
-  throughput that keeps scaling as threads are added, for the standard and
-  intrusive pointers.
-- **Read-heavy workloads**: the intrusive pointer (`intr_shared_ptr`) scales
-  best at moderate thread counts — not by a better algorithm (it and the
-  standard pointer both hide a one-bit spinlock) but by a leaner
-  implementation and a backoff policy with manners; the difference between a
-  spinlock with manners and one without is two orders of magnitude.
+  throughput that keeps scaling as threads are added from four threads on,
+  for all three pointers. From four threads up each one's rate rises six- to
+  ninefold, to
+  11–12 million operations per second at 128 threads (1.05 to 1.81
+  million at one).
+- **Read-heavy workloads**: no pointer scales — by the medians each
+  delivers less at every thread count from 4 to 64 than one thread does
+  alone — and from 16 threads on the intrusive pointer (`intr_shared_ptr`)
+  holds up best: about 1.3 million operations per second at 16 and at 64
+  threads, 1.5 to 3.3 times the hazard-pointer one's, and twice the standard
+  pointer's rate at 16, not by a better algorithm (it and the standard pointer
+  both hide a one-bit spinlock) but by a leaner implementation and a backoff
+  policy with manners.
+- **Write-heavy and graveyard workloads**, where nearly every operation goes
+  through the head: here the difference between a spinlock with manners and
+  one without is more than an order of magnitude. From four threads up the
+  intrusive pointer runs at 12 to 29 times the standard pointer's rate (5.1
+  against 0.18 million operations per second on the write-heavy workload at
+  16 threads).
 - **Insertion at the head** funnels every thread through one pointer and will
   never scale, on any implementation; there the simplest, tightest pointer
-  (the intrusive one, `intr_shared_ptr`) wins.
+  (the intrusive one, `intr_shared_ptr`) wins from four threads up. Its own
+  rate falls from 12.8 million inserts per second at one thread to 7.1 at 16
+  and 1.2 at 128, and that is still 6 to 13 times the hazard-pointer rate and
+  12 to 47 times the standard one.
+- **The hazard-pointer policy**, the lock-free one and the fastest at one
+  thread, finds that lock-freedom is a progress guarantee, not a throughput
+  one: from four threads up it delivers 6 to 15 times less than the intrusive
+  pointer on the three workloads that write at the head, and 1.5 to 3.3
+  times less on the read-heavy one. On the writing workloads it still runs
+  1.7 to 4.2 times the standard pointer's rate.
 
 The stark ledger against the hash set: the set refused to reclaim memory and
 its readers scaled without visible limit; the list reclaims perfectly — every
-node freed at the earliest safe moment, every iterator forever valid — and
-its readers stand still under contention. The choice of a memory reclamation
+node freed at the earliest safe moment (with the hazard-pointer policy, at
+the next reclamation scan after it), every iterator forever valid — and its
+readers stand still under contention. The choice of a memory reclamation
 strategy is not an implementation detail of a concurrent design. On read-heavy
 workloads, it *is* the design.
 
@@ -159,8 +204,8 @@ The pointer policies come from two sibling projects, through
   policies model
 
 The benchmark also includes `../Spinlock/gb_wall_clock.h` (through
-`-I../Spinlock`), the wall-clock accounting behind its `wall_items_per_second`
-and `finish_spread` counters.
+`-I../Spinlock`), the wall-clock accounting behind its `wall_items_per_second`,
+`finish_spread` and `start_spread` counters.
 
 The pointers are tested on their own in `../SharedPtr` (see
 [../SharedPtr/README.md](../SharedPtr/README.md)) and `../IntrSharedPtr` (see

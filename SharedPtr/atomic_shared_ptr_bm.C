@@ -16,8 +16,8 @@
  *                  later, in a batch, by whichever thread's retire crosses mm_hp's
  *                  scan threshold
  *
- * Rows ReadHeavy, WriteHeavy and HighContention report two rates and a fairness measure
- * (../Spinlock/gb_wall_clock.h defines them and does the stamping):
+ * Rows ReadHeavy, WriteHeavy and HighContention report two rates and two fairness
+ * measures (../Spinlock/gb_wall_clock.h defines them and does the stamping):
  *   items_per_second       Google Benchmark's standard rate: the item count summed over
  *                          the threads, divided by the MEAN per-thread loop time;
  *   wall_items_per_second  the same total over the wall-clock span of the run, from the
@@ -25,7 +25,10 @@
  *                          latest thread's last;
  *   finish_spread          (latest finish - earliest finish)/span, from 0 when all threads
  *                          finish together to near 1 when some thread finishes right at
- *                          the start.
+ *                          the start;
+ *   start_spread           (latest first - earliest first)/span: the share of the span
+ *                          that passed before every thread had finished its first
+ *                          iteration, 0 when all threads start together.
  * Both rates because every thread runs the same number of iterations: under a pointer
  * that lets some threads finish early while others are parked, the early ones wait at the
  * end barrier, the mean loop time is shorter than the run, and the standard rate flatters
@@ -80,7 +83,8 @@ static const int num_cpu = sysconf(_SC_NPROCESSORS_CONF);
 //
 // Counters, per row, as Google Benchmark user counters (every thread sets them
 // and GB sums them over the row's threads, so each is a total for the run;
-// unlike wall_items_per_second and finish_spread, which thread 0 alone sets):
+// unlike wall_items_per_second, finish_spread and start_spread, which thread 0
+// alone sets):
 // - cas_ok, cas_fail: results of compare_exchange_strong in the CAS rows. The
 //   rate counts iterations, i.e. attempts; the split shows how much of it was
 //   wasted, and the `destroyed` identity needs both.

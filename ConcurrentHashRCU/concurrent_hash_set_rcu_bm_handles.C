@@ -177,7 +177,7 @@ static size_t distinct_shards(const std::vector<unsigned>& numbers, size_t shard
 // (every power of two; not a num_cpu that is not one), so a run of T threads
 // that scales takes the same time as one thread's run divided by T. Measured
 // over real time with the wall-clock records of every multi-threaded row
-// (items_per_second, wall_items_per_second, finish_spread;
+// (items_per_second, wall_items_per_second, finish_spread, start_spread;
 // concurrent_hash_set_rcu_bm.C says what each one is).
 //
 // Counters beyond the rates, set by thread 0 after the loop:

@@ -64,7 +64,7 @@
 //
 // Rates, exactly as in the reference-counted list's benchmark, so the two
 // binaries' rates are comparable as they stand (gb_wall_clock.h defines the
-// two wall-clock counters and does the stamping):
+// three wall-clock counters and does the stamping):
 //   items_per_second       Google Benchmark's standard rate (SetItemsProcessed
 //                          with one item per iteration): the summed iterations
 //                          over the MEAN per-thread time, which flatters an
@@ -79,7 +79,11 @@
 //                          all threads finish together to near 1 when some
 //                          thread finishes right at the start: how much of the
 //                          run had fewer threads left contending
-// The two wall-clock counters are plain values set by thread 0 alone, so
+//   start_spread           (latest first - earliest first)/span: the share of
+//                          the span that passed before every thread had
+//                          finished its first iteration, 0 when all threads
+//                          start together
+// The three wall-clock counters are plain values set by thread 0 alone, so
 // Google Benchmark's sum over the threads leaves them as they are.
 //
 // Counters (user counters set by every thread; Google Benchmark SUMS each

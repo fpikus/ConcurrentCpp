@@ -60,11 +60,11 @@ two parks before the long sleep collapse the throughput to a quarter and to
 half of eight parks': the waiters are asleep and the lock idles between
 handoffs. Four parks gain about a fifth over eight parks; in the queue, four
 cut the median latency nearly in half, the 90th percentile twenty-seven-fold
-and the 99th by 40%, presumably because a waiter that loses four rounds
+and the 99th by 42%, presumably because a waiter that loses four rounds
 leaves for a millisecond and the holder's streaks run longer, while sixteen
 buy a 99.9th percentile twice as tight at 12–19% of the queue's throughput.
 The price shows where the lock is held about 1% of the time: four parks cost
-7–11% of the throughput at 128 threads there, and the queue's packed
+7–9% of the throughput at 128 threads there, and the queue's packed
 key-value row loses about 4% at 16 threads. Four is the compromise that
 ships.
 
@@ -158,12 +158,14 @@ directly, with repetitions) and prints Google Benchmark's console report.
 Every Google Benchmark binary here but the demo (which runs every thread to a
 common stop, so its `items_per_second` is already the honest rate; it computes
 its own `wall_items_per_second`, over the span from the earliest thread's loop
-start, as a cross-check) reports, next to `items_per_second`, two counters
+start, as a cross-check) reports, next to `items_per_second`, three counters
 from `gb_wall_clock.h`:
 `wall_items_per_second`, the same item count over the run's wall-clock span,
 from the end of the earliest thread's first iteration to the end of the latest
-thread's last, and `finish_spread`, how unevenly the threads finished — 0 when
-they finish together, near 1 when one of them finished right at the start.
+thread's last; `finish_spread`, how unevenly the threads finished — 0 when
+they finish together, near 1 when one of them finished right at the start;
+and `start_spread`, the share of the span that passed before every thread
+had finished its first iteration — 0 when they all start together.
 Every thread runs the same number of iterations, and Google Benchmark divides
 by the mean of the threads' loop times, which flatters an unfair lock: the
 threads it favours finish early, and the mean comes out shorter than the run.

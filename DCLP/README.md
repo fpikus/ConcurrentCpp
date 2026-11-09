@@ -152,7 +152,7 @@ and written once per machine; the Makefile is machine-independent. The
 `../Spinlock/spinlock.h`, so this directory uses the same lock as the rest of
 the repository rather than a private copy. The benchmark also includes
 `../Spinlock/gb_wall_clock.h`, the wall-clock accounting behind its
-`wall_items_per_second` and `finish_spread` counters.
+`wall_items_per_second`, `finish_spread` and `start_spread` counters.
 
 - `atomic_max.h` — the lock-free maximum (the shipped facility)
 - `atomic_max_test.C` — unit tests (built with ASan and TSan)

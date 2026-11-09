@@ -22,10 +22,13 @@
 // SOFTWARE.
 //
 // Custom LATENCY benchmark for RingAtomicMapQueueMPMC (the "l" in lmbm =
-// latency). Measures push->pop HANDOFF latency under MPMC contention: the
-// time from just before a producer's push to just after a consumer's pop of
-// that same element. Contrast the sibling benchmarks: gmbm/mbm report
-// throughput, and ppmbm reports uncontended 1P-1C round-trip latency.
+// latency). Measures push-to-pop latency under MPMC contention: the time from
+// just before a push to just after the pop of that same element, which is
+// mostly a thread's own round trip through the contended queue (a thread
+// usually pops what it pushed; see Self-balancing roles below), not a
+// cross-core handoff. Contrast the sibling benchmarks: gmbm/mbm report
+// throughput, and ppmbm reports the uncontended round trip between one
+// producer thread and one consumer thread, two cross-core handoffs.
 //
 // Key=Value=uint64_t so the producer's timestamp travels *inside the slot* as
 // the value: the consumer recovers it from the popped element and subtracts.

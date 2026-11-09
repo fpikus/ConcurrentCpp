@@ -185,10 +185,13 @@ then *reused* the refreshed `expected` value:
 A reader that acquires the republished pointer synchronizes only with the
 republishing thread, not with the thread that constructed the pointee — a
 formal data race (stale reads of the node's contents) under a minimally
-conforming `AtomicPtr`. It was latent in practice because all three current
-pointer implementations over-synchronize internally (embedded spinlock,
-libstdc++ mutex, hazard-pointer fences), and on x86 every `lock cmpxchg` is a
-full barrier anyway.
+conforming `AtomicPtr`. It was latent in practice because all three pointer
+policies the list is benchmarked with over-synchronize internally:
+`intr_shared_ptr` with the one-bit spinlock in its pointer word,
+libstdc++'s `std::atomic<std::shared_ptr>` with the lock bit it takes in its
+control-block pointer (spinning while another thread holds it), and
+`intr_shared_ptr_hp` with its hazard-pointer fences; and on x86 every
+`lock cmpxchg` is a full barrier anyway.
 
 Fix: `acquire` failure order at those three sites. The two sites whose
 refreshed `expected` is discarded (marking-insert CAS, which reloads with

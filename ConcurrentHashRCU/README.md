@@ -534,9 +534,14 @@ figure includes the cost of the 24-byte node against the original's 16.
   in an order unrelated to their insertion runs 1.4-1.6x slower per thread on
   that machine.
   The wall-clock span of a repetition there is still set by one or two threads
-  that take about twice the others' time, in fixed repetition positions that
-  differ with where the threads are pinned, so the per-thread rate is the
-  figure to read; the straggler's cause is still open.
+  that take about twice the others' time, in repetition positions fixed within
+  a process (how many repetitions have one varies severalfold between
+  processes), so the per-thread rate, which a slow thread moves by only about
+  one part in the thread count, is the figure to read. Traced on pinned
+  32-thread runs, the slow thread is not the container or the benchmark's
+  threading: it executes the same instructions in twice the cycles, alone on
+  its core, with an idler memory system, a halted hyperthread sibling and an
+  unchanged clock, a state of the core itself.
 - For inserts into a set with many deletions (half the keys erased, nothing
   reclaimed) the copy is 5-22% faster on the laptop, on the M3 Ultra and on
   the EPYC at low thread counts, but 16-43% slower on the 2-socket Xeon at 16
@@ -788,8 +793,8 @@ by every directory in this repository and written once per machine; binaries
 go to `build/<hostname>/`, the benchmark's per-unit objects beside it.
 Requires Google Benchmark and GoogleTest. The
 benchmark also includes `../Spinlock/gb_wall_clock.h` (through
-`-I../Spinlock`), the wall-clock accounting behind its `wall_items_per_second`
-and `finish_spread` counters.
+`-I../Spinlock`), the wall-clock accounting behind its `wall_items_per_second`,
+`finish_spread` and `start_spread` counters.
 
 - `concurrent_hash_set_rcu.h` — the hash set; its design overview says where
   dead nodes leave their chains, what that guarantees, and what it does not,

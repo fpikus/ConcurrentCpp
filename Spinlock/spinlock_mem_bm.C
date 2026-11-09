@@ -56,8 +56,9 @@
 //
 // OUTPUT
 //
-// Every row reports wall_items_per_second and finish_spread next to Google
-// Benchmark's items_per_second (defined at the top of spinlock_bm_common.h):
+// Every row reports wall_items_per_second, finish_spread and start_spread next
+// to Google Benchmark's items_per_second (defined at the top of
+// spinlock_bm_common.h):
 // the standard rate divides by the threads' mean loop time, which overstates
 // the throughput of a ladder that lets some threads finish early, and the
 // candidates can differ in how evenly they hand the lock out.

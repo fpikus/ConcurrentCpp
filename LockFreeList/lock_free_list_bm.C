@@ -69,8 +69,9 @@
 //    whose mutation anchors are erasable nodes (see its comment for what
 //    that means for the StdAtomic policy).
 //
-// Every row reports Google Benchmark's rate, the wall-clock rate and the
-// finish spread ("Pointer policies" below says why both rates are needed).
+// Every row reports Google Benchmark's rate, the wall-clock rate, the finish
+// spread and the start spread ("Pointer policies" below says why both rates
+// are needed).
 
 #include <benchmark/benchmark.h>
 #include <thread>
@@ -87,7 +88,7 @@
 //   later, in a batch, by whichever thread's retire crosses mm_hp's scan
 //   threshold.
 //
-// Every row of every policy reports two rates and a fairness measure
+// Every row of every policy reports two rates and two fairness measures
 // (gb_wall_clock.h defines them and does the stamping):
 //   items_per_second      -- Google Benchmark's own rate: the total iteration
 //                            count over the MEAN of the threads' loop times;
@@ -96,7 +97,11 @@
 //                            iteration to the end of the latest thread's last;
 //   finish_spread         -- (latest finish - earliest finish)/span, from 0
 //                            when all threads finish together to near 1 when
-//                            some thread finishes right at the start.
+//                            some thread finishes right at the start;
+//   start_spread          -- (latest first - earliest first)/span: the share
+//                            of the span that passed before every thread had
+//                            finished its first iteration, 0 when all threads
+//                            start together.
 // Both rates are needed because every thread runs the same number of
 // iterations: under a policy that lets some threads through while others wait
 // (the IntrPtr spinlock; libstdc++'s std::atomic<std::shared_ptr>, whose load
@@ -105,8 +110,8 @@
 // the mean loop time is shorter than the run, and the standard rate overstates
 // the throughput. The wall rate is the throughput the run delivered, and
 // finish_spread says how much of the run had fewer threads left contending.
-// Only thread 0 sets the two counters, so Google Benchmark's sum over the
-// threads leaves them as they are.
+// Only thread 0 sets the three wall-clock counters, so Google Benchmark's sum
+// over the threads leaves them as they are.
 
 #include "atomic_shared_ptr_concept.h"
 #include "intr_shared_ptr.h"

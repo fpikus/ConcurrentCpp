@@ -129,14 +129,21 @@ that shard's free list when `reclaim()` has left one there and otherwise
 appending under the shard's lock, so the lock is contended only when thread
 numbers collide modulo the shard count. On a 16-thread laptop (Ryzen 7940HS)
 the sharding took the pre-sized 8M-bucket fixture (`Insert_MostlyNew_Presized`)
-from about 30 to 77-95 million random inserts per second at 16 threads. On
-the EPYC that fixture runs at 19 million random inserts per second
-single-threaded, 54 million at 4 threads and 90 million at 16, against the
+from about 30 to 77-95 million random inserts per second at 16 threads
+(2026-09-25/26). Those are rates over the threads' CPU time, the rate the
+benchmark then reported, and CPU time leaves out the time a thread spends
+off the CPU, waiting in the lock's back-off. Counted over the threads' mean
+wall time instead, the same fixture on the EPYC (2026-09-25) ran 16 threads
+through one deque at an eleventh to a sixteenth of the shards' rate, its
+threads off the CPU nine tenths of the time, where on CPU time the two
+arenas came out within a factor of 1.4 of each other. On the EPYC today that
+fixture runs at 19 million random inserts per second single-threaded, 54 million at 4 threads and 90 million at 16, against the
 baseline's 10, 2.0 and 1.0 million; with the table doubling live during the
 run (`Insert_MostlyNew`), 20 million per second at one thread and 77 million
 at 128, against the baseline's 17 and 0.5 million. On a 256-thread Granite
 Rapids server one shard collapses to about a fiftieth of the default shard
-count's rate at 256 threads (2026-09-25); today the default shard count
+count's rate at 256 threads (2026-09-25, counted over the threads' mean wall
+time); today the default shard count
 inserts between 75 and 89 million random keys per second at 256 threads, the
 table doubling twice during the run (2026-11-04). The bucket table is still
 doubled under one lock, once per doubling.
@@ -204,8 +211,8 @@ The compiler, C++ standard and library paths come from `../config.mk`, shared
 by every directory in this repository and written once per machine; binaries
 go to `build/<hostname>/`. Requires Google Benchmark and GoogleTest. The
 benchmark also includes `../Spinlock/gb_wall_clock.h` (through
-`-I../Spinlock`), the wall-clock accounting behind its `wall_items_per_second`
-and `finish_spread` counters.
+`-I../Spinlock`), the wall-clock accounting behind its `wall_items_per_second`,
+`finish_spread` and `start_spread` counters.
 
 - `concurrent_hash_set.h` — the hash set
 - `concurrent_deque.h` — the backing store (see `../ConcurrentDeque`)

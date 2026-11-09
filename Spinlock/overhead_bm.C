@@ -51,9 +51,10 @@
 // other even though an iteration costs `shared` updates rather than one. Every
 // row carries the rate twice: Google Benchmark's items_per_second, which
 // divides by the threads' mean loop time, and wall_items_per_second, which
-// divides by the wall-clock span of the run, with finish_spread next to it
-// (all three defined at the top of spinlock_bm_common.h). The standard rate
-// overstates the throughput of a mechanism that lets some threads finish
+// divides by the wall-clock span of the run, with finish_spread and
+// start_spread next to it (all four defined at the top of
+// spinlock_bm_common.h). The standard rate overstates the throughput of a
+// mechanism that lets some threads finish
 // early, and the three mechanisms can differ in how evenly the threads
 // progress; finish_spread shows how much of the run had fewer threads left.
 //
@@ -69,7 +70,7 @@
 //   ./overhead_bm --benchmark_filter='threads:32$'       # one thread count
 //   ./overhead_bm --benchmark_filter='shared:(10|100)/'  # sharing-heavy
 //   ./overhead_bm --benchmark_filter='_mem/'             # memory work only
-//   ./overhead_bm --benchmark_filter='BM_(spinlock_s[18]|atomic|cas)/'  # sin/cos only
+//   ./overhead_bm --benchmark_filter='BM_(spinlock_s[14]|atomic|cas)/'  # sin/cos only
 //
 // Run the _mem benchmarks with --benchmark_repetitions=10 (and
 // --benchmark_report_aggregates_only=true) and read the mean: the memory work

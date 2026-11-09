@@ -43,8 +43,8 @@
 //               every run starts from fresh objects.
 //
 // Every row reports, next to the Time column, two rates of one item per
-// iteration and a fairness measure (../Spinlock/gb_wall_clock.h defines them
-// and does the stamping):
+// iteration and two fairness measures (../Spinlock/gb_wall_clock.h defines
+// them and does the stamping):
 //   items_per_second       Google Benchmark's rate: the iterations summed over
 //                          the threads, divided by the MEAN per-thread loop
 //                          time;
@@ -53,7 +53,11 @@
 //                          iteration to the end of the latest thread's last;
 //   finish_spread          (latest finish - earliest finish)/span, from 0 when
 //                          all threads finish together to near 1 when some
-//                          thread finishes right at the start.
+//                          thread finishes right at the start;
+//   start_spread           (latest first - earliest first)/span: the share of
+//                          the span that passed before every thread had
+//                          finished its first iteration, 0 when all threads
+//                          start together.
 // Time is the mean per-thread time per iteration (the threads' summed real
 // loop times over their summed iterations), not the wall-clock time per
 // operation of the run. Every thread runs the same number of iterations, so

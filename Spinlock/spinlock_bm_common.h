@@ -20,8 +20,8 @@
 // The estimate is order-of-magnitude only (and shrinks further once waiting
 // inflates the denominator), which is all the comparisons need.
 //
-// Every row of every benchmark built on this file reports two rates and a
-// fairness measure (gb_wall_clock.h defines them and does the stamping):
+// Every row of every benchmark built on this file reports two rates and two
+// fairness measures (gb_wall_clock.h defines them and does the stamping):
 //   items_per_second      -- Google Benchmark's own rate: the total item count
 //                            over the MEAN of the threads' loop times;
 //   wall_items_per_second -- the same total over the wall-clock span of the
@@ -29,7 +29,11 @@
 //                            iteration to the end of the latest thread's last;
 //   finish_spread         -- (latest finish - earliest finish)/span, from 0
 //                            when all threads finish together to near 1 when
-//                            some thread finishes right at the start.
+//                            some thread finishes right at the start;
+//   start_spread          -- (latest first - earliest first)/span: the share
+//                            of the span that passed before every thread had
+//                            finished its first iteration, 0 when all threads
+//                            start together.
 // Both rates are needed because every thread runs the same number of
 // iterations: under a lock that lets some threads finish early, those threads
 // wait at the end barrier, the mean loop time is shorter than the run, and the

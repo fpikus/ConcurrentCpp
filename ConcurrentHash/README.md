@@ -133,10 +133,11 @@ from about 30 to 77-95 million random inserts per second at 16 threads
 (2026-09-25/26). Those are rates over the threads' CPU time, the rate the
 benchmark then reported, and CPU time leaves out the time a thread spends
 off the CPU, waiting in the lock's back-off. Counted over the threads' mean
-wall time instead, the same fixture on the EPYC (2026-09-25) ran 16 threads
-through one deque at an eleventh to a sixteenth of the shards' rate, its
-threads off the CPU nine tenths of the time, where on CPU time the two
-arenas came out within a factor of 1.4 of each other. On the EPYC today that
+wall time instead, the same fixture on the EPYC (2026-09-25, two passes) ran
+16 threads through one deque at a ninth to a sixteenth of the shards' rate,
+its threads off the CPU nine tenths of the time, where on CPU time one deque
+came out behind in one pass and ahead in the other, within a factor of 1.4
+either way. On the EPYC today that
 fixture runs at 19 million random inserts per second single-threaded, 54 million at 4 threads and 90 million at 16, against the
 baseline's 10, 2.0 and 1.0 million; with the table doubling live during the
 run (`Insert_MostlyNew`), 20 million per second at one thread and 77 million

@@ -3797,9 +3797,10 @@ public:
     //   - RACE-FREE, approximate while operations run:
     //     get_internal_node_count(), get_internal_arena_shards(),
     //     get_internal_auto_reclaim_every(), get_internal_table_size(),
-    //     get_internal_counters(), get_internal_retire_nodes_per_shard() and
-    //     get_internal_slot_counts() read only atomics and values fixed at
-    //     construction, and may be called concurrently with any operation,
+    //     get_internal_counters(), get_internal_retire_nodes_per_shard(),
+    //     get_internal_slot_counts() and get_internal_node_address() read
+    //     only atomics and values fixed at construction (the deque's size and
+    //     directory), and may be called concurrently with any operation,
     //     explicit call or trigger; each value they read is one its source had,
     //     but a sum over the shards is not one instant's total. At a quiescent
     //     point they are exact; get_internal_arena_shards() and
@@ -3875,6 +3876,18 @@ public:
     // Diagnostic accessor: the number of arena shards (a power of two), as
     // the constructor fixed it.
     size_t get_internal_arena_shards() const { return arena_mask_ + 1; }
+    // Diagnostic accessor: the address of arena slot `slot` of shard `shard`
+    // (a node that was appended there: reachable, free, limbo or retired
+    // alike; its address is stable for the set's life), or nullptr when the
+    // shard or the slot does not exist. For a benchmark that touches the
+    // nodes' memory ahead of the operations that reach them (a software
+    // prefetch over the arena's append order); never dereferenced here.
+    const void* get_internal_node_address(size_t shard, size_t slot) const {
+        if (shard > arena_mask_) return nullptr;
+        const Shard& s = shards_[shard];
+        if (slot >= s.nodes.size()) return nullptr;
+        return &s.nodes[slot];
+    } // get_internal_node_address()
     // Diagnostic accessor, race-free: the effective cadence (nodes retired
     // per arena shard between two automatic reclaims) as the constructor
     // fixed it: 0 for a cadence-off set (both constructors with no cadence),

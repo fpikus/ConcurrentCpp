@@ -303,6 +303,34 @@ inline bool erase_layout_interleaved() {
     return interleaved;
 } // erase_layout_interleaved()
 
+// The software-prefetch control, a compile-time knob:
+// -DHASH_BM_ERASE_PREFETCH=<distance> (0 or undefined: off, the loop as
+// published). With it, a thread erasing key k first prefetches the node of
+// its key `distance` erases ahead -- arena slot k + distance*stride of the
+// prefill's shard (shard 0: the main thread, thread number 0, prefills),
+// since the single-threaded prefill appended key k as slot k of its shard
+// with the free list empty and no bucket split during the prefill (the
+// pre-sized table holds half a node per bucket; see the layout above). The
+// address comes from the set's get_internal_node_address(), a bounds check
+// and a directory lookup per iteration: the knob's own cost, so a build with
+// it is compared with itself, not with the plain build. Exists as the control for a per-core state of the hardware
+// prefetcher: a software stream over the same nodes does not depend on it. A
+// compile-time knob and not an environment one because any second form of
+// the loop in the body -- a second loop, or a call of the operation out of
+// line -- ends the inlining of the operation into the published loop (the
+// compiler inlines a function called once whatever its size, and stops at
+// two call sites), and a loop-invariant test inside the one loop stays in it.
+// The counter erase_prefetch records the build's distance per repetition.
+#ifndef HASH_BM_ERASE_PREFETCH
+#define HASH_BM_ERASE_PREFETCH 0
+#endif
+#if HASH_BM_ERASE_PREFETCH > 0
+#define HASH_BM_ERASE_PREFETCH_STEP \
+    __builtin_prefetch(set->get_internal_node_address(0, size_t(key + HASH_BM_ERASE_PREFETCH*stride)));
+#else
+#define HASH_BM_ERASE_PREFETCH_STEP
+#endif
+
 // The body of the erase rows (see above), as a macro like the shared header's bodies, so
 // that every erase row runs the same code around its own regime. ITERATION is
 // the loop body: it erases the thread's next key, `key`, into `ok`, advances
@@ -312,7 +340,10 @@ inline bool erase_layout_interleaved() {
 // both are empty in the rows without reclamation. The fixture's template
 // arguments come last. Same accounting contract as the macro bodies:
 // allocate() before the loop; report_wall() then release() after it; the
-// per-thread SkipWithError() after the loop, never inside it. Every thread
+// per-thread SkipWithError() after the loop, never inside it. The
+// software-prefetch control (HASH_BM_ERASE_PREFETCH, above) adds its
+// prefetch before ITERATION in a build that defines it and nothing
+// otherwise. Every thread
 // pins itself first when HASH_BM_PIN_CPUS says so (PinCpus); thread 0 takes
 // the fault, per-CPU and per-core snapshots before the loop and reports their
 // deltas after it (FaultSnapshot, CpuStatSnapshot, CoreStateSnapshot, shared
@@ -333,6 +364,7 @@ inline bool erase_layout_interleaved() {
         const CoreStateSnapshot corestate = CoreStateSnapshot::take(state);   \
         records.allocate(state);                                              \
         for (auto _ : WallTimed(state, records)) {                            \
+            HASH_BM_ERASE_PREFETCH_STEP                                       \
             ITERATION                                                         \
         }                                                                     \
         if (ok != state.iterations()) {                                       \
@@ -345,6 +377,7 @@ inline bool erase_layout_interleaved() {
             state.counters["retired_per_erase"] = benchmark::Counter(         \
                 double(set->get_internal_counters().retire_nodes - before.counters.retire_nodes)/erased); \
             state.counters["erase_layout"] = benchmark::Counter(erase_layout_interleaved() ? 1.0 : 0.0); \
+            state.counters["erase_prefetch"] = benchmark::Counter(double(HASH_BM_ERASE_PREFETCH)); \
             faults.report(state);                                             \
             cpustat.report(state, records);                                   \
             corestate.report(state, records);                                 \

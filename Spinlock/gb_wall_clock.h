@@ -112,6 +112,8 @@
 //                       GB_WALL_THREADS: either variable alone gives its line.
 //   WallPerf            the counter group: open before the start barrier, read
 //                       after the last iteration, both on the cold path.
+//   WallPerfRaw::list() the raw (PERF_TYPE_RAW) members GB_WALL_PERF_RAW adds
+//                       to the group, up to four, named on the `# perf` line.
 //   report_wall_threads() the per-thread detail of a run from its WallRecords:
 //                       the counters slowest_thread and slowest_share, and one
 //                       `# threads` console line with every thread's first and
@@ -289,6 +291,7 @@ struct WallStamps {
   long long task_ns = -1;               // ns the thread was scheduled on a CPU (task-clock), user and kernel
   long long enabled_ns = -1;            // ns the group was enabled while the thread was on a CPU (a per-task event's clock runs only then: about task_ns, not the wall interval)
   long long running_ns = -1;            // ns of those the group was on the PMU: below enabled_ns the group was multiplexed and the counts are partial
+  long long raw[4] = {-1, -1, -1, -1};  // the raw members of GB_WALL_PERF_RAW, in list order (WallPerfRaw); -1 when absent
 }; // struct WallStamps
 
 // Whether every thread's own hardware counters over its loop are wanted: the
@@ -301,14 +304,61 @@ inline bool wall_perf_wanted() {
   return wanted;
 } // wall_perf_wanted()
 
+// The raw members of the counter group: GB_WALL_PERF_RAW=<name>:<code>[,...],
+// up to four; <code> is the processor's raw event encoding as perf's rNNNN
+// takes it (on x86 umask << 8 | event; hex with 0x, or decimal), <name>
+// ([A-Za-z0-9_.]+, enforced: the name is printed as a field name on a line
+// split at spaces and '=') names the member's list on the `# perf` line. The
+// codes are per microarchitecture: the caller knows the machine. Read once per
+// process; a malformed list, a bad name or more than kMax entries is
+// reported once on stderr and the list ignored whole (count 0). Used only
+// with GB_WALL_PERF set.
+struct WallPerfRaw {
+  static constexpr int kMax = 4;        // members at most: the general counters of a hyperthreaded Intel core
+  int count = 0;                        // members parsed
+  std::string name[kMax];               // each member's name
+  unsigned long long config[kMax] = {}; // each member's raw encoding
+
+  // The parsed list (once per process).
+  static const WallPerfRaw& list() {
+    static const WallPerfRaw parsed = [] {
+      WallPerfRaw r;
+      const char* text = std::getenv("GB_WALL_PERF_RAW");
+      if (text == nullptr) return r;
+      const auto name_char = [](char c) {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '.';
+      }; // name_char()
+      const char* q = text;
+      while (*q != '\0') {
+        const char* colon = q;
+        while (name_char(*colon)) ++colon;
+        char* end = nullptr;
+        const unsigned long long v = *colon == ':' ? std::strtoull(colon + 1, &end, 0) : 0;
+        if (*colon != ':' || colon == q || end == colon + 1 || (*end != '\0' && *end != ',') || r.count == kMax) {
+          std::fprintf(stderr, "GB_WALL_PERF_RAW=\"%s\" is not a list of at most %d name:code entries (name [A-Za-z0-9_.]+, code a number): no raw members\n", text, kMax);
+          r.count = 0;
+          return r;
+        } // if not name:code, or too many
+        r.name[r.count].assign(q, static_cast<size_t>(colon - q));
+        r.config[r.count] = v;
+        ++r.count;
+        q = *end == ',' ? end + 1 : end;
+      } // loop over the list's entries
+      return r;
+    }();
+    return parsed;
+  } // WallPerfRaw::list()
+}; // struct WallPerfRaw
+
 // A thread's own counter group (Linux perf_event_open on the calling thread,
 // no inheritance, every event user-only: at perf_event_paranoid 2 the kernel
 // refuses an event that includes kernel mode, software events included, and
 // the task clock counts the task's whole scheduled time whatever its exclusion
 // bits say): core cycles as the leader, then reference cycles, instructions
-// and the task clock (the thread's scheduled time, user and kernel). A member
-// the PMU lacks (reference cycles on an AMD core) is left out: its counter
-// stays -1 and the group counts without it; only a refused leader leaves every
+// and the task clock (the thread's scheduled time, user and kernel), then the
+// raw members of GB_WALL_PERF_RAW (WallPerfRaw), if any. A member the PMU
+// lacks (reference cycles on an AMD core) is left out: its counter stays -1
+// and the group counts without it; only a refused leader leaves every
 // counter -1. Either case is reported once on stderr. The group is read in
 // one read() with the enabled and running times, so that a multiplexed
 // (partially scheduled) group is visible as running_ns < enabled_ns. Exists
@@ -322,8 +372,13 @@ inline bool wall_perf_wanted() {
 // neither the span nor the per-thread times include it. Not available off
 // Linux: open() returns false and every counter stays -1.
 struct WallPerf {
-  static constexpr int kEvents = 4;     // the leader and three members, in the order of WallStamps' counters
-  int fd[kEvents] = {-1, -1, -1, -1};   // per event: its descriptor while it counts, -1 when absent (each stays open while it counts: closing a member removes it from the group)
+  static constexpr int kFixed = 4;      // the leader and the three members every group has, in the order of WallStamps' counters
+  static constexpr int kEvents = kFixed + WallPerfRaw::kMax;   // plus the raw members, in WallStamps::raw order
+  int fd[kEvents];                      // per event: its descriptor while it counts, -1 when absent (each stays open while it counts: closing a member removes it from the group)
+
+  WallPerf() noexcept {
+    for (int& f : fd) f = -1;
+  } // WallPerf::WallPerf()
 
   // Whether the group is open and counting on this thread.
   bool active() const noexcept { return fd[0] >= 0; }
@@ -347,7 +402,7 @@ struct WallPerf {
 #ifdef __linux__
 inline bool WallPerf::open() noexcept {
   // One attribute per event; the leader is disabled until the whole group is
-  // open and then enabled with its group, so that the four start together.
+  // open and then enabled with its group, so that the group starts together.
   const auto attr_for = [](unsigned int type, unsigned long long config, bool leader) {
     perf_event_attr a{};
     a.size = sizeof a;
@@ -372,17 +427,22 @@ inline bool WallPerf::open() noexcept {
     return false;
   } // if the leader failed
   struct Member { const char* name; unsigned int type; unsigned long long config; };
-  const Member members[kEvents - 1] = {
+  const WallPerfRaw& raw = WallPerfRaw::list();
+  Member members[kEvents - 1] = {
     {"ref-cycles", PERF_TYPE_HARDWARE, PERF_COUNT_HW_REF_CPU_CYCLES},
     {"instructions", PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS},
     {"task-clock", PERF_TYPE_SOFTWARE, PERF_COUNT_SW_TASK_CLOCK},
   };
-  for (int i = 0; i != kEvents - 1; ++i) {
+  for (int i = 0; i != raw.count; ++i) members[kFixed - 1 + i] = {raw.name[i].c_str(), PERF_TYPE_RAW, raw.config[i]};
+  static bool reported[kEvents - 1] = {};   // per member: its refusal was printed (once per process per member)
+  for (int i = 0; i != kFixed - 1 + raw.count; ++i) {
     perf_event_attr a = attr_for(members[i].type, members[i].config, false);
     fd[i + 1] = open_one(a, fd[0]);
     if (fd[i + 1] < 0) {
-      [[maybe_unused]] static const bool reported =
-          (std::fprintf(stderr, "GB_WALL_PERF: perf_event_open(%s) failed: %s; that counter stays absent (-1)\n", members[i].name, std::strerror(errno)), true);
+      if (!reported[i]) {
+        reported[i] = true;   // a benign race between threads: at worst the line prints twice
+        std::fprintf(stderr, "GB_WALL_PERF: perf_event_open(%s) failed: %s; that counter stays absent (-1)\n", members[i].name, std::strerror(errno));
+      } // if not yet reported
       fd[i + 1] = -1;
     } // if a member failed: absent, the group goes on without it
   } // loop over the group's members
@@ -404,7 +464,7 @@ inline bool WallPerf::read_and_close(WallStamps& rec) noexcept {
   if (whole) {
     rec.enabled_ns = static_cast<long long>(buf[1]);
     rec.running_ns = static_cast<long long>(buf[2]);
-    long long* const counters[kEvents] = {&rec.cycles, &rec.ref_cycles, &rec.instructions, &rec.task_ns};
+    long long* const counters[kEvents] = {&rec.cycles, &rec.ref_cycles, &rec.instructions, &rec.task_ns, &rec.raw[0], &rec.raw[1], &rec.raw[2], &rec.raw[3]};
     int next = 3;
     for (int i = 0; i != kEvents; ++i) {
       if (fd[i] >= 0) *counters[i] = static_cast<long long>(buf[next++]);
@@ -770,12 +830,14 @@ inline void report_wall_threads(benchmark::State& state, const WallRecords& reco
 //   # perf <row> counted=<n> cycles=<v0,...> ref_cycles=<..> instructions=<..>
 //     task_ns=<..> enabled_ns=<..> running_ns=<..>
 // with every thread's own counters over its loop (WallStamps, WallPerf), in
-// thread-index order, `-` for a counter the thread does not have.
+// thread-index order, `-` for a counter the thread does not have, and one
+// more list ` <name>=<v0,...>` per raw member of GB_WALL_PERF_RAW (WallPerfRaw).
 //   state   -- thread 0's state;
 //   records -- the run's records.
 inline void report_wall_perf(benchmark::State& state, const WallRecords& records) {
-  // The six counter lists, in WallStamps order.
-  std::string perf[6];
+  // The six counter lists, in WallStamps order, then the raw members' lists.
+  const WallPerfRaw& raw = WallPerfRaw::list();
+  std::string perf[6 + WallPerfRaw::kMax];
   int counted = 0;
   const auto field = [](long long v) { return v >= 0 ? std::to_string(v) : std::string("-"); };
   for (int i = 0; i != records.threads(); ++i) {
@@ -789,11 +851,14 @@ inline void report_wall_perf(benchmark::State& state, const WallRecords& records
     perf[3] += field(rec.task_ns);
     perf[4] += field(rec.enabled_ns);
     perf[5] += field(rec.running_ns);
+    for (int r = 0; r != raw.count; ++r) perf[6 + r] += field(rec.raw[r]);
     if (rec.cycles >= 0) ++counted;
   } // loop over the threads' records
   state.counters["perf_threads"] = benchmark::Counter(static_cast<double>(counted));
-  std::printf("# perf %s counted=%d cycles=%s ref_cycles=%s instructions=%s task_ns=%s enabled_ns=%s running_ns=%s\n",
-              state.name().c_str(), counted, perf[0].c_str(), perf[1].c_str(), perf[2].c_str(), perf[3].c_str(), perf[4].c_str(), perf[5].c_str());
+  std::string raw_lists;
+  for (int r = 0; r != raw.count; ++r) raw_lists += " " + raw.name[r] + "=" + perf[6 + r];
+  std::printf("# perf %s counted=%d cycles=%s ref_cycles=%s instructions=%s task_ns=%s enabled_ns=%s running_ns=%s%s\n",
+              state.name().c_str(), counted, perf[0].c_str(), perf[1].c_str(), perf[2].c_str(), perf[3].c_str(), perf[4].c_str(), perf[5].c_str(), raw_lists.c_str());
   std::fflush(stdout);
 } // report_wall_perf()
 
